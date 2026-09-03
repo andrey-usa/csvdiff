@@ -1,0 +1,133 @@
+name: Compare CSVs
+
+# A fourth launch mode: run a comparison from the Actions tab, or call this
+# workflow from another repo's pipeline. Files come from repo paths or URLs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_a:
+        description: File A — repo path or https URL
+        required: true
+      file_b:
+        description: File B — repo path or https URL
+        required: true
+      key:
+        description: Key columns, comma separated
+        required: true
+      compare:
+        description: Columns to compare (blank = all common non-key columns)
+        default: ""
+      ignore:
+        description: Columns to ignore
+        default: ""
+      options:
+        description: Extra flags, e.g. "--trim --tolerance 0.01"
+        default: ""
+      fail_on_diff:
+        description: Fail the run when differences are found
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      file_a: { type: string, required: true }
+      file_b: { type: string, required: true }
+      key: { type: string, required: true }
+      compare: { type: string, default: "" }
+      ignore: { type: string, default: "" }
+      options: { type: string, default: "" }
+      fail_on_diff: { type: boolean, default: false }
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: |
+          pip install "duckdb>=1.0"
+          pip install -e . --no-deps
+
+      - name: Fetch inputs
+        env:
+          A: ${{ inputs.file_a }}
+          B: ${{ inputs.file_b }}
+        run: |
+          mkdir -p in
+          fetch() {  # $1 = source, $2 = destination
+            case "$1" in
+              https://*) curl -fsSL --retry 3 -o "$2" "$1" ;;
+              *) cp "$1" "$2" ;;
+            esac
+          }
+          fetch "$A" "in/$(basename "${A%%\?*}")"
+          fetch "$B" "in/$(basename "${B%%\?*}")"
+          ls -la in
+
+      - name: Compare
+        id: run
+        env:
+          A: ${{ inputs.file_a }}
+          B: ${{ inputs.file_b }}
+          KEY: ${{ inputs.key }}
+          COMPARE: ${{ inputs.compare }}
+          IGNORE: ${{ inputs.ignore }}
+          EXTRA: ${{ inputs.options }}
+        run: |
+          a="in/$(basename "${A%%\?*}")"; b="in/$(basename "${B%%\?*}")"
+          mkdir -p out
+          set -- compare "$a" "$b" --key "$KEY"
+          [ -n "$COMPARE" ] && set -- "$@" --compare "$COMPARE"
+          [ -n "$IGNORE" ] && set -- "$@" --ignore "$IGNORE"
+          set -- "$@" --threads "$(nproc)" --memory-limit 8GB \
+                 --out out/report.html --json out/summary.json --export-dir out/rows
+          set +e
+          csvdiff "$@" $EXTRA
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          [ $rc -le 1 ] || exit $rc
+
+      - name: Summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          d = json.load(open("out/summary.json")); c, m = d["counts"], d["meta"]
+          print(f"## {m['a']['name']} → {m['b']['name']}\n")
+          print(f"Key: `{', '.join(m['key'])}` · {len(m['compared'])} columns compared · "
+                f"{m['engine']}, {m['seconds']}s\n")
+          print("| metric | A | B |\n|---|---|---|")
+          print(f"| rows | {c['a_rows']:,} | {c['b_rows']:,} |")
+          print(f"| unique keys | {c['a_keys']:,} | {c['b_keys']:,} |")
+          print(f"| duplicate keys | {c['a_dup_keys']:,} | {c['b_dup_keys']:,} |\n")
+          print(f"**Matched {c['matched']:,}** — changed {c['changed']:,}, unchanged {c['unchanged']:,}. "
+                f"Added {c['added']:,}, removed {c['removed']:,}.\n")
+          top = [x for x in sorted(d["columns"], key=lambda x: -x["changed"]) if x["changed"]][:10]
+          if top:
+              print("| column | changed | blanked in B | filled in B |\n|---|---|---|---|")
+              for x in top:
+                  print(f"| {x['name']} | {x['changed']:,} | {x['blanked']:,} | {x['filled']:,} |")
+          if m["only_in_a"] or m["only_in_b"]:
+              print(f"\nSchema drift — only in A: {m['only_in_a'] or 'none'}, only in B: {m['only_in_b'] or 'none'}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: csvdiff-report
+          path: out/
+          retention-days: 30
+
+      - name: Fail on differences
+        if: inputs.fail_on_diff && steps.run.outputs.rc == '1'
+        run: |
+          echo "Differences found — see the report artifact." >&2
+          exit 1

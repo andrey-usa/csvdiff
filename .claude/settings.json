@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest*)",
+      "Bash(python scripts/*)",
+      "Bash(python -m csvdiff*)",
+      "Bash(csvdiff *)",
+      "Bash(pip install*)",
+      "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git add*)", "Bash(git commit*)",
+      "Bash(gh run*)", "Bash(gh workflow*)", "Bash(gh pr*)",
+      "Read(./**)", "Edit(./csvdiff/**)", "Edit(./scripts/**)", "Edit(./tests/**)", "Edit(./.github/**)"
+    ],
+    "ask": ["Bash(git push*)", "Bash(gh repo create*)"],
+    "deny": ["Read(./.env)", "Read(./csvdiff.toml)", "Bash(rm -rf*)"]
+  },
+  "env": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

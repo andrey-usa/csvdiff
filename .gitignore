@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+data/
+bench/
+out/
+csvdiff.toml
+*.html
+!examples/report.html
+.claude/settings.local.json

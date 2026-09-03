@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csvdiff"
+version = "1.0.0"
+description = "Parameterised composite-key CSV comparison with a self-contained HTML report"
+requires-python = ">=3.11"
+dependencies = ["duckdb>=1.0"]
+
+[project.optional-dependencies]
+fallback = ["pandas>=2.0"]
+
+[project.scripts]
+csvdiff = "csvdiff.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["csvdiff*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

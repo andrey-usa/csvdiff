@@ -1,0 +1,29 @@
+# Copy to csvdiff.toml (current dir or ~/.config/csvdiff/). Profiles let a recurring
+# comparison run as `csvdiff compare a.csv b.csv -p orders` or by mailing "csvdiff profile=orders".
+
+[profiles.orders]
+key       = ["order_id", "line_no"]
+compare   = ["qty", "unit_price", "status", "ship_date"]   # omit -> every common non-key column
+ignore    = ["updated_at"]
+trim      = true
+tolerance = 0.005
+
+[profiles.customers]
+key         = ["customer_id"]
+ignore_case = true
+empty_is_null = true
+
+[mail]
+imap_host          = "imap.example.com"
+imap_port          = 993
+imap_user          = "csvdiff@example.com"
+imap_password_env  = "CSVDIFF_MAIL_PASSWORD"   # password is read from this env var
+smtp_host          = "smtp.example.com"
+smtp_port          = 587
+smtp_starttls      = true
+from               = "csvdiff@example.com"
+folder             = "INBOX"
+subject_pattern    = '^\s*csvdiff\b'          # regex, case-insensitive
+allowed_senders    = ["@example.com"]         # exact address or domain suffix; omit to allow all
+poll_seconds       = 60
+max_report_bytes   = 9000000                  # larger reports are attached as .html.gz

@@ -1,0 +1,142 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      scales:
+        description: 'Comma-separated row counts to run, e.g. "10k,1m,10m" or "20m". "all" means 10k,1m,10m.'
+        type: string
+        default: all
+      engine:
+        description: Engine
+        type: choice
+        default: duckdb
+        options: [duckdb, pandas]
+      enforce_budget:
+        description: Fail the job when a scale exceeds its time or memory budget
+        type: boolean
+        default: true
+  schedule:
+    - cron: "17 4 * * 1"        # Mondays, 04:17 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      scales: ${{ steps.pick.outputs.scales }}
+    steps:
+      - id: pick
+        run: |
+          raw='${{ inputs.scales || 'all' }}'
+          [ "$raw" = "all" ] && raw="10k,1m,10m"
+          echo "scales=$(python3 -c "import json,sys; print(json.dumps(sys.argv[1].split(',')))" "$raw")" >> "$GITHUB_OUTPUT"
+
+  bench:
+    needs: plan
+    name: ${{ matrix.scale }} rows x 20 columns
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scale: ${{ fromJSON(needs.plan.outputs.scales) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          pip install --upgrade pip
+          if [ "${{ inputs.engine || 'duckdb' }}" = "pandas" ]; then pip install "pandas>=2.0"; else pip install "duckdb>=1.0"; fi
+          pip install -e . --no-deps
+
+      - name: Runner capacity
+        run: |
+          echo "cpus: $(nproc)"; free -g | sed -n '1,2p'; df -h / | tail -1
+
+      - name: Generate and compare ${{ matrix.scale }} rows
+        env:
+          ENFORCE: ${{ inputs.enforce_budget }}
+          ENGINE: ${{ inputs.engine || 'duckdb' }}
+        run: |
+          extra=""
+          [ "$ENFORCE" = "false" ] && extra="--no-budget"
+          python scripts/bench.py \
+            --rows ${{ matrix.scale }} \
+            --engine "$ENGINE" \
+            --data-dir data --out-dir bench \
+            --threads "$(nproc)" --memory-limit 8GB $extra
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.scale }}-${{ inputs.engine || 'duckdb' }}
+          path: |
+            bench/*.html
+            bench/*.json
+          retention-days: 30
+
+  summarise:
+    needs: bench
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          pattern: bench-*
+          merge-multiple: true
+      - name: Combined results
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, json
+          recs = [json.load(open(p)) for p in sorted(glob.glob("all/*.json")) if "summary" not in p]
+          recs.sort(key=lambda r: r["rows"])
+          print("## Benchmark results\n")
+          print("| scale | engine | input | generate | compare | throughput | peak RSS | report |")
+          print("|---|---|---|---|---|---|---|---|")
+          for r in recs:
+              print(f"| {r['scale']} | {r['engine']} | {r['input_mb']:,} MB | {r['generate_seconds']}s "
+                    f"| **{r['compare_seconds']}s** | {r['rows_per_second']:,}/s | {r['peak_rss_mb']:,} MB "
+                    f"| {r['report_mb']} MB |")
+          if recs:
+              print(f"\nRunner: {recs[0]['runner']}. Reports are attached as artifacts.")
+          PY
+
+  publish:
+    needs: bench
+    if: vars.PUBLISH_PAGES == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: site
+          pattern: bench-*
+          merge-multiple: true
+      - name: Index page
+        run: |
+          python - <<'PY'
+          import glob, os
+          links = "\n".join(f'<li><a href="{os.path.basename(p)}">{os.path.basename(p)}</a></li>'
+                            for p in sorted(glob.glob("site/*.html")))
+          open("site/index.html", "w").write(
+              f"<!doctype html><meta charset=utf-8><title>csvdiff benchmark reports</title>"
+              f"<h1>csvdiff benchmark reports</h1><ul>{links}</ul>")
+          PY
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
