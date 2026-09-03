@@ -49,11 +49,14 @@ def _sql_expressions(side: str) -> str:
     """Column expressions for one side. Deterministic pseudo-randomness from hash(i)."""
     def pick(lst, salt):
         arr = ", ".join(f"'{v}'" for v in lst)
-        return f"([{arr}])[(hash(i * 31 + {salt}) % {len(lst)}) + 1]"
+        return f"([{arr}])[((hash(i * 31 + {salt}) % {len(lst)}) + 1)::BIGINT]"
 
     b = side == "b"
     status = pick(STATUS, 11)
-    status_b = f"([{', '.join(repr(v) for v in STATUS)}])[(((hash(i * 31 + 11) % {len(STATUS)}) + 1) % {len(STATUS)}) + 1]"
+    status_b = (
+        f"([{', '.join(repr(v) for v in STATUS)}])"
+        f"[(((hash(i * 31 + 11) % {len(STATUS)}) + 1) % {len(STATUS)} + 1)::BIGINT]"
+    )
     amount = "round(((hash(i * 31 + 21) % 900000000) / 100.0) - 1000000, 2)"
     balance = "round(((hash(i * 31 + 31) % 2000000000) / 100.0), 2)"
     value_date = "strftime(DATE '2026-01-01' + to_days((hash(i * 31 + 41) % 240)::INT), '%Y-%m-%d')"
