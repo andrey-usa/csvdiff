@@ -15,6 +15,7 @@ import os
 import sys
 import webbrowser
 
+from . import engines
 from .config import load_config, options_from, parse_list
 from .engine import CompareError, compare, is_identical
 from .report import render
@@ -33,7 +34,9 @@ def _add_compare_options(p: argparse.ArgumentParser):
     p.add_argument("--max-rows", type=int, help="Rows embedded per section (default 50000)")
     p.add_argument("--delimiter", help="Force delimiter (default: auto)")
     p.add_argument("--encoding")
-    p.add_argument("--engine", choices=["auto", "duckdb", "pandas"])
+    p.add_argument("--engine", choices=engines.NAMES,
+                   help="Comparison engine; auto takes the first installed of "
+                        + ", ".join(engines.AUTO_ORDER))
     p.add_argument("--threads", type=int)
     p.add_argument("--memory-limit", help="DuckDB memory limit, e.g. 4GB")
     p.add_argument("--export-dir", help="Write full changed/added/removed CSVs here")

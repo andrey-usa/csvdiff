@@ -28,6 +28,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any
 
+from . import engines
+
 
 @dataclass
 class Options:
@@ -59,20 +61,8 @@ def compare(a_path: str, b_path: str, opt: Options) -> dict[str, Any]:
             raise CompareError(f"File not found: {p}")
 
     t0 = time.perf_counter()
-    engine = opt.engine
-    if engine == "auto":
-        try:
-            import duckdb  # noqa: F401
-            engine = "duckdb"
-        except ImportError:
-            engine = "pandas"
-
-    if engine == "duckdb":
-        result = _compare_duckdb(a_path, b_path, opt)
-    elif engine == "pandas":
-        result = _compare_pandas(a_path, b_path, opt)
-    else:
-        raise CompareError(f"Unknown engine: {engine}")
+    engine = engines.resolve_auto() if opt.engine == "auto" else opt.engine
+    result = engines.get(engine)(a_path, b_path, opt)
 
     result["meta"].update({
         "a": {"name": os.path.basename(a_path), "path": os.path.abspath(a_path),

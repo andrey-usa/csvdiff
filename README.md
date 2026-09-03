@@ -7,12 +7,15 @@ tool serves every recurring comparison.
 ## Install
 
 ```bash
-pip install duckdb            # engine
+pip install duckdb            # default engine
 pip install -e .              # gives you the `csvdiff` command
 ```
 
-Python 3.11+. Everything except the engine is standard library. If DuckDB is not
-installed the tool falls back to pandas (same results, in-memory only).
+Python 3.11+. Everything except the engines is standard library, and the engine is
+swappable: `pip install -e ".[polars]"`, `.[arrow]`, `.[datafusion]`, `.[fallback]`
+(pandas) or `.[all-engines]` for the lot. With none of them installed the standard
+library engine still works, so `csvdiff` never has nothing to run on. Every engine
+returns identical results — see [Engines](#engines) and [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Launch modes
 
@@ -69,18 +72,45 @@ per recurring comparison so nobody retypes them.
 | `--delimiter`, `--encoding` | override auto-detection |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--threads`, `--memory-limit` | DuckDB resource limits |
+| `--engine` | `auto` (default), `duckdb`, `polars`, `datafusion`, `arrow`, `pandas`, `python`, `koala` |
+| `--threads`, `--memory-limit` | resource limits (`--memory-limit` is DuckDB only) |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
 
-## Why DuckDB
+## Engines
 
-Both files are read as text (no type inference surprises such as `1.0` vs `1`),
-hash-joined on the key in parallel, and spilled to disk when they don't fit in RAM.
-Multi-GB files compare in seconds to low minutes on a laptop, with one wheel as the
-only dependency. Polars is comparably fast in memory but not out-of-core; pandas is
-5-20x slower and memory-bound.
+The comparison itself is a plug-in. Whichever engine runs it, both files are read as
+text (no type inference surprises such as `1.0` vs `1`), the first occurrence of each
+key joins, and the result is the same dict — CI asserts that the `counts`, the per
+column stats and the exported CSVs are identical across engines, so `--engine` is a
+performance and deployment choice, never a correctness one.
+
+| `--engine` | needs | in one line |
+|---|---|---|
+| `duckdb` | `duckdb` | SQL hash join that streams from disk and spills. **The only out-of-core engine, and the default.** |
+| `polars` | `polars` | Rust dataframes, lazy scan then an in-memory join. Fastest while both files fit in RAM. |
+| `datafusion` | `datafusion` | the same SQL as DuckDB, planned by Apache DataFusion on Arrow. In memory. |
+| `arrow` | `pyarrow` | Arrow's CSV reader plus an Acero hash join, no planner. In memory. |
+| `pandas` | `pandas` | the original fallback: correct, in memory, and slowest of the dataframe engines. |
+| `python` | nothing | standard library `csv` reader and a dict hash join. Always available; holds file A in memory. |
+| `koala` | `koala-diff` | third-party Rust differ, kept as a benchmark reference. **Not a drop-in**: it infers types, ignores `--ignore`/`--tolerance`, does not resolve duplicate keys and cannot produce the row lists. |
+
+`auto` (the default) picks the first of duckdb, polars, datafusion, arrow, pandas,
+python that is installed. Rule of thumb: **polars when the data fits in memory,
+DuckDB when it might not.**
+
+On 1M rows x 20 columns (4 vCPU, 15 GB): polars 4.3s, DataFusion 7.9s, pyarrow 10.3s,
+DuckDB 13.1s, standard library 13.4s, pandas 69.9s. On 10M rows x 20 columns — 1.8 GB
+per file — DuckDB finishes in 146s and **every in-memory engine is killed by the OOM
+killer**. That is the whole reason the default is DuckDB and not the fastest engine.
+The rest of the measurements, the memory curve and the three real bugs that agreement
+testing caught are in [BENCHMARKS.md](BENCHMARKS.md).
+
+```bash
+csvdiff compare a.csv b.csv -k id --engine polars
+python scripts/bench_matrix.py --scales 10k,1m --repeat 3   # rank them on your own hardware
+```
 
 ## The report
 
@@ -104,8 +134,9 @@ Three workflows in `.github/workflows`:
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | push, PR | pytest on Python 3.11/3.12/3.13, a 10k smoke comparison on both engines, a check that the report has no external references, and a job asserting DuckDB and pandas return identical counts on 200k rows |
+| `ci.yml` | push, PR | pytest on Python 3.11/3.12/3.13, one job per engine with only that engine installed, a check that the report has no external references, and a job asserting every engine returns identical counts on 200k rows |
 | `benchmark.yml` | manual, weekly cron | generates 10k / 1M / 10M rows x 20 columns, compares, enforces time and memory budgets, uploads reports, writes a results table to the job summary |
+| `engines.yml` | manual, monthly cron | runs every installed engine over the chosen scales, fails if any of them disagrees with DuckDB, and publishes the ranking table |
 | `compare.yml` | manual, or `workflow_call` from another pipeline | compares two files given as repo paths or URLs and publishes the report as an artifact |
 
 ```bash
@@ -155,6 +186,7 @@ instead of downloading artifacts.
 ```bash
 python scripts/gen_data.py --rows 10m --out-dir data     # DuckDB writes this in seconds
 python scripts/bench.py --rows 10m --engine duckdb --threads 4 --memory-limit 8GB
+python scripts/bench_matrix.py --scales 10k,1m --repeat 3        # every installed engine, ranked
 ```
 
 `bench.py` records generation time, comparison wall time, throughput, peak RSS of the comparison
@@ -178,15 +210,16 @@ Use `--export-dir` when the full list matters; the counts in the report are alwa
 cd csvdiff && claude
 ```
 
-`CLAUDE.md` is loaded automatically and carries the invariants that are easy to break: both engines
+`CLAUDE.md` is loaded automatically and carries the invariants that are easy to break: every engine
 must return identical counts, the result dict in `engine.py` is the API, the report stays a single
 file with a sparse payload, and SQL identifiers go through `_q()` / `_lit()` rather than `repr`.
 
 | Slash command | What it does |
 |---|---|
-| `/bench [10k\|1m\|10m] [duckdb\|pandas]` | runs a scale and reports time, throughput, peak RSS against budget |
+| `/bench [10k\|1m\|10m] [engine]` | runs a scale and reports time, throughput, peak RSS against budget |
+| `/bench-matrix [scales] [engines]` | benchmarks every installed engine, ranks them and flags any that disagrees |
 | `/compare <a> <b> <key> [flags]` | runs a comparison and summarises the discrepancies, flagging setup mistakes such as a non-unique key |
-| `/engines-agree` | checks DuckDB and pandas still produce identical counts on 200k rows |
+| `/engines-agree` | checks every installed engine still produces identical counts on 200k rows |
 | `/ci-fix` | pulls the latest failing run's logs, reproduces locally, fixes the cause |
 
 `.claude/settings.json` pre-approves the test, benchmark and `gh run` commands, asks before
@@ -214,7 +247,8 @@ Not built, ordered by how often they pay off in recurring comparisons:
 ## Project layout
 
 ```
-csvdiff/engine.py    comparison (DuckDB + pandas fallback), result contract documented at top
+csvdiff/engine.py    entry point + the DuckDB and pandas engines; result contract documented at top
+csvdiff/engines/     engine registry and the polars / DataFusion / pyarrow / stdlib / koala engines
 csvdiff/report.py    HTML renderer
 csvdiff/cli.py       compare / serve / mail
 csvdiff/server.py    drag-and-drop page
@@ -224,7 +258,9 @@ CLAUDE.md            project context for Claude Code
 .claude/             slash commands, permissions, report-editing skill
 scripts/gen_data.py  deterministic test payload generator (20 columns, known drift)
 scripts/bench.py     benchmark harness with budgets and job-summary output
-.github/workflows/   ci, benchmark, on-demand comparison
+scripts/bench_matrix.py  every engine x every scale, ranked and checked for agreement
+BENCHMARKS.md        measured results and why the default engine is what it is
+.github/workflows/   ci, benchmark, engine benchmark, on-demand comparison
 examples/            sample files and a generated report
 tests/               pytest
 ```

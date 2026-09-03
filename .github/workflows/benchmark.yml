@@ -11,7 +11,7 @@ on:
         description: Engine
         type: choice
         default: duckdb
-        options: [duckdb, pandas]
+        options: [duckdb, polars, datafusion, arrow, pandas, python, koala]
       enforce_budget:
         description: Fail the job when a scale exceeds its time or memory budget
         type: boolean
@@ -54,7 +54,14 @@ jobs:
       - name: Install
         run: |
           pip install --upgrade pip
-          if [ "${{ inputs.engine || 'duckdb' }}" = "pandas" ]; then pip install "pandas>=2.0"; else pip install "duckdb>=1.0"; fi
+          case "${{ inputs.engine || 'duckdb' }}" in
+            polars)     pip install "polars>=1.0" ;;
+            arrow)      pip install "pyarrow>=15.0" ;;
+            datafusion) pip install "datafusion>=40.0" ;;
+            pandas)     pip install "pandas>=2.0" ;;
+            koala)      pip install "koala-diff>=0.3" ;;
+          esac
+          pip install "duckdb>=1.0"        # gen_data.py writes the payloads with it
           pip install -e . --no-deps
 
       - name: Runner capacity

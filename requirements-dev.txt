@@ -1,4 +1,9 @@
 pytest>=8.0
-# Engines are installed separately so the fallback path can be tested on its own:
-#   pip install duckdb        (default engine)
-#   pip install pandas        (fallback)
+# Engines are installed separately so each path can be tested on its own:
+#   pip install duckdb                (default engine)
+#   pip install polars                (fastest in memory)
+#   pip install pyarrow               (Acero hash join)
+#   pip install datafusion            (same SQL as DuckDB, Arrow engine)
+#   pip install pandas                (fallback)
+#   pip install koala-diff            (third-party reference in the benchmark)
+# or all of them at once:  pip install -e ".[bench]"

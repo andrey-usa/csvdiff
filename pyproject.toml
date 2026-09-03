@@ -10,7 +10,15 @@ requires-python = ">=3.11"
 dependencies = ["duckdb>=1.0"]
 
 [project.optional-dependencies]
+# Engines are optional; `python` needs nothing and DuckDB is the default.
+# See BENCHMARKS.md for which one to pick.
 fallback = ["pandas>=2.0"]
+polars = ["polars>=1.0"]
+arrow = ["pyarrow>=15.0"]
+datafusion = ["datafusion>=40.0"]
+koala = ["koala-diff>=0.3"]
+all-engines = ["pandas>=2.0", "polars>=1.0", "pyarrow>=15.0", "datafusion>=40.0"]
+bench = ["pandas>=2.0", "polars>=1.0", "pyarrow>=15.0", "datafusion>=40.0", "koala-diff>=0.3"]
 
 [project.scripts]
 csvdiff = "csvdiff.cli:main"

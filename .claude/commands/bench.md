@@ -1,6 +1,6 @@
 ---
 description: Run a benchmark scale and report the numbers
-argument-hint: [10k|1m|10m] [duckdb|pandas]
+argument-hint: [10k|1m|10m] [duckdb|polars|datafusion|arrow|pandas|python|koala]
 allowed-tools: Bash(python scripts/*), Bash(rm -rf data), Read
 ---
 
@@ -10,3 +10,5 @@ Then report compare time, throughput, peak RSS and report size, and say whether 
 budget in `scripts/bench.py`. If a budget is exceeded, profile before changing anything: identify
 which phase (read, join, per-column stats, row extraction) dominates, and say so before proposing a fix.
 Delete generated CSVs when finished unless I asked to keep them.
+
+For a whole-field comparison rather than one engine, use `/bench-matrix` instead.

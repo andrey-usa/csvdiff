@@ -18,6 +18,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from csvdiff import engines  # noqa: E402
 from scripts.gen_data import parse_rows  # noqa: E402
 
 # Budgets on a 4-vCPU / 16 GB GitHub-hosted runner. Generous by ~2x so the gate
@@ -41,13 +42,15 @@ def budget_for(rows: int):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rows", "-n", default="10k")
-    ap.add_argument("--engine", choices=["auto", "duckdb", "pandas"], default="auto")
+    ap.add_argument("--engine", choices=engines.NAMES, default="auto")
     ap.add_argument("--out-dir", "-o", default="bench")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--keep-data", action="store_true", help="Do not delete the CSVs afterwards")
     ap.add_argument("--threads", type=int)
     ap.add_argument("--memory-limit", default=None, help="DuckDB memory limit, e.g. 8GB")
     ap.add_argument("--no-budget", action="store_true", help="Report numbers without failing on budget")
+    ap.add_argument("--key", default=KEY, help=f"Key columns (default {KEY})")
+    ap.add_argument("--ignore", default=IGNORE, help=f"Columns to skip (default {IGNORE}; '' compares them all)")
     ns = ap.parse_args()
 
     rows = parse_rows(ns.rows)
@@ -68,8 +71,10 @@ def main() -> int:
     runner = ("import resource, sys; from csvdiff.cli import main; rc = main(sys.argv[1:]); "
               "print('PEAK_RSS_KB', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss, file=sys.stderr); "
               "sys.exit(rc)")
-    cmd = [sys.executable, "-c", runner, "compare", a, b, "-k", KEY, "-i", IGNORE,
+    cmd = [sys.executable, "-c", runner, "compare", a, b, "-k", ns.key,
            "--engine", ns.engine, "-o", report, "--json", summary]
+    if ns.ignore:
+        cmd += ["-i", ns.ignore]
     if ns.threads:
         cmd += ["--threads", str(ns.threads)]
     if ns.memory_limit:
@@ -81,6 +86,11 @@ def main() -> int:
     print(proc.stdout, end="")
     print(proc.stderr, end="", file=sys.stderr)
     if proc.returncode not in (0, 1):
+        killed = " (killed by signal, most likely out of memory)" if proc.returncode < 0 else ""
+        print(f"compare failed with exit code {proc.returncode}{killed}", file=sys.stderr)
+        return 2
+    if not os.path.exists(summary):
+        print(f"compare wrote no summary at {summary}", file=sys.stderr)
         return 2
 
     # The child reports its own peak; ru_maxrss is KB on Linux, bytes on macOS.
@@ -92,7 +102,7 @@ def main() -> int:
     with open(summary) as f:
         counts = json.load(f)["counts"]
     rec = {
-        "rows": rows, "scale": label, "engine": ns.engine,
+        "rows": rows, "scale": label, "engine": ns.engine, "key": ns.key, "ignore": ns.ignore,
         "generate_seconds": gen_seconds, "compare_seconds": wall, "peak_rss_mb": peak_mb,
         "input_mb": round((os.path.getsize(a) + os.path.getsize(b)) / 1e6, 1),
         "report_mb": round(os.path.getsize(report) / 1e6, 2),
