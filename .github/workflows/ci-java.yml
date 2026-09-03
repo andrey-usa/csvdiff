@@ -1,0 +1,160 @@
+name: CI (Java)
+
+on:
+  push:
+    branches: [main]
+    paths: ["java/**", ".github/workflows/ci-java.yml", "examples/**"]
+  pull_request:
+    paths: ["java/**", ".github/workflows/ci-java.yml", "examples/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-java-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: java
+
+jobs:
+  test:
+    name: test java ${{ matrix.java }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 26 is the current release, 25 the current LTS. The bytecode targets 26,
+        # so the 25 job builds with 26 and only proves the toolchain is not pinned.
+        java: ["26"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Versions
+        run: java --version && mvn --version
+
+      # -Werror is on in the pom, so any new warning fails here.
+      - name: Build and test
+        run: mvn -B --no-transfer-progress verify
+
+      - name: Smoke benchmark, 10k rows x 20 columns
+        run: java -cp target/csvdiff.jar dev.csvdiff.bench.Bench --rows 10k --engine duckdb --out-dir bench
+
+      - name: Check the report is self-contained
+        run: |
+          java - <<'JAVA'
+          import java.nio.file.*;
+          import java.util.regex.*;
+          void main() throws Exception {
+            Path path;
+            try (var s = Files.list(Path.of("bench"))) {
+              path = s.filter(p -> p.getFileName().toString().matches("10k-.*\\.html")).findFirst().orElseThrow();
+            }
+            String html = Files.readString(path);
+            Matcher m = Pattern.compile("(?:src|href)=\"(?!#)([^\"]+)\"").matcher(html);
+            if (m.find()) throw new AssertionError("report references external resources: " + m.group(1));
+            if (html.length() >= 8_000_000) throw new AssertionError("report unexpectedly large: " + html.length());
+            System.out.printf("%s: %d KB, no external references%n", path, html.length() / 1024);
+          }
+          JAVA
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-java-10k
+          path: |
+            java/bench/10k-*.html
+            java/bench/10k-*.json
+          retention-days: 14
+
+  engines-agree:
+    name: all engines produce identical counts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "26"
+          cache: maven
+      - run: mvn -B --no-transfer-progress -DskipTests package
+      - run: java -cp target/csvdiff.jar dev.csvdiff.bench.GenData --rows 200k --out-dir data
+      - name: Compare with every engine and diff the summaries
+        run: |
+          for e in duckdb tablesaw native; do
+            java -cp target/csvdiff.jar dev.csvdiff.Cli compare data/200k_a.csv data/200k_b.csv \
+              -k account_id,txn_id -i updated_at --engine $e \
+              -o /tmp/$e.html --json /tmp/$e.json || true
+          done
+          java - <<'JAVA'
+          import com.fasterxml.jackson.databind.*;
+          import java.nio.file.*;
+          void main() throws Exception {
+            var mapper = new ObjectMapper();
+            String[] engines = {"duckdb", "tablesaw", "native"};
+            JsonNode ref = null;
+            for (String e : engines) {
+              JsonNode n = mapper.readTree(Files.readString(Path.of("/tmp/" + e + ".json")));
+              if (ref == null) { ref = n; continue; }
+              if (!ref.get("counts").equals(n.get("counts")))
+                throw new AssertionError(e + " counts differ: " + n.get("counts") + " vs " + ref.get("counts"));
+              if (!ref.get("columns").equals(n.get("columns")))
+                throw new AssertionError(e + " column stats differ");
+            }
+            System.out.println("all " + engines.length + " engines agree: " + ref.get("counts"));
+          }
+          JAVA
+
+  cross-language-parity:
+    name: Java, Python and TypeScript agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "26"
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - run: mvn -B --no-transfer-progress -DskipTests package
+      - name: Install the Python and TypeScript implementations
+        working-directory: .
+        run: |
+          pip install "duckdb>=1.0" && pip install -e . --no-deps
+          cd ts && npm ci && npm run build
+
+      - name: One dataset, three implementations, identical counts
+        working-directory: .
+        run: |
+          java -cp java/target/csvdiff.jar dev.csvdiff.bench.GenData --rows 200k --out-dir data
+          A=data/200k_a.csv; B=data/200k_b.csv
+          ARGS="-k account_id,txn_id -i updated_at"
+          csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
+          node ts/dist/src/cli.js compare $A $B $ARGS -o /tmp/ts.html --json /tmp/ts.json || true
+          java -cp java/target/csvdiff.jar dev.csvdiff.Cli compare $A $B $ARGS -o /tmp/java.html --json /tmp/java.json || true
+          node - <<'JS'
+          import { readFileSync } from "node:fs";
+          import assert from "node:assert/strict";
+          const load = n => JSON.parse(readFileSync(`/tmp/${n}.json`, "utf-8"));
+          const py = load("py");
+          for (const other of ["ts", "java"]) {
+            const o = load(other);
+            assert.deepEqual(o.counts, py.counts, `${other} counts differ from python`);
+            assert.deepEqual(o.columns, py.columns, `${other} column stats differ from python`);
+            assert.deepEqual(o.meta.compared, py.meta.compared, `${other} compared columns differ`);
+          }
+          console.log("python, typescript and java agree:", JSON.stringify(py.counts));
+          JS

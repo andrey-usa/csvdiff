@@ -1,0 +1,8 @@
+target/
+bench/
+data/
+out/
+csvdiff.toml
+# Generated reports, but never the report template that ships in the jar.
+*.html
+!src/main/resources/**/*.html

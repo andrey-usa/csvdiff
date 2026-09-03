@@ -1,4 +1,4 @@
-name: Benchmark (TypeScript)
+name: Benchmark (Java)
 
 on:
   workflow_dispatch:
@@ -8,26 +8,30 @@ on:
         type: string
         default: all
       engines:
-        description: 'Comma-separated engines to benchmark, e.g. "duckdb,polars" or "all" (duckdb,polars,arquero,native)'
+        description: 'Comma-separated engines, e.g. "duckdb,tablesaw" or "all" (duckdb,tablesaw,native)'
         type: string
         default: duckdb
-      node:
-        description: Node.js version
+      java:
+        description: Java version
         type: string
         default: "26"
+      heap_mb:
+        description: 'Child JVM max heap in MB (blank = JVM default, about 1/4 of RAM)'
+        type: string
+        default: ""
       enforce_budget:
         description: Fail the job when a scale exceeds its time or memory budget
         type: boolean
         default: true
   schedule:
-    - cron: "47 4 * * 1"        # Mondays, 04:47 UTC
+    - cron: "17 5 * * 1"        # Mondays, 05:17 UTC
 
 permissions:
   contents: read
 
 defaults:
   run:
-    working-directory: ts
+    working-directory: java
 
 jobs:
   plan:
@@ -42,15 +46,14 @@ jobs:
           raw='${{ inputs.scales || 'all' }}'
           [ "$raw" = "all" ] && raw="10k,1m,10m"
           eng='${{ inputs.engines || 'duckdb' }}'
-          [ "$eng" = "all" ] && eng="duckdb,polars,arquero,native"
-          json() { node -e 'console.log(JSON.stringify(process.argv[1].split(",")))' "$1"; }
-          echo "scales=$(json "$raw")" >> "$GITHUB_OUTPUT"
-          echo "engines=$(json "$eng")" >> "$GITHUB_OUTPUT"
+          [ "$eng" = "all" ] && eng="duckdb,tablesaw,native"
+          python3 -c "import json,sys; print('scales=' + json.dumps(sys.argv[1].split(',')))" "$raw" >> "$GITHUB_OUTPUT"
+          python3 -c "import json,sys; print('engines=' + json.dumps(sys.argv[1].split(',')))" "$eng" >> "$GITHUB_OUTPUT"
 
-  # One job per (scale, engine). An engine can exhaust memory badly enough to take
-  # the whole runner down with it — polars does exactly that at 10m rows — so each
-  # combination is isolated and no other result is lost when one dies. Generation is
-  # deterministic, so every job compares byte-identical input.
+  # One job per (scale, engine). An in-heap engine can exhaust memory badly enough
+  # to take the runner agent down with it, so each combination is isolated and no
+  # other result is lost when one dies. Generation is deterministic, so every job
+  # compares byte-identical input.
   bench:
     needs: plan
     name: ${{ matrix.scale }} / ${{ matrix.engine }}
@@ -64,17 +67,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-java@v4
         with:
-          node-version: ${{ inputs.node || '26' }}
-          cache: npm
-          cache-dependency-path: ts/package-lock.json
+          distribution: temurin
+          java-version: ${{ inputs.java || '26' }}
+          cache: maven
 
-      - name: Install and build
+      - name: Build
         run: |
-          node --version
-          npm ci
-          npm run build
+          java --version
+          mvn -B --no-transfer-progress -DskipTests package
 
       - name: Runner capacity
         run: |
@@ -83,10 +85,12 @@ jobs:
       - name: Compare ${{ matrix.scale }} rows with ${{ matrix.engine }}
         env:
           ENFORCE: ${{ inputs.enforce_budget }}
+          HEAP_MB: ${{ inputs.heap_mb }}
         run: |
           extra=""
           [ "$ENFORCE" = "false" ] && extra="--no-budget"
-          node dist/scripts/bench.js \
+          [ -n "$HEAP_MB" ] && extra="$extra --heap-mb $HEAP_MB"
+          java -cp target/csvdiff.jar dev.csvdiff.bench.Bench \
             --rows ${{ matrix.scale }} \
             --engine ${{ matrix.engine }} \
             --data-dir data --out-dir bench \
@@ -96,10 +100,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: bench-ts-${{ matrix.scale }}-${{ matrix.engine }}
+          name: bench-java-${{ matrix.scale }}-${{ matrix.engine }}
           path: |
-            ts/bench/*.html
-            ts/bench/*.json
+            java/bench/*.html
+            java/bench/*.json
           retention-days: 30
           if-no-files-found: ignore
 
@@ -114,10 +118,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: all
-          pattern: bench-ts-*
+          pattern: bench-java-*
           merge-multiple: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
       - name: Combined results
-        working-directory: .
         run: |
           node - <<'JS' >> "$GITHUB_STEP_SUMMARY"
           import { readdirSync, readFileSync, existsSync } from "node:fs";
@@ -125,16 +131,15 @@ jobs:
             .map(f => JSON.parse(readFileSync("all/" + f, "utf-8")))
             .sort((a, b) => a.rows - b.rows || a.engine.localeCompare(b.engine));
           const f = n => n === null || n === undefined ? "-" : n.toLocaleString("en-US");
-          console.log("## Benchmark results (TypeScript)\n");
+          console.log("## Benchmark results (Java)\n");
           console.log("| scale | engine | input | generate | compare | throughput | peak RSS | report |");
           console.log("|---|---|---|---|---|---|---|---|");
           for (const r of recs) {
             const compare = r.failed ? `**${r.failed}** after ${r.wall_before_failure}s` : `**${r.compare_seconds}s**`;
-            const per = r.failed ? "-" : `${f(r.rows_per_second)}/s`;
             console.log(`| ${r.scale} | ${r.engine} | ${f(r.input_mb)} MB | ${r.generate_seconds}s ` +
-              `| ${compare} | ${per} | ${f(r.peak_rss_mb)}${r.failed ? "" : " MB"} | ${r.failed ? "-" : r.report_mb + " MB"} |`);
+              `| ${compare} | ${r.failed ? "-" : f(r.rows_per_second) + "/s"} | ${f(r.peak_rss_mb)}${r.failed ? "" : " MB"} ` +
+              `| ${r.failed ? "-" : r.report_mb + " MB"} |`);
           }
-          // Fastest engine per scale, and a note on any that could not finish.
           const scales = [...new Set(recs.map(r => r.scale))];
           const winners = scales.map(s => {
             const done = recs.filter(r => r.scale === s && !r.failed);
@@ -145,8 +150,6 @@ jobs:
           if (winners.length) console.log(`\nFastest per scale — ${winners.join(", ")}.`);
           const failed = recs.filter(r => r.failed);
           if (failed.length) console.log(`\nDid not finish: ${failed.map(r => `${r.engine} at ${r.scale} (${r.failed})`).join(", ")}.`);
-          // A combination with no result at all means the runner itself died, which is
-          // what memory exhaustion severe enough to kill the agent looks like.
           const want = JSON.parse(process.env.EXPECTED_SCALES || "[]")
             .flatMap(s => JSON.parse(process.env.EXPECTED_ENGINES || "[]").map(e => `${s}/${e}`));
           const have = new Set(recs.map(r => `${r.scale}/${r.engine}`));
