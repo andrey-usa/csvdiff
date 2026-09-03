@@ -83,7 +83,16 @@ export interface CompareResult extends Omit<EngineResult, "meta"> {
   meta: Meta;
 }
 
-export type EngineName = "auto" | "duckdb" | "native";
+/**
+ * Comparison backends. `auto` picks the first available in preference order
+ * (duckdb, polars, arquero, native); every engine must return identical
+ * `counts` and `columns` for the same input.
+ */
+export type EngineName = "auto" | "duckdb" | "polars" | "arquero" | "native";
+
+/** Concrete engines, in `auto` preference order. */
+export const ENGINES = ["duckdb", "polars", "arquero", "native"] as const;
+export type ConcreteEngine = (typeof ENGINES)[number];
 
 export interface Options {
   key: string[];

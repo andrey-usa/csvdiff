@@ -21,6 +21,8 @@
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.5-r.4",
+    "arquero": "^8.0.3",
+    "nodejs-polars": "^0.26.0",
     "smol-toml": "^1.8.0"
   },
   "devDependencies": {

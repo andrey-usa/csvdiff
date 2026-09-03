@@ -13,7 +13,7 @@ import { statSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 
-import type { CompareResult, EngineName, EngineResult, Options, Val } from "./types.ts";
+import { ENGINES, type CompareResult, type ConcreteEngine, type EngineName, type EngineResult, type Options, type Val } from "./types.ts";
 
 export class CompareError extends Error {
   override name = "CompareError";
@@ -29,14 +29,7 @@ export async function compare(aPath: string, bPath: string, opt: Options): Promi
 
   const t0 = performance.now();
   const engine = await resolveEngine(opt.engine);
-  let result: EngineResult;
-  if (engine === "duckdb") {
-    const { compareDuckdb } = await import("./engine-duckdb.ts");
-    result = await compareDuckdb(aPath, bPath, opt);
-  } else {
-    const { compareNative } = await import("./engine-native.ts");
-    result = await compareNative(aPath, bPath, opt);
-  }
+  const result: EngineResult = await ENGINE_IMPLS[engine](aPath, bPath, opt);
 
   const { key: _k, compare: _c, ignore: _i, ...options } = opt;
   return {
@@ -58,15 +51,42 @@ export function isIdentical(result: CompareResult): boolean {
   return c.changed === 0 && c.added === 0 && c.removed === 0;
 }
 
-export async function resolveEngine(engine: EngineName): Promise<"duckdb" | "native"> {
-  if (engine === "duckdb" || engine === "native") return engine;
-  if (engine !== "auto") throw new CompareError(`Unknown engine: ${engine as string}`);
-  try {
-    await import("@duckdb/node-api");
-    return "duckdb";
-  } catch {
-    return "native";
+type EngineImpl = (aPath: string, bPath: string, opt: Options) => Promise<EngineResult>;
+
+/** Lazily loaded so a missing optional dependency only matters if you ask for it. */
+const ENGINE_IMPLS: Record<ConcreteEngine, EngineImpl> = {
+  duckdb: async (a, b, o) => (await import("./engine-duckdb.ts")).compareDuckdb(a, b, o),
+  polars: async (a, b, o) => (await import("./engine-polars.ts")).comparePolars(a, b, o),
+  arquero: async (a, b, o) => (await import("./engine-arquero.ts")).compareArquero(a, b, o),
+  native: async (a, b, o) => (await import("./engine-native.ts")).compareNative(a, b, o),
+};
+
+/** Which third-party module each engine needs; `native` needs none. */
+const ENGINE_MODULE: Record<ConcreteEngine, string | null> = {
+  duckdb: "@duckdb/node-api",
+  polars: "nodejs-polars",
+  arquero: "arquero",
+  native: null,
+};
+
+export async function resolveEngine(engine: EngineName): Promise<ConcreteEngine> {
+  if (engine !== "auto") {
+    if (!(ENGINES as readonly string[]).includes(engine)) {
+      throw new CompareError(`Unknown engine: ${engine as string}. Choose one of ${ENGINES.join(", ")}.`);
+    }
+    return engine as ConcreteEngine;
   }
+  for (const name of ENGINES) {
+    const mod = ENGINE_MODULE[name];
+    if (mod === null) return name;
+    try {
+      await import(mod);
+      return name;
+    } catch {
+      // try the next one
+    }
+  }
+  return "native";
 }
 
 // ----------------------------------------------------------------------------

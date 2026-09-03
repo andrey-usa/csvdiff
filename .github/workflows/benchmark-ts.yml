@@ -7,11 +7,10 @@ on:
         description: 'Comma-separated row counts to run, e.g. "10k,1m,10m" or "20m". "all" means 10k,1m,10m.'
         type: string
         default: all
-      engine:
-        description: Engine
-        type: choice
+      engines:
+        description: 'Comma-separated engines to benchmark, e.g. "duckdb,polars" or "all" (duckdb,polars,arquero,native)'
+        type: string
         default: duckdb
-        options: [duckdb, native]
       node:
         description: Node.js version
         type: string
@@ -71,22 +70,35 @@ jobs:
         run: |
           echo "cpus: $(nproc)"; free -g | sed -n '1,2p'; df -h / | tail -1
 
+      # Every engine at this scale runs on one runner against one generated pair
+      # of files, so the numbers are comparable. An engine that cannot handle the
+      # scale is recorded as a failed row rather than failing the job.
       - name: Generate and compare ${{ matrix.scale }} rows
         env:
           ENFORCE: ${{ inputs.enforce_budget }}
-          ENGINE: ${{ inputs.engine || 'duckdb' }}
+          ENGINES: ${{ inputs.engines || 'duckdb' }}
         run: |
+          [ "$ENGINES" = "all" ] && ENGINES="duckdb,polars,arquero,native"
           extra=""
           [ "$ENFORCE" = "false" ] && extra="--no-budget"
-          node dist/scripts/bench.js \
-            --rows ${{ matrix.scale }} \
-            --engine "$ENGINE" \
-            --data-dir data --out-dir bench \
-            --threads "$(nproc)" --memory-limit 8GB $extra
+          rc=0
+          for e in $(echo "$ENGINES" | tr ',' ' '); do
+            echo "::group::$e at ${{ matrix.scale }} rows"
+            node dist/scripts/bench.js \
+              --rows ${{ matrix.scale }} \
+              --engine "$e" \
+              --data-dir data --out-dir bench \
+              --threads "$(nproc)" --memory-limit 8GB \
+              --keep-data --allow-failure $extra || rc=$?
+            echo "::endgroup::"
+          done
+          rm -rf data
+          exit $rc
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: bench-ts-${{ matrix.scale }}-${{ inputs.engine || 'duckdb' }}
+          name: bench-ts-${{ matrix.scale }}
           path: |
             ts/bench/*.html
             ts/bench/*.json
@@ -108,12 +120,28 @@ jobs:
           node - <<'JS' >> "$GITHUB_STEP_SUMMARY"
           import { readdirSync, readFileSync } from "node:fs";
           const recs = readdirSync("all").filter(f => f.endsWith(".json") && !f.includes("summary"))
-            .map(f => JSON.parse(readFileSync("all/" + f, "utf-8"))).sort((a, b) => a.rows - b.rows);
-          const f = n => n.toLocaleString("en-US");
+            .map(f => JSON.parse(readFileSync("all/" + f, "utf-8")))
+            .sort((a, b) => a.rows - b.rows || a.engine.localeCompare(b.engine));
+          const f = n => n === null || n === undefined ? "-" : n.toLocaleString("en-US");
           console.log("## Benchmark results (TypeScript)\n");
           console.log("| scale | engine | input | generate | compare | throughput | peak RSS | report |");
           console.log("|---|---|---|---|---|---|---|---|");
-          for (const r of recs) console.log(`| ${r.scale} | ${r.engine} | ${f(r.input_mb)} MB | ${r.generate_seconds}s ` +
-            `| **${r.compare_seconds}s** | ${f(r.rows_per_second)}/s | ${f(r.peak_rss_mb)} MB | ${r.report_mb} MB |`);
+          for (const r of recs) {
+            const compare = r.failed ? `**${r.failed}** after ${r.wall_before_failure}s` : `**${r.compare_seconds}s**`;
+            const per = r.failed ? "-" : `${f(r.rows_per_second)}/s`;
+            console.log(`| ${r.scale} | ${r.engine} | ${f(r.input_mb)} MB | ${r.generate_seconds}s ` +
+              `| ${compare} | ${per} | ${f(r.peak_rss_mb)}${r.failed ? "" : " MB"} | ${r.failed ? "-" : r.report_mb + " MB"} |`);
+          }
+          // Fastest engine per scale, and a note on any that could not finish.
+          const scales = [...new Set(recs.map(r => r.scale))];
+          const winners = scales.map(s => {
+            const done = recs.filter(r => r.scale === s && !r.failed);
+            if (!done.length) return null;
+            const best = done.reduce((x, y) => (y.compare_seconds < x.compare_seconds ? y : x));
+            return `**${s}**: ${best.engine} (${best.compare_seconds}s)`;
+          }).filter(Boolean);
+          if (winners.length) console.log(`\nFastest per scale — ${winners.join(", ")}.`);
+          const failed = recs.filter(r => r.failed);
+          if (failed.length) console.log(`\nDid not finish: ${failed.map(r => `${r.engine} at ${r.scale} (${r.failed})`).join(", ")}.`);
           if (recs.length) console.log(`\nRunner: ${recs[0].runner}. Reports are attached as artifacts.`);
           JS

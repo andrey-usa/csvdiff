@@ -39,6 +39,31 @@ const round1 = (x: number) => Math.round(x * 10) / 10;
 const round2 = (x: number) => Math.round(x * 100) / 100;
 const f = (n: number) => n.toLocaleString("en-US");
 
+/** Turn a dead child process into a short, honest reason for the results table. */
+function classifyFailure(status: number | null, signal: string | null, stderr: string): string {
+  if (signal === "SIGKILL" || status === 137) return "OOM killed";
+  if (/JavaScript heap out of memory|Allocation failed|Reached heap limit/i.test(stderr)) return "JS heap OOM";
+  if (/Invalid string length|Array buffer allocation failed|Invalid array length/i.test(stderr)) return "exceeds V8 limit";
+  if (/No space left on device|ENOSPC/i.test(stderr)) return "disk full";
+  if (/Out of Memory Error|failed to allocate/i.test(stderr)) return "engine OOM";
+  if (signal) return `killed by ${signal}`;
+  return `exit ${status ?? "?"}`;
+}
+
+function appendSummary(line: string): void {
+  const step = process.env.GITHUB_STEP_SUMMARY;
+  if (!step) return;
+  if (!existsSync(step) || statSync(step).size === 0) {
+    appendFileSync(
+      step,
+      "| scale | engine | input | generate | compare | throughput | peak RSS | " +
+        "report | changed | added | removed | budget |\n" +
+        "|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+    );
+  }
+  appendFileSync(step, line + "\n");
+}
+
 async function main(): Promise<number> {
   const { values: ns } = parseArgs({
     options: {
@@ -50,6 +75,8 @@ async function main(): Promise<number> {
       threads: { type: "string" },
       "memory-limit": { type: "string" },
       "no-budget": { type: "boolean", default: false },
+      "heap-mb": { type: "string" },
+      "allow-failure": { type: "boolean", default: false },
     },
   });
 
@@ -72,7 +99,8 @@ async function main(): Promise<number> {
   const summary = join(ns["out-dir"], `${label}-${ns.engine}-summary.json`);
   const here = fileURLToPath(import.meta.url);
   const cli = join(here, "..", "..", "src", here.endsWith(".ts") ? "cli.ts" : "cli.js");
-  const args = [cli, "compare", a, b, "-k", KEY, "-i", IGNORE, "--engine", ns.engine, "-o", report, "--json", summary];
+  const nodeArgs = ns["heap-mb"] ? [`--max-old-space-size=${Number.parseInt(ns["heap-mb"], 10)}`] : [];
+  const args = [...nodeArgs, cli, "compare", a, b, "-k", KEY, "-i", IGNORE, "--engine", ns.engine, "-o", report, "--json", summary];
   if (ns.threads) args.push("--threads", ns.threads);
   if (ns["memory-limit"]) args.push("--memory-limit", ns["memory-limit"]);
 
@@ -85,9 +113,28 @@ async function main(): Promise<number> {
   const wall = round2((performance.now() - t0) / 1000);
   process.stdout.write(proc.stdout ?? "");
   process.stderr.write(proc.stderr ?? "");
+
   if (proc.status !== 0 && proc.status !== 1) {
-    console.error(`compare exited with ${proc.status ?? proc.signal}`);
-    return 2;
+    // An engine that cannot handle this scale is a benchmark result, not a
+    // harness error: record why it failed so the comparison table can show it.
+    const why = classifyFailure(proc.status, proc.signal, proc.stderr ?? "");
+    const rec = {
+      rows, scale: label, engine: ns.engine, generate_seconds: genSeconds,
+      compare_seconds: null, peak_rss_mb: null,
+      input_mb: round1((statSync(a).size + statSync(b).size) / 1e6),
+      report_mb: null, rows_per_second: null, counts: null,
+      failed: why, exit_status: proc.status, signal: proc.signal ?? null,
+      wall_before_failure: wall,
+      runner: `${os.type()} ${os.arch()} node${process.versions.node} ${os.availableParallelism()} cpu`,
+    };
+    writeFileSync(join(ns["out-dir"], `${label}-${ns.engine}.json`), JSON.stringify(rec, null, 2));
+    const failLine =
+      `| ${label} | ${ns.engine} | ${f(rec.input_mb)} MB | ${genSeconds}s | **${why}** after ${wall}s | - | - | - | - | - | - | failed |`;
+    appendSummary(failLine);
+    console.log(failLine);
+    console.error(`compare exited with ${proc.status ?? proc.signal}: ${why}`);
+    if (!ns["keep-data"]) for (const p of [a, b]) if (existsSync(p)) unlinkSync(p);
+    return ns["allow-failure"] ? 0 : 2;
   }
 
   // The child reports its own peak; process.resourceUsage().maxRSS is KB everywhere.
@@ -118,18 +165,7 @@ async function main(): Promise<number> {
     `${rec.rows_per_second === null ? "-" : f(rec.rows_per_second)}/s | ${f(peakMb)} MB | ${rec.report_mb} MB | ` +
     `${f(counts.changed!)} | ${f(counts.added!)} | ${f(counts.removed!)} | ` +
     `${ok ? "pass" : `over budget (${budgetS}s / ${budgetMb} MB)`} |`;
-  const step = process.env.GITHUB_STEP_SUMMARY;
-  if (step) {
-    if (!existsSync(step) || statSync(step).size === 0) {
-      appendFileSync(
-        step,
-        "| scale | engine | input | generate | compare | throughput | peak RSS | " +
-          "report | changed | added | removed | budget |\n" +
-          "|---|---|---|---|---|---|---|---|---|---|---|---|\n",
-      );
-    }
-    appendFileSync(step, line + "\n");
-  }
+  appendSummary(line);
   console.log(line);
 
   if (!ns["keep-data"]) {

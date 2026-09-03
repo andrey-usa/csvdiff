@@ -18,7 +18,7 @@ import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 import { loadConfig, optionsFrom, parseList } from "./config.ts";
 import { compare, CompareError, isIdentical } from "./engine.ts";
 import { render } from "./report.ts";
-import type { EngineName } from "./types.ts";
+import { ENGINES, type EngineName } from "./types.ts";
 
 export const USAGE = `usage: csvdiff-ts <command> [options]
 
@@ -39,7 +39,7 @@ compare options:
       --max-rows N        Rows embedded per section (default 50000)
       --delimiter D       Force delimiter (default: auto)
       --encoding ENC
-      --engine E          auto | duckdb | native
+      --engine E          auto | duckdb | polars | arquero | native
       --threads N
       --memory-limit S    DuckDB memory limit, e.g. 4GB
       --export-dir DIR    Write full changed/added/removed CSVs here
@@ -89,7 +89,7 @@ const SERVE_OPTIONS = {
   help: { type: "boolean", short: "h" },
 } satisfies ParseArgsOptionsConfig;
 
-const ENGINES: readonly EngineName[] = ["auto", "duckdb", "native"];
+const ENGINE_CHOICES: readonly EngineName[] = ["auto", ...ENGINES];
 
 function numOpt(v: string | undefined, name: string, integer = false): number | null {
   if (v === undefined) return null;
@@ -110,8 +110,8 @@ async function cmdCompare(args: string[]): Promise<number> {
   const cfg = loadConfig(values.config);
   const profile = values.profile ? (cfg.profiles ?? {})[values.profile] : undefined;
   if (values.profile && profile === undefined) throw new CompareError(`Profile not found: ${values.profile}`);
-  if (values.engine !== undefined && !ENGINES.includes(values.engine as EngineName)) {
-    throw new CompareError(`--engine must be one of ${ENGINES.join(", ")}`);
+  if (values.engine !== undefined && !ENGINE_CHOICES.includes(values.engine as EngineName)) {
+    throw new CompareError(`--engine must be one of ${ENGINE_CHOICES.join(", ")}`);
   }
   const overrides = {
     key: parseList(values.key),

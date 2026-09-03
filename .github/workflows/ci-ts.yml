@@ -27,6 +27,10 @@ jobs:
         engine: [duckdb]
         include:
           - node: "26"
+            engine: polars          # Rust columnar dataframe
+          - node: "26"
+            engine: arquero         # pure-JS dataframe
+          - node: "26"
             engine: native          # dependency-free in-memory fallback path
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +80,7 @@ jobs:
           retention-days: 14
 
   engines-agree:
-    name: engines produce identical counts
+    name: all engines produce identical counts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -87,9 +91,9 @@ jobs:
           cache-dependency-path: ts/package-lock.json
       - run: npm ci && npm run build
       - run: node dist/scripts/gen-data.js --rows 200k --out-dir data
-      - name: Compare with both engines and diff the summaries
+      - name: Compare with every engine and diff the summaries
         run: |
-          for e in duckdb native; do
+          for e in duckdb polars arquero native; do
             node dist/src/cli.js compare data/200k_a.csv data/200k_b.csv \
               -k account_id,txn_id -i updated_at --engine $e \
               -o /tmp/$e.html --json /tmp/$e.json || true
@@ -97,11 +101,15 @@ jobs:
           node - <<'JS'
           import { readFileSync } from "node:fs";
           import assert from "node:assert/strict";
-          const a = JSON.parse(readFileSync("/tmp/duckdb.json", "utf-8"));
-          const b = JSON.parse(readFileSync("/tmp/native.json", "utf-8"));
-          assert.deepEqual(a.counts, b.counts);
-          assert.deepEqual(a.columns, b.columns);
-          console.log("engines agree:", JSON.stringify(a.counts));
+          const engines = ["duckdb", "polars", "arquero", "native"];
+          const load = e => JSON.parse(readFileSync(`/tmp/${e}.json`, "utf-8"));
+          const ref = load(engines[0]);
+          for (const e of engines.slice(1)) {
+            const t = load(e);
+            assert.deepEqual(t.counts, ref.counts, `${e} counts differ from ${engines[0]}`);
+            assert.deepEqual(t.columns, ref.columns, `${e} column stats differ from ${engines[0]}`);
+          }
+          console.log(`all ${engines.length} engines agree:`, JSON.stringify(ref.counts));
           JS
 
   python-parity:
