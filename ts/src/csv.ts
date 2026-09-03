@@ -87,9 +87,30 @@ export function parseCsv(text: string, delimiter: string): Val[][] {
   return rows;
 }
 
-export function readCsv(path: string, opts: { delimiter?: string | null; encoding?: string }): CsvTable {
+/**
+ * Reads a whole file as text, with a usable message when it cannot be one.
+ *
+ * V8 caps a single string at 0x1fffffe8 characters (~512 MB), so every engine
+ * that reads a file into one string shares this hard ceiling — no amount of
+ * heap lifts it. Node reports it as a plain Error, so match on the message.
+ */
+export function readText(path: string, encoding?: string): string {
   const buf = readFileSync(path);
-  const text = new TextDecoder(opts.encoding || "utf-8").decode(buf);
+  try {
+    return new TextDecoder(encoding || "utf-8").decode(buf);
+  } catch (e) {
+    if (e instanceof Error && /string longer than|Invalid string length/i.test(e.message)) {
+      throw new Error(
+        `${path} is ${(buf.length / 1e6).toFixed(0)} MB, past the ~512 MB that a single ` +
+          `JavaScript string can hold. Use --engine duckdb, which streams from disk.`,
+      );
+    }
+    throw e;
+  }
+}
+
+export function readCsv(path: string, opts: { delimiter?: string | null; encoding?: string }): CsvTable {
+  const text = readText(path, opts.encoding);
   const delimiter = opts.delimiter || detectDelimiter(text);
   const all = parseCsv(text, delimiter);
   if (all.length === 0) return { header: [], rows: [] };

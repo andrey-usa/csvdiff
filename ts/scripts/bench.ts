@@ -43,7 +43,11 @@ const f = (n: number) => n.toLocaleString("en-US");
 function classifyFailure(status: number | null, signal: string | null, stderr: string): string {
   if (signal === "SIGKILL" || status === 137) return "OOM killed";
   if (/JavaScript heap out of memory|Allocation failed|Reached heap limit/i.test(stderr)) return "JS heap OOM";
-  if (/Invalid string length|Array buffer allocation failed|Invalid array length/i.test(stderr)) return "exceeds V8 limit";
+  // V8 caps a single string at 0x1fffffe8 characters (~512 MB). The in-heap JS
+  // engines read the whole file into one string, so they hit this well before
+  // memory runs out — it is a hard ceiling, not a tuning problem.
+  if (/Cannot create a string longer than|Invalid string length/i.test(stderr)) return "file > V8 512MB string cap";
+  if (/Array buffer allocation failed|Invalid array length/i.test(stderr)) return "exceeds V8 limit";
   if (/No space left on device|ENOSPC/i.test(stderr)) return "disk full";
   if (/Out of Memory Error|failed to allocate/i.test(stderr)) return "engine OOM";
   if (signal) return `killed by ${signal}`;
