@@ -1,0 +1,30 @@
+{
+  "name": "csvdiff-ts",
+  "version": "1.0.0",
+  "description": "Parameterised composite-key CSV comparison with a self-contained HTML report (TypeScript / Node port of csvdiff)",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "csvdiff-ts": "dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"tests/**/*.test.ts\"",
+    "start": "node src/cli.ts",
+    "gen": "node scripts/gen-data.ts",
+    "bench": "node scripts/bench.ts"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "^1.5.5-r.4",
+    "smol-toml": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
+  }
+}

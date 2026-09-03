@@ -1,0 +1,132 @@
+name: Compare CSVs (TypeScript)
+
+# Run a comparison from the Actions tab with the TypeScript implementation, or
+# call this workflow from another repo's pipeline. Files come from repo paths or URLs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_a:
+        description: File A — repo path or https URL
+        required: true
+      file_b:
+        description: File B — repo path or https URL
+        required: true
+      key:
+        description: Key columns, comma separated
+        required: true
+      compare:
+        description: Columns to compare (blank = all common non-key columns)
+        default: ""
+      ignore:
+        description: Columns to ignore
+        default: ""
+      options:
+        description: Extra flags, e.g. "--trim --tolerance 0.01"
+        default: ""
+      fail_on_diff:
+        description: Fail the run when differences are found
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      file_a: { type: string, required: true }
+      file_b: { type: string, required: true }
+      key: { type: string, required: true }
+      compare: { type: string, default: "" }
+      ignore: { type: string, default: "" }
+      options: { type: string, default: "" }
+      fail_on_diff: { type: boolean, default: false }
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - run: npm ci && npm run build
+        working-directory: ts
+
+      - name: Fetch inputs
+        env:
+          A: ${{ inputs.file_a }}
+          B: ${{ inputs.file_b }}
+        run: |
+          mkdir -p in
+          fetch() {  # $1 = source, $2 = destination
+            case "$1" in
+              https://*) curl -fsSL --retry 3 -o "$2" "$1" ;;
+              *) cp "$1" "$2" ;;
+            esac
+          }
+          fetch "$A" "in/$(basename "${A%%\?*}")"
+          fetch "$B" "in/$(basename "${B%%\?*}")"
+          ls -la in
+
+      - name: Compare
+        id: run
+        env:
+          A: ${{ inputs.file_a }}
+          B: ${{ inputs.file_b }}
+          KEY: ${{ inputs.key }}
+          COMPARE: ${{ inputs.compare }}
+          IGNORE: ${{ inputs.ignore }}
+          EXTRA: ${{ inputs.options }}
+        run: |
+          a="in/$(basename "${A%%\?*}")"; b="in/$(basename "${B%%\?*}")"
+          mkdir -p out
+          set -- compare "$a" "$b" --key "$KEY"
+          [ -n "$COMPARE" ] && set -- "$@" --compare "$COMPARE"
+          [ -n "$IGNORE" ] && set -- "$@" --ignore "$IGNORE"
+          set -- "$@" --threads "$(nproc)" --memory-limit 8GB \
+                 --out out/report.html --json out/summary.json --export-dir out/rows
+          set +e
+          node ts/dist/src/cli.js "$@" $EXTRA
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          [ $rc -le 1 ] || exit $rc
+
+      - name: Summary
+        run: |
+          node - <<'JS' >> "$GITHUB_STEP_SUMMARY"
+          import { readFileSync } from "node:fs";
+          const d = JSON.parse(readFileSync("out/summary.json", "utf-8")); const c = d.counts, m = d.meta;
+          const f = n => n.toLocaleString("en-US");
+          console.log(`## ${m.a.name} → ${m.b.name}\n`);
+          console.log(`Key: \`${m.key.join(", ")}\` · ${m.compared.length} columns compared · ${m.engine}, ${m.seconds}s\n`);
+          console.log("| metric | A | B |\n|---|---|---|");
+          console.log(`| rows | ${f(c.a_rows)} | ${f(c.b_rows)} |`);
+          console.log(`| unique keys | ${f(c.a_keys)} | ${f(c.b_keys)} |`);
+          console.log(`| duplicate keys | ${f(c.a_dup_keys)} | ${f(c.b_dup_keys)} |\n`);
+          console.log(`**Matched ${f(c.matched)}** — changed ${f(c.changed)}, unchanged ${f(c.unchanged)}. Added ${f(c.added)}, removed ${f(c.removed)}.\n`);
+          const top = d.columns.filter(x => x.changed).sort((x, y) => y.changed - x.changed).slice(0, 10);
+          if (top.length) {
+            console.log("| column | changed | blanked in B | filled in B |\n|---|---|---|---|");
+            for (const x of top) console.log(`| ${x.name} | ${f(x.changed)} | ${f(x.blanked)} | ${f(x.filled)} |`);
+          }
+          if (m.only_in_a.length || m.only_in_b.length)
+            console.log(`\nSchema drift — only in A: ${m.only_in_a.join(", ") || "none"}, only in B: ${m.only_in_b.join(", ") || "none"}`);
+          JS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: csvdiff-ts-report
+          path: out/
+          retention-days: 30
+
+      - name: Fail on differences
+        if: inputs.fail_on_diff && steps.run.outputs.rc == '1'
+        run: |
+          echo "Differences found — see the report artifact." >&2
+          exit 1

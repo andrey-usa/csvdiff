@@ -1,0 +1,142 @@
+name: CI (TypeScript)
+
+on:
+  push:
+    branches: [main]
+    paths: ["ts/**", ".github/workflows/ci-ts.yml", "examples/**"]
+  pull_request:
+    paths: ["ts/**", ".github/workflows/ci-ts.yml", "examples/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-ts-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: ts
+
+jobs:
+  test:
+    name: test node ${{ matrix.node }} / ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24", "26"]
+        engine: [duckdb]
+        include:
+          - node: "26"
+            engine: native          # dependency-free in-memory fallback path
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - name: Install
+        run: |
+          node --version && npm --version
+          npm ci
+
+      - name: Typecheck (TypeScript ${{ '' }}$(npx tsc --version))
+        run: npx tsc --version && npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Smoke benchmark, 10k rows x 20 columns (compiled CLI)
+        run: node dist/scripts/bench.js --rows 10k --engine ${{ matrix.engine }} --out-dir bench
+
+      - name: Check the report is self-contained
+        run: |
+          node - <<'JS'
+          import { readFileSync, readdirSync } from "node:fs";
+          const path = "bench/" + readdirSync("bench").filter(f => f.startsWith("10k-") && f.endsWith(".html")).sort()[0];
+          const html = readFileSync(path, "utf-8");
+          const bad = [...html.matchAll(/(?:src|href)="(?!#)([^"]+)"/g)].map(m => m[1]);
+          if (bad.length) throw new Error("report references external resources: " + bad);
+          if (html.length >= 8_000_000) throw new Error("report unexpectedly large: " + html.length);
+          console.log(`${path}: ${Math.round(html.length / 1024)} KB, no external references`);
+          JS
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.node == '26'
+        with:
+          name: report-ts-10k-${{ matrix.engine }}
+          path: |
+            ts/bench/10k-*.html
+            ts/bench/10k-*.json
+          retention-days: 14
+
+  engines-agree:
+    name: engines produce identical counts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - run: npm ci && npm run build
+      - run: node dist/scripts/gen-data.js --rows 200k --out-dir data
+      - name: Compare with both engines and diff the summaries
+        run: |
+          for e in duckdb native; do
+            node dist/src/cli.js compare data/200k_a.csv data/200k_b.csv \
+              -k account_id,txn_id -i updated_at --engine $e \
+              -o /tmp/$e.html --json /tmp/$e.json || true
+          done
+          node - <<'JS'
+          import { readFileSync } from "node:fs";
+          import assert from "node:assert/strict";
+          const a = JSON.parse(readFileSync("/tmp/duckdb.json", "utf-8"));
+          const b = JSON.parse(readFileSync("/tmp/native.json", "utf-8"));
+          assert.deepEqual(a.counts, b.counts);
+          assert.deepEqual(a.columns, b.columns);
+          console.log("engines agree:", JSON.stringify(a.counts));
+          JS
+
+  python-parity:
+    name: TypeScript and Python agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: npm ci && npm run build
+      - name: Install the Python implementation
+        working-directory: .
+        run: pip install "duckdb>=1.0" && pip install -e . --no-deps
+      - name: Same data, both implementations, identical counts and column stats
+        working-directory: .
+        run: |
+          python scripts/gen_data.py --rows 200k --out-dir data
+          csvdiff compare data/200k_a.csv data/200k_b.csv -k account_id,txn_id -i updated_at \
+            -o /tmp/py.html --json /tmp/py.json || true
+          node ts/dist/src/cli.js compare data/200k_a.csv data/200k_b.csv -k account_id,txn_id -i updated_at \
+            -o /tmp/ts.html --json /tmp/ts.json || true
+          node - <<'JS'
+          import { readFileSync } from "node:fs";
+          import assert from "node:assert/strict";
+          const py = JSON.parse(readFileSync("/tmp/py.json", "utf-8"));
+          const ts = JSON.parse(readFileSync("/tmp/ts.json", "utf-8"));
+          assert.deepEqual(ts.counts, py.counts);
+          assert.deepEqual(ts.columns, py.columns);
+          assert.deepEqual(ts.meta.compared, py.meta.compared);
+          console.log("python and typescript agree:", JSON.stringify(py.counts));
+          JS
