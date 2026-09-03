@@ -124,6 +124,9 @@ jobs:
         with:
           node-version: "26"
       - name: Combined results
+        # This job never checks the repo out, so the workflow-level java/ default
+        # would point at a directory that does not exist here.
+        working-directory: .
         run: |
           node - <<'JS' >> "$GITHUB_STEP_SUMMARY"
           import { readdirSync, readFileSync, existsSync } from "node:fs";

@@ -1,8 +1,7 @@
-target/
-bench/
-data/
-out/
-csvdiff.toml
-# Generated reports, but never the report template that ships in the jar.
-*.html
-!src/main/resources/**/*.html
+# Anchored to this directory. Unanchored, "bench/" would also match the
+# dev.csvdiff.bench source package and silently drop it from every commit.
+/target/
+/bench/
+/data/
+/out/
+/csvdiff.toml

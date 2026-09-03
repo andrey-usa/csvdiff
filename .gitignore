@@ -1,12 +1,22 @@
 __pycache__/
 *.pyc
 *.egg-info/
-build/
-dist/
-data/
-bench/
-out/
+/build/
+/dist/
+# Generated data and benchmark output, anchored per implementation. Unanchored,
+# "bench/" would also match a source package named bench (the Java port has one)
+# and silently drop it from every commit.
+/data/
+/bench/
+/out/
+/ts/data/
+/ts/bench/
+/ts/out/
+/java/data/
+/java/bench/
+/java/out/
 csvdiff.toml
 *.html
 !examples/report.html
+!java/src/main/resources/**/*.html
 .claude/settings.local.json
