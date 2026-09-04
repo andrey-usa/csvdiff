@@ -1,0 +1,180 @@
+name: CI (Go)
+
+on:
+  push:
+    branches: [main]
+    paths: ["go/**", ".github/workflows/ci-go.yml"]
+  pull_request:
+    paths: ["go/**", ".github/workflows/ci-go.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-go-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: go
+
+jobs:
+  test:
+    name: test go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go/go.sum
+
+      - run: go version
+
+      # gofmt is not advisory in Go; unformatted code is a build-quality failure.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Smoke benchmark, 10k rows x 20 columns
+        run: go run ./cmd/bench --rows 10k --engine duckdb --out-dir bench
+
+      - name: Check the report is self-contained
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+          path = glob.glob("bench/10k-*.html")[0]
+          html = open(path, encoding="utf-8").read()
+          external = re.search(r'(?:src|href)="(?!#)([^"]+)"', html)
+          if external:
+              sys.exit(f"report references external resources: {external.group(1)}")
+          if len(html) >= 8_000_000:
+              sys.exit(f"report unexpectedly large: {len(html)}")
+          print(f"{path}: {len(html) // 1024} KB, no external references")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: report-go-10k
+          path: |
+            go/bench/10k-*.html
+            go/bench/10k-*.json
+          retention-days: 14
+
+  engines-agree:
+    name: all engines produce identical counts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go/go.sum
+      - run: go build -o /tmp/csvdiff ./cmd/csvdiff
+      - run: go run ./cmd/gen-data --rows 200k --out-dir data
+      - name: Compare with every engine and diff the summaries
+        run: |
+          for e in duckdb native; do
+            /tmp/csvdiff compare data/200k_a.csv data/200k_b.csv \
+              -k account_id,txn_id -i updated_at --engine $e \
+              -o /tmp/$e.html --json /tmp/$e.json || true
+          done
+          python3 - <<'PY'
+          import json, sys
+          engines = ["duckdb", "native"]
+          ref = None
+          for e in engines:
+              n = json.load(open(f"/tmp/{e}.json"))
+              if ref is None:
+                  ref, ref_name = n, e
+                  continue
+              for section in ("counts", "columns"):
+                  if n[section] != ref[section]:
+                      sys.exit(f"{e} {section} differ from {ref_name}: {n[section]} vs {ref[section]}")
+          print(f"all {len(engines)} engines agree:", json.dumps(ref["counts"]))
+          PY
+
+  cross-language-parity:
+    name: Go agrees with Python, TypeScript and Java
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go/go.sum
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "26"
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+
+      - name: Build all four implementations
+        working-directory: .
+        run: |
+          (cd go && go build -o /tmp/csvdiff-go ./cmd/csvdiff && go build -o /tmp/gen-data-go ./cmd/gen-data)
+          (cd java && mvn -B --no-transfer-progress -DskipTests package)
+          pip install "duckdb>=1.0" && pip install -e . --no-deps
+          (cd ts && npm ci && npm run build)
+
+      # The four generators are meant to emit byte-identical files, which is what
+      # makes a benchmark number from one comparable with a number from another.
+      - name: The generators agree byte for byte
+        working-directory: .
+        run: |
+          /tmp/gen-data-go --rows 200k --out-dir gen/go --prefix 200k
+          java -cp java/target/csvdiff.jar dev.csvdiff.bench.GenData --rows 200k --out-dir gen/java --prefix 200k
+          python3 scripts/gen_data.py --rows 200k --out-dir gen/py --prefix 200k
+          node ts/dist/scripts/gen-data.js --rows 200k --out-dir gen/ts --prefix 200k
+          for side in a b; do
+            md5sum gen/*/200k_$side.csv
+            test "$(md5sum gen/*/200k_$side.csv | awk '{print $1}' | sort -u | wc -l)" = 1 \
+              || { echo "the generators have diverged on side $side"; exit 1; }
+          done
+
+      - name: One dataset, four implementations, identical results
+        working-directory: .
+        run: |
+          A=gen/go/200k_a.csv; B=gen/go/200k_b.csv
+          ARGS="-k account_id,txn_id -i updated_at"
+          /tmp/csvdiff-go compare $A $B $ARGS -o /tmp/go.html --json /tmp/go.json || true
+          csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
+          node ts/dist/src/cli.js compare $A $B $ARGS -o /tmp/ts.html --json /tmp/ts.json || true
+          java -cp java/target/csvdiff.jar dev.csvdiff.Cli compare $A $B $ARGS -o /tmp/java.html --json /tmp/java.json || true
+          python3 - <<'PY'
+          import json, sys
+          load = lambda n: json.load(open(f"/tmp/{n}.json"))
+          py = load("py")
+          for other in ("go", "ts", "java"):
+              o = load(other)
+              for section in ("counts", "columns"):
+                  if o[section] != py[section]:
+                      sys.exit(f"{other} {section} differ from python")
+              if o["meta"]["compared"] != py["meta"]["compared"]:
+                  sys.exit(f"{other} compared columns differ from python")
+          print("go, python, typescript and java agree:", json.dumps(py["counts"]))
+          PY

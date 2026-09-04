@@ -15,8 +15,17 @@ __pycache__/
 /java/data/
 /java/bench/
 /java/out/
+/go/data/
+/go/bench/
+/go/out/
+/rust/data/
+/rust/bench/
+/rust/out/
+/rust/target/
 csvdiff.toml
 *.html
 !examples/report.html
 !java/src/main/resources/**/*.html
+!go/internal/csvdiff/report.html
+!rust/src/report.html
 .claude/settings.local.json
