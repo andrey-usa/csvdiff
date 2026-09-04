@@ -13,12 +13,12 @@ import java.util.ArrayList;
 import java.util.List;
 
 /** Turns a completed join into the capped report sections, and writes the uncapped CSV exports. */
-final class Sections {
+public final class Sections {
 
   private Sections() {}
 
   /** Builds the {@link EngineResult}, capping each row list and writing {@code --export-dir}. */
-  static EngineResult assemble(
+  public static EngineResult assemble(
       EngineMeta meta,
       RowStore.Joined joined,
       Section dupA,

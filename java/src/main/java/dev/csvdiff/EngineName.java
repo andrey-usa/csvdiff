@@ -16,6 +16,12 @@ public enum EngineName {
   AUTO,
   /** DuckDB over JDBC: out-of-core, spills to disk, handles files larger than RAM. */
   DUCKDB,
+  /** Mapped with the FFM API, scanned with the Vector API, indexed on every core. */
+  SHARD,
+  /** Mapped with the FFM API, scanned with the Vector API, one thread. */
+  MMAP,
+  /** On the heap, scanned with the Vector API, one thread. */
+  SIMD,
   /** Tablesaw: in-memory columnar dataframe, pure Java. */
   TABLESAW,
   /** This project: in-memory hash join over FastCSV, no dataframe layer. */

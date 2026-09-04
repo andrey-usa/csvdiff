@@ -7,6 +7,10 @@ import dev.csvdiff.Contract.FileMeta;
 import dev.csvdiff.engine.DuckDbEngine;
 import dev.csvdiff.engine.NativeEngine;
 import dev.csvdiff.engine.TablesawEngine;
+import dev.csvdiff.engine.fast.FastEngine;
+import dev.csvdiff.engine.fast.MmapEngine;
+import dev.csvdiff.engine.fast.ShardEngine;
+import dev.csvdiff.engine.fast.SimdEngine;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
@@ -37,6 +41,9 @@ public final class CsvDiff {
   private static Map<EngineName, Supplier<CompareEngine>> buildRegistry() {
     var m = new EnumMap<EngineName, Supplier<CompareEngine>>(EngineName.class);
     m.put(EngineName.DUCKDB, DuckDbEngine::new);
+    m.put(EngineName.SHARD, ShardEngine::new);
+    m.put(EngineName.MMAP, MmapEngine::new);
+    m.put(EngineName.SIMD, SimdEngine::new);
     m.put(EngineName.TABLESAW, TablesawEngine::new);
     m.put(EngineName.NATIVE, NativeEngine::new);
     return Map.copyOf(m);
@@ -102,8 +109,14 @@ public final class CsvDiff {
           case DUCKDB -> "org.duckdb.DuckDBDriver";
           case TABLESAW -> "tech.tablesaw.api.Table";
           case NATIVE -> "de.siegmar.fastcsv.reader.CsvReader";
+          // The three fast engines share one prerequisite: the incubating Vector API, which is
+          // only on the module path when the launcher was told to put it there.
+          case SHARD, MMAP, SIMD -> null;
           case AUTO -> throw new IllegalArgumentException("AUTO is not a concrete engine");
         };
+    if (probe == null) {
+      return FastEngine.available();
+    }
     try {
       Class.forName(probe, false, CsvDiff.class.getClassLoader());
       return true;

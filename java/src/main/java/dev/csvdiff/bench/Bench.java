@@ -81,6 +81,10 @@ public final class Bench {
     if (cfg.heapMb != null) {
       command.add("-Xmx" + cfg.heapMb + "m");
     }
+    // The Vector API is an incubator module, so the simd, mmap and shard engines are only on the
+    // menu when the launcher is told to load it. Harmless for the engines that do not use it.
+    command.add("--add-modules");
+    command.add("jdk.incubator.vector");
     command.add("-cp");
     command.add(System.getProperty("java.class.path"));
     command.add("dev.csvdiff.Cli");

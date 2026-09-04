@@ -87,6 +87,10 @@
                  annotation processor is configured, so both stay off. -->
             <arg>-Xlint:all,-this-escape,-processing</arg>
             <arg>-Werror</arg>
+            <!-- The Vector API is still an incubator module. The three fast engines are the
+                 only code that touches it, and they check at runtime whether it loaded. -->
+            <arg>--add-modules</arg>
+            <arg>jdk.incubator.vector</arg>
           </compilerArgs>
         </configuration>
       </plugin>
@@ -95,6 +99,10 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>${surefire.plugin.version}</version>
+        <configuration>
+          <!-- Incubator modules are opt-in at run time as well as at compile time. -->
+          <argLine>--add-modules jdk.incubator.vector</argLine>
+        </configuration>
       </plugin>
 
       <!-- One runnable jar: `java -jar target/csvdiff.jar compare a.csv b.csv -k id`. -->

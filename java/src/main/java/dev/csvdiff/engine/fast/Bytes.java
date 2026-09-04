@@ -1,0 +1,281 @@
+package dev.csvdiff.engine.fast;
+
+import dev.csvdiff.Options;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.Locale;
+
+/**
+ * Field-level operations done on the raw bytes, without building a {@link String}.
+ *
+ * <p>This is where the fast engines earn their name. The in-heap engines allocate a String per cell
+ * — twenty columns times ten million rows is two hundred million objects that are almost all thrown
+ * away, since only the differing cells reach the report. Here a field is an offset and a length
+ * into a {@link Slab}, and hashing, equality and ordering all read the bytes in place.
+ *
+ * <p>The results are exact rather than approximately-the-same-as the other engines. Where a byte
+ * comparison could disagree with the String one — non-ASCII text under {@code --ignore-case} — the
+ * field is decoded and the String path is taken. Bulk extracts are ASCII, so that is the safety net
+ * rather than the common case.
+ */
+public final class Bytes {
+
+  private Bytes() {}
+
+  private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+  private static final long FNV_PRIME = 0x0000_0100_0000_01B3L;
+  private static final long FNV_SEED = 0xCBF2_9CE4_8422_2325L;
+
+  /** A field that is not there at all: a short row, or a column missing from the file. */
+  public static final long ABSENT = -1L;
+
+  private static final long OFFSET_MASK = 0xFF_FFFF_FFFFL; // 40 bits: 1 TB
+  private static final int LENGTH_SHIFT = 40;
+  private static final long LENGTH_MASK = 0x7F_FFFFL; // 23 bits: 8 MB
+  private static final long ESCAPED = 1L << 63;
+
+  /**
+   * A field packed into one long: offset in the low 40 bits, length in the next 23, and a flag in
+   * the top bit for the rare field that lives in the slab's side-buffer.
+   *
+   * <p>One long per field means a row's field table is a {@code long[]} rather than an object per
+   * field, which at ten million rows is the difference between an array and a garbage-collection
+   * problem.
+   */
+  public static long pack(long offset, int length) {
+    return (offset & OFFSET_MASK) | ((length & LENGTH_MASK) << LENGTH_SHIFT);
+  }
+
+  public static long escaped(long field) {
+    return field | ESCAPED;
+  }
+
+  public static boolean isEscaped(long field) {
+    return (field & ESCAPED) != 0;
+  }
+
+  public static long offset(long field) {
+    return field & OFFSET_MASK;
+  }
+
+  public static int length(long field) {
+    return (int) ((field >>> LENGTH_SHIFT) & LENGTH_MASK);
+  }
+
+  /** The largest field this packing can address. */
+  public static final int MAX_FIELD_LENGTH = (int) LENGTH_MASK;
+
+  /**
+   * Whether a field counts as absent under the options.
+   *
+   * <p>An empty field is absent whether or not it was quoted — what DuckDB's reader does, and what
+   * every implementation of this tool follows. With {@code --trim} a field of only whitespace is
+   * empty too, which also satisfies {@code --empty-is-null}.
+   */
+  public static boolean isNull(Slab slab, long field, Options opt) {
+    if (field == ABSENT) {
+      return true;
+    }
+    if (length(field) == 0) {
+      return true;
+    }
+    return opt.trim() && normLength(slab, field, opt) == 0;
+  }
+
+  /** What {@link String#trim()} strips: anything at or below U+0020. */
+  private static boolean isSpace(byte b) {
+    return b >= 0 && b <= ' ';
+  }
+
+  /** ASCII lower-casing, used only where the field is known to be ASCII. */
+  private static byte lower(byte b) {
+    return (b >= 'A' && b <= 'Z') ? (byte) (b + 32) : b;
+  }
+
+  /** The field's first byte after {@code --trim}. */
+  public static long normStart(Slab slab, long field, Options opt) {
+    long start = offset(field);
+    if (!opt.trim()) {
+      return start;
+    }
+    MemorySegment seg = slab.segmentOf(field);
+    long end = start + length(field);
+    while (start < end && isSpace(seg.get(BYTE, start))) {
+      start++;
+    }
+    return start;
+  }
+
+  /** The field's length after {@code --trim}. */
+  public static int normLength(Slab slab, long field, Options opt) {
+    int len = length(field);
+    if (!opt.trim() || len == 0) {
+      return len;
+    }
+    MemorySegment seg = slab.segmentOf(field);
+    long start = offset(field);
+    long end = start + len;
+    while (start < end && isSpace(seg.get(BYTE, start))) {
+      start++;
+    }
+    while (end > start && isSpace(seg.get(BYTE, end - 1))) {
+      end--;
+    }
+    return (int) (end - start);
+  }
+
+  private static boolean isAscii(MemorySegment seg, long start, int len) {
+    for (int i = 0; i < len; i++) {
+      if (seg.get(BYTE, start + i) < 0) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * A 64-bit hash of the normalised field, for the key index.
+   *
+   * <p>FNV-1a: one xor and one multiply per byte, no table, and spread enough for composite keys
+   * made of ids and dates. Collisions are resolved by comparing the bytes, so the hash only has to
+   * be fast and reasonably uniform.
+   */
+  public static long hash(Slab slab, long field, Options opt, long seed) {
+    if (isNull(slab, field, opt)) {
+      // An absent value still has to contribute, or (null, "x") and ("x", null) would collide.
+      return (seed ^ 0x9E37_79B9_7F4A_7C15L) * FNV_PRIME;
+    }
+    MemorySegment seg = slab.segmentOf(field);
+    long start = normStart(slab, field, opt);
+    int len = normLength(slab, field, opt);
+    long h = seed;
+    if (opt.ignoreCase()) {
+      for (int i = 0; i < len; i++) {
+        h = (h ^ (lower(seg.get(BYTE, start + i)) & 0xFF)) * FNV_PRIME;
+      }
+    } else {
+      for (int i = 0; i < len; i++) {
+        h = (h ^ (seg.get(BYTE, start + i) & 0xFF)) * FNV_PRIME;
+      }
+    }
+    // Mix the length in so that a field and its prefix cannot share a hash by accident.
+    return (h ^ (long) len) * FNV_PRIME;
+  }
+
+  /** The seed a composite-key hash starts from. */
+  public static long seed() {
+    return FNV_SEED;
+  }
+
+  /**
+   * Whether two fields hold the same value under {@code --trim} and {@code --ignore-case}.
+   *
+   * <p>Absent equals absent, and absent differs from anything present. This is the key-equality
+   * rule; {@link #differs} adds the numeric tolerance on top for values.
+   */
+  public static boolean equal(Slab ls, long lf, Slab rs, long rf, Options opt) {
+    boolean ln = isNull(ls, lf, opt);
+    boolean rn = isNull(rs, rf, opt);
+    if (ln || rn) {
+      return ln && rn;
+    }
+    MemorySegment lseg = ls.segmentOf(lf);
+    MemorySegment rseg = rs.segmentOf(rf);
+    long lo = normStart(ls, lf, opt);
+    int ll = normLength(ls, lf, opt);
+    long ro = normStart(rs, rf, opt);
+    int rl = normLength(rs, rf, opt);
+
+    if (!opt.ignoreCase()) {
+      return ll == rl && MemorySegment.mismatch(lseg, lo, lo + ll, rseg, ro, ro + rl) < 0;
+    }
+    if (isAscii(lseg, lo, ll) && isAscii(rseg, ro, rl)) {
+      if (ll != rl) {
+        return false;
+      }
+      for (int i = 0; i < ll; i++) {
+        if (lower(lseg.get(BYTE, lo + i)) != lower(rseg.get(BYTE, ro + i))) {
+          return false;
+        }
+      }
+      return true;
+    }
+    // Case folding outside ASCII can change a string's length, so this is the one path that
+    // has to agree with String rather than with bytes.
+    return decode(lseg, lo, ll, opt)
+        .toLowerCase(Locale.ROOT)
+        .equals(decode(rseg, ro, rl, opt).toLowerCase(Locale.ROOT));
+  }
+
+  /**
+   * SQL's {@code IS DISTINCT FROM}, with the numeric tolerance applied where both sides parse as
+   * numbers.
+   */
+  public static boolean differs(Slab ls, long lf, Slab rs, long rf, Options opt) {
+    boolean ln = isNull(ls, lf, opt);
+    boolean rn = isNull(rs, rf, opt);
+    if (ln && rn) {
+      return false;
+    }
+    if (opt.tolerance() > 0 && !ln && !rn) {
+      double a = number(ls, lf, opt);
+      double b = number(rs, rf, opt);
+      if (!Double.isNaN(a) && !Double.isNaN(b)) {
+        return Math.abs(a - b) > opt.tolerance();
+      }
+    }
+    return !equal(ls, lf, rs, rf, opt);
+  }
+
+  /**
+   * The field as a number, or NaN when it is not one.
+   *
+   * <p>Deliberately stricter than {@link Double#parseDouble}: {@code inf}, {@code nan}, hex and a
+   * trailing {@code d} are ordinary text in a CSV, and treating them as numbers would make two
+   * unequal strings compare equal under a tolerance.
+   */
+  public static double number(Slab slab, long field, Options opt) {
+    long start = normStart(slab, field, opt);
+    int len = normLength(slab, field, opt);
+    if (len == 0 || len > 64) {
+      return Double.NaN;
+    }
+    MemorySegment seg = slab.segmentOf(field);
+    var chars = new char[len];
+    for (int i = 0; i < len; i++) {
+      byte b = seg.get(BYTE, start + i);
+      boolean ok =
+          (b >= '0' && b <= '9') || b == '.' || b == '-' || b == '+' || b == 'e' || b == 'E';
+      if (!ok) {
+        return Double.NaN;
+      }
+      chars[i] = (char) b;
+    }
+    try {
+      double v = Double.parseDouble(new String(chars));
+      return Double.isFinite(v) ? v : Double.NaN;
+    } catch (NumberFormatException e) {
+      return Double.NaN;
+    }
+  }
+
+  /** The field as a normalised String, or {@code null} when it is absent. */
+  public static String value(Slab slab, long field, Options opt) {
+    if (isNull(slab, field, opt)) {
+      return null;
+    }
+    String s =
+        decode(slab.segmentOf(field), normStart(slab, field, opt), normLength(slab, field, opt), opt);
+    return opt.ignoreCase() ? s.toLowerCase(Locale.ROOT) : s;
+  }
+
+  /** The raw bytes as a String, with no normalisation. */
+  public static String decode(MemorySegment seg, long start, int len, Options opt) {
+    var buf = new byte[len];
+    MemorySegment.copy(seg, BYTE, start, buf, 0, len);
+    Charset cs = opt.charset();
+    return new String(buf, cs == null ? StandardCharsets.UTF_8 : cs);
+  }
+}

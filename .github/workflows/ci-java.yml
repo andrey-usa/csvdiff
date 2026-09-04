@@ -88,8 +88,9 @@ jobs:
       - run: java -cp target/csvdiff.jar dev.csvdiff.bench.GenData --rows 200k --out-dir data
       - name: Compare with every engine and diff the summaries
         run: |
-          for e in duckdb tablesaw native; do
-            java -cp target/csvdiff.jar dev.csvdiff.Cli compare data/200k_a.csv data/200k_b.csv \
+          for e in duckdb shard mmap simd tablesaw native; do
+            java --add-modules jdk.incubator.vector \
+              -cp target/csvdiff.jar dev.csvdiff.Cli compare data/200k_a.csv data/200k_b.csv \
               -k account_id,txn_id -i updated_at --engine $e \
               -o /tmp/$e.html --json /tmp/$e.json || true
           done
@@ -98,7 +99,7 @@ jobs:
           import java.nio.file.*;
           void main() throws Exception {
             var mapper = new ObjectMapper();
-            String[] engines = {"duckdb", "tablesaw", "native"};
+            String[] engines = {"duckdb", "shard", "mmap", "simd", "tablesaw", "native"};
             JsonNode ref = null;
             for (String e : engines) {
               JsonNode n = mapper.readTree(Files.readString(Path.of("/tmp/" + e + ".json")));
