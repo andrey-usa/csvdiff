@@ -110,8 +110,11 @@ public final class Cli {
     } catch (CsvDiffException e) {
       err.println("error: " + e.getMessage());
       return 2;
-    } catch (Exception e) {
-      err.println("error: " + e);
+    } catch (Throwable t) {
+      // Throwable, not Exception: OutOfMemoryError and StackOverflowError are Errors, and letting
+      // one escape would end the JVM with status 1 — which in this contract means "differences
+      // found". A failed comparison must never be mistaken for a successful one.
+      err.println("error: " + t);
       return 2;
     }
   }

@@ -137,34 +137,22 @@ public final class Bench {
             Runtime.version().feature(), Runtime.getRuntime().availableProcessors());
 
     if (status != 0 && status != 1) {
-      String why = classify(status);
-      var rec = new LinkedHashMap<String, Object>();
-      rec.put("rows", rows);
-      rec.put("scale", cfg.label);
-      rec.put("engine", cfg.engine);
-      rec.put("generate_seconds", genSeconds);
-      rec.put("compare_seconds", null);
-      rec.put("peak_rss_mb", peakMb > 0 ? peakMb : null);
-      rec.put("input_mb", inputMb);
-      rec.put("report_mb", null);
-      rec.put("rows_per_second", null);
-      rec.put("counts", null);
-      rec.put("failed", why);
-      rec.put("exit_status", status);
-      rec.put("wall_before_failure", wall);
-      rec.put("runner", runner);
-      write(mapper, cfg.outDir.resolve(cfg.label + "-" + cfg.engine + ".json"), rec);
-
-      String line = "| %s | %s | %s MB | %ss | **%s** after %ss | - | %s | - | - | - | - | failed |"
-          .formatted(cfg.label, cfg.engine, fmt(inputMb), genSeconds, why, wall,
-              peakMb > 0 ? fmt(peakMb) + " MB" : "-");
-      appendSummary(line);
-      System.out.println(line);
+      String why = classify(status, stderr.toString());
+      recordFailure(mapper, cfg, rows, genSeconds, inputMb, peakMb, wall, status, why, runner);
       System.err.printf("compare exited with %d: %s%n", status, why);
       cleanUp(cfg, a, b);
       System.exit(cfg.allowFailure ? 0 : 2);
     }
 
+    if (!Files.exists(summary)) {
+      // The child reported success but wrote nothing. Record it as a failure rather than
+      // crashing the harness on a missing file, and never present it as a result.
+      String why = "no summary written";
+      recordFailure(mapper, cfg, rows, genSeconds, inputMb, peakMb, wall, status, why, runner);
+      System.err.printf("compare exited %d but wrote no summary; recorded as failed%n", status);
+      cleanUp(cfg, a, b);
+      System.exit(cfg.allowFailure ? 0 : 2);
+    }
     JsonNode counts = mapper.readTree(Files.readString(summary)).get("counts");
     long aRows = counts.get("a_rows").asLong();
     long bRows = counts.get("b_rows").asLong();
@@ -201,6 +189,34 @@ public final class Bench {
     System.exit(ok || cfg.noBudget ? 0 : 1);
   }
 
+  /** Records a scale an engine could not handle: a JSON row plus a line in the results table. */
+  private static void recordFailure(
+      ObjectMapper mapper, Config cfg, long rows, double genSeconds, double inputMb,
+      double peakMb, double wall, int status, String why, String runner) throws IOException {
+    var rec = new LinkedHashMap<String, Object>();
+    rec.put("rows", rows);
+    rec.put("scale", cfg.label);
+    rec.put("engine", cfg.engine);
+    rec.put("generate_seconds", genSeconds);
+    rec.put("compare_seconds", null);
+    rec.put("peak_rss_mb", peakMb > 0 ? peakMb : null);
+    rec.put("input_mb", inputMb);
+    rec.put("report_mb", null);
+    rec.put("rows_per_second", null);
+    rec.put("counts", null);
+    rec.put("failed", why);
+    rec.put("exit_status", status);
+    rec.put("wall_before_failure", wall);
+    rec.put("runner", runner);
+    write(mapper, cfg.outDir.resolve(cfg.label + "-" + cfg.engine + ".json"), rec);
+
+    String line = "| %s | %s | %s MB | %ss | **%s** after %ss | - | %s | - | - | - | - | failed |"
+        .formatted(cfg.label, cfg.engine, fmt(inputMb), genSeconds, why, wall,
+            peakMb > 0 ? fmt(peakMb) + " MB" : "-");
+    appendSummary(line);
+    System.out.println(line);
+  }
+
   private static void cleanUp(Config cfg, Path a, Path b) throws IOException {
     if (!cfg.keepData) {
       Files.deleteIfExists(a);
@@ -208,13 +224,24 @@ public final class Bench {
     }
   }
 
-  /** A dead child process, turned into a short honest reason for the results table. */
-  private static String classify(int status) {
+  /**
+   * A dead child process, turned into a short honest reason for the results table.
+   *
+   * <p>An in-heap engine on a 16 GB runner hits the JVM's default max heap (a quarter of RAM,
+   * about 4 GB) long before the machine runs out, so say so: that ceiling is raised with -Xmx,
+   * whereas being killed by the OS is not.
+   */
+  private static String classify(int status, String stderr) {
+    if (stderr.contains("OutOfMemoryError")) {
+      return stderr.contains("GC overhead limit") ? "Java heap OOM (GC thrash)" : "Java heap OOM";
+    }
+    if (stderr.contains("No space left on device")) {
+      return "disk full";
+    }
     return switch (status) {
       case 137 -> "OOM killed";
       case 139 -> "segfault";
       case -1 -> "timed out";
-      case 1, 3 -> "exit " + status;
       default -> "exit " + status;
     };
   }
