@@ -77,12 +77,29 @@ def peak_rss_mb(pid: int, stop: threading.Event) -> list[float]:
     return seen
 
 
+# Address space each tool may claim, set by --mem-cap-gb. Without a cap, a tool that
+# needs more memory than the machine has does not fail — the kernel kills whatever it
+# feels like, benchmark harness included. With one, running out of memory is a result
+# the table can print. Mapped file bytes count against it, which is why the cap has to
+# leave room for the input on top of whatever the tool holds.
+MEM_CAP_BYTES: int | None = None
+
+
+def _apply_cap() -> None:
+    """Runs in the child between fork and exec."""
+    import resource
+
+    if MEM_CAP_BYTES is not None:
+        resource.setrlimit(resource.RLIMIT_AS, (MEM_CAP_BYTES, MEM_CAP_BYTES))
+
+
 def run(cmd: list[str], timeout: float = 3600, env: dict | None = None) -> tuple[int, str, str, float, float]:
     """Runs a command, returning status, stdout, stderr, wall seconds and peak RSS."""
     started = time.perf_counter()
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env={**os.environ, **(env or {})},
+        preexec_fn=_apply_cap if MEM_CAP_BYTES is not None else None,
     )
     stop = threading.Event()
     seen = peak_rss_mb(proc.pid, stop)
@@ -101,6 +118,18 @@ def run(cmd: list[str], timeout: float = 3600, env: dict | None = None) -> tuple
 # The tools
 # ---------------------------------------------------------------------------
 
+def jvm_heap_mb(cap: int) -> int:
+    """The heap to give the JVM under an address-space cap.
+
+    A JVM claims about three gigabytes of address space that is not heap — a gigabyte of
+    compressed class space, the code cache, the collector's own tables, a stack per thread —
+    and it claims all of it before running a line of the program. Asking for a heap the cap
+    cannot cover on top of that fails at startup, which would read in the table as the tool
+    being unable to do the work rather than the harness having mis-set the limit.
+    """
+    return max(512, int(cap / 1024**2) - 3 * 1024)
+
+
 def java_exe() -> Path:
     """The JDK the jar was built for, which is not necessarily the one on PATH."""
     named = os.environ.get("CSVDIFF_JAVA_HOME")
@@ -113,12 +142,25 @@ def java_exe() -> Path:
     return Path(home, "bin", "java") if home else Path("java")
 
 
+def fresh(path: Path) -> Path:
+    """Removes a tool's output before it runs.
+
+    A crashed tool writes nothing, and a leftover file from an earlier run of the same tool
+    then reads as this run's answer — which is exactly how a JVM that died at startup came
+    to be recorded as the fastest thing in the table.
+    """
+    path.unlink(missing_ok=True)
+    return path
+
+
 def ours(a: Path, b: Path, out: Path, engine: str, jar: Path) -> Result:
     """This project, as the reference every other answer is checked against."""
-    summary = out / f"ours-{engine}.json"
-    java = java_exe()
+    summary = fresh(out / f"ours-{engine}.json")
+    cmd = [str(java_exe()), "--add-modules", "jdk.incubator.vector"]
+    if MEM_CAP_BYTES is not None:
+        cmd.append(f"-Xmx{jvm_heap_mb(MEM_CAP_BYTES)}m")
     status, _, err, secs, mb = run([
-        str(java), "--add-modules", "jdk.incubator.vector", "-cp", str(jar), "dev.csvdiff.Cli",
+        *cmd, "-cp", str(jar), "dev.csvdiff.Cli",
         "compare", str(a), str(b), "-k", ",".join(KEY), "-i", IGNORE,
         "--engine", engine, "-o", str(out / f"ours-{engine}.html"), "--json", str(summary),
     ])
@@ -140,7 +182,7 @@ def go_csvdiff(a: Path, b: Path, out: Path, exe: str) -> Result:
     which is why it is quick and why it can only say *that* a row changed, not
     which cell did.
     """
-    marks = out / "go-csvdiff.csv"
+    marks = fresh(out / "go-csvdiff.csv")
     status, stdout, err, secs, mb = run([
         exe, str(a), str(b), "--primary-key", "0,1", "--ignore-columns", "19", "--format", "rowmark",
     ])
@@ -208,7 +250,7 @@ def daff_diff(a: Path, b: Path, out: Path, exe: str) -> Result:
     `--ignore` drops a column, so it does express this task. Its output is a diff
     table, not a summary, so the counts here come from tallying the `@@` marks.
     """
-    diff = out / "daff.csv"
+    diff = fresh(out / "daff.csv")
     status, _, err, secs, mb = run([
         exe, "diff", "--unordered", "--output", str(diff), "--ignore", IGNORE,
         *[arg for k in KEY for arg in ("--id", k)], str(a), str(b),
@@ -237,7 +279,7 @@ def datacompy_compare(a: Path, b: Path, out: Path) -> Result:
     Runs in a child process so its peak memory is measured the same way as
     everyone else's; the child is this same file under ``--child``.
     """
-    summary = out / "datacompy.json"
+    summary = fresh(out / "datacompy.json")
     status, _, err, secs, mb = run([
         sys.executable, str(Path(__file__).resolve()), "--child", "datacompy",
         str(a), str(b), str(summary),
@@ -252,7 +294,7 @@ def datacompy_compare(a: Path, b: Path, out: Path) -> Result:
 
 def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
     """datacompy again, this time over Polars rather than pandas."""
-    summary = out / "datacompy-polars.json"
+    summary = fresh(out / "datacompy-polars.json")
     status, _, err, secs, mb = run([
         sys.executable, str(Path(__file__).resolve()), "--child", "datacompy-polars",
         str(a), str(b), str(summary),
@@ -267,7 +309,7 @@ def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
 
 def pandas_merge(a: Path, b: Path, out: Path) -> Result:
     """The hand-written pandas outer merge — what most people write before finding a library."""
-    summary = out / "pandas.json"
+    summary = fresh(out / "pandas.json")
     status, _, err, secs, mb = run([
         sys.executable, str(Path(__file__).resolve()), "--child", "pandas",
         str(a), str(b), str(summary),
@@ -284,9 +326,14 @@ def classify(status: int, err: str) -> str:
     """Turns a non-zero exit into the reason a reader of the table cares about."""
     if status == -1:
         return "timed out"
-    tail = (err or "").strip().splitlines()
+    noise = ("Picked up JAVA_TOOL_OPTIONS", "WARNING:", "SLF4J", "#")
+    tail = [l for l in (err or "").strip().splitlines() if l and not l.startswith(noise)]
     last = tail[-1] if tail else f"exit {status}"
     for needle, reason in (
+        ("Array buffer allocation failed", "out of memory"),
+        ("JavaScript heap out of memory", "out of memory"),
+        ("Cannot enlarge memory", "out of memory"),
+        ("insufficient memory for the Java Runtime", "out of memory"),
         ("MemoryError", "out of memory"),
         ("Cannot allocate", "out of memory"),
         ("OutOfMemoryError", "out of memory"),
@@ -429,9 +476,16 @@ def main() -> int:
     parser.add_argument("--tools-dir", type=Path, default=Path("bench/external/tools"))
     parser.add_argument("--engine", default="turbo", help="engine of ours to use as the reference")
     parser.add_argument("--skip", default="", help="comma-separated tool keys to skip")
+    parser.add_argument("--mem-cap-gb", type=float, default=None,
+                        help="address space each tool may claim; without it the kernel "
+                             "picks what to kill when a tool asks for more than the machine has")
     parser.add_argument("--child", nargs=4, metavar=("TOOL", "A", "B", "SUMMARY"),
                         help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.mem_cap_gb:
+        global MEM_CAP_BYTES
+        MEM_CAP_BYTES = int(args.mem_cap_gb * 1024**3)
 
     if args.child:
         tool, a, b, summary = args.child
@@ -452,6 +506,7 @@ def main() -> int:
 
     plan: list[tuple[str, object]] = [
         ("ours", lambda: ours(a, b, out, args.engine, args.jar)),
+        ("ours-sortmerge", lambda: ours(a, b, out, "sortmerge", args.jar)),
         ("go-csvdiff", (lambda: go_csvdiff(a, b, out, go_exe)) if go_exe else None),
         ("duckdb-sql", (lambda: duckdb_sql(a, b, out, duck_exe)) if duck_exe else None),
         ("daff", (lambda: daff_diff(a, b, out, daff_exe)) if daff_exe else None),
