@@ -28,6 +28,8 @@ public enum EngineName {
   SIMD,
   /** Tablesaw: in-memory columnar dataframe, pure Java. */
   TABLESAW,
+  /** External sort-merge join: bounded memory, spills to disk, size limited by disk not RAM. */
+  SORTMERGE,
   /** This project: in-memory hash join over FastCSV, no dataframe layer. */
   NATIVE;
 

@@ -8,7 +8,7 @@ on:
         type: string
         default: all
       engines:
-        description: 'Comma-separated engines, e.g. "turbo,duckdb" or "all" (duckdb,turbo,swar,shard,mmap,simd,tablesaw,native)'
+        description: 'Comma-separated engines, e.g. "turbo,duckdb" or "all" (duckdb,turbo,swar,shard,mmap,simd,tablesaw,sortmerge,native)'
         type: string
         default: turbo
       java:
@@ -46,7 +46,7 @@ jobs:
           raw='${{ inputs.scales || 'all' }}'
           [ "$raw" = "all" ] && raw="10k,1m,10m"
           eng='${{ inputs.engines || 'duckdb' }}'
-          [ "$eng" = "all" ] && eng="duckdb,turbo,swar,shard,mmap,simd,tablesaw,native"
+          [ "$eng" = "all" ] && eng="duckdb,turbo,swar,shard,mmap,simd,tablesaw,sortmerge,native"
           python3 -c "import json,sys; print('scales=' + json.dumps(sys.argv[1].split(',')))" "$raw" >> "$GITHUB_OUTPUT"
           python3 -c "import json,sys; print('engines=' + json.dumps(sys.argv[1].split(',')))" "$eng" >> "$GITHUB_OUTPUT"
 

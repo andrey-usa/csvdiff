@@ -7,6 +7,7 @@ import dev.csvdiff.Contract.FileMeta;
 import dev.csvdiff.engine.DuckDbEngine;
 import dev.csvdiff.engine.NativeEngine;
 import dev.csvdiff.engine.TablesawEngine;
+import dev.csvdiff.engine.sortmerge.SortMergeEngine;
 import dev.csvdiff.engine.fast.FastEngine;
 import dev.csvdiff.engine.fast.MmapEngine;
 import dev.csvdiff.engine.fast.ShardEngine;
@@ -49,6 +50,7 @@ public final class CsvDiff {
     m.put(EngineName.MMAP, MmapEngine::new);
     m.put(EngineName.SIMD, SimdEngine::new);
     m.put(EngineName.TABLESAW, TablesawEngine::new);
+    m.put(EngineName.SORTMERGE, SortMergeEngine::new);
     m.put(EngineName.NATIVE, NativeEngine::new);
     return Map.copyOf(m);
   }
@@ -112,7 +114,7 @@ public final class CsvDiff {
         switch (engine) {
           case DUCKDB -> "org.duckdb.DuckDBDriver";
           case TABLESAW -> "tech.tablesaw.api.Table";
-          case NATIVE -> "de.siegmar.fastcsv.reader.CsvReader";
+          case NATIVE, SORTMERGE -> "de.siegmar.fastcsv.reader.CsvReader";
           // The vector engines need the incubating Vector API, which is only on the module path
           // when the launcher was told to put it there. The SWAR engines need nothing at all.
           case SHARD, MMAP, SIMD -> null;

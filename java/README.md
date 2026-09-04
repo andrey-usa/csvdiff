@@ -50,7 +50,7 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 | `--delimiter`, `--encoding` | override auto-detection |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--engine` | `auto` (default), `duckdb`, `turbo`, `swar`, `shard`, `mmap`, `simd`, `tablesaw`, or `native` |
+| `--engine` | `auto` (default), `duckdb`, `turbo`, `swar`, `shard`, `mmap`, `simd`, `tablesaw`, `sortmerge`, or `native` |
 | `--threads`, `--memory-limit` | DuckDB resource limits |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
@@ -58,7 +58,7 @@ Duplicate keys are counted and listed per file; the first occurrence of each key
 
 ## Engines
 
-Eight backends, one result contract. Every engine must return identical `counts` and `columns` for
+Nine backends, one result contract. Every engine must return identical `counts` and `columns` for
 the same input; the test suite asserts it on the example files under three option sets, and CI
 asserts it on 200k rows. `--engine auto` takes the first one that can load, in the order below.
 
@@ -71,14 +71,40 @@ asserts it on 200k rows. `--engine auto` takes the first one that can load, in t
 | `mmap` | FFM mapping, Vector API scan | off-heap bytes, index on heap | what real SIMD is worth on one core |
 | `simd` | heap slab, Vector API scan | in-heap, bounded by 2 GB per file | what the heap copy costs |
 | `tablesaw` | Tablesaw (pure Java) | in-memory, columnar | a dataframe-shaped comparison point |
+| `sortmerge` | external sort, merge join | bounded heap, spills to disk | files past what the heap can index |
 | `native` | this project, over FastCSV | in-memory, row-oriented | the dependency-light baseline |
 
-All eight read CSV values as text — no type inference, so `1.0` and `1` stay different unless a
-tolerance is set — and all eight treat an empty field as absent whether or not it is quoted.
+All nine read CSV values as text — no type inference, so `1.0` and `1` stay different unless a
+tolerance is set — and all nine treat an empty field as absent whether or not it is quoted.
 
 Tablesaw parses and stores the columns but the join is done by `RowStore`, because Tablesaw's own
 full outer join materialises an intermediate table this workload cannot afford at scale; the engine
 is still a fair measure of Tablesaw's parse and column storage, which is where its time goes.
+
+### `sortmerge`: the one that does not index
+
+The other eight engines all answer the same question the same way — *is this key on the other
+side?* — by building something that can be asked: a hash index, a dataframe, a DuckDB table. That
+structure grows with the file, so the largest comparison any of them can do is set by the machine
+they run on.
+
+`sortmerge` never asks. It sorts both files by key, spilling batches to disk as it goes, and then
+walks the two sorted streams together: the smaller key can only be missing from the other file,
+equal keys are a match, and the join falls out of the walk. Nothing is held but one batch, one row
+per spilled run, and the capped report.
+
+This is the oldest answer in the field — it is what reconciliation did when the files were on tape —
+and it is still the right one when the data does not fit. It is not the fastest here and is not
+trying to be: sorting is `O(n log n)` where a hash join is linear, and the spill writes the data
+twice more. What it buys is that the answer stops depending on how much RAM you have.
+
+Two things fall out of sorting that the other engines pay for separately. Duplicate keys land next
+to each other, so finding them costs nothing. And the report sections come out in key order, which
+is the order they are written in, so nothing is sorted again at the end.
+
+`--max-rows` matters more here than elsewhere: the embedded sections are the one part of this engine
+that grows with the answer rather than staying flat, so a run that must survive a small heap should
+lower it.
 
 ### The fast five
 
