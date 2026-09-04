@@ -45,9 +45,11 @@ jobs:
       - name: Smoke benchmark, 10k rows x 20 columns
         run: java -cp target/csvdiff.jar dev.csvdiff.bench.Bench --rows 10k --engine duckdb --out-dir bench
 
+      # `java -` is not a thing: the launcher rejects it. Source-file mode needs a
+      # real path, so every inline program here is written out first.
       - name: Check the report is self-contained
         run: |
-          java - <<'JAVA'
+          cat > /tmp/CheckReport.java <<'JAVA'
           import java.nio.file.*;
           import java.util.regex.*;
           void main() throws Exception {
@@ -62,6 +64,7 @@ jobs:
             System.out.printf("%s: %d KB, no external references%n", path, html.length() / 1024);
           }
           JAVA
+          java /tmp/CheckReport.java
 
       - uses: actions/upload-artifact@v4
         with:
@@ -90,7 +93,7 @@ jobs:
               -k account_id,txn_id -i updated_at --engine $e \
               -o /tmp/$e.html --json /tmp/$e.json || true
           done
-          java - <<'JAVA'
+          cat > /tmp/EnginesAgree.java <<'JAVA'
           import com.fasterxml.jackson.databind.*;
           import java.nio.file.*;
           void main() throws Exception {
@@ -108,6 +111,7 @@ jobs:
             System.out.println("all " + engines.length + " engines agree: " + ref.get("counts"));
           }
           JAVA
+          java -cp target/csvdiff.jar /tmp/EnginesAgree.java
 
   cross-language-parity:
     name: Java, Python and TypeScript agree
