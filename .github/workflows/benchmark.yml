@@ -94,7 +94,7 @@ jobs:
           merge-multiple: true
       - name: Combined results
         run: |
-          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import glob, json
           recs = [json.load(open(p)) for p in sorted(glob.glob("all/*.json")) if "summary" not in p]
           recs.sort(key=lambda r: r["rows"])
