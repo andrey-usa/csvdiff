@@ -119,7 +119,7 @@ jobs:
         # would point at a directory that does not exist here.
         working-directory: .
         run: |
-          python3 - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, os, pathlib
 
           files = sorted(pathlib.Path("all").glob("*.json")) if pathlib.Path("all").is_dir() else []

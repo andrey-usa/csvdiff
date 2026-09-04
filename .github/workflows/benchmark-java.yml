@@ -128,7 +128,7 @@ jobs:
         # would point at a directory that does not exist here.
         working-directory: .
         run: |
-          node - <<'JS' >> "$GITHUB_STEP_SUMMARY"
+          node - <<'JS' | tee -a "$GITHUB_STEP_SUMMARY"
           import { readdirSync, readFileSync, existsSync } from "node:fs";
           const recs = (existsSync("all") ? readdirSync("all") : []).filter(f => f.endsWith(".json") && !f.includes("summary"))
             .map(f => JSON.parse(readFileSync("all/" + f, "utf-8")))
