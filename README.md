@@ -211,6 +211,157 @@ Not built, ordered by how often they pay off in recurring comparisons:
 9. **Fuzzy key matching** (normalised whitespace/case is done; next is Levenshtein for near-duplicate ids).
 10. **Compare more than two files** (a chain A→B→C) or a CSV against a database query.
 
+## Benchmark results
+
+Five implementations, seventeen engines, three scales, all on **byte-identical input** — 20 columns
+keyed on `(account_id, txn_id)` with `--ignore updated_at` — on 4-vCPU / 16 GB GitHub-hosted
+runners. Reproduce with the `benchmark-*.yml` workflows; every number below is one run, so treat
+differences under about 5% as noise.
+
+### 10k rows (3.7 MB)
+
+Process startup, not comparison. A JVM costs ~0.5s before it reads a byte.
+
+| Language | Engine | Compare | Throughput | Peak RSS |
+|---|---|---|---|---|
+| Go | `native` | **0.04s** | 500,050/s | 44 MB |
+| Rust | `polars` | 0.05s | 400,040/s | 64 MB |
+| Rust | `native` | 0.08s | 250,025/s | **38 MB** |
+| TypeScript | `polars` | 0.19s | 105,273/s | 142 MB |
+| TypeScript | `native` | 0.20s | 100,010/s | 124 MB |
+| TypeScript | `arquero` | 0.34s | 58,829/s | 152 MB |
+| Rust | `duckdb` | 0.36s | 55,561/s | 114 MB |
+| Python | `duckdb` | 0.51s | 39,219/s | 175 MB |
+| Go | `duckdb` | 0.52s | 38,465/s | 192 MB |
+| TypeScript | `duckdb` | 0.52s | 38,465/s | 238 MB |
+| Java | `native` | 0.64s | 31,253/s | 138 MB |
+| Java | `mmap` | 0.67s | 29,854/s | 122 MB |
+| Java | `simd` | 0.70s | 28,574/s | 128 MB |
+| Java | `swar` | 0.78s | 25,644/s | 110 MB |
+| Java | `turbo` | 0.81s | 24,694/s | 109 MB |
+| Python | `pandas` | 0.82s | 24,392/s | 100 MB |
+| Java | `shard` | 0.88s | 22,730/s | 116 MB |
+| Java | `tablesaw` | 1.31s | 15,269/s | 183 MB |
+| Java | `duckdb` | 1.33s | 15,039/s | 244 MB |
+
+### 1M rows (368 MB)
+
+| Language | Engine | Compare | Throughput | Peak RSS |
+|---|---|---|---|---|
+| TypeScript | `polars` | **2.30s** | 869,630/s | 2,507 MB |
+| Rust | `polars` | 2.57s | 778,268/s | 2,289 MB |
+| Java | `simd` | 3.61s | 554,058/s | 908 MB |
+| Java | `shard` | 3.89s | 514,177/s | 666 MB |
+| Java | `turbo` | 4.02s | 497,550/s | 650 MB |
+| Java | `swar` | 4.07s | 491,437/s | **622 MB** |
+| Java | `mmap` | 4.37s | 457,700/s | 644 MB |
+| Java | `native` | 6.26s | 319,513/s | 3,006 MB |
+| Go | `native` | 6.35s | 314,984/s | 1,935 MB |
+| Java | `tablesaw` | 8.53s | 234,484/s | 2,054 MB |
+| TypeScript | `native` | 9.41s | 212,555/s | 3,241 MB |
+| Python | `duckdb` | 11.57s | 172,873/s | 2,395 MB |
+| Rust | `duckdb` | 11.80s | 169,504/s | 2,087 MB |
+| TypeScript | `duckdb` | 11.86s | 168,646/s | 2,691 MB |
+| Rust | `native` | 12.22s | 163,678/s | 2,896 MB |
+| Java | `duckdb` | 12.80s | 156,262/s | 2,394 MB |
+| TypeScript | `arquero` | 17.22s | 116,152/s | 3,487 MB |
+| Go | `duckdb` | 21.04s | 95,064/s | 2,271 MB |
+| Python | `pandas` | 52.89s | 37,817/s | 2,748 MB |
+
+### 10M rows (3.68 GB)
+
+Nine of nineteen engines do not finish. This is where the design decisions show.
+
+| Language | Engine | Compare | Throughput | Peak RSS |
+|---|---|---|---|---|
+| Java | `shard` | **25.33s** | 789,637/s | 5,415 MB |
+| Java | `turbo` | 25.41s | 787,151/s | 5,396 MB |
+| Java | `mmap` | 31.52s | 634,565/s | 5,280 MB |
+| Java | `swar` | 32.60s | 613,543/s | **5,270 MB** |
+| Python | `duckdb` | 120.97s | 165,342/s | 9,906 MB |
+| TypeScript | `duckdb` | 122.11s | 163,799/s | 10,145 MB |
+| Rust | `duckdb` | 122.32s | 163,518/s | 9,423 MB |
+| Java | `duckdb` | 128.34s | 155,848/s | 8,851 MB |
+| Go | `native` | 161.67s | 123,718/s | 15,174 MB |
+| Go | `duckdb` | 179.02s | 111,728/s | 9,560 MB |
+| Java | `native` | ✗ Java heap OOM after 28.0s | | |
+| Java | `tablesaw` | ✗ Java heap OOM after 64.3s | | |
+| Java | `simd` | ✗ Java heap OOM after 2.9s | | |
+| Rust | `native` | ✗ runner killed (OOM) | | |
+| Rust | `polars` | ✗ runner killed (OOM) | | |
+| TypeScript | `polars` | ✗ runner killed (OOM) | | |
+| Python | `pandas` | ✗ runner killed (OOM) | | |
+| TypeScript | `native` | ✗ V8 512 MB string cap, after 1.1s | | |
+| TypeScript | `arquero` | ✗ V8 512 MB string cap, after 0.5s | | |
+
+### Winners
+
+| Scale | Winner | Time | Runner-up |
+|---|---|---|---|
+| 10k | **Go `native`** | 0.04s | Rust `polars` 0.05s |
+| 1M | **TypeScript `polars`** | 2.30s | Rust `polars` 2.57s |
+| 10M | **Java `shard`** | 25.33s | Java `turbo` 25.41s |
+
+**By language** — each language's best engine at each scale:
+
+| Language | 10k | 1M | 10M |
+|---|---|---|---|
+| Java | `native` 0.64s | `simd` 3.61s | **`shard` 25.33s** |
+| Rust | **`polars` 0.05s** | `polars` 2.57s | `duckdb` 122.32s |
+| Go | **`native` 0.04s** | `native` 6.35s | `native` 161.67s |
+| TypeScript | `polars` 0.19s | **`polars` 2.30s** | `duckdb` 122.11s |
+| Python | `duckdb` 0.51s | `duckdb` 11.57s | `duckdb` 120.97s |
+
+**By library** — the best implementation of each, across all five languages:
+
+| Library | 10k | 1M | 10M | Verdict |
+|---|---|---|---|---|
+| **bespoke** (hand-written) | Go 0.04s | Java `simd` 3.61s | Java `shard` **25.33s** | 🥇 wins overall; only class that survives 10M in-memory |
+| **Polars** | Rust 0.05s | TS **2.30s** | ✗ OOM | fastest to 1M, cannot reach 10M |
+| **DuckDB** | Rust 0.36s | Python 11.57s | Python 120.97s | only *library* that scales; Python's binding is the best of five |
+| **Tablesaw** | Java 1.31s | Java 8.53s | ✗ OOM | last in its class |
+| **Arquero** | TS 0.34s | TS 17.22s | ✗ V8 cap | small data only |
+| **pandas** | Python 0.82s | Python 52.89s | ✗ OOM | slowest engine that finished 1M |
+
+### What the numbers say
+
+**The winner flips with scale.** Go wins 10k on startup cost, Polars wins 1M on columnar speed, and
+Java's byte-level engines win 10M because they are the only ones still standing. Any single "fastest
+implementation" claim would be wrong at two sizes out of three.
+
+**Memory decides 10M, not speed.** TypeScript `polars` is the fastest thing measured at 1M and cannot
+run 10M at all. Java `swar` uses 5.3 GB where Go `native` uses 15.2 GB for the same job — that is the
+"no String per cell" design, and it is what buys the win.
+
+**Scaling from 1M to 10M is not linear:**
+
+| Engine | 1M → 10M | Factor |
+|---|---|---|
+| Java `shard` | 3.89s → 25.33s | **×6.5** (sub-linear) |
+| Java `turbo` | 4.02s → 25.41s | ×6.3 |
+| Java `mmap` | 4.37s → 31.52s | ×7.2 |
+| Java `swar` | 4.07s → 32.60s | ×8.0 |
+| Go `duckdb` | 21.04s → 179.02s | ×8.5 |
+| Java `duckdb` | 12.80s → 128.34s | ×10.0 |
+| Rust `duckdb` | 11.80s → 122.32s | ×10.4 |
+| Python `duckdb` | 11.57s → 120.97s | ×10.5 |
+| Go `native` | 6.35s → 161.67s | **×25.5** (super-linear) |
+
+The parallel Java engines go *sub*-linear — thread setup is amortised and JVM startup stops
+mattering. Go `native` goes super-linear: at 15.2 GB peak it spends most of the run fighting the
+garbage collector.
+
+**The same library differs by binding.** DuckDB at 10M: Python 120.97s, TypeScript 122.11s, Rust
+122.32s, Java 128.34s, Go 179.02s. Identical C++ engine doing identical work; Go's cgo binding costs
+~48% over Python's.
+
+**SWAR and the Vector API are a tie.** `shard` (Vector) 25.33s against `turbo` (SWAR) 25.41s at 10M is
+0.3% — noise. On one thread the Vector API was 3% ahead here (`mmap` 31.52s vs `swar` 32.60s), while
+on a local 4-core machine SWAR was ~7% ahead of the Vector API in both pairings. Across single runs on
+shared runners, the honest reading is that the two techniques cost the same. SWAR's real advantage is
+elsewhere: it needs **no incubator module**, so `turbo` is the fastest engine that runs on a stock
+`java -jar` with no flags, and it uses slightly less memory because no vector machinery is loaded.
+
 ## Ports
 
 The same tool exists in five languages, all to one result contract: the same JSON, the same HTML
