@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Benchmark this tool against the CSV-comparison tools people actually use.
+
+Five implementations of one design tell you which language and which technique is
+faster. They do not tell you whether the design is any good. This runs the same
+comparison — 20 columns, composite key ``(account_id, txn_id)``, ``updated_at``
+ignored — through the established tools and reports time, peak memory, and
+whether the answer agrees with ours.
+
+The answer matters more than the time. A tool that is fast because it cannot
+express the task, or because it silently drops duplicate keys, is not a faster
+way of doing this job; it is a different job.
+
+Usage:
+  python scripts/bench_external.py --rows 1m --out-dir bench/external
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+KEY = ["account_id", "txn_id"]
+IGNORE = "updated_at"
+HEADER = [
+    "account_id", "txn_id", "posting_date", "value_date", "currency", "amount",
+    "fee", "balance", "status", "channel", "region", "branch_code", "product_code",
+    "counterparty", "quantity", "rate", "category", "risk_flag", "note", "updated_at",
+]
+
+
+@dataclass
+class Result:
+    """One tool's attempt at the comparison."""
+
+    tool: str
+    kind: str                      # library or approach it stands for
+    seconds: float | None = None
+    peak_mb: float | None = None
+    counts: dict[str, int] | None = None
+    failed: str | None = None
+    note: str = ""
+    expresses_task: bool = True
+    extra: dict = field(default_factory=dict)
+
+
+def peak_rss_mb(pid: int, stop: threading.Event) -> list[float]:
+    """Polls /proc for a child's high-water mark while it runs.
+
+    VmHWM is a high-water mark, so the last reading before exit would be enough
+    if we could be sure of getting one. Polling keeps the largest we saw, which
+    survives the process exiting between reads.
+    """
+    seen = [0.0]
+
+    def watch() -> None:
+        while not stop.is_set():
+            try:
+                with open(f"/proc/{pid}/status") as fh:
+                    for line in fh:
+                        if line.startswith("VmHWM:"):
+                            kb = int("".join(c for c in line if c.isdigit()))
+                            seen[0] = max(seen[0], kb / 1024)
+                            break
+            except (OSError, ValueError):
+                return
+            stop.wait(0.02)
+
+    threading.Thread(target=watch, daemon=True).start()
+    return seen
+
+
+def run(cmd: list[str], timeout: float = 3600, env: dict | None = None) -> tuple[int, str, str, float, float]:
+    """Runs a command, returning status, stdout, stderr, wall seconds and peak RSS."""
+    started = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, **(env or {})},
+    )
+    stop = threading.Event()
+    seen = peak_rss_mb(proc.pid, stop)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        stop.set()
+        return -1, out, err, time.perf_counter() - started, seen[0]
+    stop.set()
+    return proc.returncode, out, err, round(time.perf_counter() - started, 2), round(seen[0], 1)
+
+
+# ---------------------------------------------------------------------------
+# The tools
+# ---------------------------------------------------------------------------
+
+def java_exe() -> Path:
+    """The JDK the jar was built for, which is not necessarily the one on PATH."""
+    named = os.environ.get("CSVDIFF_JAVA_HOME")
+    if named:
+        return Path(named, "bin", "java")
+    newest = sorted(Path("/opt/jdks").glob("jdk-*/bin/java"), reverse=True)
+    if newest:
+        return newest[0]
+    home = os.environ.get("JAVA_HOME")
+    return Path(home, "bin", "java") if home else Path("java")
+
+
+def ours(a: Path, b: Path, out: Path, engine: str, jar: Path) -> Result:
+    """This project, as the reference every other answer is checked against."""
+    summary = out / f"ours-{engine}.json"
+    java = java_exe()
+    status, _, err, secs, mb = run([
+        str(java), "--add-modules", "jdk.incubator.vector", "-cp", str(jar), "dev.csvdiff.Cli",
+        "compare", str(a), str(b), "-k", ",".join(KEY), "-i", IGNORE,
+        "--engine", engine, "-o", str(out / f"ours-{engine}.html"), "--json", str(summary),
+    ])
+    if status not in (0, 1) or not summary.exists():
+        return Result(f"csvdiff (this project, {engine})", "bespoke", failed=classify(status, err))
+    counts = json.loads(summary.read_text())["counts"]
+    return Result(
+        f"csvdiff (this project, {engine})", "bespoke", secs, mb,
+        {"changed": counts["changed"], "added": counts["added"], "removed": counts["removed"]},
+        note="cell-level diff, duplicate-key report, self-contained HTML",
+        extra={"full": counts},
+    )
+
+
+def go_csvdiff(a: Path, b: Path, out: Path, exe: str) -> Result:
+    """aswinkarthik/csvdiff — the fastest dedicated CSV diff tool in wide use.
+
+    Hashes the key and the row with xxHash and keeps only the two hashes per row,
+    which is why it is quick and why it can only say *that* a row changed, not
+    which cell did.
+    """
+    marks = out / "go-csvdiff.csv"
+    status, stdout, err, secs, mb = run([
+        exe, str(a), str(b), "--primary-key", "0,1", "--ignore-columns", "19", "--format", "rowmark",
+    ])
+    if status != 0:
+        return Result("csvdiff (Go, aswinkarthik)", "hash-only", failed=classify(status, err))
+    marks.write_text(stdout)
+    tally = {"changed": 0, "added": 0, "removed": 0}
+    keys = {"changed": set(), "added": set(), "removed": set()}
+    for line in stdout.splitlines():
+        cells = line.rsplit(",", 1)
+        if len(cells) != 2:
+            continue
+        bucket = {"MODIFIED": "changed", "ADDED": "added", "DELETED": "removed"}.get(cells[1])
+        if bucket:
+            tally[bucket] += 1
+            keys[bucket].add(tuple(cells[0].split(",")[:2]))
+    return Result(
+        "csvdiff (Go, aswinkarthik)", "hash-only", secs, mb,
+        {k: len(v) for k, v in keys.items()},
+        note="row hash only: says a row changed, not which cell",
+        extra={"rows_emitted": tally},
+    )
+
+
+def duckdb_sql(a: Path, b: Path, out: Path, exe: str) -> Result:
+    """A full outer join written by hand in the DuckDB CLI — the SQL people reach for.
+
+    This is the honest version of "just use SQL": it expresses the whole task,
+    including the composite key and the ignored column, and it needs no code.
+    What it does not give you is a cell-level diff or a duplicate-key report,
+    and the join silently multiplies duplicate keys instead of flagging them.
+    """
+    compared = [c for c in HEADER if c != IGNORE and c not in KEY]
+    on = " AND ".join(f"a.{k} IS NOT DISTINCT FROM b.{k}" for k in KEY)
+    changed = " OR ".join(f"a.{c} IS DISTINCT FROM b.{c}" for c in compared)
+    def load(name: str, path: Path) -> str:
+        return (f"CREATE TABLE {name} AS SELECT * FROM read_csv('{path}', "
+                "all_varchar = true, header = true, sample_size = -1);")
+    sql = "\n".join([
+        load("a", a), load("b", b),
+        "SELECT",
+        f"  count(*) FILTER (WHERE a.{KEY[0]} IS NOT NULL AND b.{KEY[0]} IS NOT NULL"
+        f" AND ({changed})) AS changed,",
+        f"  count(*) FILTER (WHERE a.{KEY[0]} IS NULL) AS added,",
+        f"  count(*) FILTER (WHERE b.{KEY[0]} IS NULL) AS removed",
+        f"FROM a FULL OUTER JOIN b ON {on};",
+    ])
+    status, stdout, err, secs, mb = run([exe, "-csv", "-c", sql])
+    if status != 0:
+        return Result("DuckDB CLI (hand-written SQL)", "SQL", failed=classify(status, err))
+    rows = [r for r in stdout.strip().splitlines() if r and not r.startswith("changed")]
+    values = [int(v) for v in rows[-1].split(",")] if rows else [0, 0, 0]
+    (out / "duckdb-sql.txt").write_text(stdout)
+    return Result(
+        "DuckDB CLI (hand-written SQL)", "SQL", secs, mb,
+        dict(zip(("changed", "added", "removed"), values)),
+        note="counts only: no cell diff, no duplicate-key report, no report file",
+    )
+
+
+def daff_diff(a: Path, b: Path, out: Path, exe: str) -> Result:
+    """daff — the tabular-diff library behind `git daff` and several CSV review tools.
+
+    Alignment-based rather than key-based by default, but `--id` pins the key and
+    `--ignore` drops a column, so it does express this task. Its output is a diff
+    table, not a summary, so the counts here come from tallying the `@@` marks.
+    """
+    diff = out / "daff.csv"
+    status, _, err, secs, mb = run([
+        exe, "diff", "--unordered", "--output", str(diff), "--ignore", IGNORE,
+        *[arg for k in KEY for arg in ("--id", k)], str(a), str(b),
+    ])
+    if status not in (0, 1) or not diff.exists():
+        return Result("daff (JS)", "alignment diff", failed=classify(status, err))
+    tally = {"changed": 0, "added": 0, "removed": 0}
+    with diff.open() as fh:
+        for line in fh:
+            mark = line.split(",", 1)[0]
+            if mark == "->":
+                tally["changed"] += 1
+            elif mark == "+++":
+                tally["added"] += 1
+            elif mark == "---":
+                tally["removed"] += 1
+    return Result(
+        "daff (JS)", "alignment diff", secs, mb, tally,
+        note="cell-level diff; no duplicate-key concept — a repeated key reads as an insert",
+    )
+
+
+def datacompy_compare(a: Path, b: Path, out: Path) -> Result:
+    """datacompy (Capital One) — the reconciliation library, on pandas.
+
+    Runs in a child process so its peak memory is measured the same way as
+    everyone else's; the child is this same file under ``--child``.
+    """
+    summary = out / "datacompy.json"
+    status, _, err, secs, mb = run([
+        sys.executable, str(Path(__file__).resolve()), "--child", "datacompy",
+        str(a), str(b), str(summary),
+    ])
+    if status != 0 or not summary.exists():
+        return Result("datacompy (pandas)", "dataframe", failed=classify(status, err))
+    return Result(
+        "datacompy (pandas)", "dataframe", secs, mb, json.loads(summary.read_text()),
+        note="cell-level diff and a per-column summary; whole frame in memory",
+    )
+
+
+def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
+    """datacompy again, this time over Polars rather than pandas."""
+    summary = out / "datacompy-polars.json"
+    status, _, err, secs, mb = run([
+        sys.executable, str(Path(__file__).resolve()), "--child", "datacompy-polars",
+        str(a), str(b), str(summary),
+    ])
+    if status != 0 or not summary.exists():
+        return Result("datacompy (polars)", "dataframe", failed=classify(status, err))
+    return Result(
+        "datacompy (polars)", "dataframe", secs, mb, json.loads(summary.read_text()),
+        note="same library, columnar backend",
+    )
+
+
+def pandas_merge(a: Path, b: Path, out: Path) -> Result:
+    """The hand-written pandas outer merge — what most people write before finding a library."""
+    summary = out / "pandas.json"
+    status, _, err, secs, mb = run([
+        sys.executable, str(Path(__file__).resolve()), "--child", "pandas",
+        str(a), str(b), str(summary),
+    ])
+    if status != 0 or not summary.exists():
+        return Result("pandas (hand-written merge)", "dataframe", failed=classify(status, err))
+    return Result(
+        "pandas (hand-written merge)", "dataframe", secs, mb, json.loads(summary.read_text()),
+        note="counts only unless you write more; duplicate keys multiply through the merge",
+    )
+
+
+def classify(status: int, err: str) -> str:
+    """Turns a non-zero exit into the reason a reader of the table cares about."""
+    if status == -1:
+        return "timed out"
+    tail = (err or "").strip().splitlines()
+    last = tail[-1] if tail else f"exit {status}"
+    for needle, reason in (
+        ("MemoryError", "out of memory"),
+        ("Cannot allocate", "out of memory"),
+        ("OutOfMemoryError", "out of memory"),
+        ("Killed", "killed (out of memory)"),
+        ("std::bad_alloc", "out of memory"),
+    ):
+        if needle in err:
+            return reason
+    if status == -9 or status == 137:
+        return "killed (out of memory)"
+    return last[:120]
+
+
+# ---------------------------------------------------------------------------
+# Child mode: one dataframe tool per run, so peak memory is its own
+# ---------------------------------------------------------------------------
+
+def child_datacompy(a: Path, b: Path, summary: Path) -> None:
+    import datacompy
+    import pandas as pd
+
+    dtype = {c: "string" for c in HEADER}
+    left, right = (pd.read_csv(p, dtype=dtype, keep_default_na=False).drop(columns=[IGNORE])
+                   for p in (a, b))
+    cmp = datacompy.PandasCompare(left, right, join_columns=KEY, df1_name="a", df2_name="b")
+    _write_counts(summary, cmp)
+
+
+def child_datacompy_polars(a: Path, b: Path, summary: Path) -> None:
+    """The same library over Polars — the backend, not the design, is what changes."""
+    import datacompy
+    import polars as pl
+
+    schema = {c: pl.String for c in HEADER}
+    left, right = (pl.read_csv(p, schema=schema, has_header=True).drop(IGNORE)
+                   for p in (a, b))
+    cmp = datacompy.PolarsCompare(left, right, join_columns=KEY, df1_name="a", df2_name="b")
+    _write_counts(summary, cmp)
+
+
+def _write_counts(summary: Path, cmp: object) -> None:
+    """Both comparators expose the same three numbers under the same names."""
+    summary.write_text(json.dumps({
+        "changed": int(len(cmp.all_mismatch())),
+        "added": int(cmp.df2_unq_rows.shape[0]),
+        "removed": int(cmp.df1_unq_rows.shape[0]),
+    }))
+
+
+def child_pandas(a: Path, b: Path, summary: Path) -> None:
+    import pandas as pd
+
+    dtype = {c: "string" for c in HEADER}
+    left, right = (pd.read_csv(p, dtype=dtype, keep_default_na=False).drop(columns=[IGNORE])
+                   for p in (a, b))
+    merged = left.merge(right, on=KEY, how="outer", indicator=True, suffixes=("_a", "_b"))
+    compared = [c for c in HEADER if c != IGNORE and c not in KEY]
+    both = merged["_merge"] == "both"
+    differs = False
+    for c in compared:
+        differs = differs | (merged[f"{c}_a"].fillna("") != merged[f"{c}_b"].fillna(""))
+    summary.write_text(json.dumps({
+        "changed": int((both & differs).sum()),
+        "added": int((merged["_merge"] == "right_only").sum()),
+        "removed": int((merged["_merge"] == "left_only").sum()),
+    }))
+
+
+# ---------------------------------------------------------------------------
+# Running the set
+# ---------------------------------------------------------------------------
+
+def data_for(rows: str, data_dir: Path) -> tuple[Path, Path]:
+    """Generates the pair once and reuses it, so every tool sees the same bytes."""
+    a, b = data_dir / f"{rows}_a.csv", data_dir / f"{rows}_b.csv"
+    if not (a.exists() and b.exists()):
+        data_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run([
+            sys.executable, str(Path(__file__).resolve().parent / "gen_data.py"),
+            "--rows", rows, "--out-dir", str(data_dir), "--prefix", rows,
+        ], check=True)
+    return a, b
+
+
+def verdict(counts: dict[str, int], truth: Result) -> str:
+    """Whether a tool agrees with us, and — when it does not — why.
+
+    Every disagreement seen so far comes from one thing: a tool with no concept of
+    a duplicate key reads the repeated row as an insert on one side and a delete on
+    the other. Saying so is more useful than a bare "no", because it is a design
+    difference rather than a wrong answer about which cells changed.
+    """
+    keys = ("changed", "added", "removed")
+    delta = {k: counts.get(k, 0) - (truth.counts or {}).get(k, 0) for k in keys}
+    if not any(delta.values()):
+        return "yes"
+    full = truth.extra.get("full", {})
+    dup_a = full.get("a_dup_rows", 0) - full.get("a_dup_keys", 0)
+    dup_b = full.get("b_dup_rows", 0) - full.get("b_dup_keys", 0)
+    if delta["changed"] == 0 and delta["added"] == dup_b and delta["removed"] == dup_a:
+        return "dup keys only"
+    return "no (" + ", ".join(f"{k} {delta[k]:+d}" for k in keys if delta[k]) + ")"
+
+
+def table(results: list[Result], truth: Result | None) -> str:
+    """The comparison as a markdown table, agreement measured against our answer."""
+    def cell(value: object) -> str:
+        return "—" if value is None else str(value)
+
+    lines = [
+        "| Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |",
+        "| --- | --- | ---: | ---: | --- | --- | --- |",
+    ]
+    for r in results:
+        if r.failed:
+            lines.append(f"| {r.tool} | {r.kind} | — | — | — | — | **{r.failed}** |")
+            continue
+        counts = r.counts or {}
+        shown = " / ".join(f"{counts.get(k, 0):,}" for k in ("changed", "added", "removed"))
+        if truth is None or truth.counts is None or r.counts is None:
+            agrees = "—"
+        elif r is truth:
+            agrees = "reference"
+        else:
+            agrees = verdict(counts, truth)
+        lines.append(
+            f"| {r.tool} | {r.kind} | {r.seconds:.2f}s | {r.peak_mb:,.0f} MB | "
+            f"{shown} | {agrees} | {r.note} |"
+        )
+    return "\n".join(lines)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--rows", default="1m", help="10k, 200k, 1m, 10m")
+    parser.add_argument("--data-dir", type=Path, default=Path("bench/external/data"))
+    parser.add_argument("--out-dir", type=Path, default=Path("bench/external"))
+    parser.add_argument("--jar", type=Path, default=Path("java/target/csvdiff.jar"))
+    parser.add_argument("--tools-dir", type=Path, default=Path("bench/external/tools"))
+    parser.add_argument("--engine", default="turbo", help="engine of ours to use as the reference")
+    parser.add_argument("--skip", default="", help="comma-separated tool keys to skip")
+    parser.add_argument("--child", nargs=4, metavar=("TOOL", "A", "B", "SUMMARY"),
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if args.child:
+        tool, a, b, summary = args.child
+        {"datacompy": child_datacompy, "datacompy-polars": child_datacompy_polars,
+          "pandas": child_pandas}[tool](
+            Path(a), Path(b), Path(summary))
+        return 0
+
+    out = args.out_dir / args.rows
+    out.mkdir(parents=True, exist_ok=True)
+    a, b = data_for(args.rows, args.data_dir)
+    skip = {s.strip() for s in args.skip.split(",") if s.strip()}
+
+    go_exe = shutil.which("csvdiff", path=str(args.tools_dir)) or shutil.which("csvdiff")
+    duck_exe = shutil.which("duckdb", path=str(args.tools_dir)) or shutil.which("duckdb")
+    daff_exe = (shutil.which("daff", path=str(args.tools_dir / "node_modules" / ".bin"))
+                or shutil.which("daff"))
+
+    plan: list[tuple[str, object]] = [
+        ("ours", lambda: ours(a, b, out, args.engine, args.jar)),
+        ("go-csvdiff", (lambda: go_csvdiff(a, b, out, go_exe)) if go_exe else None),
+        ("duckdb-sql", (lambda: duckdb_sql(a, b, out, duck_exe)) if duck_exe else None),
+        ("daff", (lambda: daff_diff(a, b, out, daff_exe)) if daff_exe else None),
+        ("datacompy", lambda: datacompy_compare(a, b, out)),
+        ("datacompy-polars", lambda: datacompy_polars(a, b, out)),
+        ("pandas", lambda: pandas_merge(a, b, out)),
+    ]
+
+    results: list[Result] = []
+    for name, make in plan:
+        if name in skip:
+            continue
+        if make is None:
+            print(f"skipping {name}: not installed", file=sys.stderr)
+            continue
+        print(f"running {name} on {args.rows} ...", file=sys.stderr, flush=True)
+        results.append(make())
+        r = results[-1]
+        print(f"  {r.failed or f'{r.seconds:.2f}s  {r.peak_mb:,.0f} MB  {r.counts}'}",
+              file=sys.stderr, flush=True)
+
+    truth = next((r for r in results if r.tool.startswith("csvdiff (this project")), None)
+    rendered = table(results, truth)
+    (out / "results.md").write_text(rendered + "\n")
+    (out / "results.json").write_text(json.dumps(
+        [r.__dict__ for r in results], indent=2, default=str) + "\n")
+    print(f"\n### {args.rows}\n")
+    print(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
