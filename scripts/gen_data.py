@@ -15,10 +15,12 @@ File B is file A with a controlled amount of drift applied:
 
 Usage:
   python scripts/gen_data.py --rows 1000000 --out-dir data
-  python scripts/gen_data.py --rows 10000000 --out-dir data --engine duckdb
 
-DuckDB writes 10M x 20 in a few seconds; the pure-Python fallback streams both
-files in one pass and needs no dependencies.
+The same splitmix hash and the same drift recipe as the TypeScript, Java, Go and
+Rust generators, so the files come out byte for byte identical and a benchmark
+number from any of them is directly comparable. Money is carried in integer
+cents and the drift is applied to those integers, never to a float, so no
+language's rounding rule can enter into it.
 """
 from __future__ import annotations
 
@@ -41,77 +43,8 @@ CHG_STATUS, CHG_AMOUNT, CHG_BALANCE, CHG_VALUE_DATE = 300, 150, 150, 30   # 3%, 
 REMOVED_MOD, ADDED_RATIO, DUP_MOD = 1000, 1000, 10000
 
 
-# ---------------------------------------------------------------------------
-# DuckDB path
-# ---------------------------------------------------------------------------
-
-def _sql_expressions(side: str) -> str:
-    """Column expressions for one side. Deterministic pseudo-randomness from hash(i)."""
-    def pick(lst, salt):
-        arr = ", ".join(f"'{v}'" for v in lst)
-        return f"([{arr}])[((hash(i * 31 + {salt}) % {len(lst)}) + 1)::BIGINT]"
-
-    b = side == "b"
-    status = pick(STATUS, 11)
-    status_b = (
-        f"([{', '.join(repr(v) for v in STATUS)}])"
-        f"[(((hash(i * 31 + 11) % {len(STATUS)}) + 1) % {len(STATUS)} + 1)::BIGINT]"
-    )
-    amount = "round(((hash(i * 31 + 21) % 900000000) / 100.0) - 1000000, 2)"
-    balance = "round(((hash(i * 31 + 31) % 2000000000) / 100.0), 2)"
-    value_date = "strftime(DATE '2026-01-01' + to_days((hash(i * 31 + 41) % 240)::INT), '%Y-%m-%d')"
-    return f"""
-      'ACC-' || lpad(((i * 7919) % 250000)::VARCHAR, 8, '0')                        AS account_id,
-      'TXN-' || lpad(i::VARCHAR, 11, '0')                                           AS txn_id,
-      strftime(DATE '2026-01-01' + to_days((hash(i * 31 + 1) % 240)::INT), '%Y-%m-%d') AS posting_date,
-      {f"CASE WHEN bucket < {CHG_VALUE_DATE} THEN '' ELSE {value_date} END" if b else value_date} AS value_date,
-      {pick(CURRENCY, 51)}                                                          AS currency,
-      {f"CASE WHEN bucket >= {CHG_STATUS} AND bucket < {CHG_STATUS + CHG_AMOUNT} THEN round({amount} + 12.34, 2) ELSE {amount} END" if b else amount} AS amount,
-      round(((hash(i * 31 + 61) % 5000) / 100.0), 2)                                AS fee,
-      {f"CASE WHEN bucket >= {CHG_STATUS + CHG_AMOUNT} AND bucket < {CHG_STATUS + CHG_AMOUNT + CHG_BALANCE} THEN round({balance} * 1.01, 2) ELSE {balance} END" if b else balance} AS balance,
-      {f"CASE WHEN bucket < {CHG_STATUS} THEN {status_b} ELSE {status} END" if b else status} AS status,
-      {pick(CHANNEL, 71)}                                                           AS channel,
-      {pick(REGION, 81)}                                                            AS region,
-      'BR' || lpad(((hash(i * 31 + 91) % 900) + 100)::VARCHAR, 4, '0')              AS branch_code,
-      'P' || lpad((hash(i * 31 + 101) % 5000)::VARCHAR, 5, '0')                     AS product_code,
-      'CP-' || lpad((hash(i * 31 + 111) % 90000)::VARCHAR, 6, '0')                  AS counterparty,
-      (hash(i * 31 + 121) % 500) + 1                                                AS quantity,
-      round(((hash(i * 31 + 131) % 1200) / 10000.0), 4)                             AS rate,
-      {pick(CATEGORY, 141)}                                                         AS category,
-      CASE WHEN hash(i * 31 + 151) % 20 = 0 THEN 'Y' ELSE 'N' END                   AS risk_flag,
-      'batch ' || ((i % 997) + 1)::VARCHAR || ' line ' || ((i % 53) + 1)::VARCHAR   AS note,
-      '{"2026-09-01" if b else "2026-08-01"} 02:15:00'                              AS updated_at
-    """
-
-
-def gen_duckdb(rows: int, a_path: str, b_path: str, seed: int) -> None:
-    import duckdb
-
-    lit = lambda p: "'" + p.replace("'", "''") + "'"  # noqa: E731
-
-    con = duckdb.connect()
-    con.execute("SET preserve_insertion_order = false")
-    base = f"SELECT i, (hash(i * 31 + {seed}) % 10000) AS bucket FROM range(0, {rows}) t(i)"
-    dup_extra = max(1, rows // DUP_MOD)
-
-    con.execute(f"COPY (SELECT {_sql_expressions('a')} FROM ({base}) "
-                f"UNION ALL SELECT {_sql_expressions('a')} FROM ({base}) WHERE i < {dup_extra} "
-                f") TO {lit(a_path)} (HEADER, FORMAT CSV)")
-
-    added = max(1, rows // ADDED_RATIO)
-    added_base = f"SELECT i, (hash(i * 31 + {seed}) % 10000) AS bucket FROM range({rows}, {rows + added}) t(i)"
-    con.execute(f"COPY (SELECT {_sql_expressions('b')} FROM ({base}) WHERE i % {REMOVED_MOD} <> 7 "
-                f"UNION ALL SELECT {_sql_expressions('b')} FROM ({added_base}) "
-                f"UNION ALL SELECT {_sql_expressions('b')} FROM ({base}) WHERE i % {DUP_MOD} = 3 AND i < {rows // 2} "
-                f") TO {lit(b_path)} (HEADER, FORMAT CSV)")
-    con.close()
-
-
-# ---------------------------------------------------------------------------
-# Pure-Python path (single pass, writes both files together)
-# ---------------------------------------------------------------------------
-
-def gen_python(rows: int, a_path: str, b_path: str, seed: int) -> None:
+def generate(rows: int, a_path: str, b_path: str, seed: int) -> None:
+    """Write both files in a single pass."""
     def h(i: int, salt: int) -> int:                       # splitmix-style, deterministic
         x = (i * 31 + salt + seed) & 0xFFFFFFFFFFFFFFFF
         x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
@@ -122,27 +55,35 @@ def gen_python(rows: int, a_path: str, b_path: str, seed: int) -> None:
     d0 = date(2026, 1, 1)
     day = [(d0 + timedelta(days=n)).isoformat() for n in range(240)]
 
+    def money(cents: int) -> str:
+        """An amount held in cents, as a two-decimal number."""
+        return f"{'-' if cents < 0 else ''}{abs(cents) // 100}.{abs(cents) % 100:02d}"
+
     def row(i: int, b: bool) -> list[str]:
+        # Money is carried in integer cents and the drift is applied to those
+        # integers, never to a float. Every implementation of this generator then
+        # produces the same digits without depending on its language's rounding
+        # rule -- which is what makes the five sets of files byte-identical.
         bucket = h(i, 0) % 10000
-        amount = round(((h(i, 21) % 900000000) / 100.0) - 1000000, 2)
-        balance = round((h(i, 31) % 2000000000) / 100.0, 2)
+        amount_cents = (h(i, 21) % 900000000) - 100000000
+        balance_cents = h(i, 31) % 2000000000
         status = STATUS[h(i, 11) % len(STATUS)]
         value_date = day[h(i, 41) % 240]
         if b:
             if bucket < CHG_STATUS:
                 status = STATUS[(h(i, 11) + 1) % len(STATUS)]
             elif bucket < CHG_STATUS + CHG_AMOUNT:
-                amount = round(amount + 12.34, 2)
+                amount_cents += 1234
             elif bucket < CHG_STATUS + CHG_AMOUNT + CHG_BALANCE:
-                balance = round(balance * 1.01, 2)
+                balance_cents = (balance_cents * 101 + 50) // 100   # +1%, half up
             if bucket < CHG_VALUE_DATE:
                 value_date = ""
         return [f"ACC-{(i * 7919) % 250000:08d}", f"TXN-{i:011d}", day[h(i, 1) % 240], value_date,
-                CURRENCY[h(i, 51) % 4], f"{amount:.2f}", f"{(h(i, 61) % 5000) / 100.0:.2f}",
-                f"{balance:.2f}", status, CHANNEL[h(i, 71) % 5], REGION[h(i, 81) % 4],
+                CURRENCY[h(i, 51) % 4], money(amount_cents), money(h(i, 61) % 5000),
+                money(balance_cents), status, CHANNEL[h(i, 71) % 5], REGION[h(i, 81) % 4],
                 f"BR{(h(i, 91) % 900) + 100:04d}", f"P{h(i, 101) % 5000:05d}",
                 f"CP-{h(i, 111) % 90000:06d}", str((h(i, 121) % 500) + 1),
-                f"{(h(i, 131) % 1200) / 10000.0:.4f}", CATEGORY[h(i, 141) % 5],
+                f"0.{h(i, 131) % 1200:04d}", CATEGORY[h(i, 141) % 5],
                 "Y" if h(i, 151) % 20 == 0 else "N", f"batch {i % 997 + 1} line {i % 53 + 1}",
                 "2026-09-01 02:15:00" if b else "2026-08-01 02:15:00"]
 
@@ -179,7 +120,6 @@ def main() -> int:
     ap.add_argument("--rows", "-n", default="10k", help="Rows in file A: 10000, 10k, 1m, 10m")
     ap.add_argument("--out-dir", "-o", default="data")
     ap.add_argument("--prefix", default=None, help="File name prefix (default: rows label)")
-    ap.add_argument("--engine", choices=["auto", "duckdb", "python"], default="auto")
     ap.add_argument("--seed", type=int, default=7)
     ns = ap.parse_args()
 
@@ -189,18 +129,10 @@ def main() -> int:
     a = os.path.join(ns.out_dir, f"{prefix}_a.csv")
     b = os.path.join(ns.out_dir, f"{prefix}_b.csv")
 
-    engine = ns.engine
-    if engine == "auto":
-        try:
-            import duckdb  # noqa: F401
-            engine = "duckdb"
-        except ImportError:
-            engine = "python"
-
     t0 = time.perf_counter()
-    (gen_duckdb if engine == "duckdb" else gen_python)(rows, a, b, ns.seed)
+    generate(rows, a, b, ns.seed)
     dt = time.perf_counter() - t0
-    print(f"{engine}: {rows:,} rows x {len(COLUMNS)} columns in {dt:.1f}s")
+    print(f"python: {rows:,} rows x {len(COLUMNS)} columns in {dt:.1f}s")
     for p in (a, b):
         print(f"  {p}  {os.path.getsize(p) / 1e6:.1f} MB")
     return 0

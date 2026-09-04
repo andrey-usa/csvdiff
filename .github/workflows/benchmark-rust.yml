@@ -1,0 +1,162 @@
+name: Benchmark (Rust)
+
+on:
+  workflow_dispatch:
+    inputs:
+      scales:
+        description: 'Comma-separated row counts to run, e.g. "10k,1m,10m" or "20m". "all" means 10k,1m,10m.'
+        type: string
+        default: all
+      engines:
+        description: 'Comma-separated engines, e.g. "duckdb,polars" or "all" (duckdb,polars,native)'
+        type: string
+        default: duckdb
+      enforce_budget:
+        description: Fail the job when a scale exceeds its time or memory budget
+        type: boolean
+        default: true
+  schedule:
+    - cron: "47 5 * * 1"        # Mondays, 05:47 UTC
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    working-directory: rust
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      scales: ${{ steps.pick.outputs.scales }}
+      engines: ${{ steps.pick.outputs.engines }}
+    steps:
+      - id: pick
+        working-directory: .
+        run: |
+          raw='${{ inputs.scales || 'all' }}'
+          [ "$raw" = "all" ] && raw="10k,1m,10m"
+          eng='${{ inputs.engines || 'duckdb' }}'
+          [ "$eng" = "all" ] && eng="duckdb,polars,native"
+          python3 -c "import json,sys; print('scales=' + json.dumps(sys.argv[1].split(',')))" "$raw" >> "$GITHUB_OUTPUT"
+          python3 -c "import json,sys; print('engines=' + json.dumps(sys.argv[1].split(',')))" "$eng" >> "$GITHUB_OUTPUT"
+
+  # One job per (scale, engine). An in-memory engine can exhaust memory badly
+  # enough to take the runner agent down with it, so each combination is isolated
+  # and no other result is lost when one dies. Generation is deterministic, so
+  # every job compares byte-identical input.
+  bench:
+    needs: plan
+    name: ${{ matrix.scale }} / ${{ matrix.engine }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        scale: ${{ fromJSON(needs.plan.outputs.scales) }}
+        engine: ${{ fromJSON(needs.plan.outputs.engines) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build
+        run: |
+          rustc --version
+          cargo build --release
+
+      - name: Runner capacity
+        run: |
+          echo "cpus: $(nproc)"; free -g | sed -n '1,2p'; df -h / | tail -1
+
+      - name: Compare ${{ matrix.scale }} rows with ${{ matrix.engine }}
+        env:
+          ENFORCE: ${{ inputs.enforce_budget }}
+        run: |
+          extra=""
+          [ "$ENFORCE" = "false" ] && extra="--no-budget"
+          ./target/release/bench \
+            --rows ${{ matrix.scale }} \
+            --engine ${{ matrix.engine }} \
+            --binary ./target/release/csvdiff \
+            --data-dir data --out-dir bench \
+            --threads "$(nproc)" --memory-limit 8GB \
+            --allow-failure $extra
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-rust-${{ matrix.scale }}-${{ matrix.engine }}
+          path: |
+            rust/bench/*.html
+            rust/bench/*.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  summarise:
+    needs: [plan, bench]
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_SCALES: ${{ needs.plan.outputs.scales }}
+      EXPECTED_ENGINES: ${{ needs.plan.outputs.engines }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          pattern: bench-rust-*
+          merge-multiple: true
+      - name: Combined results
+        # This job never checks the repo out, so the workflow-level rust/ default
+        # would point at a directory that does not exist here.
+        working-directory: .
+        run: |
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, os, pathlib
+
+          files = sorted(pathlib.Path("all").glob("*.json")) if pathlib.Path("all").is_dir() else []
+          recs = [json.loads(p.read_text()) for p in files if "summary" not in p.name]
+          recs.sort(key=lambda r: (r["rows"], r["engine"]))
+          f = lambda n: "-" if n is None else f"{n:,}"
+
+          print("## Benchmark results (Rust)\n")
+          print("| scale | engine | input | generate | compare | throughput | peak RSS | report |")
+          print("|---|---|---|---|---|---|---|---|")
+          for r in recs:
+              compare = (f"**{r['failed']}** after {r['wall_before_failure']}s"
+                         if r.get("failed") else f"**{r['compare_seconds']}s**")
+              throughput = "-" if r.get("failed") else f(r["rows_per_second"]) + "/s"
+              peak = f(r["peak_rss_mb"]) + ("" if r.get("failed") else " MB")
+              report = "-" if r.get("failed") else f"{r['report_mb']} MB"
+              print(f"| {r['scale']} | {r['engine']} | {f(r['input_mb'])} MB | {r['generate_seconds']}s "
+                    f"| {compare} | {throughput} | {peak} | {report} |")
+
+          winners = []
+          for scale in dict.fromkeys(r["scale"] for r in recs):
+              done = [r for r in recs if r["scale"] == scale and not r.get("failed")]
+              if done:
+                  best = min(done, key=lambda r: r["compare_seconds"])
+                  winners.append(f"**{scale}**: {best['engine']} ({best['compare_seconds']}s)")
+          if winners:
+              print(f"\nFastest per scale — {', '.join(winners)}.")
+
+          failed = [r for r in recs if r.get("failed")]
+          if failed:
+              print("\nDid not finish: " + ", ".join(f"{r['engine']} at {r['scale']} ({r['failed']})" for r in failed) + ".")
+
+          want = {f"{s}/{e}" for s in json.loads(os.environ.get("EXPECTED_SCALES", "[]"))
+                  for e in json.loads(os.environ.get("EXPECTED_ENGINES", "[]"))}
+          have = {f"{r['scale']}/{r['engine']}" for r in recs}
+          if lost := sorted(want - have):
+              print("\nNo result recorded (the runner was lost, i.e. memory exhaustion severe enough "
+                    f"to kill the agent): {', '.join(lost)}.")
+          if recs:
+              print(f"\nRunner: {recs[0]['runner']}. Reports are attached as artifacts.")
+          PY

@@ -211,6 +211,26 @@ Not built, ordered by how often they pay off in recurring comparisons:
 9. **Fuzzy key matching** (normalised whitespace/case is done; next is Levenshtein for near-duplicate ids).
 10. **Compare more than two files** (a chain A→B→C) or a CSV against a database query.
 
+## Ports
+
+The same tool exists in five languages, all to one result contract: the same JSON, the same HTML
+template, the same exit codes, so a report from any of them is interchangeable and a benchmark
+number from one is directly comparable with a number from another.
+
+| | Directory | Engines | Notes |
+|---|---|---|---|
+| Python | `.` (this) | duckdb, pandas | the reference; also has `serve` and `mail` |
+| TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
+| Java | [`java/`](java/) | duckdb, tablesaw, native | Java 26, Maven |
+| Go | [`go/`](go/) | duckdb, native | Go 1.24 |
+| Rust | [`rust/`](rust/) | duckdb, polars, native | edition 2024 |
+
+Two things are enforced in CI by `.github/workflows/parity.yml`, on every change to any of them:
+every implementation returns identical counts and column stats for one dataset, and all five data
+generators emit byte-identical files. The generator carries money in integer cents and applies the
+drift to those integers, never to a float, so byte-identity does not depend on any language's
+floating-point rounding rule.
+
 ## Project layout
 
 ```

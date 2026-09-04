@@ -1,0 +1,111 @@
+name: Cross-language parity
+
+# The five implementations share one result contract and one data generator.
+# This is where that is enforced: change any of them and this runs.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "csvdiff/**"
+      - "scripts/**"
+      - "ts/**"
+      - "java/**"
+      - "go/**"
+      - "rust/**"
+      - ".github/workflows/parity.yml"
+  pull_request:
+    paths:
+      - "csvdiff/**"
+      - "scripts/**"
+      - "ts/**"
+      - "java/**"
+      - "go/**"
+      - "rust/**"
+      - ".github/workflows/parity.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross-language-parity:
+    name: all five implementations agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go/go.sum
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "26"
+          cache: maven
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Build all five implementations
+        working-directory: .
+        run: |
+          (cd go && go build -o /tmp/csvdiff-go ./cmd/csvdiff && go build -o /tmp/gen-data-go ./cmd/gen-data)
+          (cd java && mvn -B --no-transfer-progress -DskipTests package)
+          (cd rust && cargo build --release)
+          pip install "duckdb>=1.0" && pip install -e . --no-deps
+          (cd ts && npm ci && npm run build)
+
+      # The five generators are meant to emit byte-identical files, which is what
+      # makes a benchmark number from one comparable with a number from another.
+      # 1M rows, not 200k: the rounding divergence this check was added for only
+      # showed up past a few hundred thousand rows.
+      - name: The generators agree byte for byte
+        working-directory: .
+        run: |
+          /tmp/gen-data-go --rows 1m --out-dir gen/go --prefix 1m
+          java -cp java/target/csvdiff.jar dev.csvdiff.bench.GenData --rows 1m --out-dir gen/java --prefix 1m
+          rust/target/release/gen-data --rows 1m --out-dir gen/rust --prefix 1m
+          python3 scripts/gen_data.py --rows 1m --out-dir gen/py --prefix 1m
+          node ts/dist/scripts/gen-data.js --rows 1m --out-dir gen/ts --prefix 1m
+          for side in a b; do
+            md5sum gen/*/1m_$side.csv
+            test "$(md5sum gen/*/1m_$side.csv | awk '{print $1}' | sort -u | wc -l)" = 1 \
+              || { echo "the generators have diverged on side $side"; exit 1; }
+          done
+          # Only one copy is needed from here on, and the runner has a finite disk.
+          mv gen/go gen/keep && rm -rf gen/java gen/rust gen/py gen/ts
+
+      - name: One dataset, five implementations, identical results
+        working-directory: .
+        run: |
+          A=gen/keep/1m_a.csv; B=gen/keep/1m_b.csv
+          ARGS="-k account_id,txn_id -i updated_at"
+          /tmp/csvdiff-go compare $A $B $ARGS -o /tmp/go.html --json /tmp/go.json || true
+          rust/target/release/csvdiff compare $A $B $ARGS -o /tmp/rust.html --json /tmp/rust.json || true
+          csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
+          node ts/dist/src/cli.js compare $A $B $ARGS -o /tmp/ts.html --json /tmp/ts.json || true
+          java -cp java/target/csvdiff.jar dev.csvdiff.Cli compare $A $B $ARGS -o /tmp/java.html --json /tmp/java.json || true
+          python3 - <<'PY'
+          import json, sys
+          load = lambda n: json.load(open(f"/tmp/{n}.json"))
+          py = load("py")
+          for other in ("go", "rust", "ts", "java"):
+              o = load(other)
+              for section in ("counts", "columns"):
+                  if o[section] != py[section]:
+                      sys.exit(f"{other} {section} differ from python")
+              if o["meta"]["compared"] != py["meta"]["compared"]:
+                  sys.exit(f"{other} compared columns differ from python")
+          print("python, typescript, java, go and rust agree:", json.dumps(py["counts"]))
+          PY

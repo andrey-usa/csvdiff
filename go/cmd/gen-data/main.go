@@ -80,10 +80,15 @@ func mod(i, salt, seed int64, m int) int {
 }
 
 // row builds one row of one side.
+//
+// Money is carried in integer cents and the drift is applied to those integers,
+// never to a float. Every implementation of this generator then produces the
+// same digits without depending on its language's rounding rule — which is what
+// makes the five sets of files byte-identical.
 func row(sb *strings.Builder, i int64, b bool, seed int64) {
 	bucket := mod(i, 0, seed, 10_000)
-	amount := float64(mod(i, 21, seed, 900_000_000))/100.0 - 1_000_000
-	balance := float64(mod(i, 31, seed, 2_000_000_000)) / 100.0
+	amountCents := int64(mod(i, 21, seed, 900_000_000)) - 100_000_000
+	balanceCents := int64(mod(i, 31, seed, 2_000_000_000))
 	st := status[mod(i, 11, seed, len(status))]
 	valueDate := days[mod(i, 41, seed, 240)]
 
@@ -92,9 +97,10 @@ func row(sb *strings.Builder, i int64, b bool, seed int64) {
 		case bucket < chgStatus:
 			st = status[(mod(i, 11, seed, len(status))+1)%len(status)]
 		case bucket < chgStatus+chgAmount:
-			amount += 12.34
+			amountCents += 1234
 		case bucket < chgStatus+chgAmount+chgBalance:
-			balance *= 1.01
+			// +1%, rounded half up, in cents.
+			balanceCents = (balanceCents*101 + 50) / 100
 		}
 		if bucket < chgValueDate {
 			valueDate = ""
@@ -113,11 +119,11 @@ func row(sb *strings.Builder, i int64, b bool, seed int64) {
 	sb.WriteByte(',')
 	sb.WriteString(currency[mod(i, 51, seed, 4)])
 	sb.WriteByte(',')
-	fixed(sb, amount, 2)
+	money(sb, amountCents)
 	sb.WriteByte(',')
-	fixed(sb, float64(mod(i, 61, seed, 5000))/100.0, 2)
+	money(sb, int64(mod(i, 61, seed, 5000)))
 	sb.WriteByte(',')
-	fixed(sb, balance, 2)
+	money(sb, balanceCents)
 	sb.WriteByte(',')
 	sb.WriteString(st)
 	sb.WriteByte(',')
@@ -132,8 +138,8 @@ func row(sb *strings.Builder, i int64, b bool, seed int64) {
 	pad(sb, int64(mod(i, 111, seed, 90_000)), 6)
 	sb.WriteByte(',')
 	sb.WriteString(strconv.Itoa(mod(i, 121, seed, 500) + 1))
-	sb.WriteByte(',')
-	fixed(sb, float64(mod(i, 131, seed, 1200))/10_000.0, 4)
+	sb.WriteString(",0.")
+	pad(sb, int64(mod(i, 131, seed, 1200)), 4)
 	sb.WriteByte(',')
 	sb.WriteString(category[mod(i, 141, seed, 5)])
 	sb.WriteByte(',')
@@ -155,23 +161,23 @@ func row(sb *strings.Builder, i int64, b bool, seed int64) {
 	sb.WriteByte('\n')
 }
 
+// money writes an amount held in cents as a two-decimal number.
+func money(sb *strings.Builder, cents int64) {
+	if cents < 0 {
+		sb.WriteByte('-')
+		cents = -cents
+	}
+	sb.WriteString(strconv.FormatInt(cents/100, 10))
+	sb.WriteByte('.')
+	pad(sb, cents%100, 2)
+}
+
 func pad(sb *strings.Builder, v int64, width int) {
 	s := strconv.FormatInt(v, 10)
 	for range width - len(s) {
 		sb.WriteByte('0')
 	}
 	sb.WriteString(s)
-}
-
-// fixed formats with a fixed number of decimals, half-up like Java's %f and
-// Python's format(), not Go's default half-to-even.
-func fixed(sb *strings.Builder, v float64, decimals int) {
-	scale := math.Pow(10, float64(decimals))
-	r := math.Floor(math.Abs(v)*scale+0.5) / scale
-	if math.Signbit(v) {
-		r = -r
-	}
-	sb.WriteString(strconv.FormatFloat(r, 'f', decimals, 64))
 }
 
 // generate writes both files in one pass.

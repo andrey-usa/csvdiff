@@ -79,11 +79,17 @@ public final class GenData {
     return (int) Long.remainderUnsigned(hash(i, salt, seed), m);
   }
 
-  /** Builds one row of one side. */
+  /**
+   * Builds one row of one side.
+   *
+   * <p>Money is carried in integer cents and the drift is applied to those integers, never to a
+   * double. Every implementation of this generator then produces the same digits without depending
+   * on its language's rounding rule — which is what makes the five sets of files byte-identical.
+   */
   static String row(long i, boolean b, long seed) {
     int bucket = mod(i, 0, seed, 10_000);
-    double amount = mod(i, 21, seed, 900_000_000) / 100.0 - 1_000_000;
-    double balance = mod(i, 31, seed, 2_000_000_000) / 100.0;
+    long amountCents = mod(i, 21, seed, 900_000_000) - 100_000_000L;
+    long balanceCents = mod(i, 31, seed, 2_000_000_000);
     String status = STATUS[mod(i, 11, seed, STATUS.length)];
     String valueDate = DAYS[mod(i, 41, seed, 240)];
 
@@ -91,9 +97,10 @@ public final class GenData {
       if (bucket < CHG_STATUS) {
         status = STATUS[(mod(i, 11, seed, STATUS.length) + 1) % STATUS.length];
       } else if (bucket < CHG_STATUS + CHG_AMOUNT) {
-        amount = amount + 12.34;
+        amountCents += 1234;
       } else if (bucket < CHG_STATUS + CHG_AMOUNT + CHG_BALANCE) {
-        balance = balance * 1.01;
+        // +1%, rounded half up, in cents.
+        balanceCents = (balanceCents * 101 + 50) / 100;
       }
       if (bucket < CHG_VALUE_DATE) {
         valueDate = "";
@@ -106,9 +113,9 @@ public final class GenData {
     sb.append(DAYS[mod(i, 1, seed, 240)]).append(',');
     sb.append(valueDate).append(',');
     sb.append(CURRENCY[mod(i, 51, seed, 4)]).append(',');
-    sb.append(fixed(amount, 2)).append(',');
-    sb.append(fixed(mod(i, 61, seed, 5000) / 100.0, 2)).append(',');
-    sb.append(fixed(balance, 2)).append(',');
+    sb.append(money(amountCents)).append(',');
+    sb.append(money(mod(i, 61, seed, 5000))).append(',');
+    sb.append(money(balanceCents)).append(',');
     sb.append(status).append(',');
     sb.append(CHANNEL[mod(i, 71, seed, 5)]).append(',');
     sb.append(REGION[mod(i, 81, seed, 4)]).append(',');
@@ -116,7 +123,7 @@ public final class GenData {
     sb.append('P').append(pad(mod(i, 101, seed, 5000), 5)).append(',');
     sb.append("CP-").append(pad(mod(i, 111, seed, 90_000), 6)).append(',');
     sb.append(mod(i, 121, seed, 500) + 1).append(',');
-    sb.append(fixed(mod(i, 131, seed, 1200) / 10_000.0, 4)).append(',');
+    sb.append("0.").append(pad(mod(i, 131, seed, 1200), 4)).append(',');
     sb.append(CATEGORY[mod(i, 141, seed, 5)]).append(',');
     sb.append(mod(i, 151, seed, 20) == 0 ? 'Y' : 'N').append(',');
     sb.append("batch ").append(i % 997 + 1).append(" line ").append(i % 53 + 1).append(',');
@@ -124,13 +131,16 @@ public final class GenData {
     return sb.toString();
   }
 
+  /** Writes an amount held in cents as a two-decimal number. */
+  private static String money(long cents) {
+    String sign = cents < 0 ? "-" : "";
+    long a = Math.abs(cents);
+    return sign + (a / 100) + "." + pad(a % 100, 2);
+  }
+
   private static String pad(long v, int width) {
     String s = Long.toString(v);
     return s.length() >= width ? s : "0".repeat(width - s.length()) + s;
-  }
-
-  private static String fixed(double v, int decimals) {
-    return String.format(Locale.ROOT, "%." + decimals + "f", v);
   }
 
   /** Writes both files in one pass. */

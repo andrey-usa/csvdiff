@@ -85,16 +85,18 @@ func TestParseRows(t *testing.T) {
 	}
 }
 
-// Go rounds half to even by default; the other implementations round half up,
-// and a single differing cent would break the byte-for-byte guarantee.
-func TestFixedRoundsHalfUp(t *testing.T) {
-	for in, want := range map[float64]string{
-		0.125: "0.13", 0.135: "0.14", -0.125: "-0.13", 2.5: "2.50", 1.005: "1.00",
+// Money never passes through a float, so a two-decimal amount is the same digits
+// in every implementation regardless of its rounding rule. This pins the
+// formatter that makes that true.
+func TestMoneyFormatsCents(t *testing.T) {
+	for cents, want := range map[int64]string{
+		0: "0.00", 5: "0.05", 99: "0.99", 100: "1.00",
+		123456: "1234.56", -1234: "-12.34", -5: "-0.05",
 	} {
 		var sb strings.Builder
-		fixed(&sb, in, 2)
+		money(&sb, cents)
 		if got := sb.String(); got != want {
-			t.Errorf("fixed(%v) = %s, want %s", in, got, want)
+			t.Errorf("money(%d) = %s, want %s", cents, got, want)
 		}
 	}
 }

@@ -1,58 +1,57 @@
-name: CI (Go)
+name: CI (Rust)
 
 on:
   push:
     branches: [main]
-    paths: ["go/**", ".github/workflows/ci-go.yml"]
+    paths: ["rust/**", ".github/workflows/ci-rust.yml"]
   pull_request:
-    paths: ["go/**", ".github/workflows/ci-go.yml"]
+    paths: ["rust/**", ".github/workflows/ci-rust.yml"]
   workflow_dispatch:
 
 concurrency:
-  group: ci-go-${{ github.ref }}
+  group: ci-rust-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 defaults:
   run:
-    working-directory: go
+    working-directory: rust
 
 jobs:
   test:
-    name: test go ${{ matrix.go }}
+    name: test rust stable
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        go: ["1.24"]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: ${{ matrix.go }}
-          cache-dependency-path: go/go.sum
+          components: rustfmt, clippy
 
-      - run: go version
+      # DuckDB is compiled from its bundled amalgamation, so a cold build is
+      # several minutes; the cache is what keeps this job reasonable.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
 
-      # gofmt is not advisory in Go; unformatted code is a build-quality failure.
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "not gofmt'd:"; echo "$unformatted"; exit 1
-          fi
+      - run: cargo --version && rustc --version
 
-      - name: go vet
-        run: go vet ./...
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Test
-        run: go test -race ./...
+        run: cargo test
 
       - name: Build
-        run: go build ./...
+        run: cargo build --release
 
       - name: Smoke benchmark, 10k rows x 20 columns
-        run: go run ./cmd/bench --rows 10k --engine duckdb --out-dir bench
+        run: ./target/release/bench --rows 10k --engine duckdb --out-dir bench
 
       - name: Check the report is self-contained
         run: |
@@ -70,10 +69,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: report-go-10k
+          name: report-rust-10k
           path: |
-            go/bench/10k-*.html
-            go/bench/10k-*.json
+            rust/bench/10k-*.html
+            rust/bench/10k-*.json
           retention-days: 14
 
   engines-agree:
@@ -81,23 +80,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          go-version: "1.24"
-          cache-dependency-path: go/go.sum
-      - run: go build -o /tmp/csvdiff ./cmd/csvdiff
-      - run: go run ./cmd/gen-data --rows 200k --out-dir data
+          workspaces: rust
+      - run: cargo build --release
+      - run: ./target/release/gen-data --rows 200k --out-dir data
       - name: Compare with every engine and diff the summaries
         run: |
-          for e in duckdb native; do
-            /tmp/csvdiff compare data/200k_a.csv data/200k_b.csv \
+          for e in duckdb polars native; do
+            ./target/release/csvdiff compare data/200k_a.csv data/200k_b.csv \
               -k account_id,txn_id -i updated_at --engine $e \
               -o /tmp/$e.html --json /tmp/$e.json || true
           done
           python3 - <<'PY'
           import json, sys
-          engines = ["duckdb", "native"]
-          ref = None
+          engines = ["duckdb", "polars", "native"]
+          ref = ref_name = None
           for e in engines:
               n = json.load(open(f"/tmp/{e}.json"))
               if ref is None:

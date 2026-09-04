@@ -94,9 +94,9 @@ async function main(): Promise<number> {
   let genSeconds = 0;
   if (!(existsSync(a) && existsSync(b))) {
     const t0 = performance.now();
-    const gen = await genData(rows, a, b);
+    genData(rows, a, b);
     genSeconds = round1((performance.now() - t0) / 1000);
-    console.log(`${gen}: generated ${f(rows)} rows x 20 columns in ${genSeconds}s`);
+    console.log(`typescript: generated ${f(rows)} rows x 20 columns in ${genSeconds}s`);
   }
 
   const report = join(ns["out-dir"], `${label}-${ns.engine}.html`);

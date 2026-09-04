@@ -104,7 +104,8 @@ node scripts/gen-data.ts --rows 10k --out-dir data
 node scripts/bench.ts --rows 10k --engine duckdb
 ```
 
-`scripts/gen-data.ts` builds the same deterministic 20-column pair as the Python generator,
+`scripts/gen-data.ts` builds the same deterministic 20-column pair as the Python, Java, Go and
+Rust generators,
 keyed on `(account_id, txn_id)` with the same drift recipe, so a benchmark number here is
 directly comparable with one from `scripts/bench.py`:
 

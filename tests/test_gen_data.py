@@ -7,9 +7,8 @@ from csvdiff import Options, compare
 KEY = ["account_id", "txn_id"]
 
 
-def gen(tmp_path, rows="10k", engine="python"):
-    subprocess.run([sys.executable, "scripts/gen_data.py", "-n", rows, "-o", str(tmp_path),
-                    "--engine", engine], check=True)
+def gen(tmp_path, rows="10k"):
+    subprocess.run([sys.executable, "scripts/gen_data.py", "-n", rows, "-o", str(tmp_path)], check=True)
     return str(tmp_path / f"{rows}_a.csv"), str(tmp_path / f"{rows}_b.csv")
 
 
@@ -33,3 +32,20 @@ def test_deterministic(tmp_path):
     a2, b2 = gen(tmp_path / "two")
     assert open(a1, "rb").read() == open(a2, "rb").read()
     assert open(b1, "rb").read() == open(b2, "rb").read()
+
+
+def test_money_never_passes_through_a_float(tmp_path):
+    """Two-decimal columns come from integer cents, so every implementation of the
+    generator writes the same digits whatever its rounding rule."""
+    import csv
+
+    a, b = gen(tmp_path)
+    for path in (a, b):
+        with open(path, newline="") as fh:
+            for n, row in enumerate(csv.DictReader(fh)):
+                for column in ("amount", "fee", "balance"):
+                    value = row[column]
+                    assert value.split(".")[1] == value[-2:], f"{column}={value} is not 2dp"
+                assert len(row["rate"].split(".")[1]) == 4, f"rate={row['rate']} is not 4dp"
+                if n > 500:
+                    break

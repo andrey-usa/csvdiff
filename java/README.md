@@ -84,9 +84,10 @@ java -cp target/csvdiff.jar dev.csvdiff.bench.GenData --rows 10k --out-dir data
 java -cp target/csvdiff.jar dev.csvdiff.bench.Bench --rows 10k --engine duckdb
 ```
 
-`GenData` builds the same deterministic 20-column pair as the Python and TypeScript generators,
+`GenData` builds the same deterministic 20-column pair as the Python, TypeScript, Go and Rust
+generators,
 keyed on `(account_id, txn_id)` with the same splitmix hash and the same drift recipe, so a
-benchmark number here is directly comparable with one from the other two:
+benchmark number here is directly comparable with one from any of the others. Money is carried in integer cents and the drift is applied to those integers, never to a float, so the files come out byte for byte identical without depending on any language's rounding rule.
 
 | Drift | Share of rows |
 |---|---|
