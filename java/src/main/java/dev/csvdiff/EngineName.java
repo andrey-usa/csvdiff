@@ -16,6 +16,10 @@ public enum EngineName {
   AUTO,
   /** DuckDB over JDBC: out-of-core, spills to disk, handles files larger than RAM. */
   DUCKDB,
+  /** Mapped with the FFM API, scanned with SWAR, indexed on every core. Needs no extra modules. */
+  TURBO,
+  /** Mapped with the FFM API, scanned with SWAR, one thread. Needs no extra modules. */
+  SWAR,
   /** Mapped with the FFM API, scanned with the Vector API, indexed on every core. */
   SHARD,
   /** Mapped with the FFM API, scanned with the Vector API, one thread. */

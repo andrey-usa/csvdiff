@@ -30,7 +30,9 @@ class FastEngineTest {
   private enum Fast {
     SIMD,
     MMAP,
-    SHARD;
+    SHARD,
+    SWAR,
+    TURBO;
 
     EngineName engine() {
       return EngineName.valueOf(name());

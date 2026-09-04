@@ -26,6 +26,7 @@ public final class RowIndex {
   private static final int EMPTY = -1;
 
   private final Slab slab;
+  private final Scan scan;
   private final Options opt;
   private final int keySize;
   private final int width;
@@ -56,8 +57,11 @@ public final class RowIndex {
   private RowParser lookupParser;
   private long[] lookupFields;
 
-  public RowIndex(Slab slab, Options opt, byte delimiter, int[] sourceColumn, int width, long expectedRows) {
+  public RowIndex(
+      Slab slab, Scan scan, Options opt, byte delimiter, int[] sourceColumn, int width,
+      long expectedRows) {
     this.slab = slab;
+    this.scan = scan;
     this.opt = opt;
     this.keySize = opt.key().size();
     this.width = width;
@@ -107,7 +111,7 @@ public final class RowIndex {
 
   /** A fresh parser over this index's file, for a thread that needs one. */
   public RowParser parser() {
-    return new RowParser(slab, delimiter, sourceColumn);
+    return new RowParser(slab, scan, delimiter, sourceColumn);
   }
 
   /** Splits row {@code row} into {@code out}. */

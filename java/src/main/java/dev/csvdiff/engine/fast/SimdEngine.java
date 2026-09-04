@@ -14,6 +14,6 @@ package dev.csvdiff.engine.fast;
 public final class SimdEngine extends FastEngine {
 
   public SimdEngine() {
-    super(Source.HEAP, false);
+    super(Source.HEAP, VectorScan::new, false);
   }
 }

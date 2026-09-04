@@ -14,6 +14,6 @@ package dev.csvdiff.engine.fast;
 public final class ShardEngine extends FastEngine {
 
   public ShardEngine() {
-    super(Source.MAPPED, true);
+    super(Source.MAPPED, VectorScan::new, true);
   }
 }

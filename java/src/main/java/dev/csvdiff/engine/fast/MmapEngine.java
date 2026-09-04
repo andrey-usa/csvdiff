@@ -14,6 +14,6 @@ package dev.csvdiff.engine.fast;
 public final class MmapEngine extends FastEngine {
 
   public MmapEngine() {
-    super(Source.MAPPED, false);
+    super(Source.MAPPED, VectorScan::new, false);
   }
 }

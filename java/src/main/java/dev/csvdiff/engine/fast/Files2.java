@@ -61,7 +61,7 @@ public final class Files2 {
   }
 
   /** The delimiter to use: the one asked for, or the one the header suggests. */
-  public static byte delimiter(Slab slab, Options opt) {
+  public static byte delimiter(Slab slab, Scan scan, Options opt) {
     if (opt.delimiter() != null) {
       char c = opt.delimiter();
       if (c > 0x7F) {
@@ -71,7 +71,7 @@ public final class Files2 {
       return (byte) c;
     }
     MemorySegment seg = slab.main();
-    long end = Math.min(seg.byteSize(), Scanner.nextOf1(seg, 0, seg.byteSize(), (byte) '\n'));
+    long end = Math.min(seg.byteSize(), scan.nextOf1(seg, 0, seg.byteSize(), (byte) '\n'));
     return Csv2.detect(seg, end);
   }
 }

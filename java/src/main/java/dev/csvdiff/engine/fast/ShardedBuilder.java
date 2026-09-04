@@ -30,7 +30,7 @@ final class ShardedBuilder {
   private record Shard(long[] starts, long[] hashes, int count) {}
 
   static void build(
-      RowIndex index, Slab slab, Options opt, byte delimiter,
+      RowIndex index, Slab slab, Scan scan, Options opt, byte delimiter,
       int[] columns, int width, long dataStart) {
 
     int threads =
@@ -43,7 +43,7 @@ final class ShardedBuilder {
       return;
     }
 
-    long[] bounds = boundaries(slab, dataStart, end, delimiter, threads);
+    long[] bounds = boundaries(slab, scan, dataStart, end, delimiter, threads);
     int chunks = bounds.length - 1;
 
     List<Shard> shards;
@@ -52,7 +52,8 @@ final class ShardedBuilder {
       for (int i = 0; i < chunks; i++) {
         long from = bounds[i];
         long to = bounds[i + 1];
-        futures.add(pool.submit(() -> scan(slab, opt, delimiter, columns, width, from, to, end)));
+        futures.add(
+            pool.submit(() -> chunk(slab, scan, opt, delimiter, columns, width, from, to, end)));
       }
       shards = new ArrayList<>(chunks);
       for (Future<Shard> future : futures) {
@@ -86,12 +87,13 @@ final class ShardedBuilder {
    * <p>A row belongs to the chunk it starts in, so a chunk may read past its own end to finish the
    * row it began. That is why the boundaries only have to be row starts, not row ends.
    */
-  private static long[] boundaries(Slab slab, long from, long end, byte delimiter, int chunks) {
+  private static long[] boundaries(
+      Slab slab, Scan scan, long from, long end, byte delimiter, int chunks) {
     var bounds = new ArrayList<Long>(chunks + 1);
     bounds.add(from);
     long step = (end - from) / chunks;
     for (int i = 1; i < chunks; i++) {
-      long at = Scanner.nextRowStart(slab.main(), from + i * step, end, delimiter);
+      long at = scan.nextRowStart(slab.main(), from + i * step, end, delimiter);
       if (at > bounds.getLast() && at < end) {
         bounds.add(at);
       }
@@ -105,11 +107,11 @@ final class ShardedBuilder {
   }
 
   /** One thread's pass: split the key columns of every row that starts in the chunk, and hash them. */
-  private static Shard scan(
-      Slab slab, Options opt, byte delimiter, int[] columns, int width,
+  private static Shard chunk(
+      Slab slab, Scan scan, Options opt, byte delimiter, int[] columns, int width,
       long from, long to, long end) {
 
-    var parser = new RowParser(slab, delimiter, columns);
+    var parser = new RowParser(slab, scan, delimiter, columns);
     long[] fields = new long[width];
     int keySize = opt.key().size();
     int estimate = (int) Math.max(16, (to - from) / 96);

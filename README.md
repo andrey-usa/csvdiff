@@ -221,7 +221,7 @@ number from one is directly comparable with a number from another.
 |---|---|---|---|
 | Python | `.` (this) | duckdb, pandas | the reference; also has `serve` and `mail` |
 | TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
-| Java | [`java/`](java/) | duckdb, shard, mmap, simd, tablesaw, native | Java 26, Maven; three engines on the Vector and FFM APIs |
+| Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM |
 | Go | [`go/`](go/) | duckdb, native | Go 1.24 |
 | Rust | [`rust/`](rust/) | duckdb, polars, native | edition 2024 |
 

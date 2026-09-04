@@ -25,8 +25,13 @@ public final class Bytes {
   private Bytes() {}
 
   private static final ValueLayout.OfByte BYTE = ValueLayout.JAVA_BYTE;
+  /** Words are read little-endian so a field's first byte is always the low byte. */
+  private static final ValueLayout.OfLong LONG =
+      ValueLayout.JAVA_LONG_UNALIGNED.withOrder(java.nio.ByteOrder.LITTLE_ENDIAN);
   private static final long FNV_PRIME = 0x0000_0100_0000_01B3L;
   private static final long FNV_SEED = 0xCBF2_9CE4_8422_2325L;
+  /** The 64-bit mixing constant from splitmix64, used to stir a whole word at once. */
+  private static final long MIX = 0x9E37_79B9_7F4A_7C15L;
 
   /** A field that is not there at all: a short row, or a column missing from the file. */
   public static final long ABSENT = -1L;
@@ -145,23 +150,65 @@ public final class Bytes {
   public static long hash(Slab slab, long field, Options opt, long seed) {
     if (isNull(slab, field, opt)) {
       // An absent value still has to contribute, or (null, "x") and ("x", null) would collide.
-      return (seed ^ 0x9E37_79B9_7F4A_7C15L) * FNV_PRIME;
+      return (seed ^ MIX) * FNV_PRIME;
     }
     MemorySegment seg = slab.segmentOf(field);
     long start = normStart(slab, field, opt);
     int len = normLength(slab, field, opt);
+
+    long h = opt.ignoreCase() ? foldedHash(seg, start, len, seed) : wordHash(seg, start, len, seed);
+    // Mix the length in so a field and its prefix cannot share a hash by accident.
+    return (h ^ (long) len) * FNV_PRIME;
+  }
+
+  /**
+   * Hashes eight bytes per step instead of one.
+   *
+   * <p>The One Billion Row Challenge entries all landed here: a byte-at-a-time hash is a dependent
+   * chain of a load, an xor and a multiply per byte, and on a twenty-character key that is twenty
+   * round trips through the multiplier. Reading a whole {@code long} makes it three, and the loads
+   * are what the memory system wanted to do anyway.
+   *
+   * <p>The tail is masked rather than branched over: {@code (1 << 8n) - 1} keeps the bytes that
+   * belong to the field and zeroes whatever the last word dragged in after it. The read itself can
+   * safely overrun the field but never the segment, so the caller guarantees eight bytes of slack
+   * or the scalar path takes over.
+   */
+  private static long wordHash(MemorySegment seg, long start, int len, long seed) {
     long h = seed;
-    if (opt.ignoreCase()) {
-      for (int i = 0; i < len; i++) {
-        h = (h ^ (lower(seg.get(BYTE, start + i)) & 0xFF)) * FNV_PRIME;
-      }
-    } else {
-      for (int i = 0; i < len; i++) {
-        h = (h ^ (seg.get(BYTE, start + i) & 0xFF)) * FNV_PRIME;
+    int i = 0;
+    long limit = seg.byteSize() - Long.BYTES;
+    for (; i + Long.BYTES <= len && start + i <= limit; i += Long.BYTES) {
+      h = (h ^ mix(seg.get(LONG, start + i))) * FNV_PRIME;
+    }
+    if (i < len) {
+      if (start + i <= limit) {
+        int rest = len - i;
+        long word = seg.get(LONG, start + i) & ((1L << (rest << 3)) - 1);
+        h = (h ^ mix(word)) * FNV_PRIME;
+      } else {
+        for (; i < len; i++) {
+          h = (h ^ (seg.get(BYTE, start + i) & 0xFF)) * FNV_PRIME;
+        }
       }
     }
-    // Mix the length in so that a field and its prefix cannot share a hash by accident.
-    return (h ^ (long) len) * FNV_PRIME;
+    return h;
+  }
+
+  /** Case-insensitive hashing stays byte-at-a-time: folding a word needs the bytes apart anyway. */
+  private static long foldedHash(MemorySegment seg, long start, int len, long seed) {
+    long h = seed;
+    for (int i = 0; i < len; i++) {
+      h = (h ^ (lower(seg.get(BYTE, start + i)) & 0xFF)) * FNV_PRIME;
+    }
+    return h;
+  }
+
+  /** splitmix64's finaliser, enough to spread one word's bits across the whole hash. */
+  private static long mix(long word) {
+    long x = word * MIX;
+    x ^= x >>> 29;
+    return x;
   }
 
   /** The seed a composite-key hash starts from. */
@@ -189,7 +236,7 @@ public final class Bytes {
     int rl = normLength(rs, rf, opt);
 
     if (!opt.ignoreCase()) {
-      return ll == rl && MemorySegment.mismatch(lseg, lo, lo + ll, rseg, ro, ro + rl) < 0;
+      return ll == rl && sameBytes(lseg, lo, rseg, ro, ll);
     }
     if (isAscii(lseg, lo, ll) && isAscii(rseg, ro, rl)) {
       if (ll != rl) {
@@ -259,6 +306,31 @@ public final class Bytes {
     } catch (NumberFormatException e) {
       return Double.NaN;
     }
+  }
+
+  /**
+   * Whether two runs of bytes are identical, eight at a time.
+   *
+   * <p>{@link MemorySegment#mismatch} does the same job and is intrinsified, but it is a general
+   * routine that has to work out alignment and length class first. Keys here are a handful of bytes,
+   * so the setup is most of the cost; comparing whole words inline is measurably quicker, and it is
+   * what the One Billion Row Challenge entries do for exactly this reason.
+   */
+  private static boolean sameBytes(MemorySegment a, long ao, MemorySegment b, long bo, int len) {
+    int i = 0;
+    long aLimit = a.byteSize() - Long.BYTES;
+    long bLimit = b.byteSize() - Long.BYTES;
+    for (; i + Long.BYTES <= len && ao + i <= aLimit && bo + i <= bLimit; i += Long.BYTES) {
+      if (a.get(LONG, ao + i) != b.get(LONG, bo + i)) {
+        return false;
+      }
+    }
+    for (; i < len; i++) {
+      if (a.get(BYTE, ao + i) != b.get(BYTE, bo + i)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /** The field as a normalised String, or {@code null} when it is absent. */

@@ -26,6 +26,7 @@ public final class RowParser {
 
   private final Slab slab;
   private final MemorySegment seg;
+  private final Scan scan;
   private final byte delimiter;
   /** Where each projected column sits in the file, or -1 when the file does not have it. */
   private final int[] sourceColumn;
@@ -34,9 +35,10 @@ public final class RowParser {
 
   private byte[] scratch = new byte[256];
 
-  public RowParser(Slab slab, byte delimiter, int[] sourceColumn) {
+  public RowParser(Slab slab, Scan scan, byte delimiter, int[] sourceColumn) {
     this.slab = slab;
     this.seg = slab.main();
+    this.scan = scan;
     this.delimiter = delimiter;
     this.sourceColumn = sourceColumn.clone();
     int last = -1;
@@ -63,13 +65,13 @@ public final class RowParser {
       long next;
 
       if (pos < end && seg.get(BYTE, pos) == QUOTE) {
-        long close = Scanner.skipQuoted(seg, pos + 1, end);
+        long close = scan.skipQuoted(seg, pos + 1, end);
         fieldStart = pos + 1;
         fieldEnd = Math.max(fieldStart, close - 1);
-        next = Scanner.nextOf2(seg, close, end, delimiter, LF);
+        next = scan.nextOf2(seg, close, end, delimiter, LF);
         store(column, quotedField(fieldStart, fieldEnd), out);
       } else {
-        next = Scanner.nextOf2(seg, pos, end, delimiter, LF);
+        next = scan.nextOf2(seg, pos, end, delimiter, LF);
         fieldStart = pos;
         fieldEnd = next;
         store(column, plainField(fieldStart, fieldEnd), out);
@@ -120,7 +122,7 @@ public final class RowParser {
    * which is what makes the test a single scan.
    */
   private long quotedField(long from, long to) {
-    if (Scanner.nextOf1(seg, from, to, QUOTE) >= to) {
+    if (scan.nextOf1(seg, from, to, QUOTE) >= to) {
       return packed(from, to);
     }
     int len = (int) (to - from);
@@ -151,12 +153,12 @@ public final class RowParser {
   private long endOfRow(long pos, long end) {
     long at = pos;
     while (at < end) {
-      long next = Scanner.nextOf2(seg, at, end, LF, QUOTE);
+      long next = scan.nextOf2(seg, at, end, LF, QUOTE);
       if (next >= end) {
         return end;
       }
       if (seg.get(BYTE, next) == QUOTE) {
-        at = Scanner.skipQuoted(seg, next + 1, end);
+        at = scan.skipQuoted(seg, next + 1, end);
         continue;
       }
       return next;
@@ -168,7 +170,7 @@ public final class RowParser {
   public record Header(List<String> names, long dataStart) {}
 
   /** Reads the header row without needing a parser instance. */
-  public static Header header(Slab slab, byte delimiter, Options opt) {
+  public static Header header(Slab slab, Scan scan, byte delimiter, Options opt) {
     MemorySegment seg = slab.main();
     long end = seg.byteSize();
     var names = new ArrayList<String>();
@@ -179,12 +181,12 @@ public final class RowParser {
       long to;
       long next;
       if (pos < end && seg.get(BYTE, pos) == QUOTE) {
-        long close = Scanner.skipQuoted(seg, pos + 1, end);
+        long close = scan.skipQuoted(seg, pos + 1, end);
         from = pos + 1;
         to = Math.max(from, close - 1);
-        next = Scanner.nextOf2(seg, close, end, delimiter, LF);
+        next = scan.nextOf2(seg, close, end, delimiter, LF);
       } else {
-        next = Scanner.nextOf2(seg, pos, end, delimiter, LF);
+        next = scan.nextOf2(seg, pos, end, delimiter, LF);
         from = pos;
         to = next;
       }
