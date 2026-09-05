@@ -61,6 +61,51 @@ class FastEngineTest {
 
   @ParameterizedTest
   @EnumSource(Fast.class)
+  @DisplayName("a key near the end of the file hashes the same as one anywhere else")
+  void keyNearTheEndOfTheFileStillMatches(Fast fast, @TempDir Path dir) throws IOException {
+    // These engines hash eight bytes at a time, and a field in the last eight bytes of the file
+    // cannot be read that way — the read would run off the segment. The bytes therefore have to
+    // reach the hash by a second route, and for a while that route produced a different number for
+    // the same bytes. The effect was silent and severe: a key hashed one way in the middle of a
+    // file and another way at the end of it, so a join missed the last row and reported it as
+    // removed from one side and added to the other.
+    //
+    // Both files below are well formed and hold exactly the keys K1 and K2. They differ only in
+    // how many bytes trail the final row's key, which is what decides the route.
+    Path a = write(dir, "a.csv", "a,k,c\nx,K1,c1\ny,K2,cc\n");
+    Path b = write(dir, "b.csv", "a,k,c\nx,K1,c1\ny,K2,cccccccc\n");
+
+    var result = CsvDiff.compare(a, b, Options.builder().key(List.of("k"))
+        .engine(fast.engine().label()).build());
+
+    assertEquals(2, result.counts().matched(), "both keys are in both files");
+    assertEquals(0, result.counts().added(), "nothing was added");
+    assertEquals(0, result.counts().removed(), "nothing was removed");
+    assertEquals(1, result.counts().changed(), "only column a of the last row differs");
+  }
+
+  @ParameterizedTest
+  @EnumSource(Fast.class)
+  @DisplayName("the key's distance from the end of the file never changes the answer")
+  void hashDoesNotDependOnPositionInFile(Fast fast, @TempDir Path dir) throws IOException {
+    // The same comparison at every trailing length that straddles the eight-byte boundary, so the
+    // fix cannot be right for one padding and wrong for the next.
+    for (int trailing = 0; trailing <= 12; trailing++) {
+      String tail = "c".repeat(trailing);
+      Path a = write(dir, "a" + trailing + ".csv", "a,k,c\nx,K1,c1\ny,K2,z\n");
+      Path b = write(dir, "b" + trailing + ".csv", "a,k,c\nx,K1,c1\ny,K2,z" + tail + "\n");
+
+      var result = CsvDiff.compare(a, b, Options.builder().key(List.of("k"))
+          .engine(fast.engine().label()).build());
+
+      assertEquals(2, result.counts().matched(), "trailing bytes: " + trailing);
+      assertEquals(0, result.counts().added(), "trailing bytes: " + trailing);
+      assertEquals(0, result.counts().removed(), "trailing bytes: " + trailing);
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(Fast.class)
   @DisplayName("a quoted field holding a doubled quote keeps its real value")
   void escapedQuotes(Fast fast, @TempDir Path dir) throws IOException {
     // "a""b" is the three-character value a"b, which is not any slice of the file, so it is the

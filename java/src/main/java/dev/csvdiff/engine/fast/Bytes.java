@@ -170,29 +170,38 @@ public final class Bytes {
    * are what the memory system wanted to do anyway.
    *
    * <p>The tail is masked rather than branched over: {@code (1 << 8n) - 1} keeps the bytes that
-   * belong to the field and zeroes whatever the last word dragged in after it. The read itself can
-   * safely overrun the field but never the segment, so the caller guarantees eight bytes of slack
-   * or the scalar path takes over.
+   * belong to the field and zeroes whatever the last word dragged in after it.
+   *
+   * <p>An eight-byte read can safely overrun the field but never the segment, so a field lying in
+   * the last eight bytes of the file has its word assembled from single bytes instead. That
+   * assembled word must be <em>the same word</em> the wide read would have produced, because the
+   * hash decides whether two rows share a key: if the bytes {@code K2} hashed one way in the middle
+   * of a file and another way at the end of it, a join would miss the last row of a file and report
+   * it as removed from one side and added to the other. It did exactly that until this was fixed.
    */
   private static long wordHash(MemorySegment seg, long start, int len, long seed) {
     long h = seed;
-    int i = 0;
     long limit = seg.byteSize() - Long.BYTES;
-    for (; i + Long.BYTES <= len && start + i <= limit; i += Long.BYTES) {
-      h = (h ^ mix(seg.get(LONG, start + i))) * FNV_PRIME;
-    }
-    if (i < len) {
-      if (start + i <= limit) {
-        int rest = len - i;
-        long word = seg.get(LONG, start + i) & ((1L << (rest << 3)) - 1);
-        h = (h ^ mix(word)) * FNV_PRIME;
-      } else {
-        for (; i < len; i++) {
-          h = (h ^ (seg.get(BYTE, start + i) & 0xFF)) * FNV_PRIME;
-        }
+    int i = 0;
+    while (i < len) {
+      int rest = Math.min(Long.BYTES, len - i);
+      long word = start + i <= limit ? seg.get(LONG, start + i) : assemble(seg, start + i, rest);
+      if (rest < Long.BYTES) {
+        word &= (1L << (rest << 3)) - 1;
       }
+      h = (h ^ mix(word)) * FNV_PRIME;
+      i += rest;
     }
     return h;
+  }
+
+  /** The little-endian word an eight-byte read would give, for bytes too near the segment's end. */
+  private static long assemble(MemorySegment seg, long at, int count) {
+    long word = 0;
+    for (int j = 0; j < count; j++) {
+      word |= (seg.get(BYTE, at + j) & 0xFFL) << (j << 3);
+    }
+    return word;
   }
 
   /** Case-insensitive hashing stays byte-at-a-time: folding a word needs the bytes apart anyway. */
