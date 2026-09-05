@@ -362,6 +362,193 @@ shared runners, the honest reading is that the two techniques cost the same. SWA
 elsewhere: it needs **no incubator module**, so `turbo` is the fastest engine that runs on a stock
 `java -jar` with no flags, and it uses slightly less memory because no vector machinery is loaded.
 
+## Against the field
+
+The section above compares this project with itself: five languages, eighteen engines, one design.
+That says which language and which technique is faster. It does not say whether the design is any
+good, because every one of those engines was written here.
+
+So the same comparison — the same two files, the same composite key, the same ignored column — was
+run through the tools people actually reach for. Reproduce with:
+
+```bash
+python scripts/bench_external.py --rows 1m --mem-cap-gb 12
+```
+
+Each tool runs three times and the time is the median, the memory the largest seen — except at ten
+million rows, which is a single run because several of the tools take minutes to fail. Both inputs are
+read once before anything is timed, so no tool is charged for the page-cache miss the others avoid.
+Peak memory is the high-water mark of the whole process tree, so a shell pipeline is credited with
+what `sort` actually used. Each tool's address space is capped, because at ten million rows several
+of them want more memory than the machine has, and without a cap the kernel does not fail them — it
+kills whatever it likes.
+
+These runs are on a 4-core / 16 GB container, not on the GitHub runners the section above uses, so
+compare tools within these tables and not across to those.
+
+### The field
+
+| Tool | What it is | Expresses this task? |
+|---|---|---|
+| **csvdiff (this project)** | bespoke, `turbo` and `sortmerge` engines | yes |
+| **csvdiff (Go, aswinkarthik)** | the fastest dedicated CSV diff in wide use; xxHash of key and row | yes, but the answer is coarser |
+| **DuckDB CLI** | a full outer join written by hand in SQL | yes |
+| **daff** | the tabular-diff library behind `git daff`; alignment-based, `--id` pins a key | yes |
+| **datacompy** (Capital One) | the reconciliation library, on pandas or Polars | yes |
+| **pandas** | the outer merge people write before finding a library | yes |
+| **csv-diff** (Simon Willison) | small, popular, row dicts | **no** — one key column, no column-ignore |
+| **sort(1) + join(1)** | the shell pipeline | **no** — no idea what CSV quoting is |
+
+Surveyed and not run: **data-diff** (Datafold) bisects checksums to compare tables across a network,
+which is the wrong problem here — both files are already local, so there is nothing to avoid
+transferring. **qsv** has no keyed diff subcommand of this shape.
+
+### 10 000 rows (3.7 MB)
+
+| Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| csvdiff (this project, turbo) | bespoke | 0.70s | 111 MB | 600 / 10 / 10 | reference | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (this project, sortmerge) | bespoke | 0.64s | 137 MB | 600 / 10 / 10 | yes | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (Go, aswinkarthik) | hash-only | 0.03s | 18 MB | 600 / 10 / 10 | yes | row hash only: says a row changed, not which cell |
+| DuckDB CLI (hand-written SQL) | SQL | 0.20s | 42 MB | 600 / 10 / 10 | yes | counts only: no cell diff, no duplicate-key report, no report file |
+| daff (JS) | alignment diff | 0.30s | 120 MB | 600 / 11 / 11 | dup keys only | cell-level diff; no duplicate-key concept — a repeated key reads as an insert |
+| datacompy (pandas) | dataframe | 0.88s | 188 MB | 600 / 11 / 11 | dup keys only | cell-level diff and a per-column summary; whole frame in memory |
+| datacompy (polars) | dataframe | 0.56s | 178 MB | 600 / 11 / 11 | dup keys only | same library, columnar backend |
+| pandas (hand-written merge) | dataframe | 0.52s | 141 MB | 600 / 10 / 10 | yes | counts only unless you write more; duplicate keys multiply through the merge |
+| csv-diff (Python) | row dicts | 0.24s | 67 MB | 600 / 10 / 10 | yes | single key column and no column-ignore, so the input has to be reshaped first |
+| sort(1) + join(1) | shell pipeline | 0.08s | 5 MB | 600 / 10 / 10 | yes | counts only; no CSV quoting, no duplicate-key concept, no diff |
+
+### 1 000 000 rows (368 MB)
+
+| Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| csvdiff (this project, turbo) | bespoke | 4.94s | 667 MB | 60,049 / 1,000 / 1,000 | reference | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (this project, sortmerge) | bespoke | 17.24s | 2,031 MB | 60,049 / 1,000 / 1,000 | yes | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (Go, aswinkarthik) | hash-only | 2.81s | 1,482 MB | 60,049 / 1,000 / 1,000 | yes | row hash only: says a row changed, not which cell |
+| DuckDB CLI (hand-written SQL) | SQL | 7.57s | 1,273 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
+| daff (JS) | alignment diff | 40.61s | 4,247 MB | 60,049 / 1,050 / 1,100 | dup keys only | cell-level diff; no duplicate-key concept — a repeated key reads as an insert |
+| datacompy (pandas) | dataframe | 29.83s | 2,272 MB | 60,049 / 1,049 / 1,099 | no (added +49, removed +99) | cell-level diff and a per-column summary; whole frame in memory |
+| datacompy (polars) | dataframe | 4.09s | 2,666 MB | 60,049 / 1,049 / 1,099 | no (added +49, removed +99) | same library, columnar backend |
+| pandas (hand-written merge) | dataframe | 17.34s | 1,799 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only unless you write more; duplicate keys multiply through the merge |
+| sort(1) + join(1) | shell pipeline | 8.23s | 251 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only; no CSV quoting, no duplicate-key concept, no diff |
+
+### 10 000 000 rows (3.68 GB)
+
+| Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |
+| --- | --- | ---: | ---: | --- | --- | --- |
+| csvdiff (this project, turbo) | bespoke | 34.45s | 5,392 MB | 599,320 / 10,000 / 10,000 | reference | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (this project, sortmerge) | bespoke | 126.39s | 1,853 MB | 599,320 / 10,000 / 10,000 | yes | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (Go, aswinkarthik) | hash-only | — | — | — | — | **out of memory** |
+| DuckDB CLI (hand-written SQL) | SQL | 73.17s | 8,765 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
+| daff (JS) | alignment diff | — | — | — | — | **V8 string cap: cannot read a file over 512 MB** |
+| datacompy (pandas) | dataframe | — | — | — | — | **out of memory** |
+| datacompy (polars) | dataframe | — | — | — | — | **out of memory** |
+| pandas (hand-written merge) | dataframe | — | — | — | — | **out of memory** |
+| csv-diff (Python) | row dicts | — | — | — | — | **out of memory** |
+| sort(1) + join(1) | shell pipeline | 119.75s | 2,483 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only; no CSV quoting, no duplicate-key concept, no diff |
+
+### Where the answers differ
+
+Nothing in the table disagrees about which *cells* changed. Every disagreement is one of two design
+choices about **duplicate keys**, and the generated data carries them precisely so that it shows: at a
+million rows, 100 keys appear twice in A and 50 appear twice in B, one of which is duplicated in
+both.
+
+**Tools with no concept of a duplicate key** — daff, datacompy — read the repeated row as an insert
+on one side and a delete on the other. daff's `added +50 / removed +100` is exactly those duplicates,
+one extra row reported for each one.
+
+datacompy comes out at `+49 / +99`, one lower on each side, and the missing one is not a rounding
+difference: it pairs duplicate occurrences positionally, so the second copy in A is matched against
+the second copy in B. Exactly one key in this data is duplicated on *both* sides
+(`ACC-00023757,TXN-00000000003`), and for that key the two leftovers cancel. It is a defensible
+answer — but it is an answer to a question the tool never asks the user, and it means the count
+depends on the order the duplicates appear in.
+
+**Tools that join** — the DuckDB SQL, the pandas merge, the shell pipeline — multiply them instead. A
+key twice in A and once in B joins to two rows; the one key twice on both sides joins to four. That is
+151 extra rows at a million, and each one that happens to be a *changed* row is counted again — which
+is why `changed` lands 7 too high there and 91 too high at ten million. The number is not a property
+of the tool but of which rows happened to be duplicated, and that is the point: the join silently
+inflates the diff by an amount nobody can predict, and nothing in the output says a duplicate key was
+involved.
+
+This project reports duplicates as their own section, joins on the first occurrence of each key, and
+counts *keys* rather than rows. That is a choice too — but it is a stated one, and it is why the
+counts here differ from a plain `FULL OUTER JOIN` on the same data.
+
+The Go tool avoids both traps and agrees with us exactly. Its raw output marks 60,053 rows modified
+where we report 60,049, and that gap is the same row-versus-key distinction rather than a
+disagreement: it marks rows, we count keys, and the four extra are duplicate rows of keys already
+counted. Reduced to distinct keys its answer is identical to ours, which is what the table shows.
+
+### What the field says
+
+**At ten million rows, most of the field cannot run at all.** Six of the nine approaches fail on
+3.68 GB of input in a 12 GB budget: the Go tool, both datacompy backends, the pandas merge, csv-diff,
+and daff. The interesting thing is not that they are slow — it is that "fastest" stops being the
+question. What is left is this project's two engines, a hand-written SQL join, and a shell pipeline.
+
+**daff's ceiling is not memory.** It reads the file with `readFileSync`, and V8 refuses to build a
+string longer than 512 MB. No amount of RAM moves that limit, so daff cannot open a file this size on
+any machine. Every other failure above is a genuine memory exhaustion; this one is a wall.
+
+**The backend decides a dataframe's speed, not the library.** At a million rows datacompy takes
+29.83s on pandas and 4.09s on Polars — the same library, the same call, 7.3x apart. That gap is
+wider than any language difference in this whole project. If a dataframe reconciliation is slow, the
+first question is which backend it is on.
+
+**The dedicated tool is faster and hungrier.** csvdiff (Go) finishes a million rows in 2.81s against
+our 4.94s, and uses 1,482 MB against our 667 MB — while storing strictly less: two hashes per row,
+which is why it can say a row changed but not which cell. Then at ten million it runs out of memory
+and we do not. That is the "no String per cell" design earning its keep against a tool that
+deliberately keeps less.
+
+**Everything agrees about cells. Nothing agrees about duplicate keys.** Not one tool in this table
+found a changed cell another missed. Every difference in the counts is duplicate-key handling, and
+**none of the eight external tools reports duplicate keys at all** — they either fold them in
+silently or multiply them into the answer. On data that has any, three of these approaches will hand
+you an inflated diff and say nothing about why.
+
+**The shell pipeline is better than it has any right to be.** `sort | join` does a million rows in
+8.23s and 251 MB, and ten million in 119.75s and 2,483 MB — less memory than anything else that
+finished, because `sort` spills. It is the right instinct: an external sort-merge join is the correct
+algorithm for data larger than memory. What it cannot do is parse CSV — a comma, a quote or a newline
+inside a field and the answer is silently wrong — or tell you which cell changed.
+
+That instinct is why the `sortmerge` engine exists. It is the same algorithm with a real CSV parser
+and the full result contract, and it is the only thing here that produces the *correct* ten-million-row
+answer in under 2 GB.
+
+### The other memory question
+
+Peak RSS says what a tool used with room to spare. It does not say what it needs. This is the
+smallest `-Xmx` each Java engine can finish a million rows in, found by binary search
+(`scripts/min_heap.sh`, `--max-rows 1000`):
+
+| Engine | Smallest heap that finishes |
+|---|---:|
+| `turbo` | 159 MB |
+| `swar` | 127 MB |
+| `shard` | 159 MB |
+| `mmap` | 127 MB |
+| `simd` | 478 MB |
+| `sortmerge` | 63 MB |
+| `native` | 2470 MB |
+| `tablesaw` | 1259 MB |
+| `duckdb` | 47 MB |
+
+`sortmerge` finishes in a **63 MB** heap — 368 MB of CSV compared in a heap smaller than the report
+it produces — against 2,470 MB for the row-at-a-time `native` engine. That is a 39x difference in
+what the machine has to provide, and it is the entire point of the engine.
+
+Two caveats, or the table misleads. It measures **JVM heap**, which is what `-Xmx` controls and what
+fails first in a container — not total memory. `duckdb` looks smallest at 47 MB because it does its
+work in C++ outside the heap entirely; its actual footprint was 1,273 MB. The mapping engines
+(`turbo`, `swar`, `shard`, `mmap`) likewise map the file outside the heap. And the report cap matters:
+these runs embed 1,000 rows per section, because the embedded sections are the one part of a
+comparison that grows with the answer rather than the input.
+
 ## Ports
 
 The same tool exists in five languages, all to one result contract: the same JSON, the same HTML
