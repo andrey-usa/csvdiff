@@ -154,7 +154,12 @@ def _compare_duckdb(a_path: str, b_path: str, opt: Options) -> dict[str, Any]:
         con.execute(f"SET memory_limit = '{opt.memory_limit}'")
     con.execute("SET preserve_insertion_order = true")
 
-    read_opts = "all_varchar=true, header=true, sample_size=-1"
+    # null_padding leaves a short row's missing fields absent, which is what the other
+    # engines do with them. Without it DuckDB abandons the split on a ragged file and
+    # returns it as one column named after the header line, and the comparison then fails
+    # with "key column missing" -- a true statement about DuckDB's table and a misleading
+    # one about the file.
+    read_opts = "all_varchar=true, header=true, sample_size=-1, null_padding=true"
     if opt.delimiter:
         read_opts += f", delim={_lit(opt.delimiter)}"
     if opt.encoding and opt.encoding.lower() not in ("utf-8", "utf8"):
@@ -286,8 +291,18 @@ def _compare_pandas(a_path: str, b_path: str, opt: Options) -> dict[str, Any]:
     import pandas as pd
 
     def load(path):
+        # names + skiprows + usecols is how pandas is told to tolerate a ragged row: it pads a
+        # short one and drops the fields a long one has past the header, which is what every other
+        # engine here does with them. Left to itself pandas refuses the file outright ("Expected 3
+        # fields in line 3, saw 4"), and a row with a stray comma is a difference to report rather
+        # than a reason to compare nothing at all.
+        header = pd.read_csv(path, dtype=str, nrows=0, sep=opt.delimiter or None,
+                             engine="python" if opt.delimiter is None else "c",
+                             encoding=opt.encoding).columns.tolist()
         df = pd.read_csv(path, dtype=str, keep_default_na=False, sep=opt.delimiter or None,
-                         engine="python" if opt.delimiter is None else "c", encoding=opt.encoding)
+                         engine="python" if opt.delimiter is None else "c", encoding=opt.encoding,
+                         names=header, skiprows=1, index_col=False,
+                         usecols=range(len(header)))
         df = df.replace({"": None})
         return df
 

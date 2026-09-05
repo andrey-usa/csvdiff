@@ -49,7 +49,12 @@ func compareDuckDB(aPath, bPath string, opt Options) (EngineResult, error) {
 		return EngineResult{}, err
 	}
 
-	readOpts := "all_varchar=true, header=true, sample_size=-1"
+	// null_padding leaves a short row's missing fields absent, which is what the other
+	// engines do with them. Without it DuckDB abandons the split on a ragged file and
+	// returns it as one column named after the header line, and the comparison then fails
+	// with "key column missing" -- a true statement about DuckDB's table and a misleading
+	// one about the file.
+	readOpts := "all_varchar=true, header=true, sample_size=-1, null_padding=true"
 	if opt.Delimiter != "" {
 		readOpts += ", delim=" + lit(opt.Delimiter)
 	}
