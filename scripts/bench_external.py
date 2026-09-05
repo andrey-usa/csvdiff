@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -68,19 +69,18 @@ def peak_rss_mb(pid: int, stop: threading.Event) -> list[float]:
         return 0.0
 
     def children(of: int) -> list[int]:
-        """Direct children, from each thread's own list."""
-        found: list[int] = []
+        """Direct children, from the main thread's list.
+
+        A thread group has one of these files per thread, but reading all of them means an
+        open per thread on every poll, and a JVM has dozens — enough overhead to show up in
+        the timing this function exists to leave alone. Every tool here that forks does so
+        from its main thread, whose task id is the process id.
+        """
         try:
-            tasks = os.listdir(f"/proc/{of}/task")
-        except OSError:
-            return found
-        for task in tasks:
-            try:
-                with open(f"/proc/{of}/task/{task}/children") as fh:
-                    found.extend(int(p) for p in fh.read().split())
-            except (OSError, ValueError):
-                continue
-        return found
+            with open(f"/proc/{of}/task/{of}/children") as fh:
+                return [int(p) for p in fh.read().split()]
+        except (OSError, ValueError):
+            return []
 
     def tree(of: int) -> float:
         """The largest high-water mark anywhere in the process tree.
@@ -101,12 +101,14 @@ def peak_rss_mb(pid: int, stop: threading.Event) -> list[float]:
         return peak
 
     def watch() -> None:
+        wait = POLL_MIN_SECONDS
         while not stop.is_set():
             found = tree(pid)
             if found == 0.0 and seen[0] > 0.0:
                 return
             seen[0] = max(seen[0], found)
-            stop.wait(0.02)
+            stop.wait(wait)
+            wait = min(wait * 2, POLL_MAX_SECONDS)
 
     threading.Thread(target=watch, daemon=True).start()
     return seen
@@ -118,6 +120,17 @@ def peak_rss_mb(pid: int, stop: threading.Event) -> list[float]:
 # the table can print. Mapped file bytes count against it, which is why the cap has to
 # leave room for the input on top of whatever the tool holds.
 MEM_CAP_BYTES: int | None = None
+
+# How often to read the process tree's high-water mark, starting fast and backing off.
+#
+# VmHWM is a high-water mark the kernel maintains rather than a sample, so the only thing the
+# interval decides is whether the process is still alive to be read at all. A tool that
+# finishes in forty milliseconds needs a fast poll or it is never seen — reading it at 10 Hz
+# reported the Go tool at 2 MB when it actually peaks above 20. A tool that runs for minutes
+# needs a slow one, because polling it hard is overhead charged to the thing being timed.
+# Starting at 2 ms and doubling to 100 ms gives each what it needs.
+POLL_MIN_SECONDS = 0.002
+POLL_MAX_SECONDS = 0.1
 
 
 def _apply_cap() -> None:
@@ -469,6 +482,36 @@ def child_pandas(a: Path, b: Path, summary: Path) -> None:
 # Running the set
 # ---------------------------------------------------------------------------
 
+def warm(*paths: Path) -> None:
+    """Reads the inputs once so nobody is timed reading them off disk.
+
+    Every tool here reads the same two files, so whichever ran first would otherwise pay the
+    page-cache miss for all of them — which is exactly how a four-second comparison came to be
+    recorded as twenty-nine on a freshly booted machine.
+    """
+    for path in paths:
+        with path.open("rb") as fh:
+            while fh.read(1 << 22):
+                pass
+
+
+def repeat(make: "Callable[[], Result]", times: int) -> Result:
+    """Runs a tool several times, keeping the median time and the largest memory seen.
+
+    A single run on a shared four-core machine varies by a quarter, which is wider than most
+    of the gaps in the table it feeds. The median of three is not a rigorous statistic but it
+    is enough to stop one unlucky run from deciding a ranking.
+    """
+    runs = [make() for _ in range(max(1, times))]
+    ok = [r for r in runs if not r.failed and r.seconds is not None]
+    if not ok:
+        return runs[-1]
+    best = sorted(ok, key=lambda r: r.seconds)[len(ok) // 2]
+    best.peak_mb = max(r.peak_mb for r in ok if r.peak_mb is not None)
+    best.extra = {**best.extra, "seconds_all": [r.seconds for r in ok]}
+    return best
+
+
 def data_for(rows: str, data_dir: Path) -> tuple[Path, Path]:
     """Generates the pair once and reuses it, so every tool sees the same bytes."""
     a, b = data_dir / f"{rows}_a.csv", data_dir / f"{rows}_b.csv"
@@ -539,6 +582,9 @@ def main() -> int:
     parser.add_argument("--tools-dir", type=Path, default=Path("bench/external/tools"))
     parser.add_argument("--engine", default="turbo", help="engine of ours to use as the reference")
     parser.add_argument("--skip", default="", help="comma-separated tool keys to skip")
+    parser.add_argument("--repeats", type=int, default=3,
+                        help="times to run each tool; the reported time is the median, the "
+                             "reported memory the largest seen")
     parser.add_argument("--mem-cap-gb", type=float, default=None,
                         help="address space each tool may claim; without it the kernel "
                              "picks what to kill when a tool asks for more than the machine has")
@@ -560,6 +606,7 @@ def main() -> int:
     out = args.out_dir / args.rows
     out.mkdir(parents=True, exist_ok=True)
     a, b = data_for(args.rows, args.data_dir)
+    warm(a, b)
     skip = {s.strip() for s in args.skip.split(",") if s.strip()}
 
     go_exe = shutil.which("csvdiff", path=str(args.tools_dir)) or shutil.which("csvdiff")
@@ -587,7 +634,7 @@ def main() -> int:
             print(f"skipping {name}: not installed", file=sys.stderr)
             continue
         print(f"running {name} on {args.rows} ...", file=sys.stderr, flush=True)
-        results.append(make())
+        results.append(repeat(make, args.repeats))
         r = results[-1]
         print(f"  {r.failed or f'{r.seconds:.2f}s  {r.peak_mb:,.0f} MB  {r.counts}'}",
               file=sys.stderr, flush=True)
