@@ -83,6 +83,79 @@ class EngineParityTest {
   }
 
   @Test
+  @DisplayName("every engine agrees on an input built from the shapes that have broken one")
+  void awkwardInputAgrees(@TempDir Path dir) throws java.io.IOException {
+    // The sweep above varies the options over clean ASCII data. Both of the wrong answers this
+    // project has shipped needed neither an unusual option nor a malformed file: one wanted a key
+    // in the last eight bytes, the other a key outside ASCII. So this varies the input instead, and
+    // puts every shape that has broken an engine, or plausibly could, into one pair of files.
+    //
+    // What it asserts is not a particular answer but that the engines cannot disagree about one.
+    // Under the default options CAFE-acute and cafe-acute are different keys and under
+    // --ignore-case they are the same; either is fine, and every engine has to say the same thing.
+    String header = "k,v,w\n";
+    Path a = write(dir, "a.csv", header
+        + "CAF\u00c9,alpha,1\n"           // non-ASCII key, upper case
+        + "  padded  ,beta,2\n"            // whitespace around the key
+        + "\u212a,gamma,3\n"               // KELVIN SIGN: folds across the ASCII boundary
+        + "\"has,comma\",delta,4\n"        // quoted key holding the delimiter
+        + "\"a\"\"b\",epsilon,5\n"         // quoted key holding a doubled quote
+        + "\"two\nlines\",zeta,6\n"       // quoted key holding a newline
+        + "dup,eta,7\n"
+        + "dup,eta,8\n"                    // duplicate key
+        + "blank,,9\n"                     // empty value
+        + "gone,theta,10\n"                // only in A
+        + "z,omega,11\n");                 // short key in the last row, near end of file
+    Path b = write(dir, "b.csv", header
+        + "caf\u00e9,alpha,1\n"            // same key folded, differing only in case
+        + "padded,beta,CHANGED\n"          // same key untrimmed, value differs
+        + "k,gamma,3\n"                    // the Kelvin sign's fold
+        + "\"has,comma\",delta,4\n"
+        + "\"a\"\"b\",epsilon,CHANGED\n"
+        + "\"two\nlines\",zeta,6\n"
+        + "dup,eta,7\n"
+        + "dup,eta,8\n"
+        + "blank,,9\n"
+        + "extra,iota,12\n"                // only in B
+        + "z,omega,11\n");
+
+    List<Options.Builder> variants =
+        List.of(
+            Options.builder().key(List.of("k")),
+            Options.builder().key(List.of("k")).trim(true),
+            Options.builder().key(List.of("k")).ignoreCase(true),
+            Options.builder().key(List.of("k")).trim(true).ignoreCase(true),
+            Options.builder().key(List.of("k")).trim(true).ignoreCase(true).emptyIsNull(true));
+
+    for (Options.Builder variant : variants) {
+      // Tablesaw's reader strips the whitespace around every field and offers no way to stop it,
+      // so that engine cannot tell "  padded  " from "padded" and answers every run as though
+      // --trim were set. Where it is set there is nothing to disagree about; where it is not, this
+      // sweep would only re-discover a limitation the engine documents. See TablesawEngine.
+      boolean trimmed = variant.build().trim();
+      CompareResult reference = null;
+      for (EngineName engine : EngineName.concrete()) {
+        if (engine == EngineName.TABLESAW && !trimmed) {
+          continue;
+        }
+        var result = CsvDiff.compare(a, b, variant.engine(engine.label()).build());
+        if (reference == null) {
+          reference = result;
+          continue;
+        }
+        String where = engine.label() + " vs " + reference.meta().engine();
+        assertEquals(reference.counts(), result.counts(), where);
+        assertEquals(reference.columns(), result.columns(), where);
+        assertEquals(reference.changed(), result.changed(), where);
+        assertEquals(reference.added(), result.added(), where);
+        assertEquals(reference.removed(), result.removed(), where);
+        assertEquals(reference.dupA(), result.dupA(), where);
+        assertEquals(reference.dupB(), result.dupB(), where);
+      }
+    }
+  }
+
+  @Test
   @DisplayName("every engine agrees, under several option sets")
   void enginesAgree() {
     List<Options.Builder> variants =

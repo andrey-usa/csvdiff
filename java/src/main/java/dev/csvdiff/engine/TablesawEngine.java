@@ -48,6 +48,15 @@ public final class TablesawEngine implements CompareEngine {
         joined, dupA, dupB, opt, resolved.compared());
   }
 
+  /**
+   * Reads a file into a dataframe.
+   *
+   * <p>One caveat belongs to the library rather than to this tool: Tablesaw's reader strips the
+   * whitespace around every field and exposes no setting to stop it, so this engine cannot tell
+   * {@code "  x  "} from {@code "x"} and answers as though {@code --trim} were always set. On data
+   * with no surrounding whitespace, or with {@code --trim}, it agrees with every other engine; with
+   * significant whitespace and no {@code --trim} it will match keys the others keep apart.
+   */
   private static Table read(Path path, Options opt) throws IOException {
     // The charset is applied by handing Tablesaw a Reader; its builder has no charset setter.
     // Every column is forced to STRING so nothing is type-inferred.

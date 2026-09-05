@@ -74,12 +74,16 @@ asserts it on 200k rows. `--engine auto` takes the first one that can load, in t
 | `shard` | FFM mapping, Vector API scan, parallel index | off-heap bytes, index on heap | what real SIMD is worth under parallelism |
 | `mmap` | FFM mapping, Vector API scan | off-heap bytes, index on heap | what real SIMD is worth on one core |
 | `simd` | heap slab, Vector API scan | in-heap, bounded by 2 GB per file | what the heap copy costs |
-| `tablesaw` | Tablesaw (pure Java) | in-memory, columnar | a dataframe-shaped comparison point |
+| `tablesaw` | Tablesaw (pure Java) | in-memory, columnar | a dataframe-shaped comparison point (always trims; see below) |
 | `sortmerge` | external sort, merge join | bounded heap, spills to disk | files past what the heap can index |
 | `native` | this project, over FastCSV | in-memory, row-oriented | the dependency-light baseline |
 
 All nine read CSV values as text — no type inference, so `1.0` and `1` stay different unless a
 tolerance is set — and all nine treat an empty field as absent whether or not it is quoted.
+
+Tablesaw's reader strips the whitespace around every field and offers no setting to stop it, so
+`tablesaw` cannot tell `"  x  "` from `"x"` and answers as though `--trim` were always set. With
+`--trim`, or on data without significant surrounding whitespace, it agrees with every other engine.
 
 Tablesaw parses and stores the columns but the join is done by `RowStore`, because Tablesaw's own
 full outer join materialises an intermediate table this workload cannot afford at scale; the engine
