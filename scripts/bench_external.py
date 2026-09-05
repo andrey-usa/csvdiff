@@ -60,17 +60,52 @@ def peak_rss_mb(pid: int, stop: threading.Event) -> list[float]:
     """
     seen = [0.0]
 
+    def high_water(of: int) -> float:
+        with open(f"/proc/{of}/status") as fh:
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    return int("".join(c for c in line if c.isdigit())) / 1024
+        return 0.0
+
+    def children(of: int) -> list[int]:
+        """Direct children, from each thread's own list."""
+        found: list[int] = []
+        try:
+            tasks = os.listdir(f"/proc/{of}/task")
+        except OSError:
+            return found
+        for task in tasks:
+            try:
+                with open(f"/proc/{of}/task/{task}/children") as fh:
+                    found.extend(int(p) for p in fh.read().split())
+            except (OSError, ValueError):
+                continue
+        return found
+
+    def tree(of: int) -> float:
+        """The largest high-water mark anywhere in the process tree.
+
+        A shell pipeline holds its memory in a grandchild and a tool that forks workers holds
+        it in those, so watching only the process that was launched reports a number belonging
+        to something that did no work.
+        """
+        peak = 0.0
+        stack = [of]
+        while stack:
+            at = stack.pop()
+            try:
+                peak = max(peak, high_water(at))
+            except OSError:
+                continue
+            stack.extend(children(at))
+        return peak
+
     def watch() -> None:
         while not stop.is_set():
-            try:
-                with open(f"/proc/{pid}/status") as fh:
-                    for line in fh:
-                        if line.startswith("VmHWM:"):
-                            kb = int("".join(c for c in line if c.isdigit()))
-                            seen[0] = max(seen[0], kb / 1024)
-                            break
-            except (OSError, ValueError):
+            found = tree(pid)
+            if found == 0.0 and seen[0] > 0.0:
                 return
+            seen[0] = max(seen[0], found)
             stop.wait(0.02)
 
     threading.Thread(target=watch, daemon=True).start()
@@ -123,11 +158,14 @@ def jvm_heap_mb(cap: int) -> int:
 
     A JVM claims about three gigabytes of address space that is not heap — a gigabyte of
     compressed class space, the code cache, the collector's own tables, a stack per thread —
-    and it claims all of it before running a line of the program. Asking for a heap the cap
-    cannot cover on top of that fails at startup, which would read in the table as the tool
-    being unable to do the work rather than the harness having mis-set the limit.
+    and it reserves the whole maximum heap on top of that before running a line of the
+    program. The engines here then map both input files, which counts too. So the heap gets
+    half the cap: enough to be a real limit, with the other half left for everything the JVM
+    and the mapping need. Anything greedier fails at startup or on the first mapping, which
+    would read in the table as the tool being unable to do the work rather than the harness
+    having mis-set the limit.
     """
-    return max(512, int(cap / 1024**2) - 3 * 1024)
+    return max(512, int(cap / 1024**2) // 2)
 
 
 def java_exe() -> Path:
@@ -304,6 +342,31 @@ def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
     return Result(
         "datacompy (polars)", "dataframe", secs, mb, json.loads(summary.read_text()),
         note="same library, columnar backend",
+    )
+
+
+def unix_pipeline(a: Path, b: Path, out: Path) -> Result:
+    """sort(1) and join(1) — the same algorithm as our sortmerge engine, in forty-year-old C.
+
+    Included because it is the honest ceiling for an external sort-merge join, and because it
+    is what a lot of people actually run. It gets three numbers, quickly, on data that happens
+    to have no commas, quotes or newlines inside a field.
+    """
+    script = Path(__file__).resolve().parent / "unix_pipeline.sh"
+    work = out / "unix-work"
+    shutil.rmtree(work, ignore_errors=True)
+    status, stdout, err, secs, mb = run(["bash", str(script), str(a), str(b), str(work)])
+    shutil.rmtree(work, ignore_errors=True)
+    if status != 0:
+        return Result("sort(1) + join(1)", "shell pipeline", failed=classify(status, err))
+    counts = dict(
+        (k, int(v)) for k, v in
+        (line.split("=", 1) for line in stdout.strip().splitlines() if "=" in line)
+    )
+    return Result(
+        "sort(1) + join(1)", "shell pipeline", secs, mb, counts,
+        note="counts only; no CSV quoting, no duplicate-key concept, no diff",
+        expresses_task=False,
     )
 
 
@@ -513,6 +576,7 @@ def main() -> int:
         ("datacompy", lambda: datacompy_compare(a, b, out)),
         ("datacompy-polars", lambda: datacompy_polars(a, b, out)),
         ("pandas", lambda: pandas_merge(a, b, out)),
+        ("unix", lambda: unix_pipeline(a, b, out)),
     ]
 
     results: list[Result] = []
