@@ -109,3 +109,39 @@ jobs:
                   sys.exit(f"{other} compared columns differ from python")
           print("python, typescript, java, go and rust agree:", json.dumps(py["counts"]))
           PY
+
+      - name: The awkward fixture, five implementations, identical results
+        working-directory: .
+        run: |
+          # The dataset above is a million uniform ASCII rows, which is the shape least likely to
+          # find a disagreement. This pair is the opposite: every row is there because it has broken
+          # an engine or plausibly could. tests/fixtures/README.md says which is which.
+          A=tests/fixtures/awkward_a.csv; B=tests/fixtures/awkward_b.csv
+          fail=0
+          for opts in "" "--trim" "--ignore-case" "--trim --ignore-case"; do
+            ARGS="-k k $opts"
+            # Each compare exits 1 when it finds differences, so its status cannot say whether it
+            # ran. Clearing the output first makes a crash show up as a missing file rather than as
+            # the previous iteration's answer read back as this one's.
+            rm -f /tmp/go.json /tmp/rust.json /tmp/py.json /tmp/ts.json /tmp/java.json
+            /tmp/csvdiff-go compare $A $B $ARGS -o /tmp/go.html --json /tmp/go.json || true
+            rust/target/release/csvdiff compare $A $B $ARGS -o /tmp/rust.html --json /tmp/rust.json || true
+            csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
+            node ts/dist/src/cli.js compare $A $B $ARGS -o /tmp/ts.html --json /tmp/ts.json || true
+            java -cp java/target/csvdiff.jar dev.csvdiff.Cli compare $A $B $ARGS -o /tmp/java.html --json /tmp/java.json || true
+            OPTS="$opts" python3 - <<'PY' || fail=1
+          import json, os, sys
+          opts = os.environ.get("OPTS") or "(defaults)"
+          load = lambda n: json.load(open(f"/tmp/{n}.json"))
+          py = load("py")
+          for other in ("go", "rust", "ts", "java"):
+              o = load(other)
+              if o["counts"] != py["counts"]:
+                  print(f"{opts}: {other} counts differ from python")
+                  print(f"  python: {json.dumps(py['counts'])}")
+                  print(f"  {other}: {json.dumps(o['counts'])}")
+                  sys.exit(1)
+          print(f"{opts}: all five agree -", json.dumps(py["counts"]))
+          PY
+          done
+          test "$fail" = 0 || { echo "the implementations disagree on the awkward fixture"; exit 1; }

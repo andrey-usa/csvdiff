@@ -24,6 +24,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 class EngineParityTest {
 
   private static final Path EXAMPLES = Path.of("..", "examples");
+  private static final Path AWKWARD = Path.of("..", "tests", "fixtures");
   private static final Path A = EXAMPLES.resolve("orders_2026-08.csv");
   private static final Path B = EXAMPLES.resolve("orders_2026-09.csv");
   private static final List<String> KEY = List.of("order_id", "line_no");
@@ -84,40 +85,18 @@ class EngineParityTest {
 
   @Test
   @DisplayName("every engine agrees on an input built from the shapes that have broken one")
-  void awkwardInputAgrees(@TempDir Path dir) throws java.io.IOException {
-    // The sweep above varies the options over clean ASCII data. Both of the wrong answers this
-    // project has shipped needed neither an unusual option nor a malformed file: one wanted a key
-    // in the last eight bytes, the other a key outside ASCII. So this varies the input instead, and
-    // puts every shape that has broken an engine, or plausibly could, into one pair of files.
+  void awkwardInputAgrees() {
+    // The sweep below varies the options over clean ASCII data. Neither wrong answer this project
+    // has shipped needed an unusual option or a malformed file: one wanted a key in the last eight
+    // bytes, the other a key outside ASCII. So this varies the input instead, over the fixture in
+    // tests/fixtures, whose README says what each row is there to catch. parity.yml runs the same
+    // pair across all five languages.
     //
     // What it asserts is not a particular answer but that the engines cannot disagree about one.
-    // Under the default options CAFE-acute and cafe-acute are different keys and under
+    // Under the default options CAFE-acute and cafe-acute are different keys, and under
     // --ignore-case they are the same; either is fine, and every engine has to say the same thing.
-    String header = "k,v,w\n";
-    Path a = write(dir, "a.csv", header
-        + "CAF\u00c9,alpha,1\n"           // non-ASCII key, upper case
-        + "  padded  ,beta,2\n"            // whitespace around the key
-        + "\u212a,gamma,3\n"               // KELVIN SIGN: folds across the ASCII boundary
-        + "\"has,comma\",delta,4\n"        // quoted key holding the delimiter
-        + "\"a\"\"b\",epsilon,5\n"         // quoted key holding a doubled quote
-        + "\"two\nlines\",zeta,6\n"       // quoted key holding a newline
-        + "dup,eta,7\n"
-        + "dup,eta,8\n"                    // duplicate key
-        + "blank,,9\n"                     // empty value
-        + "gone,theta,10\n"                // only in A
-        + "z,omega,11\n");                 // short key in the last row, near end of file
-    Path b = write(dir, "b.csv", header
-        + "caf\u00e9,alpha,1\n"            // same key folded, differing only in case
-        + "padded,beta,CHANGED\n"          // same key untrimmed, value differs
-        + "k,gamma,3\n"                    // the Kelvin sign's fold
-        + "\"has,comma\",delta,4\n"
-        + "\"a\"\"b\",epsilon,CHANGED\n"
-        + "\"two\nlines\",zeta,6\n"
-        + "dup,eta,7\n"
-        + "dup,eta,8\n"
-        + "blank,,9\n"
-        + "extra,iota,12\n"                // only in B
-        + "z,omega,11\n");
+    Path a = AWKWARD.resolve("awkward_a.csv");
+    Path b = AWKWARD.resolve("awkward_b.csv");
 
     List<Options.Builder> variants =
         List.of(
