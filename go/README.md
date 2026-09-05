@@ -56,7 +56,7 @@ Duplicate keys are counted and listed per file; the first occurrence of each key
 
 ## Engines
 
-Two backends, one result contract. Every engine must return identical `counts` and `columns` for
+Three backends, one result contract. Every engine must return identical `counts` and `columns` for
 the same input; the test suite asserts it cell for cell, and CI asserts it on 200k rows.
 `--engine auto` takes the first one that can actually load, in the order below.
 
