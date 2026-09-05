@@ -74,6 +74,11 @@ per recurring comparison so nobody retypes them.
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
 
+A row with more or fewer fields than the header is a difference to report, not a file to refuse: the
+missing fields read as absent and the extra ones are ignored. All five implementations agree on this,
+and the test suites hold them to it. The one exception is Java's `tablesaw` engine, whose reader has
+no option to allow it; it refuses such a file and says which engines will take it.
+
 ## Why DuckDB
 
 Both files are read as text (no type inference surprises such as `1.0` vs `1`),
