@@ -25,7 +25,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -51,6 +51,8 @@ class Result:
     note: str = ""
     expresses_task: bool = True
     extra: dict = field(default_factory=dict)
+    stderr: str = ""               # kept for failures, so a verdict can be checked
+    status: int | None = None      # the exit status the verdict was derived from
 
 
 def peak_rss_mb(pid: int, stop: threading.Event) -> list[float]:
@@ -167,19 +169,24 @@ def run(cmd: list[str], timeout: float = 3600, env: dict | None = None) -> tuple
 # The tools
 # ---------------------------------------------------------------------------
 
-def jvm_heap_mb(cap: int) -> int:
+# Address space a JVM claims that is neither heap nor mapped input: a gigabyte of compressed
+# class space, the code cache, the collector's own tables, a stack per thread.
+JVM_OVERHEAD_MB = 3 * 1024
+
+
+def jvm_heap_mb(cap: int, inputs: "Iterable[Path]") -> int:
     """The heap to give the JVM under an address-space cap.
 
-    A JVM claims about three gigabytes of address space that is not heap — a gigabyte of
-    compressed class space, the code cache, the collector's own tables, a stack per thread —
-    and it reserves the whole maximum heap on top of that before running a line of the
-    program. The engines here then map both input files, which counts too. So the heap gets
-    half the cap: enough to be a real limit, with the other half left for everything the JVM
-    and the mapping need. Anything greedier fails at startup or on the first mapping, which
-    would read in the table as the tool being unable to do the work rather than the harness
-    having mis-set the limit.
+    A JVM reserves its whole maximum heap up front, on top of the overhead above, and the
+    mapping engines here then map both input files — which counts against the same limit. So
+    the heap is what is left after both, rather than a fixed fraction: half the cap is fine at
+    a million rows and fails on the first mapping at ten million, where the inputs are 3.7 GB.
+    Getting this wrong reads in the table as the engine being unable to do the work.
     """
-    return max(512, int(cap / 1024**2) // 2)
+    mapped = sum(p.stat().st_size for p in inputs) / 1024**2
+    # A tenth held back, because the overhead above is an estimate and a heap sized to the
+    # last megabyte of the cap fails on whatever the estimate missed.
+    return max(512, int((cap / 1024**2 - JVM_OVERHEAD_MB - mapped) * 0.9))
 
 
 def java_exe() -> Path:
@@ -210,14 +217,14 @@ def ours(a: Path, b: Path, out: Path, engine: str, jar: Path) -> Result:
     summary = fresh(out / f"ours-{engine}.json")
     cmd = [str(java_exe()), "--add-modules", "jdk.incubator.vector"]
     if MEM_CAP_BYTES is not None:
-        cmd.append(f"-Xmx{jvm_heap_mb(MEM_CAP_BYTES)}m")
+        cmd.append(f"-Xmx{jvm_heap_mb(MEM_CAP_BYTES, (a, b))}m")
     status, _, err, secs, mb = run([
         *cmd, "-cp", str(jar), "dev.csvdiff.Cli",
         "compare", str(a), str(b), "-k", ",".join(KEY), "-i", IGNORE,
         "--engine", engine, "-o", str(out / f"ours-{engine}.html"), "--json", str(summary),
     ])
     if status not in (0, 1) or not summary.exists():
-        return Result(f"csvdiff (this project, {engine})", "bespoke", failed=classify(status, err))
+        return Result(f"csvdiff (this project, {engine})", "bespoke", **failure(status, err))
     counts = json.loads(summary.read_text())["counts"]
     return Result(
         f"csvdiff (this project, {engine})", "bespoke", secs, mb,
@@ -239,7 +246,7 @@ def go_csvdiff(a: Path, b: Path, out: Path, exe: str) -> Result:
         exe, str(a), str(b), "--primary-key", "0,1", "--ignore-columns", "19", "--format", "rowmark",
     ])
     if status != 0:
-        return Result("csvdiff (Go, aswinkarthik)", "hash-only", failed=classify(status, err))
+        return Result("csvdiff (Go, aswinkarthik)", "hash-only", **failure(status, err))
     marks.write_text(stdout)
     tally = {"changed": 0, "added": 0, "removed": 0}
     keys = {"changed": set(), "added": set(), "removed": set()}
@@ -284,7 +291,7 @@ def duckdb_sql(a: Path, b: Path, out: Path, exe: str) -> Result:
     ])
     status, stdout, err, secs, mb = run([exe, "-csv", "-c", sql])
     if status != 0:
-        return Result("DuckDB CLI (hand-written SQL)", "SQL", failed=classify(status, err))
+        return Result("DuckDB CLI (hand-written SQL)", "SQL", **failure(status, err))
     rows = [r for r in stdout.strip().splitlines() if r and not r.startswith("changed")]
     values = [int(v) for v in rows[-1].split(",")] if rows else [0, 0, 0]
     (out / "duckdb-sql.txt").write_text(stdout)
@@ -308,7 +315,7 @@ def daff_diff(a: Path, b: Path, out: Path, exe: str) -> Result:
         *[arg for k in KEY for arg in ("--id", k)], str(a), str(b),
     ])
     if status not in (0, 1) or not diff.exists():
-        return Result("daff (JS)", "alignment diff", failed=classify(status, err))
+        return Result("daff (JS)", "alignment diff", **failure(status, err))
     tally = {"changed": 0, "added": 0, "removed": 0}
     with diff.open() as fh:
         for line in fh:
@@ -337,7 +344,7 @@ def datacompy_compare(a: Path, b: Path, out: Path) -> Result:
         str(a), str(b), str(summary),
     ])
     if status != 0 or not summary.exists():
-        return Result("datacompy (pandas)", "dataframe", failed=classify(status, err))
+        return Result("datacompy (pandas)", "dataframe", **failure(status, err))
     return Result(
         "datacompy (pandas)", "dataframe", secs, mb, json.loads(summary.read_text()),
         note="cell-level diff and a per-column summary; whole frame in memory",
@@ -352,7 +359,7 @@ def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
         str(a), str(b), str(summary),
     ])
     if status != 0 or not summary.exists():
-        return Result("datacompy (polars)", "dataframe", failed=classify(status, err))
+        return Result("datacompy (polars)", "dataframe", **failure(status, err))
     return Result(
         "datacompy (polars)", "dataframe", secs, mb, json.loads(summary.read_text()),
         note="same library, columnar backend",
@@ -374,7 +381,7 @@ def csv_diff_tool(a: Path, b: Path, out: Path) -> Result:
         str(a), str(b), str(summary),
     ])
     if status != 0 or not summary.exists():
-        return Result("csv-diff (Python)", "row dicts", failed=classify(status, err))
+        return Result("csv-diff (Python)", "row dicts", **failure(status, err))
     return Result(
         "csv-diff (Python)", "row dicts", secs, mb, json.loads(summary.read_text()),
         note="single key column and no column-ignore, so the input has to be reshaped first",
@@ -395,7 +402,7 @@ def unix_pipeline(a: Path, b: Path, out: Path) -> Result:
     status, stdout, err, secs, mb = run(["bash", str(script), str(a), str(b), str(work)])
     shutil.rmtree(work, ignore_errors=True)
     if status != 0:
-        return Result("sort(1) + join(1)", "shell pipeline", failed=classify(status, err))
+        return Result("sort(1) + join(1)", "shell pipeline", **failure(status, err))
     counts = dict(
         (k, int(v)) for k, v in
         (line.split("=", 1) for line in stdout.strip().splitlines() if "=" in line)
@@ -415,25 +422,49 @@ def pandas_merge(a: Path, b: Path, out: Path) -> Result:
         str(a), str(b), str(summary),
     ])
     if status != 0 or not summary.exists():
-        return Result("pandas (hand-written merge)", "dataframe", failed=classify(status, err))
+        return Result("pandas (hand-written merge)", "dataframe", **failure(status, err))
     return Result(
         "pandas (hand-written merge)", "dataframe", secs, mb, json.loads(summary.read_text()),
         note="counts only unless you write more; duplicate keys multiply through the merge",
     )
 
 
+def failure(status: int, err: str) -> dict:
+    """The keyword arguments a failed Result needs: the reason, and the evidence for it."""
+    return {"failed": classify(status, err), "stderr": (err or "")[-4000:], "status": status}
+
+
+# The verdicts classify() can reach. A stored label outside this set is a stack frame or a
+# crash banner that an older version of this function mistook for a reason, and can be
+# re-derived from the evidence; one inside it already is the reason.
+REASONS = frozenset({
+    "timed out", "out of memory", "killed (out of memory)",
+    "V8 string cap: cannot read a file over 512 MB",
+})
+
+
 def classify(status: int, err: str) -> str:
     """Turns a non-zero exit into the reason a reader of the table cares about."""
     if status == -1:
         return "timed out"
-    noise = ("Picked up JAVA_TOOL_OPTIONS", "WARNING:", "SLF4J", "#")
+    noise = ("Picked up JAVA_TOOL_OPTIONS", "WARNING:", "SLF4J", "#", "\t", " ")
     tail = [l for l in (err or "").strip().splitlines() if l and not l.startswith(noise)]
-    last = tail[-1] if tail else f"exit {status}"
+    # A stack trace's frames are not the reason. Prefer a line that names an error, then the
+    # first line, then the exit status — never a frame, and never the banner a crash ends with.
+    named = [l for l in tail if "Error:" in l or l.startswith("fatal")]
+    last = named[0] if named else (tail[0] if tail else f"exit {status}")
     for needle, reason in (
         ("Array buffer allocation failed", "out of memory"),
         ("JavaScript heap out of memory", "out of memory"),
         ("Cannot enlarge memory", "out of memory"),
+        # Not a memory shortage: V8 refuses to build a string over 512 MB, so a tool that
+        # reads a file with readFileSync cannot open one, whatever the machine has.
+        ("Cannot create a string longer than", "V8 string cap: cannot read a file over 512 MB"),
         ("insufficient memory for the Java Runtime", "out of memory"),
+        ("memory allocation of", "out of memory"),
+        ("runtime: out of memory", "out of memory"),
+        ("cannot allocate memory", "out of memory"),
+        ("out of memory", "out of memory"),
         ("MemoryError", "out of memory"),
         ("Cannot allocate", "out of memory"),
         ("OutOfMemoryError", "out of memory"),
