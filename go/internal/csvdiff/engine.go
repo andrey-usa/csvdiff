@@ -13,8 +13,9 @@ type engineFunc func(aPath, bPath string, opt Options) (EngineResult, error)
 // engines maps a name to its backend. Every entry must return identical Counts
 // and Columns for the same input; the parity test asserts it.
 var engines = map[Engine]engineFunc{
-	EngineDuckDB: compareDuckDB,
-	EngineNative: compareNative,
+	EngineDuckDB:    compareDuckDB,
+	EngineSortMerge: compareSortMerge,
+	EngineNative:    compareNative,
 }
 
 // Compare runs the comparison and attaches the run's own facts to the result.
@@ -81,7 +82,7 @@ func available(e Engine) bool {
 	switch e {
 	case EngineDuckDB:
 		return duckDBAvailable()
-	case EngineNative:
+	case EngineSortMerge, EngineNative:
 		return true
 	default:
 		return false

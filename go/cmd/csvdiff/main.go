@@ -38,7 +38,7 @@ compare options:
       --max-rows N        Rows embedded per section (default 50000)
       --delimiter D       Force delimiter (default: auto)
       --encoding ENC
-      --engine E          auto | duckdb | native
+      --engine E          auto | duckdb | sortmerge | native
       --threads N
       --memory-limit S    DuckDB memory limit, e.g. 4GB
       --export-dir DIR    Write full changed/added/removed CSVs here

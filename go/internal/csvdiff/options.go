@@ -18,12 +18,15 @@ const (
 	EngineAuto Engine = "auto"
 	// EngineDuckDB runs the comparison in DuckDB: out-of-core, handles files larger than RAM.
 	EngineDuckDB Engine = "duckdb"
+	// EngineSortMerge sorts both files by key and walks them together: bounded
+	// memory, spills to disk, size limited by disk rather than RAM.
+	EngineSortMerge Engine = "sortmerge"
 	// EngineNative parses with encoding/csv and joins in a map. In-memory only.
 	EngineNative Engine = "native"
 )
 
 // ConcreteEngines lists the real backends in EngineAuto preference order.
-var ConcreteEngines = []Engine{EngineDuckDB, EngineNative}
+var ConcreteEngines = []Engine{EngineDuckDB, EngineSortMerge, EngineNative}
 
 // ParseEngine validates a command-line spelling.
 func ParseEngine(s string) (Engine, error) {

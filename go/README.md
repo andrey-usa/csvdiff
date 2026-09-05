@@ -48,7 +48,7 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 | `--delimiter`, `--encoding` | override auto-detection |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--engine` | `auto` (default), `duckdb`, or `native` |
+| `--engine` | `auto` (default), `duckdb`, `sortmerge`, or `native` |
 | `--threads`, `--memory-limit` | DuckDB resource limits |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
@@ -63,6 +63,7 @@ the same input; the test suite asserts it cell for cell, and CI asserts it on 20
 | Engine | Implementation | Memory model | Use it for |
 |---|---|---|---|
 | `duckdb` | DuckDB through `go-duckdb` (cgo) | out-of-core, spills to disk | the default; anything that does not fit in RAM |
+| `sortmerge` | external sort, merge join | bounded memory, spills to disk | files past what memory can index |
 | `native` | this project, over `encoding/csv` | in-memory, row-oriented | the dependency-light baseline |
 
 Both read CSV values as text — no type inference, so `1.0` and `1` stay different unless a tolerance
