@@ -294,6 +294,33 @@ Nine of nineteen engines do not finish. This is where the design decisions show.
 | TypeScript | `native` | ✗ V8 512 MB string cap, after 1.1s | | |
 | TypeScript | `arquero` | ✗ V8 512 MB string cap, after 0.5s | | |
 
+### The out-of-core engine
+
+`sortmerge` came later than the tables above, so it has its own run on the same runners, against the
+fastest engine and the plain in-memory one:
+
+| Scale | Engine | Compare | Throughput | Peak RSS |
+|---|---|---|---:|---:|
+| 10k | `turbo` | 0.64s | 31,253/s | 109 MB |
+| 10k | `sortmerge` | 0.83s | 24,099/s | 123 MB |
+| 10k | `native` | 0.79s | 25,319/s | 126 MB |
+| 1M | `turbo` | **3.65s** | 547,986/s | 657 MB |
+| 1M | `sortmerge` | 7.25s | 275,883/s | 2,032 MB |
+| 1M | `native` | 5.91s | 338,435/s | 3,000 MB |
+| 10M | `turbo` | **28.18s** | 709,776/s | 5,652 MB |
+| 10M | `sortmerge` | 69.21s | 288,997/s | **1,224 MB** |
+| 10M | `native` | ✗ Java heap OOM after 31.5s | | |
+
+Sorting costs about 2.5x the time of a hash join, which is the trade it is making and not a defect.
+What it buys shows at ten million rows: `turbo` needs 5,652 MB there and `sortmerge` needs 1,224 MB —
+**4.6x less** — while `native`, which holds both files as rows, does not finish at all.
+
+Note the shape of `sortmerge`'s memory: 2,032 MB at a million rows and 1,224 MB at ten million. That
+is not a mistake. Peak RSS measures what the JVM was *allowed* to keep, not what the engine needs; at
+a million rows the heap is generous and the collector has no reason to run. The real figure is the
+one in [The other memory question](#the-other-memory-question) — the smallest heap each engine can
+finish in, which for `sortmerge` is 63 MB.
+
 ### Winners
 
 | Scale | Winner | Time | Runner-up |
