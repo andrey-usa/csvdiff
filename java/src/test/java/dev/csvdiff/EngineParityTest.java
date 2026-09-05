@@ -55,6 +55,33 @@ class EngineParityTest {
     assertEquals(List.of("carrier"), result.meta().onlyInB());
   }
 
+  @ParameterizedTest
+  @EnumSource(value = EngineName.class, names = {"AUTO", "TABLESAW"}, mode = EnumSource.Mode.EXCLUDE)
+  @DisplayName("a ragged row gets the same answer from every engine that can read one")
+  void raggedRowsAgree(EngineName engine, @TempDir Path dir) throws java.io.IOException {
+    // One short row and one long one. This used to be the input that split the engines four ways:
+    // the byte-level ones padded, FastCSV and Tablesaw refused, and DuckDB abandoned the split and
+    // returned the file as a single column, which surfaced as "key column missing" — a wrong
+    // diagnosis of a readable file. Everything except Tablesaw now agrees, and Tablesaw's reader
+    // has no option to allow it, so it is excluded here and says why at runtime.
+    Path a = write(dir, "a.csv", "k,v,w\n1,x,y\n2,short\n3,p,q,EXTRA\n");
+    Path b = write(dir, "b.csv", "k,v,w\n1,x,CHANGED\n2,short\n3,p,q,EXTRA\n");
+
+    var result = CsvDiff.compare(a, b, Options.builder().key(List.of("k"))
+        .engine(engine.label()).build());
+
+    assertEquals(3, result.counts().matched(), "every key is in both files");
+    assertEquals(1, result.counts().changed(), "only row 1 differs");
+    assertEquals(0, result.counts().added());
+    assertEquals(0, result.counts().removed());
+  }
+
+  private static Path write(Path dir, String name, String body) throws java.io.IOException {
+    Path path = dir.resolve(name);
+    Files.writeString(path, body, java.nio.charset.StandardCharsets.UTF_8);
+    return path;
+  }
+
   @Test
   @DisplayName("every engine agrees, under several option sets")
   void enginesAgree() {

@@ -2,6 +2,7 @@ package dev.csvdiff.engine.sortmerge;
 
 import de.siegmar.fastcsv.reader.CsvReader;
 import de.siegmar.fastcsv.reader.CsvRecord;
+import de.siegmar.fastcsv.reader.FieldMismatchStrategy;
 import dev.csvdiff.Columns;
 import dev.csvdiff.CompareEngine;
 import dev.csvdiff.Contract.EngineResult;
@@ -98,6 +99,12 @@ public final class SortMergeEngine implements CompareEngine {
   private static CsvReader<CsvRecord> reader(Path path, Options opt) throws IOException {
     return CsvReader.builder()
         .fieldSeparator(delimiter(path, opt))
+        // A row with more or fewer fields than the header is a difference to report, not a file to
+        // refuse — see FastEngineTest.raggedRowsArePadded. FastCSV is STRICT by default, which made
+        // this engine reject input the byte-level engines happily compared. IGNORE keeps the extra
+        // fields out of the way and leaves the missing ones absent, which is what they are.
+        .extraFieldStrategy(FieldMismatchStrategy.IGNORE)
+        .missingFieldStrategy(FieldMismatchStrategy.IGNORE)
         .ofCsvRecord(Files.newBufferedReader(path, opt.charset()));
   }
 

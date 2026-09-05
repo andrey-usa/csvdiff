@@ -2,6 +2,7 @@ package dev.csvdiff.engine;
 
 import dev.csvdiff.Columns;
 import dev.csvdiff.CompareEngine;
+import dev.csvdiff.CsvDiffException;
 import dev.csvdiff.Contract.EngineResult;
 import dev.csvdiff.Options;
 import java.io.IOException;
@@ -59,8 +60,33 @@ public final class TablesawEngine implements CompareEngine {
       if (opt.delimiter() != null) {
         builder.separator(opt.delimiter());
       }
-      return Table.read().usingOptions(builder.build());
+      try {
+        return Table.read().usingOptions(builder.build());
+      } catch (RuntimeException e) {
+        throw raggedOrRethrow(path, e);
+      }
     }
+  }
+
+  /**
+   * Explains a rejected file instead of passing Tablesaw's wording through.
+   *
+   * <p>Every other engine here treats a row with more or fewer fields than the header as a
+   * difference to report rather than a file to refuse. Tablesaw's reader has no option for it, so
+   * this engine is the one that cannot, and a user who hits it deserves to be told which engines
+   * can rather than shown a message about cells and row numbers from inside a library.
+   */
+  private static RuntimeException raggedOrRethrow(Path path, RuntimeException e) {
+    String text = String.valueOf(e.getMessage());
+    boolean ragged = text.contains("contains") && text.contains("column")
+        || text.contains("Error while adding cell");
+    if (!ragged) {
+      return e;
+    }
+    return new CsvDiffException(
+        "Tablesaw cannot read " + path + ": a row has a different number of fields than the "
+            + "header, and its reader has no option to allow that. Every other engine compares "
+            + "such a file; try --engine turbo (or native, sortmerge, duckdb).", e);
   }
 
   /** Pulls the key and compared columns out of the dataframe, normalised, into a joinable store. */

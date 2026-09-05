@@ -56,6 +56,10 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
 
+A row with more or fewer fields than the header is a difference to report, not a file to refuse: the
+missing fields read as absent and the extra ones are ignored. Every engine agrees on this except
+`tablesaw`, whose reader has no option to allow it and which says so and names the engines that do.
+
 ## Engines
 
 Nine backends, one result contract. Every engine must return identical `counts` and `columns` for

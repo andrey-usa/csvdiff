@@ -156,11 +156,11 @@ class FastEngineTest {
   @EnumSource(Fast.class)
   @DisplayName("a short row is read, with its missing cells absent")
   void raggedRowsArePadded(Fast fast, @TempDir Path dir) throws IOException {
-    // Deliberately not compared against another engine: a row with fewer fields than the header
-    // is the one case where this tool's engines do not agree with each other today. FastCSV and
-    // Tablesaw reject the file, DuckDB's sniffer reads it as a different shape, and the Go and
-    // Rust readers pad it. These engines pad, matching Go and Rust: a short row is a difference
-    // to report, not a file to refuse.
+    // A short row is a difference to report, not a file to refuse. That was once true only of
+    // these engines: FastCSV and Tablesaw rejected the file and DuckDB quietly read it as a single
+    // column, so the same input got four different answers depending on --engine. The readers that
+    // can be told to allow it now are, and EngineParityTest holds them to the same numbers; only
+    // Tablesaw still refuses, because its reader has no option for it, and it now says so.
     // Row 1 differs in v, so a non-zero count for w could only come from row 2's missing cell.
     Path a = write(dir, "a.csv", "k,v,w\n1,x,y\n2,short\n");
     Path b = write(dir, "b.csv", "k,v,w\n1,z,y\n2,short\n");

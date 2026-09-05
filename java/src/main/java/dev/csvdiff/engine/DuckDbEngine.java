@@ -159,7 +159,12 @@ public final class DuckDbEngine implements CompareEngine {
   }
 
   private static String readOptions(Options opt) {
-    var sb = new StringBuilder("all_varchar=true, header=true, sample_size=-1");
+    // null_padding leaves a short row's missing fields absent, which is what the other engines do
+    // with them. Without it DuckDB does something far worse than refuse: it abandons the split and
+    // returns the whole file as one column named after the header line, so the comparison then
+    // fails with "key column missing" — a true statement about the table DuckDB built and a
+    // thoroughly misleading one about the file the user handed over.
+    var sb = new StringBuilder("all_varchar=true, header=true, sample_size=-1, null_padding=true");
     if (opt.delimiter() != null) {
       sb.append(", delim=").append(lit(String.valueOf(opt.delimiter())));
     }
