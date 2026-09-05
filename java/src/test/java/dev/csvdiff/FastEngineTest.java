@@ -61,6 +61,42 @@ class FastEngineTest {
 
   @ParameterizedTest
   @EnumSource(Fast.class)
+  @DisplayName("--ignore-case folds a non-ASCII key the same way the comparison does")
+  void ignoreCaseFoldsNonAsciiKeysConsistently(Fast fast, @TempDir Path dir) throws IOException {
+    // These engines decide equality one way and compute the hash another, and under --ignore-case
+    // the two had drifted apart: equality handed anything non-ASCII to String.toLowerCase, while
+    // the hash lower-cased ASCII bytes and left the rest alone. CAFE-acute therefore compared equal
+    // to cafe-acute and hashed apart, so the join never looked at the pair and reported the key as
+    // added on one side and removed on the other.
+    Path a = write(dir, "a.csv", "k,v\nCAF\u00c9,x\nplain,y\n");
+    Path b = write(dir, "b.csv", "k,v\ncaf\u00e9,z\nplain,y\n");
+    agrees(a, b, Options.builder().key(List.of("k")).ignoreCase(true), fast);
+  }
+
+  @ParameterizedTest
+  @EnumSource(Fast.class)
+  @DisplayName("--ignore-case matches a key whose fold changes its length")
+  void ignoreCaseFoldsAcrossTheAsciiBoundary(Fast fast, @TempDir Path dir) throws IOException {
+    // U+212A KELVIN SIGN is three bytes and lower-cases to the one byte "k". Folding the bytes
+    // consistently was not enough on its own: the hash also mixed in the field's length to keep a
+    // field and its prefix apart, and mixing the raw three where the fold produced one put the two
+    // spellings in different buckets again. The length that gets mixed has to be the folded one.
+    Path a = write(dir, "a.csv", "k,v\n\u212a,x\nplain,y\n");
+    Path b = write(dir, "b.csv", "k,v\nk,z\nplain,y\n");
+    agrees(a, b, Options.builder().key(List.of("k")).ignoreCase(true), fast);
+  }
+
+  @ParameterizedTest
+  @EnumSource(Fast.class)
+  @DisplayName("--ignore-case on plain ASCII keys still agrees with the reference")
+  void ignoreCaseOnAsciiKeys(Fast fast, @TempDir Path dir) throws IOException {
+    Path a = write(dir, "a.csv", "k,v\nABC,x\nDeF,y\n");
+    Path b = write(dir, "b.csv", "k,v\nabc,x\ndef,z\n");
+    agrees(a, b, Options.builder().key(List.of("k")).ignoreCase(true), fast);
+  }
+
+  @ParameterizedTest
+  @EnumSource(Fast.class)
   @DisplayName("a key near the end of the file hashes the same as one anywhere else")
   void keyNearTheEndOfTheFileStillMatches(Fast fast, @TempDir Path dir) throws IOException {
     // These engines hash eight bytes at a time, and a field in the last eight bytes of the file

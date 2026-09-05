@@ -156,9 +156,13 @@ public final class Bytes {
     long start = normStart(slab, field, opt);
     int len = normLength(slab, field, opt);
 
-    long h = opt.ignoreCase() ? foldedHash(seg, start, len, seed) : wordHash(seg, start, len, seed);
-    // Mix the length in so a field and its prefix cannot share a hash by accident.
-    return (h ^ (long) len) * FNV_PRIME;
+    // Each of these mixes in the length of the bytes it actually hashed, which is not always the
+    // field's length: case folding can change it. The Kelvin sign is three bytes and folds to the
+    // one byte "k", and mixing the raw three here made it hash apart from a plain "k" even after
+    // the fold itself was made to agree.
+    return opt.ignoreCase()
+        ? foldedHash(seg, start, len, seed, opt)
+        : mixLength(wordHash(seg, start, len, seed), len);
   }
 
   /**
@@ -204,13 +208,40 @@ public final class Bytes {
     return word;
   }
 
-  /** Case-insensitive hashing stays byte-at-a-time: folding a word needs the bytes apart anyway. */
-  private static long foldedHash(MemorySegment seg, long start, int len, long seed) {
-    long h = seed;
-    for (int i = 0; i < len; i++) {
-      h = (h ^ (lower(seg.get(BYTE, start + i)) & 0xFF)) * FNV_PRIME;
+  /**
+   * Case-insensitive hashing: byte-at-a-time, because folding a word needs the bytes apart anyway.
+   *
+   * <p>It has to fold exactly the way {@link #equal} does, or two fields that compare equal will
+   * land in different buckets and the join will never look at them. {@code equal} lower-cases ASCII
+   * byte by byte but hands anything else to {@link String#toLowerCase(Locale)}, because folding
+   * outside ASCII can change a string's length. This did the ASCII thing to every field, so
+   * {@code CAFÉ} and {@code café} compared equal and hashed apart, and a key like that went missing
+   * from the join and came back as an addition and a deletion.
+   *
+   * <p>Pure ASCII keeps the byte path: for those bytes it gives what {@code toLowerCase} gives, so
+   * the two paths agree on any value both could see, including the ones that fold across the
+   * boundary such as the Kelvin sign folding to {@code k}.
+   */
+  private static long foldedHash(MemorySegment seg, long start, int len, long seed, Options opt) {
+    if (isAscii(seg, start, len)) {
+      long h = seed;
+      for (int i = 0; i < len; i++) {
+        h = (h ^ (lower(seg.get(BYTE, start + i)) & 0xFF)) * FNV_PRIME;
+      }
+      return mixLength(h, len);
     }
-    return h;
+    byte[] folded =
+        decode(seg, start, len, opt).toLowerCase(Locale.ROOT).getBytes(StandardCharsets.UTF_8);
+    long h = seed;
+    for (byte b : folded) {
+      h = (h ^ (b & 0xFF)) * FNV_PRIME;
+    }
+    return mixLength(h, folded.length);
+  }
+
+  /** Mixes a length in, so a field and its prefix cannot share a hash by accident. */
+  private static long mixLength(long h, int len) {
+    return (h ^ (long) len) * FNV_PRIME;
   }
 
   /** splitmix64's finaliser, enough to spread one word's bits across the whole hash. */
