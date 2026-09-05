@@ -301,8 +301,11 @@ Nine of nineteen engines do not finish. This is where the design decisions show.
 
 ### The out-of-core engine
 
-`sortmerge` came later than the tables above, so it has its own run on the same runners, against the
-fastest engine and the plain in-memory one:
+`sortmerge` came later than the tables above and now exists in Java, Go and Rust. All three produce
+byte-identical answers — on ten million rows: 599,320 changed, 10,000 added, 10,000 removed, 1,000
+and 500 duplicate keys.
+
+On the GitHub runners the other tables use, against the fastest engine and the plain in-memory one:
 
 | Scale | Engine | Compare | Throughput | Peak RSS |
 |---|---|---|---:|---:|
@@ -320,11 +323,67 @@ Sorting costs about 2.5x the time of a hash join, which is the trade it is makin
 What it buys shows at ten million rows: `turbo` needs 5,652 MB there and `sortmerge` needs 1,224 MB —
 **4.6x less** — while `native`, which holds both files as rows, does not finish at all.
 
-Note the shape of `sortmerge`'s memory: 2,032 MB at a million rows and 1,224 MB at ten million. That
-is not a mistake. Peak RSS measures what the JVM was *allowed* to keep, not what the engine needs; at
-a million rows the heap is generous and the collector has no reason to run. The real figure is the
-one in [The other memory question](#the-other-memory-question) — the smallest heap each engine can
-finish in, which for `sortmerge` is 63 MB.
+#### The three ports side by side
+
+The table above is Java. These are all three, on one 4-core / 16 GB container rather than the
+runners, so compare within this table and not across to the ones above. A million rows is the best of
+three runs; ten million is a single run, because at that size the in-memory engines want more memory
+than the machine has and a single timing is honest enough for a gap this wide.
+
+| Scale | Engine | Compare | Peak RSS |
+|---|---|---:|---:|
+| 1M | rust `polars` | **4.46s** | 2,250 MB |
+| 1M | java `turbo` | 5.73s | 633 MB |
+| 1M | **rust `sortmerge`** | 11.94s | **152 MB** |
+| 1M | go `native` | 12.24s | 1,857 MB |
+| 1M | java `sortmerge` | 13.85s | 1,265 MB |
+| 1M | go `sortmerge` | 16.27s | 224 MB |
+| 1M | rust `native` | 21.08s | 2,896 MB |
+| 10M | java `turbo` | **42.41s** | 5,321 MB |
+| 10M | java `sortmerge` | 151.00s | 1,106 MB |
+| 10M | go `sortmerge` | 217.21s | 313 MB |
+| 10M | **rust `sortmerge`** | 217.33s | **208 MB** |
+
+**Rust `sortmerge` compares 3.68 GB of CSV in 208 MB** — under six per cent of what the two files
+hold, and a twenty-fifth of what `turbo` needs to reach the same answer.
+
+The surprise is at a million rows, where **Rust `sortmerge` is faster than Rust `native`** — 11.94s
+against 21.08s — while using nineteen times less memory. Sorting is supposed to cost more than a hash
+join, and in Java and Go it does. It does not here because `native` allocates an owned `String` key
+per row and hashes it into a map, and that costs more than sorting the rows does. The out-of-core
+engine wins on both axes in Rust, which is not the trade-off the Java numbers describe.
+
+Go is the shape the design predicts: `sortmerge` uses eight times less memory than `native` and takes
+a third longer.
+
+Note the shape of `sortmerge`'s memory across scales — 2,032 MB at a million rows on the runners and
+1,224 MB at ten million. That is not a mistake. Peak RSS measures what the JVM was *allowed* to keep,
+not what the engine needs; at a million rows the heap is generous and the collector has no reason to
+run. The Go and Rust ports have no such allowance, which is why their figures are so much lower for
+the same work.
+
+The figure that actually answers "how little will it run in" is the smallest heap each Java engine
+can finish a million rows in, found by binary search (`scripts/min_heap.sh`, `--max-rows 1000`):
+
+| Engine | Smallest heap that finishes |
+|---|---:|
+| `duckdb` | 47 MB (but see below) |
+| **`sortmerge`** | **63 MB** |
+| `swar` / `mmap` | 127 MB |
+| `turbo` / `shard` | 159 MB |
+| `simd` | 478 MB |
+| `tablesaw` | 1,259 MB |
+| `native` | 2,470 MB |
+
+368 MB of CSV compared in a 63 MB heap, against 2,470 MB for the row-at-a-time engine: a **39x**
+difference in what the machine has to provide, which is the whole point of the design.
+
+Two caveats, or that table misleads. It measures **JVM heap**, which is what `-Xmx` controls and what
+fails first in a container — not total memory. `duckdb` looks smallest at 47 MB because it does its
+work in C++ outside the heap entirely; its actual footprint was 1,273 MB. The mapping engines
+(`turbo`, `swar`, `shard`, `mmap`) likewise map the file outside the heap. And the report cap matters:
+these runs embed 1,000 rows per section, because the embedded sections are the one part of a
+comparison that grows with the answer rather than the input.
 
 ### Winners
 
@@ -550,36 +609,15 @@ inside a field and the answer is silently wrong — or tell you which cell chang
 
 That instinct is why the `sortmerge` engine exists. It is the same algorithm with a real CSV parser
 and the full result contract, and it is the only thing here that produces the *correct* ten-million-row
-answer in under 2 GB.
+answer in under 2 GB. It now exists in Java, Go and Rust; the Rust port does that comparison in
+208 MB, which is less than the shell pipeline needs and a correct answer besides.
 
 ### The other memory question
 
-Peak RSS says what a tool used with room to spare. It does not say what it needs. This is the
-smallest `-Xmx` each Java engine can finish a million rows in, found by binary search
-(`scripts/min_heap.sh`, `--max-rows 1000`):
-
-| Engine | Smallest heap that finishes |
-|---|---:|
-| `turbo` | 159 MB |
-| `swar` | 127 MB |
-| `shard` | 159 MB |
-| `mmap` | 127 MB |
-| `simd` | 478 MB |
-| `sortmerge` | 63 MB |
-| `native` | 2470 MB |
-| `tablesaw` | 1259 MB |
-| `duckdb` | 47 MB |
-
-`sortmerge` finishes in a **63 MB** heap — 368 MB of CSV compared in a heap smaller than the report
-it produces — against 2,470 MB for the row-at-a-time `native` engine. That is a 39x difference in
-what the machine has to provide, and it is the entire point of the engine.
-
-Two caveats, or the table misleads. It measures **JVM heap**, which is what `-Xmx` controls and what
-fails first in a container — not total memory. `duckdb` looks smallest at 47 MB because it does its
-work in C++ outside the heap entirely; its actual footprint was 1,273 MB. The mapping engines
-(`turbo`, `swar`, `shard`, `mmap`) likewise map the file outside the heap. And the report cap matters:
-these runs embed 1,000 rows per section, because the embedded sections are the one part of a
-comparison that grows with the answer rather than the input.
+Peak RSS says what a tool used with room to spare; it does not say what it needs. The smallest heap
+each Java engine can finish a million rows in — and why `sortmerge`'s 63 MB against `native`'s
+2,470 MB is the number that matters — is in
+[The out-of-core engine](#the-out-of-core-engine) above.
 
 ## Ports
 
@@ -592,8 +630,8 @@ number from one is directly comparable with a number from another.
 | Python | `.` (this) | duckdb, pandas | the reference; also has `serve` and `mail` |
 | TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
 | Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, sortmerge, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM, plus an out-of-core sort-merge join |
-| Go | [`go/`](go/) | duckdb, native | Go 1.24 |
-| Rust | [`rust/`](rust/) | duckdb, polars, native | edition 2024 |
+| Go | [`go/`](go/) | duckdb, sortmerge, native | Go 1.24 |
+| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, native | edition 2024 |
 
 Two things are enforced in CI by `.github/workflows/parity.yml`, on every change to any of them:
 every implementation returns identical counts and column stats for one dataset, and all five data
