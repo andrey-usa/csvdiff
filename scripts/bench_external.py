@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -358,6 +359,29 @@ def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
     )
 
 
+def csv_diff_tool(a: Path, b: Path, out: Path) -> Result:
+    """csv-diff (Simon Willison) — the small, widely used Python one.
+
+    It takes a single key column and has no way to ignore one, so it cannot be pointed at this
+    task as it stands: keyed on account_id alone every row is ambiguous, and with updated_at
+    still in the file every row is changed. The preprocessing that makes it usable — fuse the
+    key into one column, drop the ignored one — is counted in its time, because a user reaching
+    for this tool has to do it too.
+    """
+    summary = fresh(out / "csv-diff.json")
+    status, _, err, secs, mb = run([
+        sys.executable, str(Path(__file__).resolve()), "--child", "csv-diff",
+        str(a), str(b), str(summary),
+    ])
+    if status != 0 or not summary.exists():
+        return Result("csv-diff (Python)", "row dicts", failed=classify(status, err))
+    return Result(
+        "csv-diff (Python)", "row dicts", secs, mb, json.loads(summary.read_text()),
+        note="single key column and no column-ignore, so the input has to be reshaped first",
+        expresses_task=False,
+    )
+
+
 def unix_pipeline(a: Path, b: Path, out: Path) -> Result:
     """sort(1) and join(1) — the same algorithm as our sortmerge engine, in forty-year-old C.
 
@@ -457,6 +481,32 @@ def _write_counts(summary: Path, cmp: object) -> None:
         "added": int(cmp.df2_unq_rows.shape[0]),
         "removed": int(cmp.df1_unq_rows.shape[0]),
     }))
+
+
+def child_csv_diff(a: Path, b: Path, summary: Path) -> None:
+    """Reshapes the input into what csv-diff can take, then runs it."""
+    import csv_diff
+
+    def reshape(path: Path) -> list[dict[str, str]]:
+        rows = []
+        with path.open(newline="", encoding="utf-8") as fh:
+            for row in csv.DictReader(fh):
+                row.pop(IGNORE, None)
+                row["__key"] = "\x1e".join(row[k] for k in KEY)
+                rows.append(row)
+        return rows
+
+    diff = csv_diff.compare(_keyed(reshape(a)), _keyed(reshape(b)))
+    summary.write_text(json.dumps({
+        "changed": len(diff["changed"]),
+        "added": len(diff["added"]),
+        "removed": len(diff["removed"]),
+    }))
+
+
+def _keyed(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    """The key-to-row mapping csv-diff's own loader builds, with our fused key."""
+    return {row["__key"]: row for row in rows}
 
 
 def child_pandas(a: Path, b: Path, summary: Path) -> None:
@@ -599,7 +649,7 @@ def main() -> int:
     if args.child:
         tool, a, b, summary = args.child
         {"datacompy": child_datacompy, "datacompy-polars": child_datacompy_polars,
-          "pandas": child_pandas}[tool](
+          "csv-diff": child_csv_diff, "pandas": child_pandas}[tool](
             Path(a), Path(b), Path(summary))
         return 0
 
@@ -623,6 +673,7 @@ def main() -> int:
         ("datacompy", lambda: datacompy_compare(a, b, out)),
         ("datacompy-polars", lambda: datacompy_polars(a, b, out)),
         ("pandas", lambda: pandas_merge(a, b, out)),
+        ("csv-diff", lambda: csv_diff_tool(a, b, out)),
         ("unix", lambda: unix_pipeline(a, b, out)),
     ]
 
