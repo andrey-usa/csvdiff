@@ -19,13 +19,21 @@ pub enum Engine {
     DuckDb,
     /// Polars: in-memory, columnar, multi-threaded.
     Polars,
+    /// External sort then merge join: bounded memory, spills to disk, size
+    /// limited by disk rather than RAM.
+    SortMerge,
     /// This project, over the `csv` crate: in-memory, row-oriented.
     Native,
 }
 
 impl Engine {
     /// The real backends, in `Auto` preference order.
-    pub const CONCRETE: [Engine; 3] = [Engine::DuckDb, Engine::Polars, Engine::Native];
+    pub const CONCRETE: [Engine; 4] = [
+        Engine::DuckDb,
+        Engine::Polars,
+        Engine::SortMerge,
+        Engine::Native,
+    ];
 
     /// The name used on the command line and in the report.
     pub fn label(self) -> &'static str {
@@ -33,6 +41,7 @@ impl Engine {
             Engine::Auto => "auto",
             Engine::DuckDb => "duckdb",
             Engine::Polars => "polars",
+            Engine::SortMerge => "sortmerge",
             Engine::Native => "native",
         }
     }
@@ -46,9 +55,10 @@ impl FromStr for Engine {
             "auto" => Ok(Engine::Auto),
             "duckdb" => Ok(Engine::DuckDb),
             "polars" => Ok(Engine::Polars),
+            "sortmerge" => Ok(Engine::SortMerge),
             "native" => Ok(Engine::Native),
             other => Err(Error::new(format!(
-                "unknown engine: {other}. Choose one of auto, duckdb, polars, native"
+                "unknown engine: {other}. Choose one of auto, duckdb, polars, sortmerge, native"
             ))),
         }
     }
