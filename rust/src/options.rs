@@ -19,6 +19,9 @@ pub enum Engine {
     DuckDb,
     /// Polars: in-memory, columnar, multi-threaded.
     Polars,
+    /// Byte-level: maps the file and indexes it in place, building no string
+    /// for a cell unless that cell reaches the report.
+    Turbo,
     /// External sort then merge join: bounded memory, spills to disk, size
     /// limited by disk rather than RAM.
     SortMerge,
@@ -41,6 +44,7 @@ impl Engine {
             Engine::Auto => "auto",
             Engine::DuckDb => "duckdb",
             Engine::Polars => "polars",
+            Engine::Turbo => "turbo",
             Engine::SortMerge => "sortmerge",
             Engine::Native => "native",
         }
@@ -55,10 +59,11 @@ impl FromStr for Engine {
             "auto" => Ok(Engine::Auto),
             "duckdb" => Ok(Engine::DuckDb),
             "polars" => Ok(Engine::Polars),
+            "turbo" => Ok(Engine::Turbo),
             "sortmerge" => Ok(Engine::SortMerge),
             "native" => Ok(Engine::Native),
             other => Err(Error::new(format!(
-                "unknown engine: {other}. Choose one of auto, duckdb, polars, sortmerge, native"
+                "unknown engine: {other}. Choose one of auto, duckdb, polars, turbo, sortmerge, native"
             ))),
         }
     }

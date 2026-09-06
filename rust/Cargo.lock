@@ -712,6 +712,7 @@ dependencies = [
  "csv",
  "duckdb",
  "flate2",
+ "memmap2",
  "polars",
  "serde",
  "serde_json",

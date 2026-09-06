@@ -29,6 +29,9 @@ duckdb = { version = "1.10505.0", features = ["bundled"] }
 polars = { version = "0.55.2", features = ["lazy", "csv", "dtype-full", "is_in", "strings", "abs"] }
 # Engine: native, over the csv crate.
 csv = "1.4.0"
+# Engine: turbo. Maps the file instead of reading it, so the bytes are paged in
+# on demand and evictable rather than held on the heap.
+memmap2 = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.151"
 flate2 = "1.1.10"

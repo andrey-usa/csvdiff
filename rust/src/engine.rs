@@ -4,6 +4,7 @@ pub mod duckdb;
 pub mod native;
 pub mod polars;
 pub mod sortmerge;
+pub mod turbo;
 
 use std::fs;
 use std::path::Path;
@@ -65,6 +66,7 @@ fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult
     let result = match engine {
         Engine::DuckDb => duckdb::compare(a, b, opt),
         Engine::Polars => polars::compare(a, b, opt),
+        Engine::Turbo => turbo::compare(a, b, opt),
         Engine::SortMerge => sortmerge::compare(a, b, opt),
         Engine::Native => native::compare(a, b, opt),
         Engine::Auto => unreachable!("auto is resolved before this point"),
@@ -91,6 +93,7 @@ pub fn available(engine: Engine) -> bool {
     match engine {
         Engine::DuckDb => duckdb::available(),
         Engine::Polars => polars::available(),
+        Engine::Turbo => turbo::available(),
         Engine::SortMerge => sortmerge::available(),
         Engine::Native => native::available(),
         Engine::Auto => false,

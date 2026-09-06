@@ -49,7 +49,7 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 | `--delimiter`, `--encoding` | override auto-detection |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--engine` | `auto` (default), `duckdb`, `polars`, `sortmerge`, or `native` |
+| `--engine` | `auto` (default), `duckdb`, `polars`, `turbo`, `sortmerge`, or `native` |
 | `--threads`, `--memory-limit` | DuckDB resource limits |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
@@ -57,7 +57,7 @@ Duplicate keys are counted and listed per file; the first occurrence of each key
 
 ## Engines
 
-Four backends, one result contract. Every engine must return identical `counts` and `columns` for
+Five backends, one result contract. Every engine must return identical `counts` and `columns` for
 the same input; the test suite asserts it cell for cell on every engine, and CI asserts it on 200k
 rows. `--engine auto` takes the first one that can actually load, in the order below.
 
@@ -65,6 +65,7 @@ rows. `--engine auto` takes the first one that can actually load, in the order b
 |---|---|---|---|
 | `duckdb` | DuckDB through `duckdb-rs` (bundled C++) | out-of-core, spills to disk | the default; anything that does not fit in RAM |
 | `polars` | Polars, natively | in-memory, columnar, multi-threaded | the dataframe comparison point |
+| `turbo` | mapped file, byte-level index | off-heap bytes, index in memory | **the fastest here** |
 | `sortmerge` | external sort, merge join | bounded memory, spills to disk | files past what memory can index |
 | `native` | this project, over the `csv` crate | in-memory, row-oriented | the dependency-light baseline |
 
