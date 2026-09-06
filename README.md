@@ -519,6 +519,121 @@ completes at 204 MB, with no way for it to quietly exceed what it was given. The
 only be *observed* to stay small. That is the one thing in this section a different language actually
 bought.
 
+## Twenty million rows, cell-diff engines only
+
+The survey above ends at ten million and includes tools that only produce counts. This section does
+the opposite on both axes: twice the data, and **every entry computes which cell changed**. The
+counts-only SQL joins and the shell pipeline are not here — not because they are slow, but because
+they are answering a smaller question, and at this size the interesting comparison is between things
+doing the same work.
+
+Two files of 3,679 MB each, 20,000,000 rows, one 4-core container, page cache warm, best of two.
+Peak RSS is the kernel's high-water mark from `wait4`; mapped pages are resident, so the two inputs'
+7,018 MB is in every figure and the last column takes it back out. Reproduce with:
+
+```bash
+python scripts/gen_data.py --rows 20m --out-dir bench/external/data --prefix 20m
+python scripts/bench_native.py --rows 20m --repeats 2
+```
+
+The alternative toolchains are looked for in `/tmp` and `/opt`; whichever are missing are skipped by
+name rather than dropped, so a short table means a build is absent, not that it lost.
+
+All eleven that finished agree exactly — `changed 1,197,876 · added 20,000 · removed 20,000`, with 2,000 duplicate
+keys in A and 1,000 in B — and on every per-column `changed`/`blanked`/`filled` count as well.
+
+| Build | Compare | Peak RSS | Above the mapped files |
+|---|---:|---:|---:|
+| Java 26 `turbo` (HotSpot C2) | **82.49s** | 10,504 MB | 3,487 MB |
+| C++, clang 20 | 83.60s | 8,573 MB | 1,556 MB |
+| C, clang 20 | 85.93s | 8,447 MB | 1,429 MB |
+| C++, clang 18 | 89.21s | 8,573 MB | 1,556 MB |
+| Rust, `--engine turbo` | 104.07s | 8,677 MB | 1,659 MB |
+| Java 25 `turbo` (Graal JIT) | 114.33s | 10,720 MB | 3,703 MB |
+| Zig 0.17.0-dev, ReleaseFast | 116.08s | 8,446 MB | **1,428 MB** |
+| C++, g++ 14 | 129.41s | 8,573 MB | 1,556 MB |
+| C, gcc 14 | 129.46s | 8,447 MB | 1,429 MB |
+| Zig 0.16, ReleaseFast | 130.50s | 8,446 MB | 1,429 MB |
+| C++, g++ 13 | 136.29s | 8,573 MB | 1,556 MB |
+| GraalVM native-image | ✗ did not finish | | see below |
+
+**The JVM wins, and pays for it.** Java 26 on HotSpot beats every ahead-of-time-compiled binary here,
+clang-20 C++ included. It also uses 3,487 MB above the mapped files where C++ uses 1,556 and Zig
+1,428 — more than twice the memory for a 1% lead. At twenty million rows the fastest thing in this
+project is the one with a garbage collector, which is not the result the earlier sections would lead
+you to expect.
+
+**A newer compiler is worth real time, and the effect is not small.** clang 20 over clang 18: 6%.
+g++ 14 over g++ 13: 5%. Zig 0.17.0-dev over 0.16: **11%**, the largest single-version gain measured
+anywhere in this project. None of these involved touching the source. The clang-versus-gcc gap does
+narrow with scale — 1.7x at a million rows, 1.55x here — but it is still the largest single factor in
+the table.
+
+**The memory ordering is stable across every scale.** Zig lowest, C a few megabytes behind it, C++
+next, Rust after that, the JVM last by a wide margin. The same order held at one million and ten
+million rows. Whatever else changes with scale, how much each design allocates on top of the files it
+maps does not.
+
+### Four ways to run the same jar
+
+The 20M table has Java on HotSpot and Java on the Graal JIT running *different bytecode* — the Graal
+build targets release 25 because GraalVM for JDK 26 was not out — so it cannot separate the compiler
+from the class-file version. This does, at a million rows where a run is short enough to repeat: same
+engine, same input, same flags, six ways of executing it (`bench_native.py --rows 1m --only jvm`).
+
+| Execution mode | Compare | Peak RSS |
+|---|---:|---:|
+| HotSpot C2, Java 25 jar | **5.25s** | 633 MB |
+| C2 inside GraalVM (`-XX:-UseJVMCICompiler`) | 5.26s | 663 MB |
+| HotSpot C2, Java 26 jar | 5.45s | 631 MB |
+| Graal JIT | 8.71s | 785 MB |
+| native-image, Serial GC (the default) | 93.11s | **484 MB** |
+| native-image, G1 GC (`--gc=G1`) | 108.28s | 720 MB |
+
+**The class-file version is noise.** 5.25s against 5.45s is inside run-to-run variation, so the 20M
+comparison above was not confounded after all — it really is measuring the compiler.
+
+**The Graal JIT is 1.66x slower than C2 on this workload**, and switching JVMCI off *inside GraalVM*
+recovers C2's time to the hundredth of a second. So it is the compiler, not the distribution, not the
+JDK. Graal earns its reputation on abstraction-heavy code that needs aggressive inlining and escape
+analysis; this engine is a tight loop reading memory-mapped bytes, which is exactly where C2 has had
+two decades of tuning.
+
+**Ahead-of-time compilation costs 17-21x here, and buys the lowest memory on the JVM.** native-image
+produces correct answers and the smallest peak RSS of anything in this table — 484 MB, under C2's
+631 MB. It is also seventeen times slower with the default collector and twenty-one with G1, which is
+enough to swamp its one structural advantage: on ten thousand rows, where startup should dominate and
+a just-in-time compiler has no time to warm up, the whole process still takes 1.21s against HotSpot's
+0.91s. There is no size in this project at which it comes out ahead on time.
+
+Why is a hypothesis rather than a measurement — this was not profiled. But the shape of the workload
+points somewhere specific: the engine does almost nothing except read through `MemorySegment`s backed
+by a shared `Arena`, so if the access path HotSpot intrinsifies has a weaker ahead-of-time
+counterpart, a program made entirely of those reads would pay for it on every one. A program that
+spent its time elsewhere would not.
+
+At twenty million rows the ratio makes the run impractical. With a correctly built binary and a
+bounded heap it was stopped after 10 minutes, against 82 seconds on HotSpot; earlier attempts under
+Serial and G1 were stopped at 30 and 21 minutes, and the first — before the heap was bounded — was
+killed by the kernel, because native-image sizes its heap from physical RAM without knowing about the
+7 GB of files the engine is about to map. The row is left as "did not finish" rather than filled with
+an extrapolation.
+
+Getting a working binary at all took three builds, which is part of the answer too:
+
+- `Arena.ofShared` is refused unless the image is built with `-H:+SharedArenaSupport`.
+- Jackson needs reachability metadata for the result records. The tracing agent supplies it, but only
+  for the paths the traced run actually took — a run over the small fixture missed an array type that
+  a real comparison serializes, and the failure surfaced only at the end of a long run.
+
+```bash
+# what the working build takes
+/opt/graalvm/bin/java -agentlib:native-image-agent=config-output-dir=cfg \
+  -jar csvdiff.jar compare a.csv b.csv -k id --engine turbo -o out.html --json out.json
+native-image -jar csvdiff.jar -o csvdiff-native --no-fallback -march=native -O2 \
+  -H:+UnlockExperimentalVMOptions -H:+SharedArenaSupport -H:ConfigurationFileDirectories=cfg
+```
+
 ## Against the field
 
 The section above compares this project with itself: five languages, eighteen engines, one design.
@@ -742,7 +857,12 @@ same design can be measured in four languages without three more HTML renderers 
 |---|---|---|---|
 | C | [`c/`](c/) | `cc` or `clang`, C11 | one file; no `--trim`, `--ignore-case` or `--tolerance` |
 | C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | `--ignore-case` is ASCII-only and refuses non-ASCII by name |
-| Zig | [`zig/`](zig/) | Zig 0.16, `--release=fast` | `--max-memory MB` is enforced, not advisory |
+| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | `--max-memory MB` is enforced, not advisory |
+
+The Zig source builds unchanged on 0.17.0-dev; only `build.zig` needs a newer API (`b.args` moved), so
+a dev toolchain compiles it with `zig build-exe src/main.zig -O ReleaseFast`. The Java port compiles
+at release 25 as well as 26, which is what makes it runnable on GraalVM — see
+[four ways to run the same jar](#four-ways-to-run-the-same-jar).
 
 Each has a `test.sh` holding it to the Rust port's answers on `tests/fixtures/awkward_*.csv`.
 
