@@ -259,6 +259,10 @@ Input sizes: 10k = 3.7 MB · 1M = 368 MB · 10M = 3.68 GB · 20M = 7.36 GB.
 **Nine of nineteen engines do not finish at 10M.** That is where the design decisions show, and it is
 why the recommendation table turns on memory rather than speed.
 
+**`shard`'s win at 10M does not survive to 20M.** The 0.08s between `shard` and `turbo` here is
+noise on single runs; measured properly at twice the size, `turbo` is 19% ahead. See
+[SWAR, and how it compares to real SIMD](#swar-and-how-it-compares-to-real-simd).
+
 **10k measures process startup, not comparison.** A JVM costs about half a second before it reads a
 byte, which is essentially the whole spread in that column.
 
@@ -328,6 +332,11 @@ What the engine actually allocates, with the mapped inputs subtracted:
 **The JVM wins at 20M**, one percent ahead of clang-20 C++ — and pays 3,487 MB where C++ pays 1,556
 and Zig 1,428. At the largest size tested, the fastest thing in this project is the one with a
 garbage collector. That is not where Set A pointed.
+
+The Java row is `turbo`, and it is the right choice at this size: `shard`, which edged `turbo` at 10M
+on the Set A runners, is **19% slower at 20M** (96.26s against 80.59s on this host). The full
+four-engine matrix is under
+[SWAR, and how it compares to real SIMD](#swar-and-how-it-compares-to-real-simd).
 
 **The compiler moves more than the language does.** At 1M the fastest and slowest builds are both
 C++, from the same source with the same flags, **1.8x apart**. clang beats gcc by 1.6x on C++ and
@@ -558,15 +567,41 @@ experiment. The five byte-level engines are a design matrix:
 plus `simd` — the Vector API reading from the **heap** instead of a mapping, which isolates mapping
 from vectorising.
 
-**The two techniques cost the same.** `shard` (Vector) 25.33s against `turbo` (SWAR) 25.41s at 10M is
-0.3% — noise. On one thread the Vector API was 3% ahead on the runners (`mmap` 31.52s vs `swar`
-32.60s), while on a local 4-core machine SWAR was about 7% ahead in both pairings. Across single runs
-on shared hardware, the honest reading is a tie.
+**They tie at 10M and SWAR wins at 20M.** Running the matrix at both scales, with the incubator
+module added for every run so the comparison is not confounded by it:
 
-**SWAR's real advantage is elsewhere.** It needs no incubator module, so `turbo` is the fastest
+| | Vector API | SWAR | |
+|---|---|---|---|
+| 10M, all cores *(Set A runners)* | `shard` 25.33s | `turbo` 25.41s | tie — 0.3% |
+| 10M, one thread *(Set A runners)* | `mmap` 31.52s | `swar` 32.60s | Vector by 3% |
+| **20M, all cores** *(Set B host)* | `shard` 96.26s | `turbo` **80.59s** | **SWAR by 19%** |
+| **20M, one thread** *(Set B host)* | `mmap` 119.53s | `swar` **106.91s** | **SWAR by 12%** |
+
+At 10M the honest reading was a tie: 0.3% on single runs on shared runners is noise, and the
+one-thread pairing pointed the other way. At 20M, best-of-two on an idle machine, SWAR wins both
+pairings by margins well outside the run-to-run spread — which for these runs is about 5%, measured
+by running `turbo` with and without the vector module on the classpath (80.59s against 84.87s, a
+difference it cannot causally have, since `turbo` never calls the Vector API).
+
+*Why* it reverses is not established: the scale and the host both changed between the two pairs of
+rows, so this does not isolate which is responsible. What it does settle is that "the two techniques
+cost the same" is not true at every size, and that the engine shipping as the default is the right
+one at the largest size tested.
+
+Peak RSS at 20M, where the two techniques are within 20 MB of each other in every pairing: `shard`
+10,519 MB, `turbo` 10,500 MB, `mmap` 10,027 MB, `swar` 10,037 MB, against 7,018 MB of mapped input.
+All four return `changed 1,197,876 · added 20,000 · removed 20,000`, matching the C, C++, Zig and
+Rust ports exactly.
+
+**SWAR's other advantages are structural.** It needs no incubator module, so `turbo` is the fastest
 engine that runs on a stock `java -jar` with no flags, and it uses slightly less memory because no
 vector machinery is loaded. That is also why the C, C++, Zig and Rust ports all use SWAR: it is
 portable in a way `--add-modules jdk.incubator.vector` is not.
+
+**Four cores buy less than you would expect.** `turbo` against `swar` is 1.33x and `shard` against
+`mmap` is 1.24x at 20M — well short of the 4x the core count suggests, because the scan is bound by
+memory bandwidth rather than by instruction throughput. The single-threaded engines also finish in
+about 470 MB less, which is the per-thread index and scratch structures the parallel ones allocate.
 
 **Mapping matters more than vectorising.** `simd` (Vector API, heap) is the fastest Java engine at 1M
 — 3.61s — and the *first* to die at 10M, 2.9 seconds in, because it holds the file on the heap.
@@ -771,6 +806,10 @@ python scripts/gen_data.py --rows 20m --out-dir bench/external/data --prefix 20m
 python scripts/bench_native.py --rows 20m --repeats 2
 python scripts/bench_native.py --rows 1m --only jvm     # execution modes
 
+# the four Java byte-level engines head to head (Vector API needs the module)
+java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \
+  compare a.csv b.csv -k account_id,txn_id -i updated_at --engine shard -o /dev/null
+
 # Set C — the external field
 python scripts/bench_external.py --rows 1m --mem-cap-gb 12
 
@@ -826,11 +865,14 @@ Sizes and shapes not yet answered, roughly in the order they would pay off:
    mapping engines should not, but "should" is not a measurement.
 3. **Does `sortmerge` ever beat `turbo` on time?** It does in Rust at 1M. Whether that holds at
    larger sizes, or in the other ports, is open.
-4. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
+4. **Isolate the SWAR-versus-Vector reversal.** SWAR ties the Vector API at 10M and wins by 19% at
+   20M, but the host changed with the scale. Running both scales on one host would say whether it is
+   the size or the machine.
+5. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
    cell work, and probably the ranking.
-5. **Many small comparisons** rather than one big one — where JVM startup dominates and
+6. **Many small comparisons** rather than one big one — where JVM startup dominates and
    native-image's startup advantage might finally pay for its throughput.
-6. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
+7. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
    the 17-21x should move.
 
 ## Suggested additions
