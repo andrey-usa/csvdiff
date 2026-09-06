@@ -40,3 +40,6 @@ replay_pid*.log
 # Zig build output.
 /zig/zig-out/
 /zig/.zig-cache/
+
+# C build output.
+/c/csvdiff

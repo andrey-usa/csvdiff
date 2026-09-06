@@ -33,12 +33,12 @@ On a million rows, best of three, one 4-core container:
 
 | Build | Compare | Peak RSS |
 |---|---:|---:|
-| `clang++ 18` | **3.59s** | 509 MB |
-| `g++ 13` | 6.49s | 509 MB |
+| `clang++ 18` | **3.64s** | 509 MB |
+| `g++ 13` | 6.27s | 509 MB |
 
-Same source, same flags (`-std=c++20 -O2 -march=native`), **1.8x apart**. For
-comparison, Rust and Java running the same design land at 5.53s and 5.55s — so
-whether this port is the fastest thing in the project or the slowest of the three
+Same source, same flags (`-std=c++20 -O2 -march=native`), **1.7x apart**. For
+comparison, Rust running the same design lands at 5.25s and C at 4.77s — so
+whether this port is the fastest thing in the project or the slowest of them all
 is decided by which compiler built it, not by the language it is written in.
 
 That is worth knowing before reading any single-number language comparison,

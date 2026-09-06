@@ -145,3 +145,40 @@ jobs:
           PY
           done
           test "$fail" = 0 || { echo "the implementations disagree on the awkward fixture"; exit 1; }
+
+      - name: The byte-level C and C++ ports agree with Python
+        working-directory: .
+        run: |
+          # These two need no toolchain setup on the runner, so they are cheap to hold to the same
+          # fixture. They carry the comparison and the JSON counts, not the HTML report, and the C
+          # port implements neither --trim nor --ignore-case -- so each is checked on the options it
+          # actually offers rather than being skipped for the ones it does not.
+          make -C c
+          make -C cpp
+          A=tests/fixtures/awkward_a.csv; B=tests/fixtures/awkward_b.csv
+          fail=0
+          for opts in "" "--trim"; do
+            ARGS="-k k $opts"
+            rm -f /tmp/py.json /tmp/c.json /tmp/cpp.json
+            csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
+            cpp/build/csvdiff compare $A $B $ARGS --json /tmp/cpp.json || true
+            if [ -z "$opts" ]; then c/csvdiff compare $A $B $ARGS --json /tmp/c.json || true; fi
+            OPTS="$opts" python3 - <<'PY' || fail=1
+          import json, os, sys
+          opts = os.environ.get("OPTS") or "(defaults)"
+          py = json.load(open("/tmp/py.json"))
+          for other in ("c", "cpp"):
+              try:
+                  o = json.load(open(f"/tmp/{other}.json"))
+              except FileNotFoundError:
+                  continue  # not offered by that port under these options
+              for section in ("counts", "columns"):
+                  if o[section] != py[section]:
+                      print(f"{opts}: {other} {section} differ from python")
+                      print(f"  python: {json.dumps(py[section])}")
+                      print(f"  {other}: {json.dumps(o[section])}")
+                      sys.exit(1)
+          print(f"{opts}: c and c++ agree with python")
+          PY
+          done
+          test "$fail" = 0 || { echo "the byte-level ports disagree with python"; exit 1; }
