@@ -486,6 +486,7 @@ impl RowIndex {
             dup_rows: 0,
         };
         let mut fields = vec![ABSENT; width];
+        let mut scratch = vec![ABSENT; width];
         let mut pos = from;
         while pos < end {
             // A line with nothing on it is not a row, which is what every other
@@ -508,7 +509,7 @@ impl RowIndex {
                      use --engine native"
                 )));
             }
-            idx.add(slab, pos, &fields, key_size, opt, parser, width);
+            idx.add(slab, pos, &fields, key_size, opt, parser, &mut scratch);
             if next <= pos {
                 break; // no progress: a malformed tail rather than an endless loop
             }
@@ -526,7 +527,7 @@ impl RowIndex {
         key_size: usize,
         opt: &Options,
         parser: &RowParser,
-        width: usize,
+        scratch: &mut [Field],
     ) {
         self.rows += 1;
         let row = self.row_start.len() as i32;
@@ -548,7 +549,7 @@ impl RowIndex {
             }
             let candidate = self.first_row[at as usize];
             if self.row_hash[candidate as usize] == hash
-                && self.same_key(slab, candidate, fields, key_size, opt, parser, width)
+                && self.same_key(slab, candidate, fields, key_size, opt, parser, scratch)
             {
                 self.occurrences[at as usize] += 1;
                 if self.occurrences[at as usize] == 2 {
@@ -571,10 +572,9 @@ impl RowIndex {
         key_size: usize,
         opt: &Options,
         parser: &RowParser,
-        width: usize,
+        probe: &mut [Field],
     ) -> bool {
-        let mut probe = vec![ABSENT; width];
-        self.fields_of(slab, parser, candidate, &mut probe);
+        self.fields_of(slab, parser, candidate, probe);
         (0..key_size).all(|i| same(slab, probe[i], slab, fields[i], opt))
     }
 
@@ -618,10 +618,9 @@ impl RowIndex {
         key_size: usize,
         opt: &Options,
         parser: &RowParser,
-        width: usize,
+        probe: &mut [Field],
     ) -> Option<i32> {
         let mut slot = self.slot(hash);
-        let mut probe = vec![ABSENT; width];
         loop {
             let at = self.table[slot];
             if at == EMPTY {
@@ -629,7 +628,7 @@ impl RowIndex {
             }
             let candidate = self.first_row[at as usize];
             if self.row_hash[candidate as usize] == hash {
-                self.fields_of(slab, parser, candidate, &mut probe);
+                self.fields_of(slab, parser, candidate, probe);
                 if (0..key_size).all(|i| same(slab, probe[i], other, fields[i], opt)) {
                     return Some(candidate);
                 }
@@ -727,12 +726,13 @@ fn join(
 
     let mut fa = vec![ABSENT; width];
     let mut fb = vec![ABSENT; width];
+    let mut probe = vec![ABSENT; width];
 
     // A's distinct keys, in first-appearance order, so a run is reproducible.
     for &row in &ai.first_row {
         ai.fields_of(a, ap, row, &mut fa);
         let hash = key_hash(a, &fa, key_size, opt);
-        let Some(mate) = bi.lookup(b, a, &fa, hash, key_size, opt, bp, width) else {
+        let Some(mate) = bi.lookup(b, a, &fa, hash, key_size, opt, bp, &mut probe) else {
             removed.push(Pick { row, mate: -1 });
             continue;
         };
@@ -761,7 +761,7 @@ fn join(
         bi.fields_of(b, bp, row, &mut fb);
         let hash = key_hash(b, &fb, key_size, opt);
         if ai
-            .lookup(a, b, &fb, hash, key_size, opt, ap, width)
+            .lookup(a, b, &fb, hash, key_size, opt, ap, &mut probe)
             .is_none()
         {
             added.push(Pick { row, mate: -1 });
