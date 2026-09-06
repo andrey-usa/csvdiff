@@ -533,12 +533,16 @@ python scripts/bench_external.py --rows 1m --mem-cap-gb 12
 ```
 
 Each tool runs three times and the time is the median, the memory the largest seen — except at ten
-million rows, which is a single run because several of the tools take minutes to fail. Both inputs are
+million rows, which is two runs because several of the tools take minutes to fail. Both inputs are
 read once before anything is timed, so no tool is charged for the page-cache miss the others avoid.
 Peak memory is the high-water mark of the whole process tree, so a shell pipeline is credited with
 what `sort` actually used. Each tool's address space is capped, because at ten million rows several
 of them want more memory than the machine has, and without a cap the kernel does not fail them — it
-kills whatever it likes.
+kills whatever it likes. There is exactly one exemption from that cap, and why is below.
+
+Tools are found on `PATH` or in `bench/external/tools/`; whichever are missing are skipped by name
+rather than silently dropped. The DuckDB and ClickHouse CLIs are single static binaries from their
+own projects, and `daff` comes from npm.
 
 These runs are on a 4-core / 16 GB container, not on the GitHub runners the section above uses, so
 compare tools within these tables and not across to those.
