@@ -453,6 +453,72 @@ shared runners, the honest reading is that the two techniques cost the same. SWA
 elsewhere: it needs **no incubator module**, so `turbo` is the fastest engine that runs on a stock
 `java -jar` with no flags, and it uses slightly less memory because no vector machinery is loaded.
 
+## The byte-level ports: C, C++, Zig and Rust
+
+The tables above compare engines written in five languages, but each language got whichever design
+suited it. That confounds the two things anyone actually wants separated. So the *same* byte-level
+design — map the file, pack a field into one 64-bit word (40 bits of offset, 23 of length, one for
+"contains a doubled quote"), find delimiters eight bytes at a time with SWAR, open-address the keys,
+never build a string per cell — was written three more times, in [`c/`](c/), [`cpp/`](cpp/) and
+[`zig/`](zig/), to sit alongside Rust's `--engine turbo` and Java's.
+
+Those three are **benchmark and parity ports**, not products. Each carries the comparison and the JSON
+counts, holds itself to the Rust port's answers on `tests/fixtures/awkward_*.csv`, and stops there —
+no HTML report, and in C's case no `--trim` or `--ignore-case` either. What they are for is isolating
+technique from language on numbers measured the same way.
+
+One 4-core container, one sitting, page cache warm. Peak RSS is the kernel's high-water mark from
+`wait4`, and because mapped pages are resident it includes the input files — so the column that
+carries information is the last one.
+
+**1M rows** (best of three; the two inputs map 351 MB):
+
+| Build | Compare | Peak RSS | Above the mapped files |
+|---|---:|---:|---:|
+| C++, clang 18 | **3.64s** | 509 MB | 158 MB |
+| C, clang 18 | 4.77s | 417 MB | 67 MB |
+| Rust, `--engine turbo` | 5.25s | 583 MB | 232 MB |
+| Zig 0.16, ReleaseFast | 5.31s | 414 MB | **63 MB** |
+| C, gcc 13 | 5.34s | 417 MB | 67 MB |
+| C++, gcc 13 | 6.27s | 509 MB | 158 MB |
+
+**10M rows** (best of two; the two inputs map 3,679 MB):
+
+| Build | Compare | Peak RSS | Above the mapped files |
+|---|---:|---:|---:|
+| C++, clang 18 | **37.8s** | 4,334 MB | 655 MB |
+| Rust, `--engine turbo` | 49.1s | 4,412 MB | 733 MB |
+| Zig 0.16, ReleaseFast | 59.9s | 4,224 MB | **545 MB** |
+| C, gcc 13 | 61.2s | 4,224 MB | **545 MB** |
+
+### What these ports say
+
+**The compiler moves more than the language.** The fastest and the slowest builds in the 1M table are
+both C++, from the same source with the same flags, 1.7x apart. clang is worth 1.12x on the C port and
+1.72x on the C++ one. Any comparison of C against Rust against Zig that does not name the compiler
+behind each binary is reporting the toolchain and calling it the language — which includes the earlier
+sections of this README, where the Rust and Go numbers come from whichever toolchain the runner had.
+
+**The memory floor belongs to the design, not the language.** C was written specifically to find the
+floor, and it did not find one: 67 MB above the mapped files against Zig's 63 MB at a million rows,
+and *identical* at ten million. Once the row index, the offset array and the hash table are sized the
+same way, there is nothing left for a language to save. Rust's 232 MB and C++'s 158 MB are not runtime
+overhead either — they are those same structures sized more generously.
+
+**Technique, not language, was most of the original gap.** The five-language tables above show Java's
+byte-level `turbo` at 4.02s on a million rows and Rust's row-oriented `native` at 12.22s — 3x apart,
+in a comparison people would read as "Java beat Rust". Give Rust the same design and the question
+disappears: on this host, measured back to back, Rust `native` takes 21.97s and 2,896 MB while Rust
+`turbo` takes 5.22s and 583 MB. **4.2x faster and a fifth of the memory, same language, same
+compiler, same binary** — the only thing that changed is the design. Whatever the five-language
+tables are measuring, most of it is not the language.
+
+**Zig turns a bound into a guarantee.** Its `--max-memory MB` is a `FixedBufferAllocator`, so the
+limit is enforced rather than measured: on a million rows the comparison is refused at 200 MB and
+completes at 204 MB, with no way for it to quietly exceed what it was given. The other three ports can
+only be *observed* to stay small. That is the one thing in this section a different language actually
+bought.
+
 ## Against the field
 
 The section above compares this project with itself: five languages, eighteen engines, one design.
@@ -484,6 +550,7 @@ compare tools within these tables and not across to those.
 | **csvdiff (this project)** | bespoke, `turbo` and `sortmerge` engines | yes |
 | **csvdiff (Go, aswinkarthik)** | the fastest dedicated CSV diff in wide use; xxHash of key and row | yes, but the answer is coarser |
 | **DuckDB CLI** | a full outer join written by hand in SQL | yes |
+| **clickhouse-local** | the same join, on the fastest CSV reader in the survey | yes |
 | **daff** | the tabular-diff library behind `git daff`; alignment-based, `--id` pins a key | yes |
 | **datacompy** (Capital One) | the reconciliation library, on pandas or Polars | yes |
 | **pandas** | the outer merge people write before finding a library | yes |
@@ -498,45 +565,52 @@ transferring. **qsv** has no keyed diff subcommand of this shape.
 
 | Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |
 | --- | --- | ---: | ---: | --- | --- | --- |
-| csvdiff (this project, turbo) | bespoke | 0.70s | 111 MB | 600 / 10 / 10 | reference | cell-level diff, duplicate-key report, self-contained HTML |
-| csvdiff (this project, sortmerge) | bespoke | 0.64s | 137 MB | 600 / 10 / 10 | yes | cell-level diff, duplicate-key report, self-contained HTML |
-| csvdiff (Go, aswinkarthik) | hash-only | 0.03s | 18 MB | 600 / 10 / 10 | yes | row hash only: says a row changed, not which cell |
-| DuckDB CLI (hand-written SQL) | SQL | 0.20s | 42 MB | 600 / 10 / 10 | yes | counts only: no cell diff, no duplicate-key report, no report file |
-| daff (JS) | alignment diff | 0.30s | 120 MB | 600 / 11 / 11 | dup keys only | cell-level diff; no duplicate-key concept — a repeated key reads as an insert |
-| datacompy (pandas) | dataframe | 0.88s | 188 MB | 600 / 11 / 11 | dup keys only | cell-level diff and a per-column summary; whole frame in memory |
-| datacompy (polars) | dataframe | 0.56s | 178 MB | 600 / 11 / 11 | dup keys only | same library, columnar backend |
-| pandas (hand-written merge) | dataframe | 0.52s | 141 MB | 600 / 10 / 10 | yes | counts only unless you write more; duplicate keys multiply through the merge |
-| csv-diff (Python) | row dicts | 0.24s | 67 MB | 600 / 10 / 10 | yes | single key column and no column-ignore, so the input has to be reshaped first |
-| sort(1) + join(1) | shell pipeline | 0.08s | 5 MB | 600 / 10 / 10 | yes | counts only; no CSV quoting, no duplicate-key concept, no diff |
+| csvdiff (this project, turbo) | bespoke | 0.91s | 102 MB | 600 / 10 / 10 | reference | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (this project, sortmerge) | bespoke | 0.90s | 139 MB | 600 / 10 / 10 | yes | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (Go, aswinkarthik) | hash-only | 0.05s | 22 MB | 600 / 10 / 10 | yes | row hash only: says a row changed, not which cell |
+| DuckDB CLI (hand-written SQL) | SQL | 0.26s | 47 MB | 600 / 10 / 10 | yes | counts only: no cell diff, no duplicate-key report, no report file |
+| clickhouse-local (hand-written SQL) | SQL | 0.19s | 191 MB | 600 / 10 / 10 | yes | counts only: no cell diff, no duplicate-key report, no report file |
+| clickhouse-local (SQL, spilling join) | SQL | 0.22s | 197 MB | 600 / 10 / 10 | yes | counts only: no cell diff, no duplicate-key report, no report file; spills to disk, so it finishes where the in-memory join cannot |
+| daff (JS) | alignment diff | 0.48s | 121 MB | 600 / 11 / 11 | dup keys only | cell-level diff; no duplicate-key concept — a repeated key reads as an insert |
+| datacompy (pandas) | dataframe | 1.06s | 188 MB | 600 / 11 / 11 | dup keys only | cell-level diff and a per-column summary; whole frame in memory |
+| datacompy (polars) | dataframe | 0.79s | 178 MB | 600 / 11 / 11 | dup keys only | same library, columnar backend |
+| pandas (hand-written merge) | dataframe | 0.89s | 143 MB | 600 / 10 / 10 | yes | counts only unless you write more; duplicate keys multiply through the merge |
+| csv-diff (Python) | row dicts | 0.34s | 67 MB | 600 / 10 / 10 | yes | single key column and no column-ignore, so the input has to be reshaped first |
+| sort(1) + join(1) | shell pipeline | 0.11s | 4 MB | 600 / 10 / 10 | yes | counts only; no CSV quoting, no duplicate-key concept, no diff |
 
 ### 1 000 000 rows (368 MB)
 
 | Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |
 | --- | --- | ---: | ---: | --- | --- | --- |
-| csvdiff (this project, turbo) | bespoke | 4.94s | 667 MB | 60,049 / 1,000 / 1,000 | reference | cell-level diff, duplicate-key report, self-contained HTML |
-| csvdiff (this project, sortmerge) | bespoke | 17.24s | 2,031 MB | 60,049 / 1,000 / 1,000 | yes | cell-level diff, duplicate-key report, self-contained HTML |
-| csvdiff (Go, aswinkarthik) | hash-only | 2.81s | 1,482 MB | 60,049 / 1,000 / 1,000 | yes | row hash only: says a row changed, not which cell |
-| DuckDB CLI (hand-written SQL) | SQL | 7.57s | 1,273 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
-| daff (JS) | alignment diff | 40.61s | 4,247 MB | 60,049 / 1,050 / 1,100 | dup keys only | cell-level diff; no duplicate-key concept — a repeated key reads as an insert |
-| datacompy (pandas) | dataframe | 29.83s | 2,272 MB | 60,049 / 1,049 / 1,099 | no (added +49, removed +99) | cell-level diff and a per-column summary; whole frame in memory |
-| datacompy (polars) | dataframe | 4.09s | 2,666 MB | 60,049 / 1,049 / 1,099 | no (added +49, removed +99) | same library, columnar backend |
-| pandas (hand-written merge) | dataframe | 17.34s | 1,799 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only unless you write more; duplicate keys multiply through the merge |
-| sort(1) + join(1) | shell pipeline | 8.23s | 251 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only; no CSV quoting, no duplicate-key concept, no diff |
+| csvdiff (this project, turbo) | bespoke | 6.26s | 664 MB | 60,049 / 1,000 / 1,000 | reference | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (this project, sortmerge) | bespoke | 13.93s | 1,625 MB | 60,049 / 1,000 / 1,000 | yes | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (Go, aswinkarthik) | hash-only | 3.32s | 1,519 MB | 60,049 / 1,000 / 1,000 | yes | row hash only: says a row changed, not which cell |
+| DuckDB CLI (hand-written SQL) | SQL | 8.09s | 1,151 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
+| clickhouse-local (hand-written SQL) | SQL | 2.23s | 1,417 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
+| clickhouse-local (SQL, spilling join) | SQL | 6.71s | 1,954 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only: no cell diff, no duplicate-key report, no report file; spills to disk, so it finishes where the in-memory join cannot |
+| daff (JS) | alignment diff | 46.87s | 4,134 MB | 60,049 / 1,050 / 1,100 | dup keys only | cell-level diff; no duplicate-key concept — a repeated key reads as an insert |
+| datacompy (pandas) | dataframe | 38.70s | 2,274 MB | 60,049 / 1,049 / 1,099 | no (added +49, removed +99) | cell-level diff and a per-column summary; whole frame in memory |
+| datacompy (polars) | dataframe | 5.64s | 2,685 MB | 60,049 / 1,049 / 1,099 | no (added +49, removed +99) | same library, columnar backend |
+| pandas (hand-written merge) | dataframe | 28.21s | 1,825 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only unless you write more; duplicate keys multiply through the merge |
+| csv-diff (Python) | row dicts | 25.26s | 3,420 MB | 60,049 / 1,000 / 1,000 | yes | single key column and no column-ignore, so the input has to be reshaped first |
+| sort(1) + join(1) | shell pipeline | 10.58s | 251 MB | 60,056 / 1,000 / 1,001 | no (changed +7, removed +1) | counts only; no CSV quoting, no duplicate-key concept, no diff |
 
 ### 10 000 000 rows (3.68 GB)
 
 | Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |
 | --- | --- | ---: | ---: | --- | --- | --- |
-| csvdiff (this project, turbo) | bespoke | 34.45s | 5,392 MB | 599,320 / 10,000 / 10,000 | reference | cell-level diff, duplicate-key report, self-contained HTML |
-| csvdiff (this project, sortmerge) | bespoke | 126.39s | 1,853 MB | 599,320 / 10,000 / 10,000 | yes | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (this project, turbo) | bespoke | 44.77s | 6,217 MB | 599,320 / 10,000 / 10,000 | reference | cell-level diff, duplicate-key report, self-contained HTML |
+| csvdiff (this project, sortmerge) | bespoke | 144.98s | 1,594 MB | 599,320 / 10,000 / 10,000 | yes | cell-level diff, duplicate-key report, self-contained HTML |
 | csvdiff (Go, aswinkarthik) | hash-only | — | — | — | — | **out of memory** |
-| DuckDB CLI (hand-written SQL) | SQL | 73.17s | 8,765 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
+| DuckDB CLI (hand-written SQL) | SQL | 91.94s | 8,746 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
+| clickhouse-local (hand-written SQL) | SQL | 152.57s | 8,345 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only: no cell diff, no duplicate-key report, no report file |
+| clickhouse-local (SQL, spilling join) | SQL | 507.21s | 6,711 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only: no cell diff, no duplicate-key report, no report file; spills to disk, so it finishes where the in-memory join cannot |
 | daff (JS) | alignment diff | — | — | — | — | **V8 string cap: cannot read a file over 512 MB** |
 | datacompy (pandas) | dataframe | — | — | — | — | **out of memory** |
 | datacompy (polars) | dataframe | — | — | — | — | **out of memory** |
 | pandas (hand-written merge) | dataframe | — | — | — | — | **out of memory** |
 | csv-diff (Python) | row dicts | — | — | — | — | **out of memory** |
-| sort(1) + join(1) | shell pipeline | 119.75s | 2,483 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only; no CSV quoting, no duplicate-key concept, no diff |
+| sort(1) + join(1) | shell pipeline | 118.47s | 2,483 MB | 599,411 / 10,000 / 10,001 | no (changed +91, removed +1) | counts only; no CSV quoting, no duplicate-key concept, no diff |
 
 ### Where the answers differ
 
@@ -556,7 +630,8 @@ the second copy in B. Exactly one key in this data is duplicated on *both* sides
 answer — but it is an answer to a question the tool never asks the user, and it means the count
 depends on the order the duplicates appear in.
 
-**Tools that join** — the DuckDB SQL, the pandas merge, the shell pipeline — multiply them instead. A
+**Tools that join** — the DuckDB SQL, the ClickHouse SQL, the pandas merge, the shell pipeline —
+multiply them instead. A
 key twice in A and once in B joins to two rows; the one key twice on both sides joins to four. That is
 151 extra rows at a million, and each one that happens to be a *changed* row is counted again — which
 is why `changed` lands 7 too high there and 91 too high at ten million. The number is not a property
@@ -575,36 +650,59 @@ counted. Reduced to distinct keys its answer is identical to ours, which is what
 
 ### What the field says
 
-**At ten million rows, most of the field cannot run at all.** Six of the nine approaches fail on
-3.68 GB of input in a 12 GB budget: the Go tool, both datacompy backends, the pandas merge, csv-diff,
-and daff. The interesting thing is not that they are slow — it is that "fastest" stops being the
-question. What is left is this project's two engines, a hand-written SQL join, and a shell pipeline.
+**At ten million rows, most of the field cannot run at all.** Six of the ten entries fail on 3.68 GB
+of input in a 12 GB budget: the Go tool, both datacompy backends, the pandas merge, csv-diff, and
+daff. The interesting thing is not that they are slow — it is that "fastest" stops being the question.
+What is left is this project's two engines, two SQL engines, and a shell pipeline.
 
 **daff's ceiling is not memory.** It reads the file with `readFileSync`, and V8 refuses to build a
 string longer than 512 MB. No amount of RAM moves that limit, so daff cannot open a file this size on
 any machine. Every other failure above is a genuine memory exhaustion; this one is a wall.
 
 **The backend decides a dataframe's speed, not the library.** At a million rows datacompy takes
-29.83s on pandas and 4.09s on Polars — the same library, the same call, 7.3x apart. That gap is
+38.70s on pandas and 5.64s on Polars — the same library, the same call, 6.9x apart. That gap is
 wider than any language difference in this whole project. If a dataframe reconciliation is slow, the
 first question is which backend it is on.
 
-**The dedicated tool is faster and hungrier.** csvdiff (Go) finishes a million rows in 2.81s against
-our 4.94s, and uses 1,482 MB against our 667 MB — while storing strictly less: two hashes per row,
+**The dedicated tool is faster and hungrier.** csvdiff (Go) finishes a million rows in 3.32s against
+our 6.26s, and uses 1,519 MB against our 664 MB — while storing strictly less: two hashes per row,
 which is why it can say a row changed but not which cell. Then at ten million it runs out of memory
 and we do not. That is the "no String per cell" design earning its keep against a tool that
 deliberately keeps less.
 
 **Everything agrees about cells. Nothing agrees about duplicate keys.** Not one tool in this table
 found a changed cell another missed. Every difference in the counts is duplicate-key handling, and
-**none of the eight external tools reports duplicate keys at all** — they either fold them in
-silently or multiply them into the answer. On data that has any, three of these approaches will hand
+**not one of the ten external entries reports duplicate keys at all** — they either fold them in
+silently or multiply them into the answer. On data that has any, four of these approaches will hand
 you an inflated diff and say nothing about why.
 
+**Two independent SQL engines make the identical mistake.** DuckDB and ClickHouse return exactly
+`60,056 / 1,000 / 1,001` at a million rows and exactly `599,411 / 10,000 / 10,001` at ten million —
+the same seven-too-high `changed` count, down to the row, and the shell pipeline lands on both
+numbers too. They share no code; what they share is `FULL OUTER JOIN`, and the inflation is a
+property of the operator, not of any engine. That is worth more than one tool getting it wrong: the
+answer you get from SQL here is the answer *SQL* gives, and picking a better engine does not change
+it.
+
+**The fastest SQL has a cliff, and the way down costs 3.3x.** clickhouse-local does a million
+rows in 2.23s — the fastest anything in this table, ours included, and 3.6x quicker than the DuckDB
+CLI. Then the shape of the query stops working: it loads both files into memory and joins with a
+hash, so at ten million it either takes 152.57s and 8,345 MB or aborts on its own memory limit,
+depending on how much RAM the machine happens to have free when it starts. Rewritten to stream from
+`file()` with `join_algorithm = 'partial_merge'` — a spilling sort-merge join, the same algorithm as
+our `sortmerge` engine — it finishes reliably, at 507.21s and 6,711 MB. That is 3.5x this project's
+`sortmerge` in time and 4.2x in memory, for counts rather than a diff.
+
+One caveat, because it changes what the row means: the spilling variant is the only entry measured
+outside the 12 GB address-space cap. Under `RLIMIT_AS` it does not report a memory error, it
+segfaults — ClickHouse reserves far more address space than it makes resident, so the cap fires on a
+mapping rather than on real use. Capped, the table would have recorded the instrument instead of the
+tool. Its measured 6,711 MB is well inside the budget every other row was held to.
+
 **The shell pipeline is better than it has any right to be.** `sort | join` does a million rows in
-8.23s and 251 MB, and ten million in 119.75s and 2,483 MB — less memory than anything else that
-finished, because `sort` spills. It is the right instinct: an external sort-merge join is the correct
-algorithm for data larger than memory. What it cannot do is parse CSV — a comma, a quote or a newline
+10.58s and 251 MB, and ten million in 118.47s and 2,483 MB — quicker there than either ClickHouse
+variant and on less memory than anything else that finished, because `sort` spills. It is the right
+instinct: an external sort-merge join is the correct algorithm for data larger than memory. What it cannot do is parse CSV — a comma, a quote or a newline
 inside a field and the answer is silently wrong — or tell you which cell changed.
 
 That instinct is why the `sortmerge` engine exists. It is the same algorithm with a real CSV parser
@@ -631,7 +729,18 @@ number from one is directly comparable with a number from another.
 | TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
 | Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, sortmerge, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM, plus an out-of-core sort-merge join |
 | Go | [`go/`](go/) | duckdb, sortmerge, native | Go 1.24 |
-| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, native | edition 2024 |
+| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024 |
+
+Three more carry the byte-level engine and the JSON counts only — benchmark and parity ports, so the
+same design can be measured in four languages without three more HTML renderers to keep in step:
+
+| | Directory | Built with | Scope |
+|---|---|---|---|
+| C | [`c/`](c/) | `cc` or `clang`, C11 | one file; no `--trim`, `--ignore-case` or `--tolerance` |
+| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | `--ignore-case` is ASCII-only and refuses non-ASCII by name |
+| Zig | [`zig/`](zig/) | Zig 0.16, `--release=fast` | `--max-memory MB` is enforced, not advisory |
+
+Each has a `test.sh` holding it to the Rust port's answers on `tests/fixtures/awkward_*.csv`.
 
 Two things are enforced in CI by `.github/workflows/parity.yml`, on every change to any of them:
 every implementation returns identical counts and column stats for one dataset, and all five data

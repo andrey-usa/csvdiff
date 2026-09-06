@@ -144,13 +144,20 @@ def _apply_cap() -> None:
         resource.setrlimit(resource.RLIMIT_AS, (MEM_CAP_BYTES, MEM_CAP_BYTES))
 
 
-def run(cmd: list[str], timeout: float = 3600, env: dict | None = None) -> tuple[int, str, str, float, float]:
-    """Runs a command, returning status, stdout, stderr, wall seconds and peak RSS."""
+def run(cmd: list[str], timeout: float = 3600, env: dict | None = None,
+        cap: bool = True) -> tuple[int, str, str, float, float]:
+    """Runs a command, returning status, stdout, stderr, wall seconds and peak RSS.
+
+    `cap=False` exempts a tool from the address-space limit. The limit is
+    RLIMIT_AS, which bounds *reserved* address space rather than resident pages,
+    and one tool here reserves far more than it ever touches — see
+    `clickhouse_sql`. Use it only where the cap is measuring the wrong thing.
+    """
     started = time.perf_counter()
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env={**os.environ, **(env or {})},
-        preexec_fn=_apply_cap if MEM_CAP_BYTES is not None else None,
+        preexec_fn=_apply_cap if (cap and MEM_CAP_BYTES is not None) else None,
     )
     stop = threading.Event()
     seen = peak_rss_mb(proc.pid, stop)
@@ -300,6 +307,79 @@ def duckdb_sql(a: Path, b: Path, out: Path, exe: str) -> Result:
         dict(zip(("changed", "added", "removed"), values)),
         note="counts only: no cell diff, no duplicate-key report, no report file",
     )
+
+
+def clickhouse_sql(a: Path, b: Path, out: Path, exe: str, spill: bool = False) -> Result:
+    """The same full outer join, run by clickhouse-local — the fastest SQL in the survey.
+
+    ClickHouse reads CSV faster than anything else here and joins in parallel,
+    so this is the strongest form of "just use SQL". The columns are declared
+    `String` rather than inferred, for the same reason DuckDB is given
+    `all_varchar`: a comparison tool that reformats a number before comparing it
+    is answering a different question. `join_use_nulls = 1` is required — without
+    it an unmatched side comes back as the column's default value rather than
+    NULL, and every added row silently becomes a changed one.
+
+    Two variants, because the default one has a cliff. The default loads both
+    files into `ENGINE = Memory` tables and joins with the in-memory hash — the
+    query anyone would write, and the fastest thing in the survey until the
+    inputs stop fitting, at which point it aborts on its own memory limit.
+    `spill=True` is the version you rewrite it as: read straight from `file()`,
+    no intermediate tables, and `join_algorithm = 'partial_merge'`, which is a
+    spilling sort-merge join. That one finishes where the default cannot, in
+    exchange for being an order of magnitude slower.
+
+    Its blind spots are the same as DuckDB's either way: the join multiplies
+    duplicate keys instead of reporting them, and this dataset has them on both
+    sides.
+    """
+    struct = ", ".join(f"{c} String" for c in HEADER)
+    compared = [c for c in HEADER if c != IGNORE and c not in KEY]
+    on = " AND ".join(f"a.{k} = b.{k}" for k in KEY)
+    changed = " OR ".join(f"a.{c} IS DISTINCT FROM b.{c}" for c in compared)
+    src = lambda p: f"file('{p}', CSVWithNames, '{struct}')"
+    label = "clickhouse-local (SQL, spilling join)" if spill else "clickhouse-local (hand-written SQL)"
+
+    head: list[str] = []
+    if spill:
+        frm = f"FROM {src(a)} AS a FULL OUTER JOIN {src(b)} AS b ON {on}"
+        settings = ("SETTINGS join_use_nulls = 1, join_algorithm = 'partial_merge',"
+                    " max_bytes_in_join = 3000000000, max_memory_usage = 10000000000;")
+    else:
+        head = [f"CREATE TABLE {n} ENGINE = Memory AS SELECT * FROM {src(p)};"
+                for n, p in (("a", a), ("b", b))]
+        frm = f"FROM a FULL OUTER JOIN b ON {on}"
+        settings = "SETTINGS join_use_nulls = 1;"
+    sql = "\n".join(head + [
+        "SELECT",
+        f"  countIf(a.{KEY[0]} IS NOT NULL AND b.{KEY[0]} IS NOT NULL"
+        f" AND ({changed})) AS changed,",
+        f"  countIf(a.{KEY[0]} IS NULL) AS added,",
+        f"  countIf(b.{KEY[0]} IS NULL) AS removed",
+        frm, settings,
+    ])
+    stem = "clickhouse-spill" if spill else "clickhouse-sql"
+    script = out / f"{stem}.sql"
+    script.write_text(sql + "\n")
+    # The spilling variant is run without the address-space cap. Under RLIMIT_AS
+    # it does not report a memory error, it segfaults — ClickHouse reserves far
+    # more address space than it makes resident, so the cap fires on a mapping
+    # rather than on real use, and what the table would then record is the
+    # instrument rather than the tool. Its own `max_memory_usage` in the SQL
+    # above keeps the run bounded instead; measured RSS stays well under the cap.
+    status, stdout, err, secs, mb = run(
+        [exe, "local", "--format", "CSV", "--queries-file", str(script)],
+        cap=not spill)
+    if status != 0:
+        return Result(label, "SQL", **failure(status, err))
+    rows = [r for r in stdout.strip().splitlines() if r]
+    values = [int(v) for v in rows[-1].split(",")] if rows else [0, 0, 0]
+    (out / f"{stem}.txt").write_text(stdout)
+    note = "counts only: no cell diff, no duplicate-key report, no report file"
+    if spill:
+        note += "; spills to disk, so it finishes where the in-memory join cannot"
+    return Result(label, "SQL", secs, mb,
+                  dict(zip(("changed", "added", "removed"), values)), note=note)
 
 
 def daff_diff(a: Path, b: Path, out: Path, exe: str) -> Result:
@@ -694,12 +774,18 @@ def main() -> int:
     duck_exe = shutil.which("duckdb", path=str(args.tools_dir)) or shutil.which("duckdb")
     daff_exe = (shutil.which("daff", path=str(args.tools_dir / "node_modules" / ".bin"))
                 or shutil.which("daff"))
+    ch_exe = (shutil.which("clickhouse", path=str(args.tools_dir))
+              or shutil.which("clickhouse") or shutil.which("clickhouse-local"))
 
     plan: list[tuple[str, object]] = [
         ("ours", lambda: ours(a, b, out, args.engine, args.jar)),
         ("ours-sortmerge", lambda: ours(a, b, out, "sortmerge", args.jar)),
         ("go-csvdiff", (lambda: go_csvdiff(a, b, out, go_exe)) if go_exe else None),
         ("duckdb-sql", (lambda: duckdb_sql(a, b, out, duck_exe)) if duck_exe else None),
+        ("clickhouse-sql",
+         (lambda: clickhouse_sql(a, b, out, ch_exe)) if ch_exe else None),
+        ("clickhouse-spill",
+         (lambda: clickhouse_sql(a, b, out, ch_exe, spill=True)) if ch_exe else None),
         ("daff", (lambda: daff_diff(a, b, out, daff_exe)) if daff_exe else None),
         ("datacompy", lambda: datacompy_compare(a, b, out)),
         ("datacompy-polars", lambda: datacompy_polars(a, b, out)),
