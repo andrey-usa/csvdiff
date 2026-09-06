@@ -36,3 +36,7 @@ replay_pid*.log
 
 # C++ build output.
 /cpp/build/
+
+# Zig build output.
+/zig/zig-out/
+/zig/.zig-cache/
