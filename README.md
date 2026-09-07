@@ -790,25 +790,55 @@ The Zig port has the structural two-thread version only; chunking it is open.
 
 ## Input formats: is CSV the problem?
 
-CSV is a text format that has to be parsed a byte at a time. Parquet, Arrow and
-JSON are the obvious alternatives, so: ten million rows, one file, twenty columns,
-converted and read back with polars, page cache warm.
+CSV is text that has to be parsed a byte at a time. Parquet and JSON are the
+obvious alternatives, so: ten million rows, both files, **the same comparison** —
+first-occurrence-wins on the key, inner join, per-cell diff over seventeen
+columns — with the engine held constant and only the input format changing.
 
-| Format | Size | Full read | Six columns |
+DuckDB is the constant because it reads all of them natively and spills rather
+than dying. Polars was tried first and was killed by the OOM killer at ten
+million rows on CSV alone, twice.
+
+| Engine and input | Size | Convert | **Compare** | Peak RSS |
+|---|---:|---:|---:|---:|
+| DuckDB, CSV | 3,509 MB | — | 54.78s | 12,372 MB |
+| DuckDB, Parquet + zstd | 544 MB | 60.4s | 18.39s | 11,667 MB |
+| DuckDB, Parquet uncompressed | 2,088 MB | 55.3s | **15.41s** | 11,772 MB |
+| DuckDB, JSON (ndjson) | 8,487 MB | 108.6s | 17.08s | 11,260 MB |
+| **ours (C++), CSV** | 3,509 MB | — | **12.34s** | **4,336 MB** |
+
+Every row returns identical counts — matched 9,990,000, changed 599,320, added
+10,000, removed 10,000 — so these are five ways of doing exactly the same work.
+
+**For DuckDB the format is worth 3.6x.** CSV 54.78s against uncompressed Parquet
+15.41s is a far bigger gap than the format is worth to us, because DuckDB spends
+proportionally much more of its run parsing text.
+
+**Converting costs about four times what it saves.** Writing the Parquet takes
+55-60s to save 39s on the comparison. A one-off comparison is never worth
+converting for; it only pays when the same file is compared repeatedly, which is
+exactly the recurring-reconciliation case this tool is built for.
+
+**JSON is fast here and slow elsewhere, which is a warning about single numbers.**
+DuckDB compares ndjson in 17.08s, quicker than its own CSV path, despite the file
+being 2.4x larger. Reading one file with polars, the ranking reverses — 9.56s for
+ndjson against 4.17s for CSV. The format's cost is a property of the reader, not
+of the format:
+
+| Reading one 10M file with polars | Size | Full read | Six columns |
 |---|---:|---:|---:|
-| Parquet + zstd | **288 MB** | 0.89s | 0.31s |
+| Parquet + zstd | 288 MB | 0.89s | 0.31s |
 | Parquet, uncompressed | 966 MB | **0.56s** | **0.18s** |
 | CSV | 1,755 MB | 4.17s | 1.89s |
 | Arrow IPC | 3,537 MB | 1.01s | 0.34s |
 | JSON (ndjson) | 4,244 MB | 9.56s | 5.46s |
 
-**Parquet wins on both axes** — six times smaller than CSV with zstd, and ten times
-faster to read when only some columns are wanted. **JSON loses on both** — 2.4x
-larger than CSV *and* 2.9x slower. **Arrow IPC is fast but fat**: every column here
-is a string, and offsets plus data come to twice what the text does.
+Arrow IPC is worth a line of its own: every column here is a string, and offsets
+plus data come to **twice what the text does**. It is fast to read and the largest
+file in the table.
 
-**And yet none of it would help much**, which is the useful part. Timing the phases
-of a ten-million-row comparison in the C++ port:
+**And for our engine none of it would help much.** Timing the phases of a
+ten-million-row comparison in the C++ port:
 
 | Phase | Wall |
 |---|---:|
@@ -817,14 +847,14 @@ of a ten-million-row comparison in the C++ port:
 | The join | ~7s |
 | **Total** | **12.02s** |
 
-Parsing is **15%** of the run. A format that made it free would save 15%, and the
-0.18s Parquet figure above is one file read by a columnar engine that then still
-has to hash and join. The sequential insert alone costs more than all the parsing.
+Parsing is **15%** of the run, so a format that made it free would save 15% — where
+the same change is worth 3.6x to DuckDB. That difference is the whole point: a
+byte-level CSV parser is already close to the cost of not parsing at all, so the
+sequential insert, which costs more than all the parsing, is the thing worth
+attacking. Adding a Parquet reader would buy less than sharding that would.
 
-So the format is not the bottleneck, and adding a Parquet reader would buy less
-than sharding the insert would. The one real argument for Parquet is memory rather
-than speed: at 966 MB uncompressed against 1,755 MB of CSV, the mapped input
-roughly halves.
+The one real argument for Parquet here is memory rather than speed: at 2,088 MB
+against 3,509 MB of CSV, the mapped input shrinks by 40%.
 
 ## Using less memory than the report says
 
@@ -1072,6 +1102,9 @@ python scripts/bench_scale.py --sizes 10k,1m,10m,20m,50m --threads 4
 
 # the smallest memory limit a comparison finishes in
 scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
+
+# the same comparison from CSV, Parquet and JSON, engine held constant
+python scripts/bench_formats.py
 
 # the four Java byte-level engines head to head (Vector API needs the module)
 java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \
