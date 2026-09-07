@@ -186,7 +186,8 @@ settings. `.claude/skills/csvdiff-report/` covers changes to the HTML report spe
 | Up to ~100k rows | anything | every engine finishes well under a second; startup cost dominates, so pick on convenience |
 | 100k – 2M rows | `polars` where you have it, else `turbo` | columnar wins this band outright; the byte-level engines are close behind on a quarter of the memory |
 | 2M – 20M rows, memory to spare | `turbo` | byte-level scanning; the only class that stays fast *and* still finishes at 10M+ |
-| 2M+ and you can build C++ or Zig | the [`cpp/`](cpp/) or [`zig/`](zig/) port | same design, threaded, 1.3-1.6x faster than the JVM on the same box and 2 GB lighter — but counts and JSON only, no HTML report |
+| 2M+ and you can build C++ | the [`cpp/`](cpp/) port, `--threads 4` | same design across every core: 2.5x the JVM on the same box and 1.5 GB lighter — but counts and JSON only, no HTML report |
+| 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design, two threads, lowest memory of anything here — counts and JSON only |
 | Any size, memory constrained | `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB in the Rust port |
 | Larger than tested, or unknown | `sortmerge` | the only engine whose memory does not grow with the input |
 | You need a hard guarantee | Zig port, `--max-memory MB` | a `FixedBufferAllocator`, so the bound is enforced rather than hoped for |
@@ -304,17 +305,18 @@ that finished agrees exactly, counts and per-column stats alike.
 
 | Build | Threads | 1M | 20M |
 |---|---|---|---|
-| C++, clang 20 | 2 | **2.57s** · 512 MB | **52.45s** · 8,574 MB |
-| Zig 0.17-dev | 2 | 2.72s · 414 MB | 63.86s · **8,446 MB** |
+| C++, clang 20 | 4 | **1.72s** · 514 MB | **33.32s** · 9,012 MB |
+| C++, clang 20 | 2 | 2.57s · 512 MB | 54.60s · 8,574 MB |
+| Zig 0.17-dev | 2 | 2.72s · 414 MB | 63.30s · **8,446 MB** |
 | Zig 0.16 | 2 | 3.13s · 414 MB | — |
-| C++, clang 20 | 1 | 3.57s · 509 MB | 84.03s · 8,573 MB |
+| C++, clang 20 | 1 | 3.57s · 509 MB | 94.74s · 8,573 MB |
 | C, clang 20 | 1 | 3.57s · 417 MB | 85.93s · 8,447 MB |
 | C++, clang 18 | 1 | 3.62s · 509 MB | 89.21s · 8,573 MB |
-| Zig 0.17-dev | 1 | 4.47s · 414 MB | 114.58s · 8,446 MB |
+| Zig 0.17-dev | 1 | 4.47s · 414 MB | 117.92s · 8,446 MB |
 | C, gcc 14 | 1 | 5.27s · 417 MB | 129.46s · 8,447 MB |
 | Rust `turbo` | 1 | 5.33s · 583 MB | 104.07s · 8,677 MB |
 | Zig 0.16 | 1 | 5.37s · 414 MB | 130.50s · 8,446 MB |
-| Java 26 `turbo`, HotSpot | 4 | 5.54s · 628 MB | 85.90s · 10,500 MB |
+| Java 26 `turbo`, HotSpot | 4 | 5.54s · 628 MB | 83.79s · 10,499 MB |
 | C++, g++ 14 | 1 | 5.73s · 509 MB | 129.41s · 8,573 MB |
 | C++, g++ 13 | 1 | 6.33s · 509 MB | 136.29s · 8,573 MB |
 | Java 25 `turbo`, Graal JIT | 4 | 7.98s · 777 MB | 114.33s · 10,720 MB |
@@ -347,14 +349,18 @@ What the engine actually allocates, with the mapped inputs subtracted:
 | Java 26 `turbo`, HotSpot | 277 MB | 3,482 MB |
 | Java 25 `turbo`, Graal JIT | 426 MB | 3,703 MB |
 
-**Given the same number of threads, the native builds win comfortably.** Threaded C++ does 20M in
-52.45s against Java's 85.90s — **1.64x** — and threaded Zig in 63.86s, on 8.5 GB against Java's
-10.5 GB. Single-threaded C++ alone, at 84.03s, matches Java's four-core engine.
+**Given the same cores, the native builds win comfortably.** C++ on four threads does 20M in 33.32s
+against Java's 83.79s — **2.5x** — on 9.0 GB against Java's 10.5. Zig on two threads manages 63.30s.
+Single-threaded C++, at 94.74s, is within 13% of Java's four-core engine.
 
-**Four cores buy 1.6-1.8x, not four.** C++ goes 84.03s → 52.45s and Zig 114.58s → 63.86s, and Java's
-`turbo` manages only 1.18x cpu/wall at this size. The scan is bound by memory bandwidth rather than
-instruction throughput, so past two threads there is little left to win — which is also why two
-threads were enough to overturn the result.
+**Java's `turbo` gets 1.18x cpu/wall at this size; C++ on four threads gets 2.53x.** Both name
+themselves parallel, and the gap between those two figures is most of the gap in the wall times. How
+the C++ port got there — and the measurement that redirected the work halfway — is under
+[Using more than two cores](#using-more-than-two-cores).
+
+These runs vary more than the smaller ones: the same single-threaded binary measured 84.03s in one
+sitting and 94.74s in another, a 12% spread, so read differences under about 15% here as noise. The
+2.5x is not one of them.
 
 The Java row is `turbo`, the right choice at this size: `shard`, which edged `turbo` at 10M on the
 Set A runners, is **19% slower at 20M**. The full four-engine matrix is under
@@ -660,6 +666,71 @@ about 470 MB less, which is the per-thread index and scratch structures the para
 `mmap` is the same vectorised scan over a mapping and survives. Between the two, the mapping is worth
 more than the SIMD.
 
+## Using more than two cores
+
+The first threading here was structural — one thread per file, one per join direction — so it stopped
+at two and left half a four-core box idle. Whether more would help turned on a question worth
+answering before writing any code: **is the scan bound by memory bandwidth?** If it were, splitting
+the work further would buy nothing.
+
+It is not. Running N copies of the single-threaded binary at once, on the same warm input:
+
+| Copies | Mean per copy | vs alone |
+|---|---:|---:|
+| 1 | 4.61s | 1.00x |
+| 2 | 4.37s | 0.95x |
+| 4 | 4.15s | **0.90x** |
+
+Four copies each doing the whole job finish *faster* than one copy alone — four cores' worth of
+throughput, with the small gain coming from the machine staying busy rather than idling between
+runs. So the ceiling was the design, not the hardware.
+
+**Chunked index building.** Each file is split at row boundaries, parsed and hashed in parallel, then
+inserted into the table on one thread in file order. Insertion has to stay ordered: first occurrence
+of a key wins, and the duplicate counts follow from that, so doing it in parallel would make the
+answer depend on thread scheduling.
+
+Finding the boundaries is the interesting part. A newline inside a quoted field is not a row
+boundary, and a thread starting mid-file cannot tell whether it is inside one. **Quote parity settles
+it:** every `"` toggles in-quote state — including both halves of a doubled quote, which toggles
+twice and so correctly leaves the state alone — so the number of quotes before a position says
+whether that position is inside a field. Counting them is a scan for one byte, far cheaper than
+parsing, and it splits across the same threads. From the boundary, a two-state machine walks to the
+first newline outside quotes; that is the row start.
+
+**And it bought nothing.** Instrumenting the phases said why:
+
+| Phase, per file at 1M | Time |
+|---|---:|
+| Sweep — parse and hash every row | 0.34s |
+| Insert — build the table in order | 0.13s |
+| *Everything else (the join)* | *~1.8s* |
+
+The index build is about 20% of the run. Chunking it perfectly could not have moved the total much,
+and the measurement is the only reason that was obvious rather than mysterious.
+
+**The join was the long pole.** A's side — look up every distinct key in B, re-parse both rows,
+compare every column — now splits over contiguous ranges of A's keys. Each range keeps its own
+counts, column stats and capped row lists, merged in range order so the rows surviving `--max-rows`
+are the same rows one thread would have kept.
+
+| 20M rows | Wall | cpu/wall |
+|---|---:|---:|
+| No threading | 94.74s | 1.00x |
+| Two threads (structural) | 54.60s | 1.71x |
+| **Four threads (chunked + parallel join)** | **33.32s** | **2.53x** |
+
+2.8x over single-threaded, and past four threads it gets slower again on a four-core box. It costs
+memory — 2,055 MB above the mapped files against 1,556 for the two-thread build, which is the
+per-chunk row and hash arrays — and `--threads 1` restores the old behaviour.
+
+Correctness is checked where chunking can actually break it: a 5.4 MB file whose rows carry newlines
+and doubled quotes inside quoted fields, above the 4 MB threshold where splitting turns on. Identical
+counts at 1, 2, 3, 4 and 8 threads, matching the Rust port, the Python reference and the awkward
+fixture.
+
+The Zig port has the structural two-thread version only; chunking it is open.
+
 ## The out-of-core engine
 
 `sortmerge` batches rows, sorts each batch, spills it to disk, and does a k-way merge with the tie
@@ -809,11 +880,13 @@ same design can be measured in four languages without three more HTML renderers 
 | | Directory | Built with | Scope |
 |---|---|---|---|
 | C | [`c/`](c/) | `cc` or `clang`, C11 | one file, single-threaded on purpose — it exists to find the memory floor; no `--trim`, `--ignore-case` or `--tolerance` |
-| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | threaded; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
+| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
 | Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | threaded; `--max-memory MB` is enforced, not advisory |
 
 The C++ and Zig ports build both indexes at once and run the two directions of the join at once,
-which is what Java's `turbo` has always done. Two things had to change to make that sound: the probe
+which is what Java's `turbo` has always done. C++ goes further, splitting each file into row-aligned
+chunks and A's side of the join into ranges — see
+[Using more than two cores](#using-more-than-two-cores). Two things had to change to make that sound: the probe
 buffer each index kept for key comparison is now supplied by the caller, which is why `lookup` is
 const and two threads can probe one index; and Zig's `--max-memory` uses the lock-taking
 `FixedBufferAllocator`, since a bump pointer without a lock would hand both threads the same bytes.
@@ -865,6 +938,7 @@ python scripts/bench.py --rows 10m --engine duckdb --threads 4 --memory-limit 8G
 python scripts/gen_data.py --rows 20m --out-dir bench/external/data --prefix 20m
 python scripts/bench_native.py --rows 20m --repeats 2
 python scripts/bench_native.py --rows 1m --only jvm     # execution modes
+cpp/build/csvdiff compare a.csv b.csv -k id --threads 4  # C++ thread scaling
 
 # the four Java byte-level engines head to head (Vector API needs the module)
 java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \
@@ -928,16 +1002,20 @@ Sizes and shapes not yet answered, roughly in the order they would pay off:
 4. **Isolate the SWAR-versus-Vector reversal.** SWAR ties the Vector API at 10M and wins by 19% at
    20M, but the host changed with the scale. Running both scales on one host would say whether it is
    the size or the machine.
-5. **More than two threads in the native ports.** The parallelism there is structural — two indexes,
-   two join directions — so it stops at two. Splitting one file into per-core chunks at row
-   boundaries would use all four, though at 1.18-1.78x cpu/wall the scan already looks
-   bandwidth-bound, so the ceiling may be close.
-6. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
+5. **More than two threads in the Zig port.** Answered for C++ — see
+   [Using more than two cores](#using-more-than-two-cores), which took it from 1.71x to 2.53x
+   cpu/wall and 20M from 54.60s to 33.32s. The guess in this slot that the scan was already
+   bandwidth-bound was wrong, and the test that disproved it took one script. Zig still has the
+   two-thread version only.
+6. **Where does the C++ port stop scaling?** 2.53x cpu/wall on four cores is short of four, and the
+   remaining sequential parts — table insertion, B's side of the join — are now the obvious suspects.
+   A box with more cores would say whether the design or the machine is the limit.
+7. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
    cell work, and probably the ranking. It would also re-open the SIMD question: longer rows mean
    longer scans, which is the one shape where a vector register might pay.
-7. **Many small comparisons** rather than one big one — where JVM startup dominates and
+8. **Many small comparisons** rather than one big one — where JVM startup dominates and
    native-image's startup advantage might finally pay for its throughput.
-8. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
+9. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
    the 17-21x should move.
 
 ## Suggested additions
