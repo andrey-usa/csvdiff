@@ -29,6 +29,10 @@ struct Options {
     double tolerance = 0.0;
     std::size_t max_rows = 50000;
     std::optional<char> delimiter;      // unset means sniff it from the header
+    // 0 means "as many as the machine has". Both files are read at once, and
+    // each is split into this many chunks, so the work is spread this wide in
+    // total rather than per file.
+    unsigned threads = 0;
 };
 
 // Row counts. Always exact, even when the embedded row lists are capped.

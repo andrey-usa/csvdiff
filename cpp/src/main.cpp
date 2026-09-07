@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
             else if (f == "--tolerance") opt.tolerance = std::stod(next());
             else if (f == "--max-rows") opt.max_rows = std::stoul(next());
             else if (f == "--delimiter") opt.delimiter = next().at(0);
+            else if (f == "--threads") opt.threads = static_cast<unsigned>(std::stoul(next()));
             else if (f == "--json") json_path = next();
             else if (f == "--engine") next();  // accepted and ignored: there is one
             else if (f == "-o" || f == "--out") next();  // no HTML report in this port

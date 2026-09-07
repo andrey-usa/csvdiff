@@ -431,36 +431,55 @@ class RowParser {
 // is cheap because the parser stops at the last needed column.
 class RowIndex {
   public:
+    // Rows are found and hashed in `threads` parallel chunks, then inserted in
+    // file order on this one. The split is safe because the two halves need
+    // different things: parsing a row depends on nothing but where it starts,
+    // while the table depends on the order rows arrive -- first occurrence of a
+    // key wins, and duplicate counts follow from that. Doing the second half in
+    // parallel would make the answer depend on thread scheduling.
     RowIndex(const Slab& slab, const RowParser& parser, std::size_t from, std::size_t key_size,
-             const Options& opt)
+             const Options& opt, unsigned threads = 1)
         : slab_(slab), parser_(parser), key_size_(key_size), opt_(opt) {
         table_.assign(1 << 12, kEmpty);
         mask_ = table_.size() - 1;
-        scratch_.assign(parser.width(), kAbsent);
+        scratch_.assign(parser.width() * 2, kAbsent);  // probe, then this row's key
 
         const std::string_view d = slab.bytes();
         const std::size_t end = d.size();
-        std::vector<Field> fields(parser.width());
-        std::size_t pos = from;
-        while (pos < end) {
-            // A line with nothing on it is not a row.
-            if (d[pos] == '\n') {
-                ++pos;
-                continue;
+        if (from >= end) return;
+
+        const std::vector<std::size_t> bounds = chunk_bounds(d, from, threads);
+        const std::size_t n = bounds.size() - 1;
+        std::vector<Chunk> chunks(n);
+        std::vector<std::exception_ptr> failures(n);
+
+        auto scan = [&](std::size_t i) {
+            try {
+                sweep(d, parser, bounds[i], bounds[i + 1], end, chunks[i]);
+            } catch (...) {
+                failures[i] = std::current_exception();
             }
-            if (d[pos] == '\r' && pos + 1 < end && d[pos + 1] == '\n') {
-                pos += 2;
-                continue;
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(n - 1);
+        for (std::size_t i = 1; i < n; ++i) {
+            try {
+                workers.emplace_back(scan, i);
+            } catch (const std::system_error&) {
+                scan(i);  // no thread to be had: the same work, here
             }
-            const std::size_t next = parser.parse(d, pos, end, fields.data());
-            for (Field f : fields)
-                if (f == kTooLong)
-                    throw Error("a field larger than " + std::to_string(kMaxFieldLen) +
-                                " bytes is more than this engine packs");
-            add(pos, fields.data());
-            if (next <= pos) break;  // no progress: a malformed tail, not an endless loop
-            pos = next;
         }
+        scan(0);
+        for (auto& w : workers) w.join();
+        for (const auto& f : failures)
+            if (f) std::rethrow_exception(f);
+
+        std::size_t total = 0;
+        for (const auto& c : chunks) total += c.starts.size();
+        row_start_.reserve(total);
+        row_hash_.reserve(total);
+        for (const auto& c : chunks)
+            for (std::size_t i = 0; i < c.starts.size(); ++i) insert(c.starts[i], c.hashes[i]);
     }
 
     void fields_of(int row, Field* out) const {
@@ -498,15 +517,123 @@ class RowIndex {
   private:
     static constexpr int kEmpty = -1;
 
-    void add(std::size_t start, const Field* fields) {
+    // One chunk's rows, in the order they appear in it.
+    struct Chunk {
+        std::vector<std::size_t> starts;
+        std::vector<std::uint64_t> hashes;
+    };
+
+    // Where each chunk begins, as offsets of real row starts. The nominal
+    // split is `size / threads`, then walked forward to the next row.
+    //
+    // Walking forward is the whole difficulty: a newline inside a quoted field
+    // is not a row boundary, and a thread starting mid-file cannot tell whether
+    // it is inside such a field. Parity settles it. Every `"` toggles in-quote
+    // state -- including both halves of a doubled quote, which toggles twice and
+    // so leaves the state alone, which is exactly right -- so the count of
+    // quotes before a position says whether that position is inside a field.
+    // Counting them is a scan for one byte, far cheaper than parsing, and it
+    // splits across the same threads.
+    static std::vector<std::size_t> chunk_bounds(std::string_view d, std::size_t from,
+                                                 unsigned threads) {
+        const std::size_t end = d.size();
+        // Below this there is nothing to divide: the boundary work would cost
+        // more than the parsing it splits.
+        if (threads <= 1 || end - from < (4u << 20)) return {from, end};
+
+        std::vector<std::size_t> nominal;
+        for (unsigned i = 1; i < threads; ++i)
+            nominal.push_back(from + (end - from) * i / threads);
+
+        // Quotes before each nominal split, counted in parallel.
+        std::vector<std::size_t> quotes(nominal.size(), 0);
+        {
+            std::vector<std::thread> counters;
+            auto count = [&](std::size_t i) {
+                std::size_t n = 0;
+                for (std::size_t at = from; at < nominal[i];) {
+                    const std::size_t q = next_of1(d, at, nominal[i], '"');
+                    if (q >= nominal[i]) break;
+                    ++n;
+                    at = q + 1;
+                }
+                quotes[i] = n;
+            };
+            counters.reserve(nominal.size() - 1);
+            for (std::size_t i = 1; i < nominal.size(); ++i) {
+                try {
+                    counters.emplace_back(count, i);
+                } catch (const std::system_error&) {
+                    count(i);
+                }
+            }
+            count(0);
+            for (auto& c : counters) c.join();
+        }
+
+        std::vector<std::size_t> bounds{from};
+        for (std::size_t i = 0; i < nominal.size(); ++i) {
+            bool in_quotes = (quotes[i] & 1) != 0;
+            std::size_t at = nominal[i];
+            for (; at < end; ++at) {
+                const char c = d[at];
+                if (c == '"') {
+                    in_quotes = !in_quotes;
+                } else if (c == '\n' && !in_quotes) {
+                    ++at;
+                    break;
+                }
+            }
+            if (at > bounds.back() && at < end) bounds.push_back(at);
+        }
+        bounds.push_back(end);
+        return bounds;
+    }
+
+    // Parses and hashes every row that *starts* in [begin, stop), running past
+    // `stop` to finish the last one. `end` is the end of the file. This is the
+    // work worth splitting: it reads the members but writes only `out`, so any
+    // number of threads may be inside it at once.
+    void sweep(std::string_view d, const RowParser& parser, std::size_t begin, std::size_t stop,
+               std::size_t end, Chunk& out) const {
+        std::vector<Field> fields(parser.width());
+        std::size_t pos = begin;
+        while (pos < stop) {
+            // A line with nothing on it is not a row.
+            if (d[pos] == '\n') {
+                ++pos;
+                continue;
+            }
+            if (d[pos] == '\r' && pos + 1 < end && d[pos + 1] == '\n') {
+                pos += 2;
+                continue;
+            }
+            const std::size_t next = parser.parse(d, pos, end, fields.data());
+            for (Field f : fields)
+                if (f == kTooLong)
+                    throw Error("a field larger than " + std::to_string(kMaxFieldLen) +
+                                " bytes is more than this engine packs");
+            out.starts.push_back(pos);
+            out.hashes.push_back(key_hash(slab_, fields.data(), key_size_, opt_));
+            if (next <= pos) break;  // no progress: a malformed tail, not an endless loop
+            pos = next;
+        }
+    }
+
+    void insert(std::size_t start, std::uint64_t hash) {
         ++rows_;
         const int row = static_cast<int>(row_start_.size());
-        const std::uint64_t hash = key_hash(slab_, fields, key_size_, opt_);
         row_start_.push_back(start);
         row_hash_.push_back(hash);
 
         std::size_t slot = slot_of(hash);
-        Field* probe = scratch_.data();  // only the constructor calls this, on one thread
+        // Two buffers, both only touched here, and only on the one thread that
+        // runs the insertions: the candidate's key and this row's. This row's
+        // fields are re-parsed rather than carried over from the sweep because
+        // the sweep produced twenty million of them and this branch wants two.
+        Field* probe = scratch_.data();
+        Field* mine = scratch_.data() + parser_.width();
+        bool mine_parsed = false;
         for (;;) {
             const int at = table_[slot];
             if (at == kEmpty) {
@@ -518,10 +645,14 @@ class RowIndex {
             }
             const int candidate = first_row_[at];
             if (row_hash_[candidate] == hash) {
+                if (!mine_parsed) {
+                    parser_.parse(slab_.bytes(), start, slab_.bytes().size(), mine);
+                    mine_parsed = true;
+                }
                 fields_of(candidate, probe);
                 bool ok = true;
                 for (std::size_t i = 0; i < key_size_ && ok; ++i)
-                    ok = same(slab_, probe[i], slab_, fields[i], opt_);
+                    ok = same(slab_, probe[i], slab_, mine[i], opt_);
                 if (ok) {
                     if (++occurrences_[at] == 2) {
                         ++dup_keys_;
@@ -710,22 +841,27 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     const RowParser ap(a_delim, positions(a_header));
     const RowParser bp(b_delim, positions(b_header));
 
-    // The two indexes share nothing, so they are built at the same time. This is
-    // most of the run: parsing and hashing every row of both files. An exception
+    // The two indexes share nothing, so they are built at the same time, and
+    // each is split further into chunks. Two files across N cores is N/2 chunks
+    // each -- so the whole machine is busy, not just two of it. An exception
     // thrown on the worker is carried back and rethrown here, because a parse
     // error has to reach the caller as an error and not as a crash.
+    unsigned budget = opt.threads;
+    if (budget == 0) budget = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned per_file = std::max(1u, budget / 2);
+
     std::optional<RowIndex> ai_slot, bi_slot;
     std::exception_ptr worker_failure;
     {
         std::thread worker([&] {
             try {
-                bi_slot.emplace(b, bp, b_start, key_size, opt);
+                bi_slot.emplace(b, bp, b_start, key_size, opt, per_file);
             } catch (...) {
                 worker_failure = std::current_exception();
             }
         });
         try {
-            ai_slot.emplace(a, ap, a_start, key_size, opt);
+            ai_slot.emplace(a, ap, a_start, key_size, opt, per_file);
         } catch (...) {
             worker.join();
             throw;
@@ -754,30 +890,95 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // both indexes without writing either, so they run at the same time. Each
     // owns its field buffers and its probe scratch; nothing is shared but the
     // two finished indexes and the two mappings, which are const from here on.
-    auto a_side = [&] {
+    // A's side is the long pole: every distinct key is looked up in B, both rows
+    // are re-parsed, and every compared column is examined. It splits over
+    // contiguous ranges of A's keys. Each range accumulates into its own counts,
+    // its own column stats and its own capped row lists; because the ranges are
+    // contiguous and merged in order, the result is identical to one thread's,
+    // including which rows survive the cap.
+    struct Part {
+        std::int64_t matched = 0;
+        std::vector<ColumnStat> columns;
+        std::vector<std::pair<int, int>> changed, removed;
+        std::int64_t changed_total = 0, removed_total = 0;
+    };
+
+    const std::vector<int>& a_keys = ai.first_rows();
+    unsigned join_ways = std::max(1u, budget > 1 ? budget - 1 : 1u);
+    if (a_keys.size() < 1u << 14) join_ways = 1;  // too few keys to be worth splitting
+    std::vector<Part> parts(join_ways);
+    for (auto& part : parts) part.columns.resize(nc);
+
+    auto a_range = [&](unsigned p) {
+        Part& out = parts[p];
+        const std::size_t lo = a_keys.size() * p / join_ways;
+        const std::size_t hi = a_keys.size() * (p + 1) / join_ways;
         std::vector<Field> fa(width), fb(width), probe(width);
-        // A's distinct keys, in first-appearance order, so a run is reproducible.
-        for (int row : ai.first_rows()) {
+        for (std::size_t at = lo; at < hi; ++at) {
+            const int row = a_keys[at];
             ai.fields_of(row, fa.data());
             const int mate =
                 bi.lookup(a, fa.data(), key_hash(a, fa.data(), key_size, opt), probe.data());
             if (mate < 0) {
-                removed.push(row, -1);
+                ++out.removed_total;
+                if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
                 continue;
             }
-            ++matched;
+            ++out.matched;
             bi.fields_of(mate, fb.data());
             bool any = false;
             for (std::size_t i = 0; i < nc; ++i) {
                 const Field x = fa[key_size + i], y = fb[key_size + i];
                 if (cell_differs(a, x, b, y, opt)) {
                     any = true;
-                    ++r.columns[i].changed;
-                    if (is_absent(b, y, opt)) ++r.columns[i].blanked;
-                    if (is_absent(a, x, opt)) ++r.columns[i].filled;
+                    ++out.columns[i].changed;
+                    if (is_absent(b, y, opt)) ++out.columns[i].blanked;
+                    if (is_absent(a, x, opt)) ++out.columns[i].filled;
                 }
             }
-            if (any) changed.push(row, mate);
+            if (any) {
+                ++out.changed_total;
+                if (out.changed.size() <= opt.max_rows) out.changed.emplace_back(row, mate);
+            }
+        }
+    };
+
+    auto a_side = [&] {
+        std::vector<std::thread> workers;
+        std::vector<std::exception_ptr> failures(join_ways);
+        workers.reserve(join_ways - 1);
+        auto guarded = [&](unsigned p) {
+            try {
+                a_range(p);
+            } catch (...) {
+                failures[p] = std::current_exception();
+            }
+        };
+        for (unsigned p = 1; p < join_ways; ++p) {
+            try {
+                workers.emplace_back(guarded, p);
+            } catch (const std::system_error&) {
+                guarded(p);
+            }
+        }
+        guarded(0);
+        for (auto& w : workers) w.join();
+        for (const auto& f : failures)
+            if (f) std::rethrow_exception(f);
+
+        // Merged in range order, so the rows kept under the cap are the same
+        // rows one thread would have kept.
+        for (const Part& part : parts) {
+            matched += part.matched;
+            for (std::size_t i = 0; i < nc; ++i) {
+                r.columns[i].changed += part.columns[i].changed;
+                r.columns[i].blanked += part.columns[i].blanked;
+                r.columns[i].filled += part.columns[i].filled;
+            }
+            for (const auto& [row, mate] : part.changed) changed.push(row, mate);
+            changed.total += part.changed_total - static_cast<std::int64_t>(part.changed.size());
+            for (const auto& [row, mate] : part.removed) removed.push(row, mate);
+            removed.total += part.removed_total - static_cast<std::int64_t>(part.removed.size());
         }
     };
     auto b_side = [&] {
