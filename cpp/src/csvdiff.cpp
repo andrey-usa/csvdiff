@@ -128,6 +128,12 @@ std::size_t skip_quoted(std::string_view d, std::size_t from, std::size_t end) {
 // The mapped file
 // ---------------------------------------------------------------------------
 
+// Which text dialect a mapped file is in. It rides on the Slab because the
+// escape rule has to follow the file: CSV doubles a quote, JSON puts a
+// backslash in front of one, and `for_each_byte` is the single route every
+// comparison reads a field through.
+enum class Dialect { Csv, Json };
+
 class Slab {
   public:
     explicit Slab(const std::string& path) {
@@ -159,6 +165,9 @@ class Slab {
     Slab(const Slab&) = delete;
     Slab& operator=(const Slab&) = delete;
 
+    Dialect dialect() const { return dialect_; }
+    void set_dialect(Dialect d) { dialect_ = d; }
+
     std::string_view bytes() const { return {data_, size_}; }
 
     // The field's raw span, still holding any doubled quotes.
@@ -171,6 +180,7 @@ class Slab {
     int fd_ = -1;
     const char* data_ = nullptr;
     std::size_t size_ = 0;
+    Dialect dialect_ = Dialect::Csv;
 };
 
 // A field's logical bytes: the raw span with the second quote of each doubled
@@ -184,10 +194,96 @@ void for_each_byte(const Slab& s, Field f, Fn&& fn) {
         for (char c : raw) fn(static_cast<unsigned char>(c));
         return;
     }
+    if (s.dialect() == Dialect::Csv) {
+        for (std::size_t i = 0; i < raw.size(); ++i) {
+            const char c = raw[i];
+            fn(static_cast<unsigned char>(c));
+            if (c == '"' && i + 1 < raw.size() && raw[i + 1] == '"') ++i;
+        }
+        return;
+    }
+    // JSON: a backslash escape. \uXXXX is decoded to UTF-8 so that a value
+    // written escaped and the same value written literally compare equal --
+    // which they must, because a JSON writer is free to escape either way.
     for (std::size_t i = 0; i < raw.size(); ++i) {
-        const char c = raw[i];
-        fn(static_cast<unsigned char>(c));
-        if (c == '"' && i + 1 < raw.size() && raw[i + 1] == '"') ++i;
+        if (raw[i] != '\\' || i + 1 >= raw.size()) {
+            fn(static_cast<unsigned char>(raw[i]));
+            continue;
+        }
+        const char e = raw[++i];
+        switch (e) {
+            case 'n': fn('\n'); break;
+            case 't': fn('\t'); break;
+            case 'r': fn('\r'); break;
+            case 'b': fn('\b'); break;
+            case 'f': fn('\f'); break;
+            case '"': fn('"'); break;
+            case '\\': fn('\\'); break;
+            case '/': fn('/'); break;
+            case 'u': {
+                unsigned cp = 0;
+                if (i + 4 < raw.size()) {
+                    bool ok = true;
+                    for (int k = 1; k <= 4 && ok; ++k) {
+                        const char h = raw[i + static_cast<std::size_t>(k)];
+                        const unsigned d = h >= '0' && h <= '9'   ? unsigned(h - '0')
+                                           : h >= 'a' && h <= 'f' ? unsigned(h - 'a' + 10)
+                                           : h >= 'A' && h <= 'F' ? unsigned(h - 'A' + 10)
+                                                                  : 16u;
+                        if (d == 16u) ok = false;
+                        cp = cp * 16 + (ok ? d : 0);
+                    }
+                    if (!ok) {  // not four hex digits: emit it as written
+                        fn('\\');
+                        fn(static_cast<unsigned char>(e));
+                        break;
+                    }
+                    i += 4;
+                    // A surrogate pair is one code point in two escapes.
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < raw.size() &&
+                        raw[i + 1] == '\\' && raw[i + 2] == 'u') {
+                        unsigned lo = 0;
+                        bool ok2 = true;
+                        for (int k = 3; k <= 6 && ok2; ++k) {
+                            const char h = raw[i + static_cast<std::size_t>(k)];
+                            const unsigned d = h >= '0' && h <= '9'   ? unsigned(h - '0')
+                                               : h >= 'a' && h <= 'f' ? unsigned(h - 'a' + 10)
+                                               : h >= 'A' && h <= 'F' ? unsigned(h - 'A' + 10)
+                                                                      : 16u;
+                            if (d == 16u) ok2 = false;
+                            lo = lo * 16 + (ok2 ? d : 0);
+                        }
+                        if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            i += 6;
+                        }
+                    }
+                    if (cp < 0x80) {
+                        fn(static_cast<unsigned char>(cp));
+                    } else if (cp < 0x800) {
+                        fn(static_cast<unsigned char>(0xC0 | (cp >> 6)));
+                        fn(static_cast<unsigned char>(0x80 | (cp & 0x3F)));
+                    } else if (cp < 0x10000) {
+                        fn(static_cast<unsigned char>(0xE0 | (cp >> 12)));
+                        fn(static_cast<unsigned char>(0x80 | ((cp >> 6) & 0x3F)));
+                        fn(static_cast<unsigned char>(0x80 | (cp & 0x3F)));
+                    } else {
+                        fn(static_cast<unsigned char>(0xF0 | (cp >> 18)));
+                        fn(static_cast<unsigned char>(0x80 | ((cp >> 12) & 0x3F)));
+                        fn(static_cast<unsigned char>(0x80 | ((cp >> 6) & 0x3F)));
+                        fn(static_cast<unsigned char>(0x80 | (cp & 0x3F)));
+                    }
+                } else {
+                    fn('\\');
+                    fn(static_cast<unsigned char>(e));
+                }
+                break;
+            }
+            default:  // not an escape this dialect defines: emit both bytes
+                fn('\\');
+                fn(static_cast<unsigned char>(e));
+                break;
+        }
     }
 }
 
@@ -348,6 +444,33 @@ int compare_keys(const std::vector<Val>& x, const std::vector<Val>& y, std::size
 // the last needed column has been read the rest of the row is skipped to its
 // newline without its fields ever being delimited: on twenty columns keyed on
 // the first two, most of a row is never looked at.
+// One JSON object's worth of scanning: where a value starts and ends, and
+// whether it carries a backslash. Values are contiguous bytes in the file, which
+// is what lets a JSON field stay an offset and a length into the mapping rather
+// than a string built per cell -- the same representation the CSV path uses.
+struct JsonValue {
+    std::size_t from = 0, to = 0;
+    bool escaped = false;
+    bool absent = false;  // JSON null, which compares as an empty cell
+};
+
+// Skips one JSON string starting at the opening quote, returning the offset one
+// past the closing quote. `escaped` is set if it contains a backslash.
+inline std::size_t skip_json_string(std::string_view d, std::size_t at, std::size_t end,
+                                    bool* escaped) {
+    ++at;  // the opening quote
+    for (;;) {
+        const std::size_t stop = next_of2(d, at, end, '"', '\\');
+        if (stop >= end) return end;
+        if (d[stop] == '"') return stop + 1;
+        *escaped = true;
+        at = stop + 2;  // the backslash and whatever it escapes
+        if (at > end) return end;
+    }
+}
+
+inline bool json_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
 class RowParser {
   public:
     RowParser(char delimiter, std::vector<int> source)
@@ -355,10 +478,32 @@ class RowParser {
         for (int c : source_) last_needed_ = std::max(last_needed_, c);
     }
 
+    // The JSON form. A CSV row is addressed by column number; a JSON object is
+    // addressed by key, so the wanted names are held here and looked up as the
+    // object is walked. `wanted[i]` is the name whose value belongs in slot i;
+    // an empty name is a column this file does not have.
+    RowParser(Dialect dialect, std::vector<std::string> wanted)
+        : dialect_(dialect), wanted_(std::move(wanted)) {
+        // A small open-addressed table from key name to slot, so a key costs one
+        // hash rather than a walk of twenty names. Sized to at least twice the
+        // keys so probes stay short.
+        std::size_t n = 16;
+        while (n < wanted_.size() * 4) n <<= 1;
+        slot_mask_ = n - 1;
+        slots_.assign(n, -1);
+        for (std::size_t i = 0; i < wanted_.size(); ++i) {
+            if (wanted_[i].empty()) continue;
+            std::size_t at = name_hash(wanted_[i]) & slot_mask_;
+            while (slots_[at] >= 0) at = (at + 1) & slot_mask_;
+            slots_[at] = static_cast<int>(i);
+        }
+    }
+
     // Parses one row into `out`, returning the offset of the next row. A row
     // shorter than the header leaves the missing fields absent, which is a
     // difference to report rather than a file to refuse.
     std::size_t parse(std::string_view d, std::size_t start, std::size_t end, Field* out) const {
+        if (dialect_ == Dialect::Json) return parse_json(d, start, end, out);
         std::fill(out, out + source_.size(), kAbsent);
         std::size_t pos = start;
         int column = 0;
@@ -392,9 +537,133 @@ class RowParser {
         return end;
     }
 
-    std::size_t width() const { return source_.size(); }
+    std::size_t width() const {
+        return dialect_ == Dialect::Json ? wanted_.size() : source_.size();
+    }
 
   private:
+    static std::uint64_t name_hash(std::string_view s) {
+        std::uint64_t h = 0xcbf29ce484222325ULL;
+        for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ULL;
+        return h ^ (h >> 32);
+    }
+
+    // Walks one JSON object, storing the values of the keys we want. One pass
+    // over the object, one hash per key -- not a search per wanted column, which
+    // at twenty columns would be four hundred comparisons a row.
+    std::size_t parse_json(std::string_view d, std::size_t start, std::size_t end,
+                           Field* out) const {
+        std::fill(out, out + wanted_.size(), kAbsent);
+        std::size_t pos = start;
+        while (pos < end && json_space(d[pos])) ++pos;
+        if (pos >= end) return end;
+        if (d[pos] != '{') return end_of_json_row(d, pos, end);  // not an object: skip the line
+        ++pos;
+
+        for (;;) {
+            while (pos < end && json_space(d[pos])) ++pos;
+            if (pos >= end) break;
+            if (d[pos] == '}') {
+                ++pos;
+                break;
+            }
+            if (d[pos] == ',') {
+                ++pos;
+                continue;
+            }
+            if (d[pos] != '"') break;  // malformed: stop reading this object
+            bool key_escaped = false;
+            const std::size_t key_from = pos + 1;
+            const std::size_t key_end = skip_json_string(d, pos, end, &key_escaped);
+            if (key_end > end || key_end < 2) break;
+            const std::string_view key = d.substr(key_from, key_end - 1 - key_from);
+            pos = key_end;
+            while (pos < end && json_space(d[pos])) ++pos;
+            if (pos >= end || d[pos] != ':') break;
+            ++pos;
+            while (pos < end && json_space(d[pos])) ++pos;
+            if (pos >= end) break;
+
+            JsonValue v;
+            if (d[pos] == '"') {
+                v.from = pos + 1;
+                const std::size_t close = skip_json_string(d, pos, end, &v.escaped);
+                v.to = close > pos + 1 ? close - 1 : pos + 1;
+                pos = close;
+            } else {
+                // A number, true, false or null: runs to the next comma, brace
+                // or space. Nested objects and arrays are not a cell value and
+                // are left absent rather than guessed at.
+                const std::size_t from = pos;
+                if (d[pos] == '{' || d[pos] == '[') {
+                    pos = skip_json_nested(d, pos, end);
+                    v.absent = true;
+                } else {
+                    while (pos < end && d[pos] != ',' && d[pos] != '}' && !json_space(d[pos])) ++pos;
+                    v.from = from;
+                    v.to = pos;
+                    v.absent = (pos - from == 4 && d.compare(from, 4, "null") == 0);
+                }
+            }
+            if (!v.absent) {
+                const int slot = slot_for(key);
+                if (slot >= 0) out[slot] = pack(v.from, v.to - v.from, v.escaped);
+            }
+        }
+        return end_of_json_row(d, pos, end);
+    }
+
+    int slot_for(std::string_view key) const {
+        std::size_t at = name_hash(key) & slot_mask_;
+        for (;;) {
+            const int i = slots_[at];
+            if (i < 0) return -1;
+            if (wanted_[static_cast<std::size_t>(i)] == key) return i;
+            at = (at + 1) & slot_mask_;
+        }
+    }
+
+    // Past the end of this object's line. Records are newline-delimited, so a
+    // newline outside a string ends the row.
+    static std::size_t end_of_json_row(std::string_view d, std::size_t pos, std::size_t end) {
+        while (pos < end) {
+            const std::size_t stop = next_of2(d, pos, end, '\n', '"');
+            if (stop >= end) return end;
+            if (d[stop] == '\n') return stop + 1;
+            bool ignored = false;
+            pos = skip_json_string(d, stop, end, &ignored);
+            if (pos <= stop) return end;
+        }
+        return end;
+    }
+
+  public:
+    static std::size_t skip_nested_public(std::string_view d, std::size_t pos, std::size_t end) {
+        return skip_json_nested(d, pos, end);
+    }
+
+  private:
+    static std::size_t skip_json_nested(std::string_view d, std::size_t pos, std::size_t end) {
+        int depth = 0;
+        while (pos < end) {
+            const char c = d[pos];
+            if (c == '"') {
+                bool ignored = false;
+                pos = skip_json_string(d, pos, end, &ignored);
+                continue;
+            }
+            if (c == '{' || c == '[') ++depth;
+            if (c == '}' || c == ']') {
+                --depth;
+                ++pos;
+                if (depth <= 0) return pos;
+                continue;
+            }
+            ++pos;
+        }
+        return end;
+    }
+
     void store(int column, Field f, Field* out) const {
         if (column > last_needed_) return;
         for (std::size_t i = 0; i < source_.size(); ++i)
@@ -415,9 +684,13 @@ class RowParser {
         return end;
     }
 
-    char delimiter_;
+    char delimiter_ = ',';
     std::vector<int> source_;
     int last_needed_ = 0;
+    Dialect dialect_ = Dialect::Csv;
+    std::vector<std::string> wanted_;   // JSON: the key whose value goes in each slot
+    std::vector<int> slots_;            // JSON: open-addressed name -> slot
+    std::size_t slot_mask_ = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -722,6 +995,59 @@ char detect_delimiter(std::string_view header) {
     return best;
 }
 
+// Newline-delimited JSON if the first thing that is not whitespace is a brace.
+// A CSV header can begin with anything else, and a `{` in the first column of a
+// CSV header is not something this project has ever had to read.
+Dialect sniff_dialect(std::string_view d) {
+    for (std::size_t i = 0; i < d.size() && i < 64; ++i) {
+        if (json_space(d[i])) continue;
+        return d[i] == '{' ? Dialect::Json : Dialect::Csv;
+    }
+    return Dialect::Csv;
+}
+
+// A JSON file has no header row, so the column names are the keys of the first
+// object, in the order it lists them. Two files may list them in different
+// orders and still compare: the join is by name.
+std::vector<std::string> json_header(const Slab& s, const std::string& path) {
+    const std::string_view d = s.bytes();
+    std::vector<std::string> names;
+    std::size_t pos = 0;
+    while (pos < d.size() && json_space(d[pos])) ++pos;
+    if (pos >= d.size() || d[pos] != '{') throw Error("file has no JSON object to read: " + path);
+    ++pos;
+    for (;;) {
+        while (pos < d.size() && json_space(d[pos])) ++pos;
+        if (pos >= d.size() || d[pos] == '}') break;
+        if (d[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (d[pos] != '"') break;
+        bool escaped = false;
+        const std::size_t from = pos + 1;
+        const std::size_t close = skip_json_string(d, pos, d.size(), &escaped);
+        if (close <= from) break;
+        names.emplace_back(d.substr(from, close - 1 - from));
+        pos = close;
+        while (pos < d.size() && json_space(d[pos])) ++pos;
+        if (pos >= d.size() || d[pos] != ':') break;
+        ++pos;
+        while (pos < d.size() && json_space(d[pos])) ++pos;
+        if (pos >= d.size()) break;
+        if (d[pos] == '"') {
+            bool ignore = false;
+            pos = skip_json_string(d, pos, d.size(), &ignore);
+        } else if (d[pos] == '{' || d[pos] == '[') {
+            pos = RowParser::skip_nested_public(d, pos, d.size());
+        } else {
+            while (pos < d.size() && d[pos] != ',' && d[pos] != '}' && !json_space(d[pos])) ++pos;
+        }
+    }
+    if (names.empty()) throw Error("the first JSON object has no keys: " + path);
+    return names;
+}
+
 // The header row's names, and where the first data row starts.
 std::pair<std::vector<std::string>, std::size_t> read_header(const Slab& s, char delimiter,
                                                              const std::string& path) {
@@ -821,6 +1147,11 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     if (opt.key.empty()) throw Error("at least one key column is required");
 
     Slab a(a_path), b(b_path);
+    // The two sides may be in different formats: comparing a CSV export against
+    // the JSON the same pipeline emits is the case that motivates this.
+    a.set_dialect(sniff_dialect(a.bytes()));
+    b.set_dialect(sniff_dialect(b.bytes()));
+
     const char a_delim =
         opt.delimiter.value_or(detect_delimiter(a.bytes().substr(
             0, next_of1(a.bytes(), 0, a.bytes().size(), '\n'))));
@@ -828,8 +1159,18 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         opt.delimiter.value_or(detect_delimiter(b.bytes().substr(
             0, next_of1(b.bytes(), 0, b.bytes().size(), '\n'))));
 
-    auto [a_header, a_start] = read_header(a, a_delim, a_path);
-    auto [b_header, b_start] = read_header(b, b_delim, b_path);
+    std::vector<std::string> a_header, b_header;
+    std::size_t a_start = 0, b_start = 0;
+    if (a.dialect() == Dialect::Json) {
+        a_header = json_header(a, a_path);
+    } else {
+        std::tie(a_header, a_start) = read_header(a, a_delim, a_path);
+    }
+    if (b.dialect() == Dialect::Json) {
+        b_header = json_header(b, b_path);
+    } else {
+        std::tie(b_header, b_start) = read_header(b, b_delim, b_path);
+    }
     const Resolved resolved = resolve(a_header, b_header, opt);
 
     const std::size_t key_size = opt.key.size();
@@ -847,8 +1188,18 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         return out;
     };
 
-    const RowParser ap(a_delim, positions(a_header));
-    const RowParser bp(b_delim, positions(b_header));
+    // A CSV parser is told which column number each slot comes from; a JSON one
+    // is told which key. `wanted` is the same list either way.
+    const auto names_for = [&](const std::vector<std::string>& header) {
+        std::vector<std::string> out;
+        for (const auto& n : wanted)
+            out.push_back(std::find(header.begin(), header.end(), n) == header.end() ? "" : n);
+        return out;
+    };
+    const RowParser ap = a.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(a_header))
+                                                     : RowParser(a_delim, positions(a_header));
+    const RowParser bp = b.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(b_header))
+                                                     : RowParser(b_delim, positions(b_header));
 
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
