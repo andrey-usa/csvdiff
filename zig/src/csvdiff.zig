@@ -542,17 +542,26 @@ const RowIndex = struct {
 
     /// The row carrying `fields`' key, or null. `other` is the slab those fields
     /// live in, which is the opposite file when this is a join probe.
-    fn lookup(self: *RowIndex, other: Slab, fields: []const Field, hash: u64, s: *Scratch) !?i32 {
+    // `probe` is scratch the caller owns. The join runs both directions at once,
+    // and a buffer hanging off the index would be shared between those threads.
+    fn lookup(
+        self: *const RowIndex,
+        other: Slab,
+        fields: []const Field,
+        hash: u64,
+        s: *Scratch,
+        probe: []Field,
+    ) !?i32 {
         var slot = self.slotOf(hash);
         while (true) {
             const at = self.table[slot];
             if (at == EMPTY) return null;
             const candidate = self.first_row.items[@intCast(at)];
             if (self.row_hash.items[@intCast(candidate)] == hash) {
-                self.fieldsOf(candidate, self.probe);
+                self.fieldsOf(candidate, probe);
                 var ok = true;
                 for (0..self.key_size) |i| {
-                    if (!(try same(self.slab, self.probe[i], other, fields[i], self.opt, s))) {
+                    if (!(try same(self.slab, probe[i], other, fields[i], self.opt, s))) {
                         ok = false;
                         break;
                     }
@@ -726,9 +735,60 @@ pub fn compare(
     const ap = RowParser.init(a_delim, a_src);
     const bp = RowParser.init(b_delim, b_src);
 
-    var ai = try RowIndex.build(gpa, a, ap, a_head.start, width, key_size, opt);
+    // The two indexes share nothing, so they are built at the same time. This is
+    // most of the run: parsing and hashing every row of both files.
+    //
+    // `gpa` has to be thread-safe for this. Under --max-memory it is a
+    // FixedBufferAllocator -- a bump pointer with no lock, which would hand both
+    // threads the same bytes -- so main.zig passes its lock-taking variant. The
+    // budget it enforces is unchanged.
+    //
+    // The error type is spelled out rather than inferred: storing a failure as
+    // `anyerror` would widen this function's error set and cost main.zig its
+    // exhaustive switch.
+    const Fault = Error || std.mem.Allocator.Error;
+    const Build = struct {
+        fn run(
+            out: *?RowIndex,
+            err: *?Fault,
+            al: std.mem.Allocator,
+            slab: Slab,
+            parser: RowParser,
+            start: usize,
+            w: usize,
+            ks: usize,
+            o: Options,
+        ) void {
+            out.* = RowIndex.build(al, slab, parser, start, w, ks, o) catch |e| {
+                err.* = e;
+                return;
+            };
+        }
+    };
+
+    var ai_slot: ?RowIndex = null;
+    var ai_err: ?Fault = null;
+    var bi_slot: ?RowIndex = null;
+    var bi_err: ?Fault = null;
+
+    // A thread that cannot be spawned is not a reason to fail: it is the same
+    // work, so it falls back to doing both indexes here in turn.
+    const build_worker: ?std.Thread = std.Thread.spawn(.{}, Build.run, .{
+        &bi_slot, &bi_err, gpa, b, bp, b_head.start, width, key_size, opt,
+    }) catch null;
+    if (build_worker == null)
+        Build.run(&bi_slot, &bi_err, gpa, b, bp, b_head.start, width, key_size, opt);
+    Build.run(&ai_slot, &ai_err, gpa, a, ap, a_head.start, width, key_size, opt);
+    if (build_worker) |w| w.join();
+
+    if (ai_err != null or bi_err != null) {
+        if (ai_slot) |*x| x.deinit();
+        if (bi_slot) |*x| x.deinit();
+        return ai_err orelse bi_err.?;
+    }
+    var ai = ai_slot.?;
     defer ai.deinit();
-    var bi = try RowIndex.build(gpa, b, bp, b_head.start, width, key_size, opt);
+    var bi = bi_slot.?;
     defer bi.deinit();
 
     // Owned copies: the names point into the header, which is released when this
@@ -744,41 +804,140 @@ pub fn compare(
         made += 1;
     }
 
-    const fa = try gpa.alloc(Field, width);
-    defer gpa.free(fa);
-    const fb = try gpa.alloc(Field, width);
-    defer gpa.free(fb);
-    var s = Scratch{};
-
-    var counts = Counts{};
-    // A's distinct keys, in first-appearance order, so a run is reproducible.
-    for (ai.first_row.items) |row| {
-        ai.fieldsOf(row, fa);
-        const hash = try keyHash(a, fa, key_size, opt, &s.a);
-        const mate = try bi.lookup(a, fa, hash, &s) orelse {
-            counts.removed += 1;
-            continue;
-        };
-        counts.matched += 1;
-        bi.fieldsOf(mate, fb);
-        var any = false;
-        for (0..nc) |i| {
-            const x = fa[key_size + i];
-            const y = fb[key_size + i];
-            if (try cellDiffers(a, x, b, y, opt, &s)) {
-                any = true;
-                columns[i].changed += 1;
-                if (try isAbsent(b, y, opt, &s.b)) columns[i].blanked += 1;
-                if (try isAbsent(a, x, opt, &s.a)) columns[i].filled += 1;
+    // The two directions of the join read both indexes and write different
+    // outputs -- one fills changed, removed and the per-column counts, the other
+    // only added -- so they run at the same time. Each side allocates its own
+    // field buffers and its own Scratch; all they share is the two finished
+    // indexes and the two mappings, which are read-only from here on.
+    const Sides = struct {
+        // A's distinct keys, in first-appearance order, so a run is reproducible.
+        fn aSide(
+            err: *?Fault,
+            al: std.mem.Allocator,
+            sa: Slab,
+            sb: Slab,
+            ia: *const RowIndex,
+            ib: *const RowIndex,
+            cs: *Counts,
+            cols: []ColumnStat,
+            w: usize,
+            ks: usize,
+            n: usize,
+            o: Options,
+        ) void {
+            const fa = al.alloc(Field, w) catch |e| {
+                err.* = e;
+                return;
+            };
+            defer al.free(fa);
+            const fb = al.alloc(Field, w) catch |e| {
+                err.* = e;
+                return;
+            };
+            defer al.free(fb);
+            const probe = al.alloc(Field, w) catch |e| {
+                err.* = e;
+                return;
+            };
+            defer al.free(probe);
+            var s = Scratch{};
+            for (ia.first_row.items) |row| {
+                ia.fieldsOf(row, fa);
+                const hash = keyHash(sa, fa, ks, o, &s.a) catch |e| {
+                    err.* = e;
+                    return;
+                };
+                const mate = (ib.lookup(sa, fa, hash, &s, probe) catch |e| {
+                    err.* = e;
+                    return;
+                }) orelse {
+                    cs.removed += 1;
+                    continue;
+                };
+                cs.matched += 1;
+                ib.fieldsOf(mate, fb);
+                var any = false;
+                for (0..n) |i| {
+                    const x = fa[ks + i];
+                    const y = fb[ks + i];
+                    const differs = cellDiffers(sa, x, sb, y, o, &s) catch |e| {
+                        err.* = e;
+                        return;
+                    };
+                    if (differs) {
+                        any = true;
+                        cols[i].changed += 1;
+                        const blank = isAbsent(sb, y, o, &s.b) catch |e| {
+                            err.* = e;
+                            return;
+                        };
+                        if (blank) cols[i].blanked += 1;
+                        const fill = isAbsent(sa, x, o, &s.a) catch |e| {
+                            err.* = e;
+                            return;
+                        };
+                        if (fill) cols[i].filled += 1;
+                    }
+                }
+                if (any) cs.changed += 1;
             }
         }
-        if (any) counts.changed += 1;
-    }
-    for (bi.first_row.items) |row| {
-        bi.fieldsOf(row, fb);
-        const hash = try keyHash(b, fb, key_size, opt, &s.b);
-        if (try ai.lookup(b, fb, hash, &s) == null) counts.added += 1;
-    }
+
+        fn bSide(
+            out: *i64,
+            err: *?Fault,
+            al: std.mem.Allocator,
+            sb: Slab,
+            ia: *const RowIndex,
+            ib: *const RowIndex,
+            w: usize,
+            ks: usize,
+            o: Options,
+        ) void {
+            const fb = al.alloc(Field, w) catch |e| {
+                err.* = e;
+                return;
+            };
+            defer al.free(fb);
+            const probe = al.alloc(Field, w) catch |e| {
+                err.* = e;
+                return;
+            };
+            defer al.free(probe);
+            var s = Scratch{};
+            var n: i64 = 0;
+            for (ib.first_row.items) |row| {
+                ib.fieldsOf(row, fb);
+                const hash = keyHash(sb, fb, ks, o, &s.b) catch |e| {
+                    err.* = e;
+                    return;
+                };
+                const hit = ia.lookup(sb, fb, hash, &s, probe) catch |e| {
+                    err.* = e;
+                    return;
+                };
+                if (hit == null) n += 1;
+            }
+            out.* = n;
+        }
+    };
+
+    var counts = Counts{};
+    var added_count: i64 = 0;
+    var a_err: ?Fault = null;
+    var b_err: ?Fault = null;
+
+    const join_worker: ?std.Thread = std.Thread.spawn(.{}, Sides.bSide, .{
+        &added_count, &b_err, gpa, b, &ai, &bi, width, key_size, opt,
+    }) catch null;
+    if (join_worker == null)
+        Sides.bSide(&added_count, &b_err, gpa, b, &ai, &bi, width, key_size, opt);
+    Sides.aSide(&a_err, gpa, a, b, &ai, &bi, &counts, columns, width, key_size, nc, opt);
+    if (join_worker) |w| w.join();
+
+    if (a_err) |e| return e;
+    if (b_err) |e| return e;
+    counts.added = added_count;
 
     counts.a_rows = ai.rows;
     counts.b_rows = bi.rows;

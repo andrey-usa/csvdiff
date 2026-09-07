@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <optional>
+#include <thread>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -466,10 +468,11 @@ class RowIndex {
     }
 
     // The row carrying `fields`' key, or -1. `other` is the slab those fields
-    // live in, which is the opposite file when this is a join probe.
-    int lookup(const Slab& other, const Field* fields, std::uint64_t hash) const {
+    // live in, which is the opposite file when this is a join probe. `probe` is
+    // scratch the caller owns: the join runs both directions at once, and a
+    // buffer hanging off the index would be shared between those threads.
+    int lookup(const Slab& other, const Field* fields, std::uint64_t hash, Field* probe) const {
         std::size_t slot = slot_of(hash);
-        Field* probe = scratch_.data();
         for (;;) {
             const int at = table_[slot];
             if (at == kEmpty) return -1;
@@ -503,7 +506,7 @@ class RowIndex {
         row_hash_.push_back(hash);
 
         std::size_t slot = slot_of(hash);
-        Field* probe = scratch_.data();
+        Field* probe = scratch_.data();  // only the constructor calls this, on one thread
         for (;;) {
             const int at = table_[slot];
             if (at == kEmpty) {
@@ -706,8 +709,32 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
 
     const RowParser ap(a_delim, positions(a_header));
     const RowParser bp(b_delim, positions(b_header));
-    const RowIndex ai(a, ap, a_start, key_size, opt);
-    const RowIndex bi(b, bp, b_start, key_size, opt);
+
+    // The two indexes share nothing, so they are built at the same time. This is
+    // most of the run: parsing and hashing every row of both files. An exception
+    // thrown on the worker is carried back and rethrown here, because a parse
+    // error has to reach the caller as an error and not as a crash.
+    std::optional<RowIndex> ai_slot, bi_slot;
+    std::exception_ptr worker_failure;
+    {
+        std::thread worker([&] {
+            try {
+                bi_slot.emplace(b, bp, b_start, key_size, opt);
+            } catch (...) {
+                worker_failure = std::current_exception();
+            }
+        });
+        try {
+            ai_slot.emplace(a, ap, a_start, key_size, opt);
+        } catch (...) {
+            worker.join();
+            throw;
+        }
+        worker.join();
+    }
+    if (worker_failure) std::rethrow_exception(worker_failure);
+    const RowIndex& ai = *ai_slot;
+    const RowIndex& bi = *bi_slot;
 
     Result r;
     r.key = opt.key;
@@ -721,34 +748,63 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
 
     Capped changed(opt.max_rows), added(opt.max_rows), removed(opt.max_rows);
     std::int64_t matched = 0;
-    std::vector<Field> fa(width), fb(width);
 
-    // A's distinct keys, in first-appearance order, so a run is reproducible.
-    for (int row : ai.first_rows()) {
-        ai.fields_of(row, fa.data());
-        const int mate = bi.lookup(a, fa.data(), key_hash(a, fa.data(), key_size, opt));
-        if (mate < 0) {
-            removed.push(row, -1);
-            continue;
-        }
-        ++matched;
-        bi.fields_of(mate, fb.data());
-        bool any = false;
-        for (std::size_t i = 0; i < nc; ++i) {
-            const Field x = fa[key_size + i], y = fb[key_size + i];
-            if (cell_differs(a, x, b, y, opt)) {
-                any = true;
-                ++r.columns[i].changed;
-                if (is_absent(b, y, opt)) ++r.columns[i].blanked;
-                if (is_absent(a, x, opt)) ++r.columns[i].filled;
+    // The two directions of the join touch different outputs -- one fills
+    // changed, removed and the column counts, the other only added -- and read
+    // both indexes without writing either, so they run at the same time. Each
+    // owns its field buffers and its probe scratch; nothing is shared but the
+    // two finished indexes and the two mappings, which are const from here on.
+    auto a_side = [&] {
+        std::vector<Field> fa(width), fb(width), probe(width);
+        // A's distinct keys, in first-appearance order, so a run is reproducible.
+        for (int row : ai.first_rows()) {
+            ai.fields_of(row, fa.data());
+            const int mate =
+                bi.lookup(a, fa.data(), key_hash(a, fa.data(), key_size, opt), probe.data());
+            if (mate < 0) {
+                removed.push(row, -1);
+                continue;
             }
+            ++matched;
+            bi.fields_of(mate, fb.data());
+            bool any = false;
+            for (std::size_t i = 0; i < nc; ++i) {
+                const Field x = fa[key_size + i], y = fb[key_size + i];
+                if (cell_differs(a, x, b, y, opt)) {
+                    any = true;
+                    ++r.columns[i].changed;
+                    if (is_absent(b, y, opt)) ++r.columns[i].blanked;
+                    if (is_absent(a, x, opt)) ++r.columns[i].filled;
+                }
+            }
+            if (any) changed.push(row, mate);
         }
-        if (any) changed.push(row, mate);
-    }
-    for (int row : bi.first_rows()) {
-        bi.fields_of(row, fb.data());
-        if (ai.lookup(b, fb.data(), key_hash(b, fb.data(), key_size, opt)) < 0)
-            added.push(row, -1);
+    };
+    auto b_side = [&] {
+        std::vector<Field> fb(width), probe(width);
+        for (int row : bi.first_rows()) {
+            bi.fields_of(row, fb.data());
+            if (ai.lookup(b, fb.data(), key_hash(b, fb.data(), key_size, opt), probe.data()) < 0)
+                added.push(row, -1);
+        }
+    };
+    {
+        std::exception_ptr failure;
+        std::thread worker([&] {
+            try {
+                b_side();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        try {
+            a_side();
+        } catch (...) {
+            worker.join();
+            throw;
+        }
+        worker.join();
+        if (failure) std::rethrow_exception(failure);
     }
 
     // Only now does anything become a string, and only for the rows kept.

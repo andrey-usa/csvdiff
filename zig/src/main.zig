@@ -138,7 +138,10 @@ pub fn main(init: std.process.Init) !u8 {
             return 2;
         };
         fixed = std.heap.FixedBufferAllocator.init(budget.?);
-        gpa = fixed.allocator();
+        // The lock-taking variant, because the comparison builds its two indexes
+        // on two threads. A bump pointer without a lock would hand both the same
+        // bytes; the budget it enforces is unchanged.
+        gpa = fixed.threadSafeAllocator();
     }
 
     var result = csvdiff.compare(io, gpa, files.items[0], files.items[1], opt) catch |err| {
