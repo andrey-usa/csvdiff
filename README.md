@@ -9,7 +9,7 @@ parity ports. That is what makes the benchmark section below a like-for-like
 comparison rather than a collection of anecdotes.
 
 **Jump to:** [Using it](#using-it) · [Which engine at which size](#which-engine-at-which-size) ·
-[Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) · [Techniques](#techniques) · [Ports](#ports) ·
+[Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) · [Formats](#input-formats-is-csv-the-problem) · [Techniques](#techniques) · [Ports](#ports) ·
 [Reproducing](#reproducing-the-numbers) · [Open questions](#open-questions)
 
 ---
@@ -495,11 +495,23 @@ about 100 MB per million rows. That is the row index, the offset array and the h
 what sets the real ceiling: at a billion rows it would want roughly 100 GB, which is where
 `sortmerge` stops being the conservative choice and becomes the only one.
 
-**Generating the data got its own fix.** The ladder needs 29 GB of input across five sizes, and the
-Python generator writes a million rows in 30.5s — around 25 minutes for 50M alone. All five ports
-emit byte-identical files (`parity.yml` enforces it), so the harness now picks the Go generator,
-which does the same million rows in 4.6s. **6.6x**, and 50M generates in three minutes instead of
-twenty-five.
+**Generating the data got its own fix, twice.** The ladder needs 29 GB of input across five sizes,
+and the Python generator writes a million rows in 30.5s — around 25 minutes for 50M alone. All the
+generators emit byte-identical files (`parity.yml` enforces it), so the harness is free to pick on
+speed. Go was the first answer; a threaded C++ one ([`cpp/tools/gen_data.cpp`](cpp/tools/gen_data.cpp))
+is the last one worth having:
+
+| Generating 10M rows (3.7 GB) | Time | vs the disk |
+|---|---:|---:|
+| Python | ~305s | 18x |
+| Go | 43.0s | 2.6x |
+| **C++, four threads** | **17.7s** | **1.07x** |
+| `dd` writing the same bytes | 16.6s | 1.00x |
+
+Every row is a pure function of its index, so rows can be formatted without seeing any other row.
+They are, in waves: N threads fill their own buffers, the buffers are written in order, and memory
+is bounded by the wave rather than the file. At 17.7s against `dd`'s 16.6s there is nothing left to
+win — generation is now pure I/O.
 
 ## Set C — against the field
 
@@ -776,6 +788,73 @@ fixture.
 
 The Zig port has the structural two-thread version only; chunking it is open.
 
+## Input formats: is CSV the problem?
+
+CSV is a text format that has to be parsed a byte at a time. Parquet, Arrow and
+JSON are the obvious alternatives, so: ten million rows, one file, twenty columns,
+converted and read back with polars, page cache warm.
+
+| Format | Size | Full read | Six columns |
+|---|---:|---:|---:|
+| Parquet + zstd | **288 MB** | 0.89s | 0.31s |
+| Parquet, uncompressed | 966 MB | **0.56s** | **0.18s** |
+| CSV | 1,755 MB | 4.17s | 1.89s |
+| Arrow IPC | 3,537 MB | 1.01s | 0.34s |
+| JSON (ndjson) | 4,244 MB | 9.56s | 5.46s |
+
+**Parquet wins on both axes** — six times smaller than CSV with zstd, and ten times
+faster to read when only some columns are wanted. **JSON loses on both** — 2.4x
+larger than CSV *and* 2.9x slower. **Arrow IPC is fast but fat**: every column here
+is a string, and offsets plus data come to twice what the text does.
+
+**And yet none of it would help much**, which is the useful part. Timing the phases
+of a ten-million-row comparison in the C++ port:
+
+| Phase | Wall |
+|---|---:|
+| Parse and hash both files | 1.86s |
+| Insert into the index (single-threaded) | 3.09s |
+| The join | ~7s |
+| **Total** | **12.02s** |
+
+Parsing is **15%** of the run. A format that made it free would save 15%, and the
+0.18s Parquet figure above is one file read by a columnar engine that then still
+has to hash and join. The sequential insert alone costs more than all the parsing.
+
+So the format is not the bottleneck, and adding a Parquet reader would buy less
+than sharding the insert would. The one real argument for Parquet is memory rather
+than speed: at 966 MB uncompressed against 1,755 MB of CSV, the mapped input
+roughly halves.
+
+## Using less memory than the report says
+
+Peak RSS is what a process used with room to spare. For an engine that maps its
+input that is close to meaningless — mapped pages are reclaimable, so the figure
+is whatever the kernel let it keep, not what the work needed.
+`scripts/memory_floor.sh` measures the number that matters by binary-searching the
+smallest memory cgroup a comparison actually finishes in.
+
+Ten million rows, 3.3 GB of CSV, four threads:
+
+| | Reported peak RSS | Smallest limit that finishes |
+|---|---:|---:|
+| Holding chunk buffers to the end | 4,562 MB | 1,016 MB |
+| **Freeing each chunk as it is consumed** | 4,375 MB | **857 MB** |
+
+**The engine compares 3.3 GB of CSV inside 857 MB**, about 10% slower than
+unconstrained. Peak RSS is five times that figure and moves 4% between the two
+builds, where the floor moves 16% — so it was measuring the machine's spare
+capacity, not the engine.
+
+The change itself is small: the parallel sweep built per-chunk arrays of row
+starts and hashes and held all of them while copying into the index, so every
+row's start and hash existed twice at the peak. Released as each chunk is
+consumed, the two curves cross instead of adding. It costs about 4% of time.
+
+One trap worth writing down, since it cost an hour: each probe needs a **fresh**
+cgroup. Lowering the limit on a cgroup that already has pages charged to it
+fails silently, and the run then passes because nothing was actually constrained.
+
 ## The out-of-core engine
 
 `sortmerge` batches rows, sorts each batch, spills it to disk, and does a k-way merge with the tie
@@ -988,6 +1067,12 @@ cpp/build/csvdiff compare a.csv b.csv -k id --threads 4  # C++ thread scaling
 # one engine across every size, generating and deleting each pair in turn
 python scripts/bench_scale.py --sizes 10k,1m,10m,20m,50m --threads 4
 
+# the generator that keeps up with the disk
+(cd cpp && make gen-data) && cpp/build/gen-data --rows 10m --out-dir data --prefix 10m
+
+# the smallest memory limit a comparison finishes in
+scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
+
 # the four Java byte-level engines head to head (Vector API needs the module)
 java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \
   compare a.csv b.csv -k account_id,txn_id -i updated_at --engine shard -o /dev/null
@@ -1058,15 +1143,19 @@ Sizes and shapes not yet answered, roughly in the order they would pay off:
    cpu/wall and 20M from 54.60s to 33.32s. The guess in this slot that the scan was already
    bandwidth-bound was wrong, and the test that disproved it took one script. Zig still has the
    two-thread version only.
-6. **Where does the C++ port stop scaling?** 2.53x cpu/wall on four cores is short of four, and the
-   remaining sequential parts — table insertion, B's side of the join — are now the obvious suspects.
-   A box with more cores would say whether the design or the machine is the limit.
-7. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
+6. **Shard the index insertion.** Phase timing puts it at 3.09s of a 12.02s run at ten million rows,
+   single-threaded, which now costs more than all the parsing. Sharding the hash table by key so each
+   thread owns a slice would parallelise it while keeping first-occurrence-wins, and it is worth more
+   than any input format would be.
+7. **Where does the C++ port stop scaling?** 2.53x cpu/wall on four cores is short of four, and the
+   remaining sequential parts — table insertion, B's side of the join — are the obvious suspects. A
+   box with more cores would say whether the design or the machine is the limit.
+8. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
    cell work, and probably the ranking. It would also re-open the SIMD question: longer rows mean
    longer scans, which is the one shape where a vector register might pay.
-8. **Many small comparisons** rather than one big one — where JVM startup dominates and
+9. **Many small comparisons** rather than one big one — where JVM startup dominates and
    native-image's startup advantage might finally pay for its throughput.
-9. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
+10. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
    the 17-21x should move.
 
 ## Suggested additions
