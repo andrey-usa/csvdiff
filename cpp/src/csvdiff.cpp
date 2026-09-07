@@ -478,8 +478,17 @@ class RowIndex {
         for (const auto& c : chunks) total += c.starts.size();
         row_start_.reserve(total);
         row_hash_.reserve(total);
-        for (const auto& c : chunks)
+        // Each chunk is released as soon as it has been inserted. Holding all of
+        // them until the end would keep two copies of every row's start and hash
+        // alive at once -- the chunks and the arrays being filled from them --
+        // which is sixteen bytes a row of pure duplication, 320 MB at ten
+        // million rows across both files. Freed as it goes, the two curves cross
+        // instead of adding.
+        for (auto& c : chunks) {
             for (std::size_t i = 0; i < c.starts.size(); ++i) insert(c.starts[i], c.hashes[i]);
+            std::vector<std::size_t>().swap(c.starts);
+            std::vector<std::uint64_t>().swap(c.hashes);
+        }
     }
 
     void fields_of(int row, Field* out) const {
