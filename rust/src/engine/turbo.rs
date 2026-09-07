@@ -8,337 +8,108 @@
 //! mapped bytes; hashing and comparison read those bytes in place, and only the
 //! capped report sections are ever decoded.
 //!
-//! That is the same design as the Java `turbo` engine, and it exists here for a
-//! specific reason: Java `turbo` beats Rust `native` by nearly six times on time
-//! and four on memory, which reads as a language result and is not one. With
-//! both designs in one language the comparison is honest.
+//! That is the same design as the Java `turbo` engine and the C, C++ and Zig
+//! ports, and it exists here for a specific reason: Java `turbo` beats Rust
+//! `native` by nearly six times on time and four on memory, which reads as a
+//! language result and is not one. With both designs in one language the
+//! comparison is honest.
 //!
-//! Normalisation is delegated rather than reimplemented. With `--trim`,
-//! `--ignore-case`, `--empty-is-null` or a tolerance in play a field is decoded
-//! and handed to the same [`crate::columns`] functions every other engine uses,
-//! so the answer cannot drift; without them the raw bytes are compared and
-//! hashed directly, which is the path the benchmarks take. Hashing and equality
-//! therefore always read the same bytes by the same route — the property whose
-//! absence produced two silently wrong answers in the Java port.
+//! Three things are layered on that base, and each is worth a sentence:
+//!
+//! - **Three input formats.** CSV, newline-delimited JSON and Parquet all reduce
+//!   to the same field word, so the two sides of a comparison need not be in the
+//!   same format: a CSV export compares against the Parquet a warehouse emits.
+//!   See [`text`] and [`parquet`].
+//! - **Every core.** Each file is split at row boundaries, parsed and hashed in
+//!   parallel, and inserted into its index in file order; the join then splits
+//!   over contiguous ranges of A's keys. Ordering is preserved where it is
+//!   load-bearing, so the answer does not depend on the thread count.
+//! - **Normalisation is delegated rather than reimplemented.** With `--trim`,
+//!   `--ignore-case`, `--empty-is-null` or a tolerance in play a field is decoded
+//!   and handed to the same [`crate::columns`] functions every other engine uses,
+//!   so the answer cannot drift; without them the raw bytes are compared and
+//!   hashed directly, which is the path the benchmarks take.
+//!
+//! Hashing and equality always read the same bytes by the same route — the
+//! property whose absence produced two silently wrong answers in the Java port.
 
-use std::fs::File;
+mod codec;
+mod encoding;
+mod field;
+mod parquet;
+mod slab;
+mod text;
+mod thrift;
+
 use std::path::Path;
 
-use memmap2::Mmap;
+use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
+use slab::{Dialect, Slab, same_bytes, text_of};
+use text::{RowParser, csv_header, detect_delimiter, json_header, sniff_dialect};
 
-use crate::columns::{compare_keys, detect_delimiter, differs, empty_to_null, normalise, resolve};
+use crate::columns::{compare_keys, differs, empty_to_null, normalise, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::rowstore::Joined;
 use crate::sections::assemble;
 
-/// A field packed into one word: offset, length, and whether it needs unescaping.
-///
-/// 40 bits of offset addresses a terabyte and 23 bits of length a field of eight
-/// megabytes, which is more than a CSV cell has any business being.
-type Field = u64;
+/// Below this there is nothing to divide: finding the chunk boundaries would
+/// cost more than the parsing it splits.
+const CHUNKING_THRESHOLD: usize = 4 << 20;
 
-const ABSENT: Field = u64::MAX;
-/// A field too long for the packed length. Reported rather than truncated: the
-/// length is masked into 23 bits, so silently packing an over-long field would
-/// corrupt its value instead of failing.
-const TOO_LONG: Field = u64::MAX - 1;
-const OFFSET_MASK: u64 = (1 << 40) - 1;
-const LENGTH_SHIFT: u32 = 40;
-const LENGTH_MASK: u64 = (1 << 23) - 1;
-const ESCAPED: u64 = 1 << 63;
-const MAX_FIELD_LEN: u64 = LENGTH_MASK;
+/// How many keys make the join worth splitting.
+const JOIN_THRESHOLD: usize = 1 << 14;
 
-fn pack(offset: u64, len: u64, escaped: bool) -> Field {
-    if len > MAX_FIELD_LEN {
-        return TOO_LONG;
-    }
-    (offset & OFFSET_MASK)
-        | ((len & LENGTH_MASK) << LENGTH_SHIFT)
-        | if escaped { ESCAPED } else { 0 }
-}
-
-fn offset_of(f: Field) -> usize {
-    (f & OFFSET_MASK) as usize
-}
-
-fn len_of(f: Field) -> usize {
-    ((f >> LENGTH_SHIFT) & LENGTH_MASK) as usize
-}
-
-fn is_escaped(f: Field) -> bool {
-    f & ESCAPED != 0
+/// How many threads this comparison may use in total. Both files are read at
+/// once and each is split further, so this is the width of the whole run rather
+/// than of one file.
+fn budget(opt: &Options) -> usize {
+    opt.threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
 }
 
 // ---------------------------------------------------------------------------
-// SWAR scanning
+// One file, read into the representation the join works on
 // ---------------------------------------------------------------------------
 
-const ONES: u64 = 0x0101_0101_0101_0101;
-const HIGH: u64 = 0x8080_8080_8080_8080;
-
-fn broadcast(b: u8) -> u64 {
-    (b as u64) * ONES
+/// How a file's rows are addressed.
+enum Rows {
+    /// Text: a row is an offset into the mapping, re-parsed on demand. The index
+    /// stores where a row starts rather than its fields, because an offset is
+    /// eight bytes where the fields would be twenty times that, and re-parsing is
+    /// cheap because the parser stops at the last needed column.
+    Text { parser: RowParser, from: usize },
+    /// Parquet: there is no row to re-read, so the fields are materialised once,
+    /// row-major, and a row is an index into them.
+    Columnar { fields: Vec<Field>, rows: usize },
 }
 
-/// Sets the high bit of every byte of `word` that equals `target`.
-///
-/// `diff - ONES` borrows across a byte only where that byte was zero, and
-/// `!diff` cancels the false positives the borrow creates, so what survives
-/// marks exactly the matching bytes.
-fn match_bits(word: u64, target: u64) -> u64 {
-    let diff = word ^ target;
-    (diff.wrapping_sub(ONES)) & !diff & HIGH
+/// One file: the bytes its fields point into, and how to get a row's fields.
+struct Side {
+    slab: Slab,
+    rows: Rows,
+    width: usize,
 }
 
-/// The offset of the first byte at or after `from` that is `a` or `b`, or `end`.
-fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> usize {
-    let (ba, bb) = (broadcast(a), broadcast(b));
-    let mut at = from;
-    while at + 8 <= end {
-        let word = u64::from_le_bytes(data[at..at + 8].try_into().expect("eight bytes"));
-        let hits = match_bits(word, ba) | match_bits(word, bb);
-        if hits != 0 {
-            return at + (hits.trailing_zeros() >> 3) as usize;
-        }
-        at += 8;
-    }
-    while at < end {
-        if data[at] == a || data[at] == b {
-            return at;
-        }
-        at += 1;
-    }
-    end
-}
-
-/// The offset of the first `target` at or after `from`, or `end`.
-fn next_of1(data: &[u8], from: usize, end: usize, target: u8) -> usize {
-    let bt = broadcast(target);
-    let mut at = from;
-    while at + 8 <= end {
-        let word = u64::from_le_bytes(data[at..at + 8].try_into().expect("eight bytes"));
-        let hits = match_bits(word, bt);
-        if hits != 0 {
-            return at + (hits.trailing_zeros() >> 3) as usize;
-        }
-        at += 8;
-    }
-    while at < end {
-        if data[at] == target {
-            return at;
-        }
-        at += 1;
-    }
-    end
-}
-
-/// Walks past a quoted field's body, returning the offset after its closing quote.
-/// A doubled quote inside is content, not the end.
-fn skip_quoted(data: &[u8], from: usize, end: usize) -> usize {
-    let mut at = from;
-    loop {
-        let q = next_of1(data, at, end, b'"');
-        if q >= end {
-            return end;
-        }
-        if q + 1 < end && data[q + 1] == b'"' {
-            at = q + 2;
-            continue;
-        }
-        return q + 1;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The mapped file
-// ---------------------------------------------------------------------------
-
-/// The file's bytes.
-///
-/// A quoted field holding a doubled quote is the one value that is not a slice
-/// of the file. Rather than copy it into a side buffer, such a field is flagged
-/// and the second quote of each pair is skipped when the bytes are read — so
-/// parsing needs no buffer, no allocation and no mutation, and a parser can be
-/// shared and re-run freely.
-struct Slab {
-    _file: File,
-    map: Mmap,
-}
-
-impl Slab {
-    fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)
-            .map_err(|e| Error::new(format!("cannot read {}: {e}", path.display())))?;
-        // Safety: the file is opened read-only and not modified while mapped.
-        // A concurrent truncation would be a torn read, which is the documented
-        // hazard of every mapping engine here and of DuckDB's reader too.
-        let map = unsafe { Mmap::map(&file) }
-            .map_err(|e| Error::new(format!("cannot map {}: {e}", path.display())))?;
-        Ok(Slab { _file: file, map })
-    }
-
-    fn bytes(&self) -> &[u8] {
-        &self.map
-    }
-
-    /// The field's raw span, still holding any doubled quotes.
-    fn raw(&self, f: Field) -> &[u8] {
-        if f == ABSENT || f == TOO_LONG {
-            return &[];
-        }
-        let (at, len) = (offset_of(f), len_of(f));
-        &self.map[at..at + len]
-    }
-
-    /// The field's logical bytes: the raw span with the second quote of each
-    /// doubled pair dropped. Equality, hashing and decoding all read a field
-    /// through this one route, so they cannot disagree about its value.
-    fn logical(&self, f: Field) -> LogicalBytes<'_> {
-        let real = f != ABSENT && f != TOO_LONG;
-        LogicalBytes {
-            raw: self.raw(f),
-            escaped: real && is_escaped(f),
-            at: 0,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Parsing
-// ---------------------------------------------------------------------------
-
-/// Splits rows into fields, projecting straight to the columns asked for.
-///
-/// Once the last needed column has been read the rest of the row is skipped to
-/// its newline without its fields ever being delimited. On twenty columns keyed
-/// on the first two that is most of the row never looked at.
-struct RowParser {
-    delimiter: u8,
-    /// Where each projected column sits in the file, or `None` when absent.
-    source: Vec<Option<usize>>,
-    last_needed: usize,
-}
-
-impl RowParser {
-    fn new(delimiter: u8, source: Vec<Option<usize>>) -> Self {
-        let last_needed = source.iter().flatten().copied().max().unwrap_or(0);
-        RowParser {
-            delimiter,
-            source,
-            last_needed,
-        }
-    }
-
-    /// Parses one row into `out`, returning the offset of the next row.
-    ///
-    /// A row shorter than the header leaves the missing fields [`ABSENT`], which
-    /// compares as absent — a difference to report, not a file to refuse.
-    fn parse(&self, data: &[u8], start: usize, end: usize, out: &mut [Field]) -> usize {
-        out.fill(ABSENT);
-        let mut pos = start;
-        let mut column = 0usize;
-
-        while pos <= end {
-            let (field, next) = if pos < end && data[pos] == b'"' {
-                let close = skip_quoted(data, pos + 1, end);
-                let body_end = close.saturating_sub(1).max(pos + 1);
-                let next = next_of2(data, close, end, self.delimiter, b'\n');
-                (quoted_field(data, pos + 1, body_end), next)
-            } else {
-                let next = next_of2(data, pos, end, self.delimiter, b'\n');
-                (plain_field(data, pos, next), next)
-            };
-            self.store(column, field, out);
-            column += 1;
-
-            if next >= end {
-                return end;
+impl Side {
+    /// The fields of the row addressed by `at` — a byte offset for a text file,
+    /// a row number for a columnar one.
+    fn fields_at(&self, at: u64, out: &mut [Field]) {
+        match &self.rows {
+            Rows::Text { parser, .. } => {
+                let data = self.slab.data();
+                parser.parse(data, at as usize, data.len(), out);
             }
-            if data[next] == b'\n' {
-                return next + 1;
-            }
-            pos = next + 1;
-            if column > self.last_needed {
-                let eol = end_of_row(data, pos, end);
-                return if eol >= end { end } else { eol + 1 };
-            }
-        }
-        end
-    }
-
-    fn store(&self, column: usize, field: Field, out: &mut [Field]) {
-        if column > self.last_needed {
-            return;
-        }
-        for (i, at) in self.source.iter().enumerate() {
-            if *at == Some(column) {
-                out[i] = field;
+            Rows::Columnar { fields, .. } => {
+                let from = at as usize * self.width;
+                out.copy_from_slice(&fields[from..from + self.width]);
             }
         }
     }
-}
-
-/// A quoted field, flagged when it holds a doubled quote. A quote inside the
-/// body can only be half of such a pair, which is what makes the test a single
-/// scan and lets the unescaping wait until the bytes are actually read.
-fn quoted_field(data: &[u8], from: usize, to: usize) -> Field {
-    let escaped = next_of1(data, from, to, b'"') < to;
-    pack(from as u64, (to - from) as u64, escaped)
-}
-
-/// A field's logical bytes, dropping the second quote of each doubled pair.
-struct LogicalBytes<'a> {
-    raw: &'a [u8],
-    escaped: bool,
-    at: usize,
-}
-
-impl Iterator for LogicalBytes<'_> {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<u8> {
-        let b = *self.raw.get(self.at)?;
-        self.at += 1;
-        if self.escaped && b == b'"' && self.raw.get(self.at) == Some(&b'"') {
-            self.at += 1;
-        }
-        Some(b)
-    }
-}
-
-impl LogicalBytes<'_> {
-    /// True when no unescaping is needed, so callers can take the slice whole.
-    fn is_plain(&self) -> bool {
-        !self.escaped
-    }
-}
-
-/// An unquoted field, with a trailing carriage return stripped so CRLF behaves like LF.
-fn plain_field(data: &[u8], from: usize, to: usize) -> Field {
-    let mut stop = to;
-    if stop > from && data[stop - 1] == b'\r' {
-        stop -= 1;
-    }
-    pack(from as u64, (stop - from) as u64, false)
-}
-
-/// The offset of the newline ending the row that starts at `pos`.
-fn end_of_row(data: &[u8], pos: usize, end: usize) -> usize {
-    let mut at = pos;
-    while at < end {
-        let next = next_of2(data, at, end, b'\n', b'"');
-        if next >= end {
-            return end;
-        }
-        if data[next] == b'"' {
-            at = skip_quoted(data, next + 1, end);
-            continue;
-        }
-        return next;
-    }
-    end
 }
 
 // ---------------------------------------------------------------------------
@@ -358,28 +129,8 @@ fn value(slab: &Slab, f: Field, opt: &Options) -> Val {
     normalise(empty_to_null(&text_of(slab, f)), opt)
 }
 
-/// The field decoded. Only the report sections and the normalising paths call
-/// this; the fast path never builds a string for a cell at all.
-fn text_of(slab: &Slab, f: Field) -> String {
-    let logical = slab.logical(f);
-    if logical.is_plain() {
-        return String::from_utf8_lossy(slab.raw(f)).into_owned();
-    }
-    let bytes: Vec<u8> = logical.collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// Whether two fields hold the same logical bytes, without decoding either.
-fn same_bytes(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
-    let (lx, ly) = (a.logical(x), b.logical(y));
-    if lx.is_plain() && ly.is_plain() {
-        return a.raw(x) == b.raw(y);
-    }
-    lx.eq(ly)
-}
-
 fn is_absent(slab: &Slab, f: Field, opt: &Options) -> bool {
-    if f == ABSENT || len_of(f) == 0 {
+    if f == ABSENT || field::len_of(f) == 0 || f == TOO_LONG {
         return true;
     }
     if !needs_normalising(opt) {
@@ -390,9 +141,9 @@ fn is_absent(slab: &Slab, f: Field, opt: &Options) -> bool {
 
 fn same(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
     if !needs_normalising(opt) {
-        let (xa, xb) = (is_absent(a, x, opt), is_absent(b, y, opt));
-        if xa || xb {
-            return xa && xb;
+        let (xa, yb) = (is_absent(a, x, opt), is_absent(b, y, opt));
+        if xa || yb {
+            return xa && yb;
         }
         return same_bytes(a, x, b, y);
     }
@@ -444,13 +195,19 @@ fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u6
 // The index
 // ---------------------------------------------------------------------------
 
+/// One chunk's rows, in the order they appear in it.
+struct Chunk {
+    at: Vec<u64>,
+    hash: Vec<u64>,
+}
+
 /// An open-addressing index over one file's rows, keyed on the composite key.
 ///
-/// Everything is a primitive array: row starts, row hashes, and a table of row
-/// numbers masked into a power-of-two slot count. Collisions are resolved by
-/// comparing the key bytes, so the hash only has to be fast and spread.
+/// Everything is a primitive array: where each row is, its key hash, and a table
+/// of key numbers masked into a power-of-two slot count. Collisions are resolved
+/// by comparing the key bytes, so the hash only has to be fast and spread.
 struct RowIndex {
-    row_start: Vec<u64>,
+    row_at: Vec<u64>,
     row_hash: Vec<u64>,
     table: Vec<i32>,
     mask: usize,
@@ -465,18 +222,21 @@ struct RowIndex {
 const EMPTY: i32 = -1;
 
 impl RowIndex {
-    fn build(
-        slab: &Slab,
-        parser: &RowParser,
-        from: usize,
-        width: usize,
-        key_size: usize,
-        opt: &Options,
-    ) -> Result<Self> {
-        let end = slab.bytes().len();
+    /// Finds and hashes every row in parallel, then inserts them on one thread in
+    /// file order.
+    ///
+    /// The split is safe because the two halves need different things: parsing a
+    /// row depends on nothing but where it starts, while the table depends on the
+    /// order rows arrive — first occurrence of a key wins, and the duplicate
+    /// counts follow from that. Doing the second half in parallel would make the
+    /// answer depend on thread scheduling.
+    fn build(side: &Side, key_size: usize, opt: &Options, threads: usize) -> Result<Self> {
+        let mut chunks = sweep(side, key_size, opt, threads)?;
+
+        let total: usize = chunks.iter().map(|c| c.at.len()).sum();
         let mut idx = RowIndex {
-            row_start: Vec::new(),
-            row_hash: Vec::new(),
+            row_at: Vec::with_capacity(total),
+            row_hash: Vec::with_capacity(total),
             table: vec![EMPTY; 1 << 12],
             mask: (1 << 12) - 1,
             first_row: Vec::new(),
@@ -485,60 +245,51 @@ impl RowIndex {
             dup_keys: 0,
             dup_rows: 0,
         };
-        let mut fields = vec![ABSENT; width];
-        let mut scratch = vec![ABSENT; width];
-        let mut pos = from;
-        while pos < end {
-            // A line with nothing on it is not a row, which is what every other
-            // reader here does.
-            match slab.bytes()[pos] {
-                b'\n' => {
-                    pos += 1;
-                    continue;
-                }
-                b'\r' if pos + 1 < end && slab.bytes()[pos + 1] == b'\n' => {
-                    pos += 2;
-                    continue;
-                }
-                _ => {}
+        let mut probe = vec![ABSENT; side.width];
+        let mut mine = vec![ABSENT; side.width];
+        // Each chunk is released as soon as it has been inserted. Holding all of
+        // them to the end would keep two copies of every row's address and hash
+        // alive at once, which is sixteen bytes a row of pure duplication —
+        // 320 MB at ten million rows across both files.
+        for chunk in &mut chunks {
+            for i in 0..chunk.at.len() {
+                idx.insert(
+                    side,
+                    chunk.at[i],
+                    chunk.hash[i],
+                    key_size,
+                    opt,
+                    &mut probe,
+                    &mut mine,
+                );
             }
-            let next = parser.parse(slab.bytes(), pos, end, &mut fields);
-            if fields.contains(&TOO_LONG) {
-                return Err(Error::new(format!(
-                    "a field larger than {MAX_FIELD_LEN} bytes is more than this engine packs; \
-                     use --engine native"
-                )));
-            }
-            idx.add(slab, pos, &fields, key_size, opt, parser, &mut scratch);
-            if next <= pos {
-                break; // no progress: a malformed tail rather than an endless loop
-            }
-            pos = next;
+            chunk.at = Vec::new();
+            chunk.hash = Vec::new();
         }
         Ok(idx)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add(
+    fn insert(
         &mut self,
-        slab: &Slab,
-        start: usize,
-        fields: &[Field],
+        side: &Side,
+        at: u64,
+        hash: u64,
         key_size: usize,
         opt: &Options,
-        parser: &RowParser,
-        scratch: &mut [Field],
+        probe: &mut [Field],
+        mine: &mut [Field],
     ) {
         self.rows += 1;
-        let row = self.row_start.len() as i32;
-        let hash = key_hash(slab, fields, key_size, opt);
-        self.row_start.push(start as u64);
+        let row = self.row_at.len() as i32;
+        self.row_at.push(at);
         self.row_hash.push(hash);
 
         let mut slot = self.slot(hash);
+        let mut mine_parsed = false;
         loop {
-            let at = self.table[slot];
-            if at == EMPTY {
+            let key = self.table[slot];
+            if key == EMPTY {
                 self.table[slot] = self.first_row.len() as i32;
                 self.first_row.push(row);
                 self.occurrences.push(1);
@@ -547,44 +298,32 @@ impl RowIndex {
                 }
                 return;
             }
-            let candidate = self.first_row[at as usize];
-            if self.row_hash[candidate as usize] == hash
-                && self.same_key(slab, candidate, fields, key_size, opt, parser, scratch)
-            {
-                self.occurrences[at as usize] += 1;
-                if self.occurrences[at as usize] == 2 {
-                    self.dup_keys += 1;
-                    self.dup_rows += 1; // the first occurrence counts once the key is known to repeat
+            let candidate = self.first_row[key as usize];
+            if self.row_hash[candidate as usize] == hash {
+                // This row's fields are re-parsed rather than carried over from
+                // the sweep because the sweep produced ten million of them and
+                // this branch wants one.
+                if !mine_parsed {
+                    side.fields_at(at, mine);
+                    mine_parsed = true;
                 }
-                self.dup_rows += 1;
-                return;
+                self.fields_of(side, candidate, probe);
+                if (0..key_size).all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt)) {
+                    self.occurrences[key as usize] += 1;
+                    if self.occurrences[key as usize] == 2 {
+                        self.dup_keys += 1;
+                        self.dup_rows += 1; // the first occurrence counts once the key repeats
+                    }
+                    self.dup_rows += 1;
+                    return;
+                }
             }
             slot = (slot + 1) & self.mask;
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn same_key(
-        &self,
-        slab: &Slab,
-        candidate: i32,
-        fields: &[Field],
-        key_size: usize,
-        opt: &Options,
-        parser: &RowParser,
-        probe: &mut [Field],
-    ) -> bool {
-        self.fields_of(slab, parser, candidate, probe);
-        (0..key_size).all(|i| same(slab, probe[i], slab, fields[i], opt))
-    }
-
-    /// Re-parses a row. The index stores where each row starts, not its fields,
-    /// because a row number and an offset are sixteen bytes where the fields
-    /// would be twenty times that. Re-parsing is cheap because the parser stops
-    /// at the last needed column, and it needs no mutable state.
-    fn fields_of(&self, slab: &Slab, parser: &RowParser, row: i32, out: &mut [Field]) {
-        let start = self.row_start[row as usize] as usize;
-        parser.parse(slab.bytes(), start, slab.bytes().len(), out);
+    fn fields_of(&self, side: &Side, row: i32, out: &mut [Field]) {
+        side.fields_at(self.row_at[row as usize], out);
     }
 
     fn slot(&self, hash: u64) -> usize {
@@ -607,29 +346,31 @@ impl RowIndex {
         }
     }
 
-    /// The row carrying `fields`' key in this index, or `None`.
+    /// The row carrying `fields`' key in this index, or `None`. `other` is the
+    /// side those fields live in, which is the opposite file when this is a join
+    /// probe. `probe` is scratch the caller owns: the join runs several ranges
+    /// at once, and a buffer hanging off the index would be shared between them.
     #[allow(clippy::too_many_arguments)]
     fn lookup(
         &self,
-        slab: &Slab,
+        side: &Side,
         other: &Slab,
         fields: &[Field],
         hash: u64,
         key_size: usize,
         opt: &Options,
-        parser: &RowParser,
         probe: &mut [Field],
     ) -> Option<i32> {
         let mut slot = self.slot(hash);
         loop {
-            let at = self.table[slot];
-            if at == EMPTY {
+            let key = self.table[slot];
+            if key == EMPTY {
                 return None;
             }
-            let candidate = self.first_row[at as usize];
+            let candidate = self.first_row[key as usize];
             if self.row_hash[candidate as usize] == hash {
-                self.fields_of(slab, parser, candidate, probe);
-                if (0..key_size).all(|i| same(slab, probe[i], other, fields[i], opt)) {
+                self.fields_of(side, candidate, probe);
+                if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
                     return Some(candidate);
                 }
             }
@@ -643,10 +384,198 @@ impl RowIndex {
 }
 
 // ---------------------------------------------------------------------------
+// The sweep: finding and hashing every row, in parallel
+// ---------------------------------------------------------------------------
+
+fn sweep(side: &Side, key_size: usize, opt: &Options, threads: usize) -> Result<Vec<Chunk>> {
+    match &side.rows {
+        Rows::Text { parser, from } => sweep_text(side, parser, *from, key_size, opt, threads),
+        Rows::Columnar { rows, .. } => sweep_columnar(side, *rows, key_size, opt, threads),
+    }
+}
+
+/// Runs `each` over `0..parts` on that many threads, collecting what they return
+/// in order. A thread that cannot be spawned is not a failure: it is the same
+/// work, done here.
+fn in_parallel<T, F>(parts: usize, each: F) -> Vec<Result<T>>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T> + Sync,
+{
+    if parts <= 1 {
+        return vec![each(0)];
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..parts)
+            .map(|i| {
+                let each = &each;
+                scope.spawn(move || each(i))
+            })
+            .collect();
+        let mut out = vec![each(0)];
+        for handle in handles {
+            out.push(
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::new("a comparison worker panicked"))),
+            );
+        }
+        out
+    })
+}
+
+/// Parses and hashes every row of a mapped text file, in `threads` chunks.
+fn sweep_text(
+    side: &Side,
+    parser: &RowParser,
+    from: usize,
+    key_size: usize,
+    opt: &Options,
+    threads: usize,
+) -> Result<Vec<Chunk>> {
+    let data = side.slab.data();
+    if from >= data.len() {
+        return Ok(Vec::new());
+    }
+    let bounds = chunk_bounds(data, from, threads, side.slab.dialect());
+    let parts = bounds.len() - 1;
+
+    let results = in_parallel(parts, |i| {
+        let (begin, stop) = (bounds[i], bounds[i + 1]);
+        let mut chunk = Chunk {
+            at: Vec::new(),
+            hash: Vec::new(),
+        };
+        let mut fields = vec![ABSENT; side.width];
+        let mut pos = begin;
+        // Rows that *start* in this chunk belong to it; the last one is finished
+        // past the boundary rather than cut in half.
+        while pos < stop {
+            match data[pos] {
+                // A line with nothing on it is not a row.
+                b'\n' => {
+                    pos += 1;
+                    continue;
+                }
+                b'\r' if pos + 1 < data.len() && data[pos + 1] == b'\n' => {
+                    pos += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            let next = parser.parse(data, pos, data.len(), &mut fields);
+            if fields.contains(&TOO_LONG) {
+                return Err(Error::new(format!(
+                    "a field larger than {MAX_FIELD_LEN} bytes is more than this engine packs; \
+                     use --engine native"
+                )));
+            }
+            chunk.at.push(pos as u64);
+            chunk
+                .hash
+                .push(key_hash(&side.slab, &fields, key_size, opt));
+            if next <= pos {
+                break; // no progress: a malformed tail rather than an endless loop
+            }
+            pos = next;
+        }
+        Ok(chunk)
+    });
+    results.into_iter().collect()
+}
+
+/// Hashes every row of an already-materialised columnar file. There is nothing
+/// to find — row `n` is row `n` — so this splits into equal ranges.
+fn sweep_columnar(
+    side: &Side,
+    rows: usize,
+    key_size: usize,
+    opt: &Options,
+    threads: usize,
+) -> Result<Vec<Chunk>> {
+    let parts = threads.clamp(1, rows.div_ceil(1 << 14).max(1));
+    let results = in_parallel(parts, |i| {
+        let lo = rows * i / parts;
+        let hi = rows * (i + 1) / parts;
+        let mut chunk = Chunk {
+            at: Vec::with_capacity(hi - lo),
+            hash: Vec::with_capacity(hi - lo),
+        };
+        let mut fields = vec![ABSENT; side.width];
+        for row in lo..hi {
+            side.fields_at(row as u64, &mut fields);
+            chunk.at.push(row as u64);
+            chunk
+                .hash
+                .push(key_hash(&side.slab, &fields, key_size, opt));
+        }
+        Ok(chunk)
+    });
+    results.into_iter().collect()
+}
+
+/// Where each chunk begins, as offsets of real row starts.
+///
+/// The nominal split is `size / threads`, walked forward to the next row. Walking
+/// forward is the whole difficulty for CSV: a newline inside a quoted field is
+/// not a row boundary, and a thread starting mid-file cannot tell whether it is
+/// inside one. Parity settles it — every `"` toggles in-quote state, including
+/// both halves of a doubled quote, which toggles twice and so correctly leaves
+/// the state alone, so the count of quotes before a position says whether that
+/// position is inside a field. Counting them is a scan for one byte, far cheaper
+/// than parsing, and it splits across the same threads.
+///
+/// JSON needs none of that: a raw newline inside a string is not valid JSON, so
+/// every newline ends a record.
+fn chunk_bounds(data: &[u8], from: usize, threads: usize, dialect: Dialect) -> Vec<usize> {
+    let end = data.len();
+    if threads <= 1 || end - from < CHUNKING_THRESHOLD {
+        return vec![from, end];
+    }
+    let nominal: Vec<usize> = (1..threads)
+        .map(|i| from + (end - from) * i / threads)
+        .collect();
+
+    let quotes: Vec<usize> = if dialect == Dialect::Json {
+        vec![0; nominal.len()]
+    } else {
+        in_parallel(nominal.len(), |i| {
+            Ok(count_byte(data, from, nominal[i], b'"'))
+        })
+        .into_iter()
+        .map(|r| r.unwrap_or(0))
+        .collect()
+    };
+
+    let mut bounds = vec![from];
+    for (i, &start) in nominal.iter().enumerate() {
+        let mut in_quotes = quotes[i] % 2 == 1;
+        let mut at = start;
+        while at < end {
+            match data[at] {
+                b'"' if dialect == Dialect::Csv => in_quotes = !in_quotes,
+                b'\n' if !in_quotes => {
+                    at += 1;
+                    break;
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        if at > *bounds.last().expect("a first bound") && at < end {
+            bounds.push(at);
+        }
+    }
+    bounds.push(end);
+    bounds
+}
+
+// ---------------------------------------------------------------------------
 // The join
 // ---------------------------------------------------------------------------
 
 /// A row chosen for a report section, with the row it matched on the other side.
+#[derive(Clone, Copy)]
 struct Pick {
     row: i32,
     mate: i32,
@@ -679,20 +608,29 @@ impl Capped {
     }
 }
 
+/// One range of A's keys, joined on its own thread.
+///
+/// Each range keeps its own counts, column stats and capped lists; because the
+/// ranges are contiguous and merged in order, the result is identical to one
+/// thread's, including which rows survive the cap.
+struct Part {
+    matched: i64,
+    changed_per: Vec<i64>,
+    blanked_per: Vec<i64>,
+    filled_per: Vec<i64>,
+    changed: Vec<Pick>,
+    removed: Vec<Pick>,
+    changed_total: i64,
+    removed_total: i64,
+}
+
 /// Decodes one row's key and compared columns into the owned values the report
 /// holds. This is the only place a cell becomes a `String`, and it runs at most
 /// `--max-rows` times per section rather than once per row in the file.
-fn row_values(
-    slab: &Slab,
-    parser: &RowParser,
-    idx: &RowIndex,
-    row: i32,
-    width: usize,
-    opt: &Options,
-) -> Vec<Val> {
-    let mut fields = vec![ABSENT; width];
-    idx.fields_of(slab, parser, row, &mut fields);
-    fields.iter().map(|f| value(slab, *f, opt)).collect()
+fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> {
+    let mut fields = vec![ABSENT; side.width];
+    idx.fields_of(side, row, &mut fields);
+    fields.iter().map(|f| value(&side.slab, *f, opt)).collect()
 }
 
 fn to_cells(values: &[Val]) -> Vec<Cell> {
@@ -701,71 +639,144 @@ fn to_cells(values: &[Val]) -> Vec<Cell> {
 
 #[allow(clippy::too_many_arguments)]
 fn join(
-    a: &Slab,
+    a: &Side,
     ai: &RowIndex,
-    ap: &RowParser,
-    b: &Slab,
+    b: &Side,
     bi: &RowIndex,
-    bp: &RowParser,
     opt: &Options,
     compared: &[String],
     exporting: bool,
+    threads: usize,
 ) -> Joined {
     let key_size = opt.key.len();
     let nc = compared.len();
     let width = key_size + nc;
+    let cap = opt.max_rows;
 
-    let mut changed_per = vec![0i64; nc];
-    let mut blanked_per = vec![0i64; nc];
-    let mut filled_per = vec![0i64; nc];
+    // A's side is the long pole: every distinct key is looked up in B, both rows
+    // are read, and every compared column is examined. B's side only asks whether
+    // each of its keys exists in A. So A splits over ranges and B gets a thread
+    // of its own; the two write different outputs and read both indexes without
+    // writing either.
+    let mut ways = threads.saturating_sub(1).max(1);
+    if ai.first_row.len() < JOIN_THRESHOLD {
+        ways = 1;
+    }
 
-    let mut changed = Capped::new(opt.max_rows, exporting);
-    let mut added = Capped::new(opt.max_rows, exporting);
-    let mut removed = Capped::new(opt.max_rows, exporting);
-    let mut matched = 0i64;
-
-    let mut fa = vec![ABSENT; width];
-    let mut fb = vec![ABSENT; width];
-    let mut probe = vec![ABSENT; width];
-
-    // A's distinct keys, in first-appearance order, so a run is reproducible.
-    for &row in &ai.first_row {
-        ai.fields_of(a, ap, row, &mut fa);
-        let hash = key_hash(a, &fa, key_size, opt);
-        let Some(mate) = bi.lookup(b, a, &fa, hash, key_size, opt, bp, &mut probe) else {
-            removed.push(Pick { row, mate: -1 });
-            continue;
+    let a_range = |p: usize| -> Part {
+        let mut out = Part {
+            matched: 0,
+            changed_per: vec![0; nc],
+            blanked_per: vec![0; nc],
+            filled_per: vec![0; nc],
+            changed: Vec::new(),
+            removed: Vec::new(),
+            changed_total: 0,
+            removed_total: 0,
         };
-        matched += 1;
-        bi.fields_of(b, bp, mate, &mut fb);
-
-        let mut any = false;
-        for i in 0..nc {
-            let (x, y) = (fa[key_size + i], fb[key_size + i]);
-            if cell_differs(a, x, b, y, opt) {
-                any = true;
-                changed_per[i] += 1;
-                if is_absent(b, y, opt) {
-                    blanked_per[i] += 1;
+        let (mut fa, mut fb, mut probe) = (
+            vec![ABSENT; width],
+            vec![ABSENT; width],
+            vec![ABSENT; width],
+        );
+        let lo = ai.first_row.len() * p / ways;
+        let hi = ai.first_row.len() * (p + 1) / ways;
+        for &row in &ai.first_row[lo..hi] {
+            ai.fields_of(a, row, &mut fa);
+            let hash = key_hash(&a.slab, &fa, key_size, opt);
+            let Some(mate) = bi.lookup(b, &a.slab, &fa, hash, key_size, opt, &mut probe) else {
+                out.removed_total += 1;
+                if exporting || out.removed.len() <= cap {
+                    out.removed.push(Pick { row, mate: -1 });
                 }
-                if is_absent(a, x, opt) {
-                    filled_per[i] += 1;
+                continue;
+            };
+            out.matched += 1;
+            bi.fields_of(b, mate, &mut fb);
+
+            let mut any = false;
+            for i in 0..nc {
+                let (x, y) = (fa[key_size + i], fb[key_size + i]);
+                if cell_differs(&a.slab, x, &b.slab, y, opt) {
+                    any = true;
+                    out.changed_per[i] += 1;
+                    if is_absent(&b.slab, y, opt) {
+                        out.blanked_per[i] += 1;
+                    }
+                    if is_absent(&a.slab, x, opt) {
+                        out.filled_per[i] += 1;
+                    }
+                }
+            }
+            if any {
+                out.changed_total += 1;
+                if exporting || out.changed.len() <= cap {
+                    out.changed.push(Pick { row, mate });
                 }
             }
         }
-        if any {
-            changed.push(Pick { row, mate });
+        out
+    };
+
+    let b_side = || -> Capped {
+        let mut added = Capped::new(cap, exporting);
+        let (mut fb, mut probe) = (vec![ABSENT; width], vec![ABSENT; width]);
+        for &row in &bi.first_row {
+            bi.fields_of(b, row, &mut fb);
+            let hash = key_hash(&b.slab, &fb, key_size, opt);
+            if ai
+                .lookup(a, &b.slab, &fb, hash, key_size, opt, &mut probe)
+                .is_none()
+            {
+                added.push(Pick { row, mate: -1 });
+            }
         }
-    }
-    for &row in &bi.first_row {
-        bi.fields_of(b, bp, row, &mut fb);
-        let hash = key_hash(b, &fb, key_size, opt);
-        if ai
-            .lookup(a, b, &fb, hash, key_size, opt, ap, &mut probe)
-            .is_none()
-        {
-            added.push(Pick { row, mate: -1 });
+        added
+    };
+
+    let (parts, added) = std::thread::scope(|scope| {
+        let b_worker = scope.spawn(b_side);
+        let mut parts: Vec<Part> = Vec::with_capacity(ways);
+        if ways == 1 {
+            parts.push(a_range(0));
+        } else {
+            let handles: Vec<_> = (1..ways)
+                .map(|p| {
+                    let a_range = &a_range;
+                    scope.spawn(move || a_range(p))
+                })
+                .collect();
+            parts.push(a_range(0));
+            for handle in handles {
+                parts.push(handle.join().expect("a join range"));
+            }
         }
+        (parts, b_worker.join().expect("the added side"))
+    });
+
+    // Merged in range order, so the rows kept under the cap are the same rows
+    // one thread would have kept.
+    let mut changed = Capped::new(cap, exporting);
+    let mut removed = Capped::new(cap, exporting);
+    let mut matched = 0i64;
+    let mut changed_per = vec![0i64; nc];
+    let mut blanked_per = vec![0i64; nc];
+    let mut filled_per = vec![0i64; nc];
+    for part in &parts {
+        matched += part.matched;
+        for i in 0..nc {
+            changed_per[i] += part.changed_per[i];
+            blanked_per[i] += part.blanked_per[i];
+            filled_per[i] += part.filled_per[i];
+        }
+        for pick in &part.changed {
+            changed.push(*pick);
+        }
+        changed.total += part.changed_total - part.changed.len() as i64;
+        for pick in &part.removed {
+            removed.push(*pick);
+        }
+        removed.total += part.removed_total - part.removed.len() as i64;
     }
 
     let columns: Vec<ColumnStat> = (0..nc)
@@ -781,22 +792,22 @@ fn join(
     let mut removed_rows: Vec<Vec<Val>> = removed
         .held
         .iter()
-        .map(|p| row_values(a, ap, ai, p.row, width, opt))
+        .map(|p| row_values(a, ai, p.row, opt))
         .collect();
     let mut added_rows: Vec<Vec<Val>> = added
         .held
         .iter()
-        .map(|p| row_values(b, bp, bi, p.row, width, opt))
+        .map(|p| row_values(b, bi, p.row, opt))
         .collect();
     let mut changed_a: Vec<Vec<Val>> = changed
         .held
         .iter()
-        .map(|p| row_values(a, ap, ai, p.row, width, opt))
+        .map(|p| row_values(a, ai, p.row, opt))
         .collect();
     let mut changed_b: Vec<Vec<Val>> = changed
         .held
         .iter()
-        .map(|p| row_values(b, bp, bi, p.mate, width, opt))
+        .map(|p| row_values(b, bi, p.mate, opt))
         .collect();
 
     sort_rows(&mut removed_rows, key_size);
@@ -867,13 +878,7 @@ fn sort_changed_together(a: &mut Vec<Vec<Val>>, b: &mut Vec<Vec<Val>>, key_size:
 }
 
 /// The duplicate-key section: most duplicated first, then by key.
-fn duplicate_section(
-    slab: &Slab,
-    idx: &RowIndex,
-    parser: &RowParser,
-    width: usize,
-    opt: &Options,
-) -> Section {
+fn duplicate_section(side: &Side, idx: &RowIndex, opt: &Options) -> Section {
     let key_size = opt.key.len();
     let mut entries: Vec<(Vec<Val>, i64)> = idx
         .first_row
@@ -881,7 +886,7 @@ fn duplicate_section(
         .zip(&idx.occurrences)
         .filter(|(_, n)| **n > 1)
         .map(|(row, n)| {
-            let values = row_values(slab, parser, idx, *row, width, opt);
+            let values = row_values(side, idx, *row, opt);
             (values[..key_size].to_vec(), *n as i64)
         })
         .collect();
@@ -910,106 +915,211 @@ fn duplicate_section(
 }
 
 // ---------------------------------------------------------------------------
+// Opening a file, whatever format it is in
+// ---------------------------------------------------------------------------
+
+/// A file after its header has been read but before the comparison knows which
+/// columns it wants. The two phases are separate because a Parquet file should
+/// decode the columns being compared and no others, and that list is not known
+/// until both headers have been resolved against each other.
+enum Input {
+    Text {
+        slab: Slab,
+        delimiter: u8,
+        from: usize,
+        header: Vec<String>,
+    },
+    Parquet {
+        reader: parquet::Reader,
+        header: Vec<String>,
+    },
+}
+
+impl Input {
+    fn open(path: &Path, opt: &Options) -> Result<Input> {
+        // The format is decided by what is in the file, not by its name: a file
+        // called `.parquet` that is really a CSV is read as a CSV.
+        let probe = Slab::map(path)?;
+        if parquet::looks_like_parquet(probe.data()) {
+            drop(probe);
+            let reader = parquet::Reader::open(path)?;
+            let header = reader.column_names();
+            return Ok(Input::Parquet { reader, header });
+        }
+        // A file that begins with the magic and does not end with it is a
+        // truncated Parquet file. Reading it as a CSV would report a missing key
+        // column, which sends the reader looking in the wrong place entirely.
+        if probe.data().starts_with(b"PAR1") {
+            return Err(Error::new(format!(
+                "{} begins with a Parquet magic number but does not end with one: \
+                 the file is truncated",
+                path.display()
+            )));
+        }
+        let mut slab = probe;
+        let dialect = sniff_dialect(slab.data());
+        slab.set_dialect(dialect);
+        if dialect == Dialect::Json {
+            let header = json_header(&slab, path)?;
+            return Ok(Input::Text {
+                slab,
+                delimiter: b',',
+                from: 0,
+                header,
+            });
+        }
+        let delimiter = match opt.delimiter_byte()? {
+            Some(d) => d,
+            None => {
+                let data = slab.data();
+                detect_delimiter(&data[..next_of1(data, 0, data.len(), b'\n')])
+            }
+        };
+        let (header, from) = csv_header(&slab, delimiter, path)?;
+        Ok(Input::Text {
+            slab,
+            delimiter,
+            from,
+            header,
+        })
+    }
+
+    fn header(&self) -> &[String] {
+        match self {
+            Input::Text { header, .. } | Input::Parquet { header, .. } => header,
+        }
+    }
+
+    /// Reads the file into the join's representation, keeping only `wanted`.
+    fn project(self, wanted: &[&String], threads: usize) -> Result<Side> {
+        let width = wanted.len();
+        match self {
+            Input::Text {
+                slab,
+                delimiter,
+                from,
+                header,
+            } => {
+                let has = |n: &String| header.iter().any(|c| c == n);
+                let parser = if slab.dialect() == Dialect::Json {
+                    RowParser::json(
+                        wanted
+                            .iter()
+                            .map(|n| has(n).then(|| (*n).clone()))
+                            .collect(),
+                    )
+                } else {
+                    RowParser::csv(
+                        delimiter,
+                        wanted
+                            .iter()
+                            .map(|n| header.iter().position(|c| &c == n))
+                            .collect(),
+                    )
+                };
+                Ok(Side {
+                    slab,
+                    rows: Rows::Text { parser, from },
+                    width,
+                })
+            }
+            Input::Parquet { reader, header } => {
+                let names: Vec<Option<&str>> = wanted
+                    .iter()
+                    .map(|n| header.iter().any(|c| c == *n).then_some(n.as_str()))
+                    .collect();
+                let rows = reader.rows();
+                let (fields, arena) = reader.project(&names, threads)?;
+                // The mapping is finished with: everything the join reads now
+                // lives in the arena, so the file's pages can be given back.
+                drop(reader);
+                Ok(Side {
+                    slab: Slab::owned(arena, Dialect::Raw),
+                    rows: Rows::Columnar { fields, rows },
+                    width,
+                })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResult> {
-    let a = Slab::open(a_path)?;
-    let b = Slab::open(b_path)?;
-
-    let a_delim = delimiter(&a, opt)?;
-    let b_delim = delimiter(&b, opt)?;
-    let (a_header, a_start) = header(&a, a_delim, a_path)?;
-    let (b_header, b_start) = header(&b, b_delim, b_path)?;
-    let resolved = resolve(&a_header, &b_header, opt)?;
+    let total = budget(opt);
+    let a_input = Input::open(a_path, opt)?;
+    let b_input = Input::open(b_path, opt)?;
+    let resolved = resolve(a_input.header(), b_input.header(), opt)?;
 
     let key_size = opt.key.len();
-    let width = key_size + resolved.compared.len();
+    let a_cols = a_input.header().len();
+    let b_cols = b_input.header().len();
     let wanted: Vec<&String> = opt.key.iter().chain(&resolved.compared).collect();
 
-    let ap = RowParser::new(
-        a_delim,
-        wanted
-            .iter()
-            .map(|n| a_header.iter().position(|c| &c == n))
-            .collect(),
-    );
-    let bp = RowParser::new(
-        b_delim,
-        wanted
-            .iter()
-            .map(|n| b_header.iter().position(|c| &c == n))
-            .collect(),
-    );
+    // The two files share nothing until the join, so they are read at the same
+    // time, and each is split further: two files across four cores is two chunks
+    // each, so the whole machine is busy rather than half of it.
+    let per_file = (total / 2).max(1);
+    let prepare = |input: Input| -> Result<(Side, RowIndex)> {
+        let side = input.project(&wanted, per_file)?;
+        let index = RowIndex::build(&side, key_size, opt, per_file)?;
+        Ok((side, index))
+    };
+    let (from_a, from_b) = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| prepare(b_input));
+        let mine = prepare(a_input);
+        let theirs = worker
+            .join()
+            .unwrap_or_else(|_| Err(Error::new("a file reader panicked")));
+        (mine, theirs)
+    });
+    let (a, ai) = from_a?;
+    let (b, bi) = from_b?;
 
-    let ai = RowIndex::build(&a, &ap, a_start, width, key_size, opt)?;
-    let bi = RowIndex::build(&b, &bp, b_start, width, key_size, opt)?;
-
-    let dup_a = duplicate_section(&a, &ai, &ap, width, opt);
-    let dup_b = duplicate_section(&b, &bi, &bp, width, opt);
+    let dup_a = duplicate_section(&a, &ai, opt);
+    let dup_b = duplicate_section(&b, &bi, opt);
     let joined = join(
         &a,
         &ai,
-        &ap,
         &b,
         &bi,
-        &bp,
         opt,
         &resolved.compared,
         opt.export_dir.is_some(),
+        total,
     );
 
-    let meta = resolved.meta(&opt.key, a_header.len(), b_header.len());
+    let meta = resolved.meta(&opt.key, a_cols, b_cols);
     assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared)
-}
-
-fn delimiter(slab: &Slab, opt: &Options) -> Result<u8> {
-    if let Some(d) = opt.delimiter_byte()? {
-        return Ok(d);
-    }
-    let data = slab.bytes();
-    let line_end = next_of1(data, 0, data.len(), b'\n');
-    Ok(detect_delimiter(&String::from_utf8_lossy(
-        &data[..line_end],
-    )))
-}
-
-/// The header row's names, and where the first data row starts.
-fn header(slab: &Slab, delimiter: u8, path: &Path) -> Result<(Vec<String>, usize)> {
-    let data = slab.bytes();
-    let end = data.len();
-    if end == 0 {
-        return Err(Error::new(format!(
-            "file has no header row: {}",
-            path.display()
-        )));
-    }
-    let mut names = Vec::new();
-    let mut pos = 0usize;
-    loop {
-        let (field, next) = if pos < end && data[pos] == b'"' {
-            let close = skip_quoted(data, pos + 1, end);
-            let body_end = close.saturating_sub(1).max(pos + 1);
-            (
-                quoted_field(data, pos + 1, body_end),
-                next_of2(data, close, end, delimiter, b'\n'),
-            )
-        } else {
-            let next = next_of2(data, pos, end, delimiter, b'\n');
-            (plain_field(data, pos, next), next)
-        };
-        names.push(text_of(slab, field));
-        if next >= end {
-            return Ok((names, end));
-        }
-        if data[next] == b'\n' {
-            return Ok((names, next + 1));
-        }
-        pos = next + 1;
-    }
 }
 
 /// The turbo engine has no optional dependency.
 pub fn available() -> bool {
     true
+}
+
+/// Whether this file is in a format only this engine reads.
+///
+/// The other engines are CSV readers, so a Parquet or JSON input has exactly one
+/// backend that can answer for it — and `--engine auto` should choose that one
+/// rather than hand the file to DuckDB's CSV reader and report the parse error
+/// it makes of a binary footer.
+pub fn only_this_engine_reads(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::{Read, Seek, SeekFrom};
+    let mut head = [0u8; 64];
+    let read = file.read(&mut head).unwrap_or(0);
+    if read >= 4 && &head[..4] == b"PAR1" {
+        // The magic is at both ends, so a CSV that happens to start with it is
+        // not mistaken for Parquet.
+        let mut tail = [0u8; 4];
+        if file.seek(SeekFrom::End(-4)).is_ok() && file.read_exact(&mut tail).is_ok() {
+            return &tail == b"PAR1";
+        }
+    }
+    sniff_dialect(&head[..read]) == Dialect::Json
 }

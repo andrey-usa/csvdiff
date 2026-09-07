@@ -36,7 +36,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &mut Options) -> Result<Compar
         }
     }
 
-    let engine = resolve_engine(opt.engine_name()?);
+    // Only the byte-level engine reads JSON and Parquet, so an input in either
+    // format decides `auto` on its own rather than being handed to DuckDB's CSV
+    // reader and reported as the parse error it makes of a binary footer.
+    let requested = opt.engine_name()?;
+    let engine = if requested == Engine::Auto
+        && (turbo::only_this_engine_reads(a_path) || turbo::only_this_engine_reads(b_path))
+    {
+        Engine::Turbo
+    } else {
+        resolve_engine(requested)
+    };
     let start = Instant::now();
     let result = run(engine, a_path, b_path, opt)?;
     let seconds = (start.elapsed().as_millis() as f64) / 1000.0;
