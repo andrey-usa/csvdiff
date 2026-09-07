@@ -837,7 +837,57 @@ Arrow IPC is worth a line of its own: every column here is a string, and offsets
 plus data come to **twice what the text does**. It is fast to read and the largest
 file in the table.
 
-**And for our engine none of it would help much.** Timing the phases of a
+### Reading JSON natively
+
+The C++ port reads newline-delimited JSON as well as CSV, and the two meet at the
+join — a CSV export compares against the JSON the same pipeline emits, with the
+key order on each side free to differ.
+
+| Input | Size | Compare | Rows/s | Peak RSS |
+|---|---:|---:|---:|---:|
+| CSV | 3,509 MB | **9.51s** | 1,051,760 | **4,371 MB** |
+| JSON (ndjson) | 8,487 MB | 17.91s | 558,350 | 9,349 MB |
+
+Identical counts from both. **JSON is 1.9x slower, and that is the format rather
+than the reader**: it is 2.4x the bytes and every field carries its name. Against
+DuckDB on the same ndjson — 17.08s, 11,260 MB — this is level on time and 17%
+under on memory, where on CSV it is 5.8x faster. It is worth having for the input
+people actually receive, not for speed.
+
+It fits because a JSON value is a contiguous run of bytes, so a field stays an
+offset and a length into the mapping exactly as it does for CSV. The one new rule
+is the escape: CSV doubles a quote, JSON puts a backslash in front of one. Both go
+through `for_each_byte`, the single route every comparison reads a field through,
+so hashing and equality cannot come to different conclusions about the same value.
+`\uXXXX` and surrogate pairs are decoded rather than compared as written, because
+a writer may emit a character either way and both spellings have to compare equal.
+
+### Why there is no native Parquet
+
+Everything this engine needs from a file is *given a row start, fill the fields,
+return the next row start*. Parquet is columnar and has no row start: values for
+one row live in twenty separate column chunks. Reconstructing row N for the join
+means keeping an offset per row per column, and at ten million rows that is the
+whole argument:
+
+| | At 10M rows |
+|---|---:|
+| A field offset per row per compared column | **1.42 GB** |
+| Dictionary indices instead, where a column is dictionary-encoded | 0.71 GB |
+| *The entire index today* | *0.98 GB* |
+| Mapped Parquet input, both files, uncompressed | 2.04 GB |
+| Mapped CSV input, both files | 3.43 GB |
+
+Best case — every column dictionary-encoded — that is 2.04 + 0.71 = **2.75 GB
+against today's 4.41 GB**, so about a third less memory, for a Thrift metadata
+parser, a page decoder, snappy, and a join that no longer re-reads rows from the
+mapping. Worst case it is *more* memory than CSV.
+
+Set against a 15% ceiling on the time it could save, it is the wrong next thing to
+build. Sharding the index insert is worth more and is a day's work rather than a
+fortnight's. That is why this table exists instead of a Parquet reader.
+
+**And for our engine none of the formats would help much.** Timing the phases of a
 ten-million-row comparison in the C++ port:
 
 | Phase | Wall |
@@ -1034,7 +1084,7 @@ same design can be measured in four languages without three more HTML renderers 
 | | Directory | Built with | Scope |
 |---|---|---|---|
 | C | [`c/`](c/) | `cc` or `clang`, C11 | one file, single-threaded on purpose — it exists to find the memory floor; no `--trim`, `--ignore-case` or `--tolerance` |
-| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
+| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | reads CSV **and newline-delimited JSON**, including one of each; `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
 | Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | threaded; `--max-memory MB` is enforced, not advisory |
 
 The C++ and Zig ports build both indexes at once and run the two directions of the join at once,
@@ -1105,6 +1155,9 @@ scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
 
 # the same comparison from CSV, Parquet and JSON, engine held constant
 python scripts/bench_formats.py
+
+# our own reader on either format
+cpp/build/csvdiff compare a.ndjson b.ndjson -k id --threads 4
 
 # the four Java byte-level engines head to head (Vector API needs the module)
 java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \
@@ -1179,7 +1232,8 @@ Sizes and shapes not yet answered, roughly in the order they would pay off:
 6. **Shard the index insertion.** Phase timing puts it at 3.09s of a 12.02s run at ten million rows,
    single-threaded, which now costs more than all the parsing. Sharding the hash table by key so each
    thread owns a slice would parallelise it while keeping first-occurrence-wins, and it is worth more
-   than any input format would be.
+   than any input format would be — see
+   [Why there is no native Parquet](#why-there-is-no-native-parquet).
 7. **Where does the C++ port stop scaling?** 2.53x cpu/wall on four cores is short of four, and the
    remaining sequential parts — table insertion, B's side of the join — are the obvious suspects. A
    box with more cores would say whether the design or the machine is the limit.
