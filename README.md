@@ -9,7 +9,7 @@ parity ports. That is what makes the benchmark section below a like-for-like
 comparison rather than a collection of anecdotes.
 
 **Jump to:** [Using it](#using-it) · [Which engine at which size](#which-engine-at-which-size) ·
-[Benchmarks](#benchmarks) · [Techniques](#techniques) · [Ports](#ports) ·
+[Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) · [Techniques](#techniques) · [Ports](#ports) ·
 [Reproducing](#reproducing-the-numbers) · [Open questions](#open-questions)
 
 ---
@@ -455,6 +455,51 @@ Getting a working image at all took three builds, which is part of the answer to
 native-image -jar csvdiff.jar -o csvdiff-native --no-fallback -march=native -O2 \
   -H:+UnlockExperimentalVMOptions -H:+SharedArenaSupport -H:ConfigurationFileDirectories=cfg
 ```
+
+## How the fastest build scales
+
+Sets A to C compare engines against each other at fixed sizes. This is the other
+question: one engine, one thread count, every size from ten thousand rows to fifty million —
+the C++ port on four threads, which is the fastest thing measured here.
+
+Fifty million rows is 17.5 GB of input, more than the disk and the RAM of the machine that ran it,
+so each pair is generated, measured and deleted in turn (`scripts/bench_scale.py`).
+
+| Rows | Input | Wall | Rows/s | cpu/wall | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| 10k | 4 MB | 0.03s | 394,000 | 1.38x | 12 MB | 8 MB |
+| 1M | 351 MB | 1.83s | 548,000 | 2.27x | 514 MB | 164 MB |
+| 10M | 3,509 MB | 16.66s | **600,000** | 2.54x | 4,462 MB | 953 MB |
+| 20M | 7,018 MB | 33.53s | 596,000 | 2.45x | 9,041 MB | 2,023 MB |
+| 50M | 17,544 MB | 126.85s | 394,000 | 2.25x | 13,435 MB | *evicted* |
+
+Counts at every size match the drift recipe exactly — at 50M, 2,994,637 changed, 50,000 added,
+50,000 removed, 5,000 and 2,500 duplicate keys.
+
+**Throughput is flat from 1M to 20M** — 548k, 600k, 596k rows a second. Twenty times the data for
+twenty times the time, with no penalty for size. The 10k row is startup, not comparison.
+
+**Then it falls 34% at 50M**, and the reason is in the last column. The two files are 17.5 GB and the
+machine has 16 GB, so the page cache cannot hold them: pages are read, evicted and read again. This
+is the first size in this project where the input does not fit in RAM, and the cost of that is what
+the drop measures — not anything about the algorithm.
+
+**At 50M the process is smaller than the files it is comparing.** Peak RSS is 13,435 MB against
+17,544 MB of input, which is why the "above" column has nothing to report: the kernel reclaimed
+mapped pages the engine had already passed. A design that read the files into memory would have
+needed 17.5 GB and failed; this one uses whatever is left and keeps going. That is the same property
+`sortmerge` is built for, arrived at by mapping rather than by spilling.
+
+**Memory above the input grows linearly with rows** — 164 MB at 1M, 953 at 10M, 2,023 at 20M, so
+about 100 MB per million rows. That is the row index, the offset array and the hash table, and it is
+what sets the real ceiling: at a billion rows it would want roughly 100 GB, which is where
+`sortmerge` stops being the conservative choice and becomes the only one.
+
+**Generating the data got its own fix.** The ladder needs 29 GB of input across five sizes, and the
+Python generator writes a million rows in 30.5s — around 25 minutes for 50M alone. All five ports
+emit byte-identical files (`parity.yml` enforces it), so the harness now picks the Go generator,
+which does the same million rows in 4.6s. **6.6x**, and 50M generates in three minutes instead of
+twenty-five.
 
 ## Set C — against the field
 
@@ -940,6 +985,9 @@ python scripts/bench_native.py --rows 20m --repeats 2
 python scripts/bench_native.py --rows 1m --only jvm     # execution modes
 cpp/build/csvdiff compare a.csv b.csv -k id --threads 4  # C++ thread scaling
 
+# one engine across every size, generating and deleting each pair in turn
+python scripts/bench_scale.py --sizes 10k,1m,10m,20m,50m --threads 4
+
 # the four Java byte-level engines head to head (Vector API needs the module)
 java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \
   compare a.csv b.csv -k account_id,txn_id -i updated_at --engine shard -o /dev/null
@@ -995,8 +1043,11 @@ Sizes and shapes not yet answered, roughly in the order they would pay off:
 1. **Where is the crossover between `polars` and `turbo`?** Polars wins at 1M and cannot reach 10M.
    The band between is unmeasured; 2M / 4M / 8M would find the exact point the recommendation
    changes.
-2. **50M and 100M rows.** 20M is the largest tested. `sortmerge` should stay flat in memory and the
-   mapping engines should not, but "should" is not a measurement.
+2. **100M rows, and `sortmerge` at 50M.** 50M is now measured for the fastest build — see
+   [How the fastest build scales](#how-the-fastest-build-scales) — and it is where the input stops
+   fitting in RAM. What is still open is the same size through `sortmerge`, which should hold its
+   memory flat where the mapping engines cannot, and 100M, where "about 100 MB per million rows"
+   predicts 10 GB of index.
 3. **Does `sortmerge` ever beat `turbo` on time?** It does in Rust at 1M. Whether that holds at
    larger sizes, or in the other ports, is open.
 4. **Isolate the SWAR-versus-Vector reversal.** SWAR ties the Vector API at 10M and wins by 19% at
