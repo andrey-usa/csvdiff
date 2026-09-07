@@ -186,6 +186,7 @@ settings. `.claude/skills/csvdiff-report/` covers changes to the HTML report spe
 | Up to ~100k rows | anything | every engine finishes well under a second; startup cost dominates, so pick on convenience |
 | 100k – 2M rows | `polars` where you have it, else `turbo` | columnar wins this band outright; the byte-level engines are close behind on a quarter of the memory |
 | 2M – 20M rows, memory to spare | `turbo` | byte-level scanning; the only class that stays fast *and* still finishes at 10M+ |
+| 2M+ and you can build C++ or Zig | the [`cpp/`](cpp/) or [`zig/`](zig/) port | same design, threaded, 1.3-1.6x faster than the JVM on the same box and 2 GB lighter — but counts and JSON only, no HTML report |
 | Any size, memory constrained | `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB in the Rust port |
 | Larger than tested, or unknown | `sortmerge` | the only engine whose memory does not grow with the input |
 | You need a hard guarantee | Zig port, `--max-memory MB` | a `FixedBufferAllocator`, so the bound is enforced rather than hoped for |
@@ -301,41 +302,62 @@ described under [The byte-level design](#the-byte-level-design) — and varies o
 purpose: at this size the comparison worth making is between things doing the same work. Everything
 that finished agrees exactly, counts and per-column stats alike.
 
-| Build | 10k | 1M | 20M |
+| Build | Threads | 1M | 20M |
 |---|---|---|---|
-| C++, clang 20 | **0.05s** · 11 MB | **3.57s** · 509 MB | 83.60s · 8,573 MB |
-| C, clang 20 | 0.05s · 11 MB | 3.57s · 417 MB | 85.93s · 8,447 MB |
-| C++, clang 18 | 0.05s · 11 MB | 3.62s · 509 MB | 89.21s · 8,573 MB |
-| Zig 0.17-dev | 0.05s · 11 MB | 4.47s · 414 MB | 116.08s · 8,446 MB |
-| C, gcc 14 | 0.05s · 11 MB | 5.27s · 417 MB | 129.46s · 8,447 MB |
-| Rust `turbo` | 0.10s · 17 MB | 5.33s · 583 MB | 104.07s · 8,677 MB |
-| Zig 0.16 | 0.05s · 11 MB | 5.37s · 414 MB | 130.50s · 8,446 MB |
-| Java 26 `turbo`, HotSpot | 0.95s · 103 MB | 5.54s · 628 MB | **82.49s** · 10,504 MB |
-| C++, g++ 14 | 0.10s · 11 MB | 5.73s · 509 MB | 129.41s · 8,573 MB |
-| C++, g++ 13 | 0.10s · 11 MB | 6.33s · 509 MB | 136.29s · 8,573 MB |
-| Java 25 `turbo`, Graal JIT | 1.01s · 201 MB | 7.98s · 777 MB | 114.33s · 10,720 MB |
-| GraalVM native-image, Serial GC | 1.16s · 71 MB | 90.62s · 481 MB | ✗ did not finish |
-| GraalVM native-image, G1 GC | 1.41s · 175 MB | 107.00s · 768 MB | ✗ did not finish |
+| C++, clang 20 | 2 | **2.57s** · 512 MB | **52.45s** · 8,574 MB |
+| Zig 0.17-dev | 2 | 2.72s · 414 MB | 63.86s · **8,446 MB** |
+| Zig 0.16 | 2 | 3.13s · 414 MB | — |
+| C++, clang 20 | 1 | 3.57s · 509 MB | 84.03s · 8,573 MB |
+| C, clang 20 | 1 | 3.57s · 417 MB | 85.93s · 8,447 MB |
+| C++, clang 18 | 1 | 3.62s · 509 MB | 89.21s · 8,573 MB |
+| Zig 0.17-dev | 1 | 4.47s · 414 MB | 114.58s · 8,446 MB |
+| C, gcc 14 | 1 | 5.27s · 417 MB | 129.46s · 8,447 MB |
+| Rust `turbo` | 1 | 5.33s · 583 MB | 104.07s · 8,677 MB |
+| Zig 0.16 | 1 | 5.37s · 414 MB | 130.50s · 8,446 MB |
+| Java 26 `turbo`, HotSpot | 4 | 5.54s · 628 MB | 85.90s · 10,500 MB |
+| C++, g++ 14 | 1 | 5.73s · 509 MB | 129.41s · 8,573 MB |
+| C++, g++ 13 | 1 | 6.33s · 509 MB | 136.29s · 8,573 MB |
+| Java 25 `turbo`, Graal JIT | 4 | 7.98s · 777 MB | 114.33s · 10,720 MB |
+| GraalVM native-image, Serial GC | 1 | 90.62s · 481 MB | ✗ did not finish |
+| GraalVM native-image, G1 GC | 1 | 107.00s · 768 MB | ✗ did not finish |
+
+The **Threads** column is there because an earlier version of this table did not
+have it, and the omission produced a wrong conclusion. Java's `turbo` builds its
+index on every core; the C, C++, Zig and Rust ports were strictly
+single-threaded, which `cpu/wall` over the whole run makes unarguable — C++
+1.00x, C 1.00x, Zig 1.00x, Rust 1.00x, Java `turbo` 1.54x. Comparing those
+directly measured the thread count and called it a language. The C++ and Zig
+ports are now threaded too, and the rows say which is which.
+
+At 10k every native build is 0.05-0.10s and every JVM one 0.95-1.66s; that
+column measured process startup rather than comparison, so it is dropped here
+and left in [Set A](#set-a--five-languages-nineteen-engines) where startup is
+the point.
 
 What the engine actually allocates, with the mapped inputs subtracted:
 
 | Build | 1M (351 MB mapped) | 20M (7,018 MB mapped) |
 |---|---:|---:|
-| Zig 0.16 / 0.17-dev | **63 MB** | **1,428 MB** |
+| Zig, either version or thread count | **63 MB** | **1,428 MB** |
 | C, either compiler | 67 MB | 1,429 MB |
 | native-image, Serial GC | 130 MB | — |
-| C++, either compiler | 158 MB | 1,556 MB |
+| C++, one thread | 158 MB | 1,555 MB |
+| C++, threaded | 161 MB | 1,556 MB |
 | Rust `turbo` | 232 MB | 1,659 MB |
-| Java 26 `turbo`, HotSpot | 277 MB | 3,487 MB |
+| Java 26 `turbo`, HotSpot | 277 MB | 3,482 MB |
 | Java 25 `turbo`, Graal JIT | 426 MB | 3,703 MB |
 
-**The JVM wins at 20M**, one percent ahead of clang-20 C++ — and pays 3,487 MB where C++ pays 1,556
-and Zig 1,428. At the largest size tested, the fastest thing in this project is the one with a
-garbage collector. That is not where Set A pointed.
+**Given the same number of threads, the native builds win comfortably.** Threaded C++ does 20M in
+52.45s against Java's 85.90s — **1.64x** — and threaded Zig in 63.86s, on 8.5 GB against Java's
+10.5 GB. Single-threaded C++ alone, at 84.03s, matches Java's four-core engine.
 
-The Java row is `turbo`, and it is the right choice at this size: `shard`, which edged `turbo` at 10M
-on the Set A runners, is **19% slower at 20M** (96.26s against 80.59s on this host). The full
-four-engine matrix is under
+**Four cores buy 1.6-1.8x, not four.** C++ goes 84.03s → 52.45s and Zig 114.58s → 63.86s, and Java's
+`turbo` manages only 1.18x cpu/wall at this size. The scan is bound by memory bandwidth rather than
+instruction throughput, so past two threads there is little left to win — which is also why two
+threads were enough to overturn the result.
+
+The Java row is `turbo`, the right choice at this size: `shard`, which edged `turbo` at 10M on the
+Set A runners, is **19% slower at 20M**. The full four-engine matrix is under
 [SWAR, and how it compares to real SIMD](#swar-and-how-it-compares-to-real-simd).
 
 **The compiler moves more than the language does.** At 1M the fastest and slowest builds are both
@@ -577,6 +599,10 @@ module added for every run so the comparison is not confounded by it:
 | **20M, all cores** *(Set B host)* | `shard` 96.26s | `turbo` **80.59s** | **SWAR by 19%** |
 | **20M, one thread** *(Set B host)* | `mmap` 119.53s | `swar` **106.91s** | **SWAR by 12%** |
 
+These four are their own run, so the `turbo` figure here (80.59s) and the one in the Set B table
+(85.90s) are two sittings of the same thing, about 6% apart — which is roughly the spread measured
+below. Compare within each table.
+
 At 10M the honest reading was a tie: 0.3% on single runs on shared runners is noise, and the
 one-thread pairing pointed the other way. At 20M, best-of-two on an idle machine, SWAR wins both
 pairings by margins well outside the run-to-run spread — which for these runs is about 5%, measured
@@ -592,6 +618,32 @@ Peak RSS at 20M, where the two techniques are within 20 MB of each other in ever
 10,519 MB, `turbo` 10,500 MB, `mmap` 10,027 MB, `swar` 10,037 MB, against 7,018 MB of mapped input.
 All four return `changed 1,197,876 · added 20,000 · removed 20,000`, matching the C, C++, Zig and
 Rust ports exactly.
+
+**Real SIMD does not help the native ports either, and that was tested five ways.** The obvious move
+is to replace SWAR's eight bytes per step with a vector register's thirty-two or sixty-four. In C++,
+on a machine with AVX-512, every variant was *slower* than plain SWAR at 1M:
+
+| Scanner | 1M | vs SWAR |
+|---|---:|---:|
+| SWAR, 8 bytes per step | **3.76s** | — |
+| AVX2 throughout, 32 bytes | 3.92s | +4% |
+| AVX-512 throughout, 64 bytes | 4.35s | +16% |
+| One SWAR step, then AVX2 | 4.17s | +11% |
+| One SWAR step, then AVX-512 | 4.38s | +16% |
+| The same, with the escalation out of line | 4.71s | +25% |
+
+The reason is the data, not the instruction set: **fields in this file average 9.2 bytes**, so a
+single SWAR step usually finds the delimiter, and a 64-byte load to answer a 9-byte question reads
+eight times the memory it needs. Trying to escalate only on long runs did not rescue it either —
+with a 9.2-byte mean, the first step misses about half the time, so the escalation is not the rare
+branch that design assumes. Nor is it AVX-512 frequency licensing: AVX2 alone still lost. Restricting
+the compare to one column, which leaves a ~120-byte tail to skip per row, still lost (2.55s against
+2.22s).
+
+This is the same conclusion the JVM reached by a completely different route, and the agreement is
+worth more than either result alone: real SIMD through the Vector API lost to SWAR by 19% at 20M, and
+real SIMD through AVX2/AVX-512 intrinsics loses to SWAR by 4-25% in C++. **For CSV of this shape the
+scan is not the place to spend a vector register.** The code kept is the SWAR scanner.
 
 **SWAR's other advantages are structural.** It needs no incubator module, so `turbo` is the fastest
 engine that runs on a stock `java -jar` with no flags, and it uses slightly less memory because no
@@ -756,9 +808,17 @@ same design can be measured in four languages without three more HTML renderers 
 
 | | Directory | Built with | Scope |
 |---|---|---|---|
-| C | [`c/`](c/) | `cc` or `clang`, C11 | one file; no `--trim`, `--ignore-case` or `--tolerance` |
-| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | `--ignore-case` is ASCII-only and refuses non-ASCII by name |
-| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | `--max-memory MB` is enforced, not advisory |
+| C | [`c/`](c/) | `cc` or `clang`, C11 | one file, single-threaded on purpose — it exists to find the memory floor; no `--trim`, `--ignore-case` or `--tolerance` |
+| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | threaded; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
+| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | threaded; `--max-memory MB` is enforced, not advisory |
+
+The C++ and Zig ports build both indexes at once and run the two directions of the join at once,
+which is what Java's `turbo` has always done. Two things had to change to make that sound: the probe
+buffer each index kept for key comparison is now supplied by the caller, which is why `lookup` is
+const and two threads can probe one index; and Zig's `--max-memory` uses the lock-taking
+`FixedBufferAllocator`, since a bump pointer without a lock would hand both threads the same bytes.
+The budget it enforces is unchanged. A thread that cannot be spawned falls back to doing both halves
+in turn.
 
 The Zig source builds unchanged on 0.17.0-dev; only `build.zig` needs a newer API (`b.args` moved),
 so a dev toolchain compiles it with `zig build-exe src/main.zig -O ReleaseFast`. The Java port
@@ -868,11 +928,16 @@ Sizes and shapes not yet answered, roughly in the order they would pay off:
 4. **Isolate the SWAR-versus-Vector reversal.** SWAR ties the Vector API at 10M and wins by 19% at
    20M, but the host changed with the scale. Running both scales on one host would say whether it is
    the size or the machine.
-5. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
-   cell work, and probably the ranking.
-6. **Many small comparisons** rather than one big one — where JVM startup dominates and
+5. **More than two threads in the native ports.** The parallelism there is structural — two indexes,
+   two join directions — so it stops at two. Splitting one file into per-core chunks at row
+   boundaries would use all four, though at 1.18-1.78x cpu/wall the scan already looks
+   bandwidth-bound, so the ceiling may be close.
+6. **Wide files.** Everything here is 20 columns. A 200-column file changes the ratio of key work to
+   cell work, and probably the ranking. It would also re-open the SIMD question: longer rows mean
+   longer scans, which is the one shape where a vector register might pay.
+7. **Many small comparisons** rather than one big one — where JVM startup dominates and
    native-image's startup advantage might finally pay for its throughput.
-7. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
+8. **A newer GraalVM.** The AOT result is from Oracle GraalVM 25; if the FFM access path improves,
    the 17-21x should move.
 
 ## Suggested additions
