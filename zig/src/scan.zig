@@ -79,3 +79,34 @@ test "skipQuoted treats a doubled quote as content" {
     const d = "\"a\"\"b\",rest";
     try std.testing.expectEqual(@as(usize, 6), skipQuoted(d, 1, d.len));
 }
+
+/// How many `target` bytes there are in `data[from..end]`.
+///
+/// Only the chunked index build needs this, and only for the quote character:
+/// the number of quotes before a position is what says whether that position is
+/// inside a quoted field. Counting whole words at a time keeps it far cheaper
+/// than the parsing it makes parallel.
+pub fn countByte(data: []const u8, from: usize, end: usize, target: u8) usize {
+    const bt = broadcast(target);
+    var n: usize = 0;
+    var at = from;
+    while (at + 8 <= end) : (at += 8) {
+        n += @popCount(matchBits(load64(data, at), bt));
+    }
+    while (at < end) : (at += 1) {
+        if (data[at] == target) n += 1;
+    }
+    return n;
+}
+
+test "countByte counts the same as one byte at a time" {
+    const d = "a\"b\"\"c\"d\"e\"\"\"f";
+    var from: usize = 0;
+    while (from < d.len) : (from += 1) {
+        var want: usize = 0;
+        for (d[from..]) |b| {
+            if (b == '"') want += 1;
+        }
+        try std.testing.expectEqual(want, countByte(d, from, d.len, '"'));
+    }
+}

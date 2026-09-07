@@ -1,0 +1,446 @@
+//! The two text readers: CSV, and newline-delimited JSON.
+//!
+//! They are one module because they are one design. A JSON value is a contiguous
+//! run of bytes in the file exactly as a CSV field is, so a field stays an offset
+//! and a length for both and nothing downstream has to know which format it came
+//! from. What differs is how a row is walked — by column number, or by key — and
+//! how a value is escaped, which `slab.zig` settles.
+//!
+//! The two sides of a comparison need not agree: a CSV export compares against
+//! the JSON the same pipeline emits, with the key order on each side free to
+//! differ, because the JSON reader joins by name.
+
+const std = @import("std");
+const scan = @import("scan.zig");
+const f = @import("field.zig");
+const Field = f.Field;
+const Slab = @import("slab.zig").Slab;
+const Dialect = @import("slab.zig").Dialect;
+
+pub const Error = error{ NoHeaderRow, NoJsonObject };
+
+fn jsonSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+/// Newline-delimited JSON if the first thing that is not whitespace is a brace.
+///
+/// A CSV header can begin with anything else, and a `{` in the first column of a
+/// CSV header is not something this project has ever had to read.
+pub fn sniffDialect(data: []const u8) Dialect {
+    for (data[0..@min(data.len, 64)]) |b| {
+        if (jsonSpace(b)) continue;
+        return if (b == '{') .json else .csv;
+    }
+    return .csv;
+}
+
+/// Guesses the delimiter from the header line, defaulting to a comma.
+pub fn detectDelimiter(header: []const u8) u8 {
+    var best: u8 = ',';
+    var best_count: isize = -1;
+    for ([_]u8{ ',', ';', '\t', '|' }) |c| {
+        var n: isize = 0;
+        for (header) |b| {
+            if (b == c) n += 1;
+        }
+        if (n > best_count) {
+            best = c;
+            best_count = n;
+        }
+    }
+    return best;
+}
+
+/// A quoted CSV field, flagged when it holds a doubled quote. A quote inside the
+/// body can only be half of such a pair, which is what makes the test a single
+/// scan and lets the unescaping wait until the bytes are actually read.
+fn quotedField(d: []const u8, from: usize, to: usize) Field {
+    return f.pack(from, to - from, scan.nextOf1(d, from, to, '"') < to);
+}
+
+/// An unquoted field, with a trailing carriage return stripped so CRLF behaves
+/// like LF.
+fn plainField(d: []const u8, from: usize, to: usize) Field {
+    var stop = to;
+    if (stop > from and d[stop - 1] == '\r') stop -= 1;
+    return f.pack(from, stop - from, false);
+}
+
+/// The offset of the newline ending the row that starts at `pos`.
+fn endOfRow(d: []const u8, pos: usize, end: usize) usize {
+    var at = pos;
+    while (at < end) {
+        const next = scan.nextOf2(d, at, end, '\n', '"');
+        if (next >= end) return end;
+        if (d[next] == '"') {
+            at = scan.skipQuoted(d, next + 1, end);
+            continue;
+        }
+        return next;
+    }
+    return end;
+}
+
+/// Skips one JSON string starting at its opening quote, returning the offset one
+/// past the closing quote and whether the string holds a backslash.
+fn skipJsonString(d: []const u8, from: usize, end: usize) struct { usize, bool } {
+    var at = from + 1; // the opening quote
+    var escaped = false;
+    while (true) {
+        const stop = scan.nextOf2(d, at, end, '"', '\\');
+        if (stop >= end) return .{ end, escaped };
+        if (d[stop] == '"') return .{ stop + 1, escaped };
+        escaped = true;
+        at = stop + 2; // the backslash and whatever it escapes
+        if (at > end) return .{ end, escaped };
+    }
+}
+
+/// Skips a nested object or array, which is not a cell value.
+fn skipJsonNested(d: []const u8, from: usize, end: usize) usize {
+    var pos = from;
+    var depth: i32 = 0;
+    while (pos < end) {
+        switch (d[pos]) {
+            '"' => {
+                pos = skipJsonString(d, pos, end)[0];
+                continue;
+            },
+            '{', '[' => depth += 1,
+            '}', ']' => {
+                depth -= 1;
+                pos += 1;
+                if (depth <= 0) return pos;
+                continue;
+            },
+            else => {},
+        }
+        pos += 1;
+    }
+    return end;
+}
+
+/// Past the end of this object's line. Records are newline-delimited, so a
+/// newline outside a string ends the row.
+fn endOfJsonRow(d: []const u8, from: usize, end: usize) usize {
+    var pos = from;
+    while (pos < end) {
+        const stop = scan.nextOf2(d, pos, end, '\n', '"');
+        if (stop >= end) return end;
+        if (d[stop] == '\n') return stop + 1;
+        const next = skipJsonString(d, stop, end)[0];
+        if (next <= stop) return end;
+        pos = next;
+    }
+    return end;
+}
+
+fn nameHash(s: []const u8) u64 {
+    var h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (s) |c| h = (h ^ c) *% 0x100_0000_01b3;
+    return h ^ (h >> 32);
+}
+
+/// Splits rows into fields, projecting straight to the columns asked for.
+///
+/// The CSV form is addressed by column number: once the last needed column has
+/// been read the rest of the row is skipped to its newline without its fields
+/// ever being delimited, so on twenty columns keyed on the first two most of a
+/// row is never looked at. The JSON form is addressed by key instead, so it walks
+/// the whole object — but only once, and one hash per key rather than a search
+/// per wanted column, which at twenty columns would be four hundred comparisons
+/// a row.
+pub const RowParser = union(enum) {
+    csv: Csv,
+    json: Json,
+
+    pub const Csv = struct {
+        delimiter: u8,
+        /// Where each projected column sits in the file, or null when absent.
+        source: []const ?usize,
+        last_needed: usize,
+    };
+
+    pub const Json = struct {
+        /// The key whose value belongs in each slot; null for a column this file
+        /// does not have.
+        wanted: []const ?[]const u8,
+        /// Open-addressed name to slot, so a key costs one hash.
+        slots: []i32,
+        slot_mask: usize,
+
+        fn slotFor(self: Json, key: []const u8) ?usize {
+            var at = nameHash(key) & self.slot_mask;
+            while (true) {
+                const i = self.slots[at];
+                if (i < 0) return null;
+                const name = self.wanted[@intCast(i)];
+                if (name != null and std.mem.eql(u8, name.?, key)) return @intCast(i);
+                at = (at + 1) & self.slot_mask;
+            }
+        }
+    };
+
+    pub fn initCsv(delimiter: u8, source: []const ?usize) RowParser {
+        var last: usize = 0;
+        for (source) |s| if (s) |c| {
+            if (c > last) last = c;
+        };
+        return .{ .csv = .{ .delimiter = delimiter, .source = source, .last_needed = last } };
+    }
+
+    pub fn initJson(gpa: std.mem.Allocator, wanted: []const ?[]const u8) !RowParser {
+        var n: usize = 16;
+        while (n < wanted.len * 4) n <<= 1;
+        const slots = try gpa.alloc(i32, n);
+        @memset(slots, -1);
+        const mask = n - 1;
+        for (wanted, 0..) |name, i| {
+            if (name == null) continue;
+            var at = nameHash(name.?) & mask;
+            while (slots[at] >= 0) at = (at + 1) & mask;
+            slots[at] = @intCast(i);
+        }
+        return .{ .json = .{ .wanted = wanted, .slots = slots, .slot_mask = mask } };
+    }
+
+    pub fn deinit(self: RowParser, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .json => |j| gpa.free(j.slots),
+            .csv => {},
+        }
+    }
+
+    /// Parses one row into `out`, returning the offset of the next row. A row
+    /// shorter than the header leaves the missing fields absent, which is a
+    /// difference to report rather than a file to refuse.
+    pub fn parse(self: RowParser, d: []const u8, start: usize, end: usize, out: []Field) usize {
+        return switch (self) {
+            .csv => |c| parseCsv(c, d, start, end, out),
+            .json => |j| parseJson(j, d, start, end, out),
+        };
+    }
+
+    fn parseCsv(self: Csv, d: []const u8, start: usize, end: usize, out: []Field) usize {
+        @memset(out, f.ABSENT);
+        var pos = start;
+        var column: usize = 0;
+
+        while (pos <= end) {
+            var field: Field = undefined;
+            var next: usize = undefined;
+            if (pos < end and d[pos] == '"') {
+                const close = scan.skipQuoted(d, pos + 1, end);
+                const body_end = if (close > pos + 1) close - 1 else pos + 1;
+                next = scan.nextOf2(d, close, end, self.delimiter, '\n');
+                field = quotedField(d, pos + 1, body_end);
+            } else {
+                next = scan.nextOf2(d, pos, end, self.delimiter, '\n');
+                field = plainField(d, pos, next);
+            }
+            if (column <= self.last_needed) {
+                for (self.source, 0..) |s, i| {
+                    if (s != null and s.? == column) out[i] = field;
+                }
+            }
+            column += 1;
+
+            if (next >= end) return end;
+            if (d[next] == '\n') return next + 1;
+            pos = next + 1;
+            if (column > self.last_needed) {
+                const eol = endOfRow(d, pos, end);
+                return if (eol >= end) end else eol + 1;
+            }
+        }
+        return end;
+    }
+
+    /// Walks one JSON object, storing the values of the keys we want.
+    fn parseJson(self: Json, d: []const u8, start: usize, end: usize, out: []Field) usize {
+        @memset(out, f.ABSENT);
+        var pos = start;
+        while (pos < end and jsonSpace(d[pos])) pos += 1;
+        if (pos >= end) return end;
+        if (d[pos] != '{') return endOfJsonRow(d, pos, end); // not an object: skip the line
+        pos += 1;
+
+        while (true) {
+            while (pos < end and jsonSpace(d[pos])) pos += 1;
+            if (pos >= end) break;
+            if (d[pos] == '}') {
+                pos += 1;
+                break;
+            }
+            if (d[pos] == ',') {
+                pos += 1;
+                continue;
+            }
+            if (d[pos] != '"') break; // malformed: stop reading this object
+
+            const key_from = pos + 1;
+            const key_end = skipJsonString(d, pos, end)[0];
+            if (key_end > end or key_end < 2) break;
+            const key = d[key_from .. key_end - 1];
+            pos = key_end;
+            while (pos < end and jsonSpace(d[pos])) pos += 1;
+            if (pos >= end or d[pos] != ':') break;
+            pos += 1;
+            while (pos < end and jsonSpace(d[pos])) pos += 1;
+            if (pos >= end) break;
+
+            var field: ?Field = null;
+            if (d[pos] == '"') {
+                const from = pos + 1;
+                const close, const escaped = skipJsonString(d, pos, end);
+                const to = if (close > from) close - 1 else from;
+                pos = close;
+                field = f.pack(from, to - from, escaped);
+            } else if (d[pos] == '{' or d[pos] == '[') {
+                // Not a cell value. Left absent rather than guessed at.
+                pos = skipJsonNested(d, pos, end);
+            } else {
+                // A number, true, false or null: it runs to the next comma,
+                // brace or space.
+                const from = pos;
+                while (pos < end and d[pos] != ',' and d[pos] != '}' and !jsonSpace(d[pos])) pos += 1;
+                if (!std.mem.eql(u8, d[from..pos], "null")) field = f.pack(from, pos - from, false);
+            }
+            if (field) |value| {
+                if (self.slotFor(key)) |slot| out[slot] = value;
+            }
+        }
+        return endOfJsonRow(d, pos, end);
+    }
+
+};
+
+/// A header name is one of the few strings this engine owns; there is one per
+/// column, not one per cell.
+fn ownField(gpa: std.mem.Allocator, slab: Slab, field: Field) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    var it = slab.logical(field);
+    while (it.next()) |b| try buf.append(gpa, b);
+    return buf.toOwnedSlice(gpa);
+}
+
+pub const Header = struct { names: [][]const u8, start: usize };
+
+/// The CSV header row's names, and where the first data row starts.
+pub fn readCsvHeader(gpa: std.mem.Allocator, slab: Slab, delimiter: u8) !Header {
+    const d = slab.data;
+    if (d.len == 0) return Error.NoHeaderRow;
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(gpa);
+    var pos: usize = 0;
+    while (true) {
+        var field: Field = undefined;
+        var next: usize = undefined;
+        if (pos < d.len and d[pos] == '"') {
+            const close = scan.skipQuoted(d, pos + 1, d.len);
+            const body_end = if (close > pos + 1) close - 1 else pos + 1;
+            next = scan.nextOf2(d, close, d.len, delimiter, '\n');
+            field = quotedField(d, pos + 1, body_end);
+        } else {
+            next = scan.nextOf2(d, pos, d.len, delimiter, '\n');
+            field = plainField(d, pos, next);
+        }
+        try names.append(gpa, try ownField(gpa, slab, field));
+
+        if (next >= d.len) return .{ .names = try names.toOwnedSlice(gpa), .start = d.len };
+        if (d[next] == '\n') return .{ .names = try names.toOwnedSlice(gpa), .start = next + 1 };
+        pos = next + 1;
+    }
+}
+
+/// A JSON file has no header row, so the column names are the keys of the first
+/// object, in the order it lists them.
+pub fn readJsonHeader(gpa: std.mem.Allocator, slab: Slab) !Header {
+    const d = slab.data;
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer names.deinit(gpa);
+    var pos: usize = 0;
+    while (pos < d.len and jsonSpace(d[pos])) pos += 1;
+    if (pos >= d.len or d[pos] != '{') return Error.NoJsonObject;
+    pos += 1;
+    while (true) {
+        while (pos < d.len and jsonSpace(d[pos])) pos += 1;
+        if (pos >= d.len or d[pos] == '}') break;
+        if (d[pos] == ',') {
+            pos += 1;
+            continue;
+        }
+        if (d[pos] != '"') break;
+        const from = pos + 1;
+        const close, const escaped = skipJsonString(d, pos, d.len);
+        if (close <= from) break;
+        try names.append(gpa, try ownField(gpa, slab, f.pack(from, close - 1 - from, escaped)));
+        pos = close;
+        while (pos < d.len and jsonSpace(d[pos])) pos += 1;
+        if (pos >= d.len or d[pos] != ':') break;
+        pos += 1;
+        while (pos < d.len and jsonSpace(d[pos])) pos += 1;
+        if (pos >= d.len) break;
+        if (d[pos] == '"') {
+            pos = skipJsonString(d, pos, d.len)[0];
+        } else if (d[pos] == '{' or d[pos] == '[') {
+            pos = skipJsonNested(d, pos, d.len);
+        } else {
+            while (pos < d.len and d[pos] != ',' and d[pos] != '}' and !jsonSpace(d[pos])) pos += 1;
+        }
+    }
+    if (names.items.len == 0) return Error.NoJsonObject;
+    return .{ .names = try names.toOwnedSlice(gpa), .start = 0 };
+}
+
+test "a brace is json and anything else is csv" {
+    try std.testing.expectEqual(Dialect.json, sniffDialect("  {\"a\":1}"));
+    try std.testing.expectEqual(Dialect.csv, sniffDialect("a,b,c\n"));
+    try std.testing.expectEqual(Dialect.csv, sniffDialect(""));
+}
+
+test "json values are read by key whatever order they come in" {
+    const text = "{\"k\":\"1\",\"v\":\"a\"}\n{\"v\":\"b\",\"k\":\"2\"}\n";
+    const slab = Slab{ .data = text, .dialect = .json };
+    const gpa = std.testing.allocator;
+    const wanted = [_]?[]const u8{ "k", "v" };
+    const parser = try RowParser.initJson(gpa, &wanted);
+    defer parser.deinit(gpa);
+    var out: [2]Field = undefined;
+    const next = parser.parse(text, 0, text.len, &out);
+    try std.testing.expectEqualStrings("1", slab.raw(out[0]));
+    try std.testing.expectEqualStrings("a", slab.raw(out[1]));
+    _ = parser.parse(text, next, text.len, &out);
+    try std.testing.expectEqualStrings("2", slab.raw(out[0]));
+    try std.testing.expectEqualStrings("b", slab.raw(out[1]));
+}
+
+test "null, a nested value and a missing key are all absent" {
+    const text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":1},\"x\":[1,2]}\n";
+    const gpa = std.testing.allocator;
+    const wanted = [_]?[]const u8{ "k", "v", "w", "x", "missing" };
+    const parser = try RowParser.initJson(gpa, &wanted);
+    defer parser.deinit(gpa);
+    var out: [5]Field = undefined;
+    const next = parser.parse(text, 0, text.len, &out);
+    const slab = Slab{ .data = text, .dialect = .json };
+    try std.testing.expectEqualStrings("1", slab.raw(out[0]));
+    for (out[1..]) |field| try std.testing.expectEqual(f.ABSENT, field);
+    try std.testing.expectEqual(text.len, next);
+}
+
+test "the json header is the first object's keys in order" {
+    const text = "{\"b\":1,\"a\":\"x\",\"n\":null}\n";
+    const gpa = std.testing.allocator;
+    const head = try readJsonHeader(gpa, .{ .data = text, .dialect = .json });
+    defer {
+        for (head.names) |n| gpa.free(n);
+        gpa.free(head.names);
+    }
+    try std.testing.expectEqual(@as(usize, 3), head.names.len);
+    try std.testing.expectEqualStrings("b", head.names[0]);
+    try std.testing.expectEqualStrings("a", head.names[1]);
+    try std.testing.expectEqualStrings("n", head.names[2]);
+}

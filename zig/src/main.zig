@@ -12,7 +12,7 @@ const std = @import("std");
 const csvdiff = @import("csvdiff.zig");
 
 const usage =
-    \\csvdiff - composite-key CSV comparison, byte-level, with a memory budget
+    \\csvdiff - composite-key comparison of CSV, JSON and Parquet, with a memory budget
     \\
     \\usage:
     \\  csvdiff compare A B -k COLS [options]
@@ -27,6 +27,7 @@ const usage =
     \\      --tolerance N     absolute numeric tolerance
     \\      --max-rows N      rows embedded per section (default 50000)
     \\      --delimiter D     force the delimiter (default: sniff it)
+    \\      --threads N       how many threads to use (default: as many as cores)
     \\      --max-memory MB   fail rather than exceed this much memory
     \\      --json PATH       write the JSON summary here
     \\
@@ -104,6 +105,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, f, "--max-rows")) {
             opt.max_rows = std.fmt.parseInt(usize, need(args, &i) orelse "", 10) catch
                 return fail(&stderr, "--max-rows needs a number");
+        } else if (std.mem.eql(u8, f, "--threads")) {
+            opt.threads = std.fmt.parseInt(usize, need(args, &i) orelse "", 10) catch
+                return fail(&stderr, "--threads needs a number");
         } else if (std.mem.eql(u8, f, "--max-memory")) {
             max_memory_mb = std.fmt.parseInt(usize, need(args, &i) orelse "", 10) catch
                 return fail(&stderr, "--max-memory needs a number of megabytes");
@@ -145,27 +149,19 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     var result = csvdiff.compare(io, gpa, files.items[0], files.items[1], opt) catch |err| {
-        const message = switch (err) {
-            error.OutOfMemory => blk: {
-                if (max_memory_mb) |mb| {
-                    try stderr.interface.print(
-                        "error: the comparison needs more than the {d} MB it was given\n",
-                        .{mb},
-                    );
-                    try stderr.interface.flush();
-                    return 2;
-                }
-                break :blk "out of memory";
-            },
-            csvdiff.Error.KeyColumnMissing => "key column(s) missing from one of the files",
-            csvdiff.Error.ComparedColumnMissing => "compared column missing from one of the files",
-            csvdiff.Error.NoHeaderRow => "file has no header row",
-            csvdiff.Error.FieldTooLong => "a field is larger than this engine packs",
-            csvdiff.Error.CannotReadFile => "cannot read one of the files",
-            csvdiff.Error.NonAsciiCaseFold => "--ignore-case outside ASCII needs Unicode case " ++
-                "folding, which this port does not carry; use another implementation for that data",
-        };
-        try stderr.interface.print("error: {s}\n", .{message});
+        // A budget that was not enough is the one failure worth naming in full:
+        // it is the answer to the question --max-memory was asked.
+        if (err == error.OutOfMemory) {
+            if (max_memory_mb) |mb| {
+                try stderr.interface.print(
+                    "error: the comparison needs more than the {d} MB it was given\n",
+                    .{mb},
+                );
+                try stderr.interface.flush();
+                return 2;
+            }
+        }
+        try stderr.interface.print("error: {s}\n", .{csvdiff.message(err)});
         try stderr.interface.flush();
         return 2;
     };
