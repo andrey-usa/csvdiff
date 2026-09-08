@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const csvdiff = @import("csvdiff.zig");
+const pqdiff = @import("pqdiff.zig");
 
 const usage =
     \\csvdiff - composite-key CSV comparison, byte-level, with a memory budget
@@ -144,7 +145,21 @@ pub fn main(init: std.process.Init) !u8 {
         gpa = fixed.threadSafeAllocator();
     }
 
-    var result = csvdiff.compare(io, gpa, files.items[0], files.items[1], opt) catch |err| {
+    // Parquet is not a text format and is not read as one: it goes to the
+    // columnar path, which never reconstructs a row. Both sides have to be
+    // Parquet -- comparing a column store against a byte stream would mean
+    // building rows out of one of them, and that is the cost the columnar path
+    // exists to avoid.
+    const a_parquet = pqdiff.isParquetFile(io, files.items[0]);
+    const b_parquet = pqdiff.isParquetFile(io, files.items[1]);
+    if (a_parquet != b_parquet) {
+        return fail(&stderr, "one file is parquet and the other is not; convert one of them first");
+    }
+
+    var result = (if (a_parquet)
+        pqdiff.compare(io, gpa, files.items[0], files.items[1], opt)
+    else
+        csvdiff.compare(io, gpa, files.items[0], files.items[1], opt)) catch |err| {
         const message = switch (err) {
             error.OutOfMemory => blk: {
                 if (max_memory_mb) |mb| {
@@ -164,6 +179,13 @@ pub fn main(init: std.process.Init) !u8 {
             csvdiff.Error.CannotReadFile => "cannot read one of the files",
             csvdiff.Error.NonAsciiCaseFold => "--ignore-case outside ASCII needs Unicode case " ++
                 "folding, which this port does not carry; use another implementation for that data",
+            pqdiff.Error.ParquetKeyColumnMissing => "key column(s) missing from one of the files",
+            pqdiff.Error.ParquetComparedColumnMissing => "compared column missing from one of the files",
+            pqdiff.Error.ParquetRowCountMismatch => "parquet columns disagree about how many rows the file has",
+            pqdiff.Error.ParquetMixedWithText => "one file is parquet and the other is not",
+            // The reader refuses what it does not implement by name rather than
+            // guessing, and the name is the message.
+            else => @errorName(err),
         };
         try stderr.interface.print("error: {s}\n", .{message});
         try stderr.interface.flush();
@@ -196,9 +218,15 @@ pub fn main(init: std.process.Init) !u8 {
         try w.interface.flush();
     }
 
+    // Which path ran, not which one was asked for: a Parquet pair never goes
+    // through the byte scanner.
     try stdout.interface.print(
-        "A {d} rows | B {d} rows | matched {d} (changed {d}) | added {d} | removed {d} | dup keys A {d} B {d} | turbo\n",
-        .{ c.a_rows, c.b_rows, c.matched, c.changed, c.added, c.removed, c.a_dup_keys, c.b_dup_keys },
+        "A {d} rows | B {d} rows | matched {d} (changed {d}) | added {d} | removed {d} | dup keys A {d} B {d} | {s}\n",
+        .{
+            c.a_rows,       c.b_rows,   c.matched,       c.changed,
+            c.added,        c.removed,  c.a_dup_keys,    c.b_dup_keys,
+            if (a_parquet) @as([]const u8, "parquet") else "turbo",
+        },
     );
     try stdout.interface.flush();
     return if (result.identical()) 0 else 1;

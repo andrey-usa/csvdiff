@@ -7,11 +7,21 @@ field is an offset and a length packed into one word, delimiters are found eight
 bytes at a time with SWAR, and nothing becomes a string unless it reaches the
 report.
 
+It reads **CSV and Parquet**. A Parquet pair takes a different path entirely —
+[columnar, and never reconstructing a row](../README.md#reading-parquet-natively)
+— and the budget bounds that path exactly as it bounds this one.
+
 ```bash
 zig build --release=fast
 zig-out/bin/csvdiff compare a.csv b.csv -k id --json summary.json
 zig-out/bin/csvdiff compare a.csv b.csv -k id --max-memory 256
+zig-out/bin/csvdiff compare a.parquet b.parquet -k account_id,txn_id
+./test.sh                # against the Rust port, and Parquet against its own CSV
 ```
+
+**Build it with `--release=fast`.** A plain `zig build` is a Debug build and is
+about four times slower on the Parquet path; Zig 0.16 spells the flag
+`--release`, not `-Doptimize`.
 
 ## Why this port exists
 
@@ -76,4 +86,6 @@ refused by name instead.
 |---|---|
 | `src/scan.zig` | SWAR scanning, with its own unit tests (`zig build test`) |
 | `src/csvdiff.zig` | the mapped slab, the parser, the index, the join |
+| `src/parquet.zig` | a Parquet reader shaped for comparing: Thrift footer, page decoder, RLE/bit-packed hybrid, snappy |
+| `src/pqdiff.zig` | the columnar comparison — key join first, then one column at a time, on shared dictionary ids |
 | `src/main.zig` | the command line and the memory budget |
