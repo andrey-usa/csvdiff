@@ -62,7 +62,7 @@ r=$("$RUST" compare "$tmp/a.csv" "$tmp/b.csv" -k k --engine turbo -o /dev/null 2
 c=$(build/csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | head -1 | sed 's/ | turbo.*//') || true
 [ "$r" = "$c" ] && echo "  ok    key in the last bytes of the file" || { echo "  FAIL  key near end: rust=$r cpp=$c"; fail=1; }
 
-echo "parquet, written natively and read back:"
+echo "written natively and read back:"
 # The generator writes Parquet from the same field-by-field recipe it writes CSV
 # from, so the two can be held against each other without a third tool in the
 # way -- and these checks run wherever the port builds, rather than only where
@@ -75,7 +75,10 @@ gencheck() { # label, rows, prefix, then generator flags
   gen "$rows" "$prefix"
   gen "$rows" "$prefix" "$@"
   local ext=.parquet
-  case " $* " in *" none "*) ext=.unc.parquet ;; esac
+  case " $* " in
+    *" json "*) ext=.ndjson ;;
+    *" none "*) ext=.unc.parquet ;;
+  esac
   build/csvdiff compare "$tmpg/${prefix}_a.csv" "$tmpg/${prefix}_b.csv" \
     -k account_id,txn_id -i updated_at --json "$tmpg/csv.json" >/dev/null 2>&1 || true
   build/csvdiff compare "$tmpg/${prefix}_a$ext" "$tmpg/${prefix}_b$ext" \
@@ -93,6 +96,7 @@ PYEOF
   else printf '  FAIL  %s: the parquet report differs from the csv one\n' "$label"; fail=1; fi
   rm -f "$tmpg/${prefix}"_*
 }
+gencheck "newline-delimited json" 20k s0 --format json
 gencheck "snappy, one row group" 20k s1 --format parquet --compression snappy
 gencheck "uncompressed" 20k s2 --format parquet --compression none
 gencheck "many small row groups" 20k s3 --format parquet --compression snappy --row-group-size 512

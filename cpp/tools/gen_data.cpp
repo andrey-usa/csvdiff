@@ -211,22 +211,94 @@ char* row(char* dst, Row& scratch, std::int64_t i, bool b, std::int64_t seed) {
     return dst;
 }
 
+// The column names, split out of the CSV header once so the JSON and Parquet
+// writers can name their fields.
+const std::vector<std::string>& column_names() {
+    static const std::vector<std::string> names = [] {
+        std::vector<std::string> out;
+        for (const char* p = kColumns; *p;) {
+            const char* q = p;
+            while (*q && *q != ',' && *q != '\n') ++q;
+            out.emplace_back(p, static_cast<std::size_t>(q - p));
+            p = *q ? q + 1 : q;
+        }
+        return out;
+    }();
+    return names;
+}
+
+// A JSON string body. None of the generated values need escaping, but a
+// generator that only happens to be correct for its own data is a trap for
+// whoever changes the recipe next.
+char* put_json(char* p, std::string_view v) {
+    for (char c : v) {
+        switch (c) {
+            case '"': *p++ = '\\'; *p++ = '"'; break;
+            case '\\': *p++ = '\\'; *p++ = '\\'; break;
+            case '\n': *p++ = '\\'; *p++ = 'n'; break;
+            case '\r': *p++ = '\\'; *p++ = 'r'; break;
+            case '\t': *p++ = '\\'; *p++ = 't'; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    static const char kHex[] = "0123456789abcdef";
+                    *p++ = '\\'; *p++ = 'u'; *p++ = '0'; *p++ = '0';
+                    *p++ = kHex[(c >> 4) & 0xF];
+                    *p++ = kHex[c & 0xF];
+                } else {
+                    *p++ = c;
+                }
+        }
+    }
+    return p;
+}
+
+// The same row as one line of newline-delimited JSON. An empty field becomes
+// `null`, which is what the empty CSV field means and what the Parquet writer
+// puts there. `dst` must have at least 1024 bytes of room.
+char* row_json(char* dst, Row& scratch, std::int64_t i, bool b, std::int64_t seed) {
+    fields(scratch, i, b, seed);
+    const std::vector<std::string>& names = column_names();
+    *dst++ = '{';
+    for (int c = 0; c < kFieldCount; ++c) {
+        if (c) *dst++ = ',';
+        *dst++ = '"';
+        std::memcpy(dst, names[c].data(), names[c].size());
+        dst += names[c].size();
+        *dst++ = '"';
+        *dst++ = ':';
+        if (scratch.f[c].empty()) {
+            std::memcpy(dst, "null", 4);
+            dst += 4;
+            continue;
+        }
+        *dst++ = '"';
+        dst = put_json(dst, scratch.f[c]);
+        *dst++ = '"';
+    }
+    *dst++ = '}';
+    *dst++ = '\n';
+    return dst;
+}
+
 // Every row index in [from, to) as it appears in file A, then in file B. The
 // two sides differ: B drops one row in a thousand and repeats one in ten
 // thousand, both decided by the index alone, which is what lets a chunk be
 // built without seeing the chunks before it.
-void fill(std::int64_t from, std::int64_t to, std::int64_t rows, std::int64_t seed,
+void fill(std::int64_t from, std::int64_t to, std::int64_t rows, std::int64_t seed, bool json,
           std::string& a, std::string& b) {
     a.clear();
     b.clear();
     Row scratch;
-    char line[256];
+    char line[1024];
+    const auto one = [&](std::int64_t i, bool side_b, std::string& out) {
+        const char* end = json ? row_json(line, scratch, i, side_b, seed)
+                               : row(line, scratch, i, side_b, seed);
+        out.append(line, static_cast<std::size_t>(end - line));
+    };
     for (std::int64_t i = from; i < to; ++i) {
-        a.append(line, static_cast<std::size_t>(row(line, scratch, i, false, seed) - line));
-        if (i % kRemovedMod != 7)
-            b.append(line, static_cast<std::size_t>(row(line, scratch, i, true, seed) - line));
-        if (i % kDupMod == 3 && i < rows / 2)
-            b.append(line, static_cast<std::size_t>(row(line, scratch, i, true, seed) - line));
+        one(i, false, a);
+        if (i % kRemovedMod != 7) one(i, true, b);
+        if (i % kDupMod == 3 && i < rows / 2) one(i, true, b);
     }
 }
 
@@ -258,14 +330,7 @@ void each_row(bool b, std::int64_t rows, Fn&& emit) {
 void write_parquet(const std::string& path, std::int64_t rows, std::int64_t seed, bool b,
                    pqwrite::Codec codec, std::int64_t rg_rows, std::size_t dict_limit,
                    unsigned threads) {
-    std::vector<std::string> names;
-    for (const char* p = kColumns; *p;) {
-        const char* q = p;
-        while (*q && *q != ',' && *q != '\n') ++q;
-        names.emplace_back(p, static_cast<std::size_t>(q - p));
-        p = *q ? q + 1 : q;
-    }
-    pqwrite::Writer w(path, names, codec, rg_rows, dict_limit, threads);
+    pqwrite::Writer w(path, column_names(), codec, rg_rows, dict_limit, threads);
     Row scratch;
     std::vector<pqwrite::Value> cells(kFieldCount);
     each_row(b, rows, [&](std::int64_t i) {
@@ -329,7 +394,7 @@ int main(int argc, char** argv) {
         else if (f == "-h" || f == "--help") {
             std::printf(
                 "usage: gen-data --rows 10m --out-dir DIR [--prefix P] [--threads N]\n"
-                "                [--format csv|parquet] [--compression snappy|none]\n"
+                "                [--format csv|json|parquet] [--compression snappy|none]\n"
                 "                [--row-group-size N] [--dict-limit N]\n"
                 "\n"
                 "--dict-limit is how many distinct values a column may have in one row\n"
@@ -383,29 +448,37 @@ int main(int argc, char** argv) {
                     static_cast<long long>(rows), compression.c_str(), threads);
         return 0;
     }
-    if (format != "csv") {
-        std::fprintf(stderr, "error: --format must be csv or parquet\n");
+    if (format != "csv" && format != "json") {
+        std::fprintf(stderr, "error: --format must be csv, json or parquet\n");
         return 2;
     }
 
-    const std::string a_path = out_dir + "/" + prefix + "_a.csv";
-    const std::string b_path = out_dir + "/" + prefix + "_b.csv";
+    // CSV and newline-delimited JSON are both line-oriented, so they take the
+    // same path: waves of threads formatting their own chunk, written in order.
+    // Only the line differs, and the header, which JSON does not have -- its
+    // field names are on every row.
+    const bool json = format == "json";
+    const std::string ext = json ? ".ndjson" : ".csv";
+    const std::string a_path = out_dir + "/" + prefix + "_a" + ext;
+    const std::string b_path = out_dir + "/" + prefix + "_b" + ext;
     const int fa = ::open(a_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     const int fb = ::open(b_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fa < 0 || fb < 0) {
         std::fprintf(stderr, "error: cannot create the output files in %s\n", out_dir.c_str());
         return 2;
     }
-    write_all(fa, kColumns, std::strlen(kColumns), a_path.c_str());
-    write_all(fb, kColumns, std::strlen(kColumns), b_path.c_str());
+    if (!json) {
+        write_all(fa, kColumns, std::strlen(kColumns), a_path.c_str());
+        write_all(fb, kColumns, std::strlen(kColumns), b_path.c_str());
+    }
 
     // Enough rows per chunk that a thread has real work, few enough that a wave
     // of them stays comfortably inside the page cache.
     const std::int64_t per_chunk = std::max<std::int64_t>(1 << 14, rows / (threads * 16));
     std::vector<std::string> a_buf(threads), b_buf(threads);
     for (unsigned t = 0; t < threads; ++t) {
-        a_buf[t].reserve(static_cast<std::size_t>(per_chunk) * 200);
-        b_buf[t].reserve(static_cast<std::size_t>(per_chunk) * 200);
+        a_buf[t].reserve(static_cast<std::size_t>(per_chunk) * (json ? 512 : 200));
+        b_buf[t].reserve(static_cast<std::size_t>(per_chunk) * (json ? 512 : 200));
     }
 
     for (std::int64_t start = 0; start < rows; start += per_chunk * threads) {
@@ -417,10 +490,11 @@ int main(int argc, char** argv) {
             const std::int64_t to = std::min(from + per_chunk, rows);
             ++live;
             if (t == 0) continue;  // this thread takes chunk 0 itself
-            workers.emplace_back([&, t, from, to] { fill(from, to, rows, seed, a_buf[t], b_buf[t]); });
+            workers.emplace_back(
+                [&, t, from, to] { fill(from, to, rows, seed, json, a_buf[t], b_buf[t]); });
         }
         if (live == 0) break;
-        fill(start, std::min(start + per_chunk, rows), rows, seed, a_buf[0], b_buf[0]);
+        fill(start, std::min(start + per_chunk, rows), rows, seed, json, a_buf[0], b_buf[0]);
         for (auto& w : workers) w.join();
         for (unsigned t = 0; t < live; ++t) {
             write_all(fa, a_buf[t].data(), a_buf[t].size(), a_path.c_str());
@@ -433,18 +507,21 @@ int main(int argc, char** argv) {
     const std::int64_t added = std::max<std::int64_t>(1, rows / kAddedRatio);
     std::string tail;
     Row scratch;
-    char line[256];
-    for (std::int64_t i = 0; i < dup_extra; ++i)
-        tail.append(line, static_cast<std::size_t>(row(line, scratch, i, false, seed) - line));
+    char line[1024];
+    const auto one = [&](std::int64_t i, bool side_b) {
+        const char* end = json ? row_json(line, scratch, i, side_b, seed)
+                               : row(line, scratch, i, side_b, seed);
+        tail.append(line, static_cast<std::size_t>(end - line));
+    };
+    for (std::int64_t i = 0; i < dup_extra; ++i) one(i, false);
     write_all(fa, tail.data(), tail.size(), a_path.c_str());
     tail.clear();
-    for (std::int64_t i = rows; i < rows + added; ++i)
-        tail.append(line, static_cast<std::size_t>(row(line, scratch, i, true, seed) - line));
+    for (std::int64_t i = rows; i < rows + added; ++i) one(i, true);
     write_all(fb, tail.data(), tail.size(), b_path.c_str());
 
     ::close(fa);
     ::close(fb);
-    std::printf("c++: %lld rows x 20 columns on %u threads\n", static_cast<long long>(rows),
-                threads);
+    std::printf("c++: %lld rows x 20 columns, %s on %u threads\n",
+                static_cast<long long>(rows), json ? "ndjson" : "csv", threads);
     return 0;
 }
