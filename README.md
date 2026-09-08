@@ -676,13 +676,14 @@ these are not idle engines — but the two that trail do so for opposite reasons
   AVX2` spends **24.7s of CPU, the least of any build in the table** — less than
   the C++ port's best at 25.9s — and still finishes behind it, 8.93s against
   8.58s, because it runs at 2.77x cores against 3.02x. Rust is doing the least
-  work and spreading it worst. Some of that is the report: the renderer is
-  single-threaded, and `Rust, engine only` sits at 3.02x. The rest is the
-  engine's own tail, and it is the one thing in this table where the fix is
-  plainly threading rather than tuning.
+  work and spreading it worst. The cause is entirely the report, which the same
+  column proves: `Rust, engine only` sits at 3.02x, against the C++ port's
+  3.04x — the engine is as parallel as C++ is, and the gap is the fifty
+  thousand rows the renderer turns into strings on one thread.
 
 None of that is visible in a table of wall times, which is why every row here
-carries CPU.
+carries CPU. All three were acted on rather than noted; what each turned out to
+be is under [What the CPU column found](#what-the-cpu-column-found).
 
 **The vector scanner beats SWAR in all three ports, and by very different
 amounts**: 3.4% in C++, 10.3% in Zig, **12.3% in Rust**. The CPU column shows it
@@ -702,6 +703,53 @@ agreeing on zero is a firmer result than one would be: the mask scan is a few
 per cent of that path at most, because the columnar comparison is bound by the
 gathers through the two dictionaries rather than by reading the mask they
 produce.
+
+### What the CPU column found
+
+Three gaps, one per port, none of them visible in wall time — and the diagnosis
+was wrong about one of them until the column was read properly.
+
+**Zig on CSV was executing 21% more instructions than C++ for the same answer.**
+Callgrind on a 200,000-row pair, one thread: 4.586 billion against 3.803
+billion, which matches the 24% CPU gap measured at ten million on a machine
+where nothing else agreed. Two causes:
+
+| | Before | After |
+|---|---:|---:|
+| Blanking the output row in `parseCsv` | 315M instructions | 13M |
+| `sameBytes`, comparing cells | 762M | 532M |
+| **Whole comparison** | **4.586G** | **4.062G** |
+
+The first was clearing twenty field words per row per file before parsing, when
+only the columns *after* a row runs out need blanking — and a well-formed row
+runs out of nothing. The second is the better story. `sameBytes` had a memcmp
+fast path, gated on `Logical.isPlain()`, which is `dialect == .raw`: true for
+Parquet and **false for every CSV file ever compared**. The fast path had never
+once run on the format the benchmark measures, so every cell of every row went
+through the byte-at-a-time escape iterator. The field word already records
+whether a field carries an escape, which is the question that was meant to be
+asked all along.
+
+**Zig's columnar path read its key columns one side at a time.** They are the
+phase that decodes pages for ten million rows, and the two sides share nothing,
+so all of them now run at once. The interning after them stays serial because
+the shared id space is serial by construction — but that is a few thousand
+string comparisons against ten million rows.
+
+**Rust's gap was the report, and the first reading of it was wrong.** It looked
+like an engine that would not thread. The column says otherwise: `Rust, engine
+only` runs at **3.02x cores against the C++ port's 3.04x**, so the engine is
+exactly as parallel as C++ and there is no tail to find. What is serial is the
+report — up to two hundred thousand rows over twenty columns turned into strings
+on one thread — which is now chunked across the same thread budget. Its gzip
+also drops from level 9 to level 6: on the largest report this cap allows, level
+9 buys **0.71% of file size for 29% of the render**, and compression is the one
+part of a run that cannot be spread across cores at all.
+
+That last one is the argument for the column in miniature. Wall time said
+"slower engine". CPU time said "same work, fewer cores", and cores-busy on the
+`engine only` row said "not the engine". Three different fixes, and only the
+third was the right one.
 
 ## Set C — against the field
 
