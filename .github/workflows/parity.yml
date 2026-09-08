@@ -1,27 +1,28 @@
 name: Cross-language parity
 
-# The five implementations share one result contract and one data generator.
-# This is where that is enforced: change any of them and this runs.
+# One dataset, every native port, the same answer.
+#
+# This used to build five implementations -- Python, Java, TypeScript, Go and
+# Rust -- and spent most of its wall clock installing toolchains for engines the
+# project no longer competes on. It now asks the narrower question that is still
+# capable of failing: do the byte-level ports agree, on a file none of them
+# generated for themselves?
+#
+# The dataset comes from c/gen-data, which is the cheapest generator to build
+# here and writes the same bytes as every other one -- which c/test.sh
+# --with-ports checks, so this job does not have to.
+
 on:
   push:
-    branches: [main]
+    branches: [main, "claude/**"]
     paths:
-      - "csvdiff/**"
-      - "scripts/**"
-      - "ts/**"
-      - "java/**"
+      - "c/**"
+      - "cpp/**"
+      - "rust/src/**"
+      - "zig/src/**"
       - "go/**"
-      - "rust/**"
       - ".github/workflows/parity.yml"
   pull_request:
-    paths:
-      - "csvdiff/**"
-      - "scripts/**"
-      - "ts/**"
-      - "java/**"
-      - "go/**"
-      - "rust/**"
-      - ".github/workflows/parity.yml"
   workflow_dispatch:
 
 concurrency:
@@ -29,156 +30,81 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  cross-language-parity:
-    name: all five implementations agree
+  parity:
+    name: one dataset, every native port
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          cache-dependency-path: go/go.sum
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "26"
-          cache: maven
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-          cache: pip
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "26"
-          cache: npm
-          cache-dependency-path: ts/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-
-      - name: Build all five implementations
-        working-directory: .
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache-dependency-path: go/go.sum
+      - name: Install Zig
         run: |
-          (cd go && go build -o /tmp/csvdiff-go ./cmd/csvdiff && go build -o /tmp/gen-data-go ./cmd/gen-data)
-          (cd java && mvn -B --no-transfer-progress -DskipTests package)
-          (cd rust && cargo build --release)
-          pip install -e .
-          (cd ts && npm ci && npm run build)
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+            | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
 
-      # The five generators are meant to emit byte-identical files, which is what
-      # makes a benchmark number from one comparable with a number from another.
-      # 1M rows, not 200k: the rounding divergence this check was added for only
-      # showed up past a few hundred thousand rows.
-      - name: The generators agree byte for byte
-        working-directory: .
+      - name: Build the native ports
         run: |
-          /tmp/gen-data-go --rows 1m --out-dir gen/go --prefix 1m
-          java -cp java/target/csvdiff.jar dev.csvdiff.bench.GenData --rows 1m --out-dir gen/java --prefix 1m
-          rust/target/release/gen-data --rows 1m --out-dir gen/rust --prefix 1m
-          python3 scripts/gen_data.py --rows 1m --out-dir gen/py --prefix 1m
-          node ts/dist/scripts/gen-data.js --rows 1m --out-dir gen/ts --prefix 1m
-          for side in a b; do
-            md5sum gen/*/1m_$side.csv
-            test "$(md5sum gen/*/1m_$side.csv | awk '{print $1}' | sort -u | wc -l)" = 1 \
-              || { echo "the generators have diverged on side $side"; exit 1; }
-          done
-          # Only one copy is needed from here on, and the runner has a finite disk.
-          mv gen/go gen/keep && rm -rf gen/java gen/rust gen/py gen/ts
-
-      - name: One dataset, five implementations, identical results
-        working-directory: .
-        run: |
-          A=gen/keep/1m_a.csv; B=gen/keep/1m_b.csv
-          ARGS="-k account_id,txn_id -i updated_at"
-          /tmp/csvdiff-go compare $A $B $ARGS -o /tmp/go.html --json /tmp/go.json || true
-          rust/target/release/csvdiff compare $A $B $ARGS -o /tmp/rust.html --json /tmp/rust.json || true
-          csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
-          node ts/dist/src/cli.js compare $A $B $ARGS -o /tmp/ts.html --json /tmp/ts.json || true
-          java -cp java/target/csvdiff.jar dev.csvdiff.Cli compare $A $B $ARGS -o /tmp/java.html --json /tmp/java.json || true
-          python3 - <<'PY'
-          import json, sys
-          load = lambda n: json.load(open(f"/tmp/{n}.json"))
-          py = load("py")
-          for other in ("go", "rust", "ts", "java"):
-              o = load(other)
-              for section in ("counts", "columns"):
-                  if o[section] != py[section]:
-                      sys.exit(f"{other} {section} differ from python")
-              if o["meta"]["compared"] != py["meta"]["compared"]:
-                  sys.exit(f"{other} compared columns differ from python")
-          print("python, typescript, java, go and rust agree:", json.dumps(py["counts"]))
-          PY
-
-      - name: The awkward fixture, five implementations, identical results
-        working-directory: .
-        run: |
-          # The dataset above is a million uniform ASCII rows, which is the shape least likely to
-          # find a disagreement. This pair is the opposite: every row is there because it has broken
-          # an engine or plausibly could. tests/fixtures/README.md says which is which.
-          A=tests/fixtures/awkward_a.csv; B=tests/fixtures/awkward_b.csv
-          fail=0
-          for opts in "" "--trim" "--ignore-case" "--trim --ignore-case"; do
-            ARGS="-k k $opts"
-            # Each compare exits 1 when it finds differences, so its status cannot say whether it
-            # ran. Clearing the output first makes a crash show up as a missing file rather than as
-            # the previous iteration's answer read back as this one's.
-            rm -f /tmp/go.json /tmp/rust.json /tmp/py.json /tmp/ts.json /tmp/java.json
-            /tmp/csvdiff-go compare $A $B $ARGS -o /tmp/go.html --json /tmp/go.json || true
-            rust/target/release/csvdiff compare $A $B $ARGS -o /tmp/rust.html --json /tmp/rust.json || true
-            csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
-            node ts/dist/src/cli.js compare $A $B $ARGS -o /tmp/ts.html --json /tmp/ts.json || true
-            java -cp java/target/csvdiff.jar dev.csvdiff.Cli compare $A $B $ARGS -o /tmp/java.html --json /tmp/java.json || true
-            OPTS="$opts" python3 - <<'PY' || fail=1
-          import json, os, sys
-          opts = os.environ.get("OPTS") or "(defaults)"
-          load = lambda n: json.load(open(f"/tmp/{n}.json"))
-          py = load("py")
-          for other in ("go", "rust", "ts", "java"):
-              o = load(other)
-              if o["counts"] != py["counts"]:
-                  print(f"{opts}: {other} counts differ from python")
-                  print(f"  python: {json.dumps(py['counts'])}")
-                  print(f"  {other}: {json.dumps(o['counts'])}")
-                  sys.exit(1)
-          print(f"{opts}: all five agree -", json.dumps(py["counts"]))
-          PY
-          done
-          test "$fail" = 0 || { echo "the implementations disagree on the awkward fixture"; exit 1; }
-
-      - name: The byte-level C and C++ ports agree with Python
-        working-directory: .
-        run: |
-          # These two need no toolchain setup on the runner, so they are cheap to hold to the same
-          # fixture. They carry the comparison and the JSON counts, not the HTML report, and the C
-          # port implements neither --trim nor --ignore-case -- so each is checked on the options it
-          # actually offers rather than being skipped for the ones it does not.
           make -C c
           make -C cpp
-          A=tests/fixtures/awkward_a.csv; B=tests/fixtures/awkward_b.csv
-          fail=0
-          for opts in "" "--trim"; do
-            ARGS="-k k $opts"
-            rm -f /tmp/py.json /tmp/c.json /tmp/cpp.json
-            csvdiff compare $A $B $ARGS -o /tmp/py.html --json /tmp/py.json || true
-            cpp/build/csvdiff compare $A $B $ARGS --json /tmp/cpp.json || true
-            if [ -z "$opts" ]; then c/csvdiff compare $A $B $ARGS --json /tmp/c.json || true; fi
-            OPTS="$opts" python3 - <<'PY' || fail=1
-          import json, os, sys
-          opts = os.environ.get("OPTS") or "(defaults)"
-          py = json.load(open("/tmp/py.json"))
-          for other in ("c", "cpp"):
-              try:
-                  o = json.load(open(f"/tmp/{other}.json"))
-              except FileNotFoundError:
-                  continue  # not offered by that port under these options
-              for section in ("counts", "columns"):
-                  if o[section] != py[section]:
-                      print(f"{opts}: {other} {section} differ from python")
-                      print(f"  python: {json.dumps(py[section])}")
-                      print(f"  {other}: {json.dumps(o[section])}")
-                      sys.exit(1)
-          print(f"{opts}: c and c++ agree with python")
-          PY
+          cargo build --release --manifest-path rust/Cargo.toml
+          (cd zig && zig build --release=fast)
+          (cd go && go build -o csvdiff ./cmd/csvdiff)
+
+      - name: One dataset, from the C generator
+        run: |
+          mkdir -p data
+          c/gen-data --rows 200k --out-dir data --prefix p
+          c/gen-data --rows 200k --out-dir data --prefix p --format json
+          c/gen-data --rows 200k --out-dir data --prefix p --format parquet
+
+      # Each port is asked for every format it reads. A port that refuses a
+      # format is skipped by name rather than counted as agreeing with everyone.
+      - name: Every port, every format it reads
+        run: |
+          set -u
+          KEY="-k account_id,txn_id -i updated_at"
+          run() { # name, format, then the argv
+            local name=$1 fmt=$2; shift 2
+            if "$@" $KEY --json "/tmp/$name.$fmt.json" >/dev/null 2>&1 || [ $? -le 1 ]; then :; fi
+            [ -s "/tmp/$name.$fmt.json" ] || rm -f "/tmp/$name.$fmt.json"
+          }
+          for fmt in csv ndjson unc.parquet; do
+            a="data/p_a.$fmt"; b="data/p_b.$fmt"
+            run c    "$fmt" c/csvdiff compare "$a" "$b"
+            run cpp  "$fmt" cpp/build/csvdiff compare "$a" "$b"
+            run rust "$fmt" rust/target/release/csvdiff compare "$a" "$b" --engine turbo -o /dev/null
+            run zig  "$fmt" zig/zig-out/bin/csvdiff compare "$a" "$b"
+            run go   "$fmt" go/csvdiff compare "$a" "$b" --engine native -o /dev/null
           done
-          test "$fail" = 0 || { echo "the byte-level ports disagree with python"; exit 1; }
+          python3 - <<'PY'
+          import glob, json, sys, collections
+          by_fmt = collections.defaultdict(dict)
+          for path in sorted(glob.glob("/tmp/*.json")):
+              name = path.split("/")[-1]
+              port, fmt = name.split(".", 1)
+              by_fmt[fmt[:-5]][port] = json.load(open(path))
+          bad = 0
+          for fmt, ports in sorted(by_fmt.items()):
+              if len(ports) < 2:
+                  print(f"{fmt}: only {list(ports)} read it")
+                  continue
+              ref_name, ref = sorted(ports.items())[0]
+              for port, got in sorted(ports.items()):
+                  for section in ("counts", "columns"):
+                      if got.get(section) != ref.get(section):
+                          print(f"::error::{fmt}: {port} {section} differ from {ref_name}")
+                          bad = 1
+              print(f"{fmt}: {len(ports)} ports agree -- {', '.join(sorted(ports))}")
+          sys.exit(bad)
+          PY

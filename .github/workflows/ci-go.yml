@@ -58,7 +58,7 @@ jobs:
         run: go build ./...
 
       - name: Smoke benchmark, 10k rows x 20 columns
-        run: go run ./cmd/bench --rows 10k --engine duckdb --out-dir bench
+        run: go run ./cmd/bench --rows 10k --engine native --out-dir bench
 
       - name: Check the report is self-contained
         run: |
@@ -101,14 +101,14 @@ jobs:
       - run: go run ./cmd/gen-data --rows 200k --out-dir data
       - name: Compare with every engine and diff the summaries
         run: |
-          for e in duckdb native; do
+          for e in native; do
             /tmp/csvdiff compare data/200k_a.csv data/200k_b.csv \
               -k account_id,txn_id -i updated_at --engine $e \
               -o /tmp/$e.html --json /tmp/$e.json || true
           done
           python3 - <<'PY'
           import json, sys
-          engines = ["duckdb", "native"]
+          engines = ["native"]
           ref = None
           for e in engines:
               n = json.load(open(f"/tmp/{e}.json"))

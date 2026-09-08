@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every native port, on one pair of files, interleaved.
+"""Every native port that reads the format, on one pair of files, interleaved.
 
 The question this answers is narrow on purpose: given the same columnar design
 and the same input, how much is left for the language and the toolchain? The
@@ -22,7 +22,12 @@ mark rather than a poll that can miss a spike. These engines map their inputs,
 so resident pages include the files; the column that carries information is
 `above`, which subtracts them.
 
-    python scripts/bench_ports_parquet.py A.parquet B.parquet --repeats 5
+A port that cannot read the pair it is given is left out by name rather than
+counted as slow or as agreeing with everyone: on `main` the Rust and Zig ports
+refuse newline-delimited JSON, and a table that quietly omitted them would read
+as though they had not been asked.
+
+    python scripts/bench_ports.py A.parquet B.parquet --repeats 5
 """
 from __future__ import annotations
 
@@ -106,6 +111,23 @@ def main() -> int:
         raise SystemExit("no ports are built")
     warm(args.a, args.b)
     size = (os.path.getsize(args.a) + os.path.getsize(args.b)) / 2**20
+
+    # One run each first, to find out who can read this pair at all.
+    reads: list[tuple[str, list[str], list[str]]] = []
+    for label, prefix, flags in builds:
+        out = f"{args.tmp}/ports_{label.replace('+', 'p')}.json"
+        _, _, _, code = run(prefix + ["compare", args.a, args.b, "-k", args.key,
+                                      "-i", args.ignore, "--json", out] + flags,
+                            f"{args.tmp}/ports_err.txt")
+        if code in (0, 1) and counts(out) is not None:
+            reads.append((label, prefix, flags))
+        else:
+            why = open(f"{args.tmp}/ports_err.txt").read().strip().splitlines()
+            print(f"  {label:5s} -- does not read this pair"
+                  f"{': ' + why[0][:90] if why else ''}", file=sys.stderr)
+    if not reads:
+        raise SystemExit("no port read the pair")
+    builds = reads
 
     times: dict[str, list[tuple[float, float, float]]] = {l: [] for l, _, _ in builds}
     answers: dict[str, dict | None] = {}

@@ -1,28 +1,24 @@
 name: CI (C)
 
-# The C port carries two things nothing else gates: the memory floor, and the
-# only Parquet reader here that refuses compression outright. Both are easy to
-# break silently, so both are checked on every push that touches c/.
+# Two jobs, because they cost very different amounts.
 #
-# The benchmark is a separate job on a button, not on every push. It needs ten
-# million rows written twice and every port built, which is minutes rather than
-# seconds -- and a number is only worth having when it comes off a host anyone
-# reading this can rent.
+# `test` builds nothing but this port. It generates its own fixtures now, so
+# there is no Rust or C++ toolchain between a change and knowing whether it
+# broke anything, and it finishes in under a minute on both compilers.
+#
+# `ports` adds the cross-port checks -- the Rust port as the oracle on CSV, the
+# C++ port on ndjson, and the two generators' bytes against each other. That
+# last group is what keeps the fast job honest: a generator that drifted would
+# fail nothing in it, because both sides of every comparison would drift
+# together.
 
 on:
   push:
     branches: [main, "claude/**"]
-    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports_parquet.py"]
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports.py"]
   pull_request:
-    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports_parquet.py"]
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports.py"]
   workflow_dispatch:
-    inputs:
-      rows:
-        description: "Rows for the benchmark job (10m, 2m, 20m ...)"
-        default: "10m"
-      repeats:
-        description: "Interleaved rounds per port"
-        default: "5"
 
 concurrency:
   group: ci-c-${{ github.ref }}
@@ -55,19 +51,6 @@ jobs:
       # test.sh holds the C port to the Rust port's answers on the awkward
       # fixture, and its Parquet fixtures come from the C++ generator, so both
       # have to exist before it runs.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust
-      # test.sh holds the C port to Rust's answers on CSV, to the C++ port's on
-      # ndjson (the only other port that reads it), and generates its Parquet and
-      # JSON fixtures with the C++ generator. All three have to exist.
-      - name: Build the ports test.sh compares against
-        run: |
-          cargo build --release --manifest-path rust/Cargo.toml
-          make -C cpp
-          make -C cpp gen-data
-
       - name: Build
         run: CC=${{ matrix.cc }} make -C c
 
@@ -77,7 +60,7 @@ jobs:
       - name: test.sh
         run: |
           set -o pipefail
-          bash c/test.sh 2>&1 | tee /tmp/c-test.txt
+          (cd c && bash test.sh) 2>&1 | tee /tmp/c-test.txt
           if grep -q '^skip' /tmp/c-test.txt; then
             echo "::error::a check skipped rather than ran"
             exit 1
@@ -94,8 +77,8 @@ jobs:
               -Wall -Wextra -pthread -o /tmp/csvdiff-asan c/*.c
           tmp=$(mktemp -d)
           for flags in "" "--dict-limit 1" "--dict-limit 175 --row-group-size 300"; do
-            cpp/build/gen-data --rows 5k --out-dir "$tmp" --prefix s \
-                --format parquet --compression none $flags >/dev/null
+            c/gen-data --rows 5k --out-dir "$tmp" --prefix s \
+                --format parquet $flags >/dev/null
             code=0
             /tmp/csvdiff-asan compare "$tmp/s_a.unc.parquet" "$tmp/s_b.unc.parquet" \
                 -k account_id,txn_id -i updated_at --json /dev/null || code=$?
@@ -104,8 +87,8 @@ jobs:
           # And the two text shapes, including the threaded sweep: 5k rows is
           # under the four-megabyte split threshold, so `--threads` is what makes
           # the boundary logic run under the sanitizers at all.
-          cpp/build/gen-data --rows 60k --out-dir "$tmp" --prefix t >/dev/null
-          cpp/build/gen-data --rows 60k --out-dir "$tmp" --prefix t --format json >/dev/null
+          c/gen-data --rows 60k --out-dir "$tmp" --prefix t >/dev/null
+          c/gen-data --rows 60k --out-dir "$tmp" --prefix t --format json >/dev/null
           for pair in "t_a.csv t_b.csv" "t_a.ndjson t_b.ndjson"; do
             set -- $pair
             for t in 1 4; do
@@ -116,11 +99,9 @@ jobs:
             done
           done
 
-  bench:
-    name: every port, ${{ github.event.inputs.rows || '10m' }} rows
-    if: github.event_name == 'workflow_dispatch'
+  ports:
+    name: against the other ports
     runs-on: ubuntu-latest
-    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -130,49 +111,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: Install Zig
+      - name: Build what the cross-checks compare against
         run: |
-          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
-            | tar -xJ -C /opt
-          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
-
-      # Ten million rows of Parquet is 2 GB written twice, and the runner ships
-      # with tens of gigabytes of toolchains this job never opens.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          df -h / | tail -1
-
-      - name: What this runner is
-        run: |
-          {
-            echo "## Host"
-            echo '```'
-            lscpu | grep -E 'Model name|^CPU\(s\)|L3 cache'
-            free -g | head -2
-            echo "transparent_hugepage: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Build every port
-        run: |
+          make -C c
           make -C cpp
           make -C cpp gen-data
-          make -C c
           cargo build --release --manifest-path rust/Cargo.toml
-          (cd zig && zig build --release=fast)
-
-      - name: Generate and run
+      - name: test.sh --with-ports
         run: |
-          rows="${{ github.event.inputs.rows || '10m' }}"
-          reps="${{ github.event.inputs.repeats || '5' }}"
-          data=$(mktemp -d)
-          cpp/build/gen-data --rows "$rows" --out-dir "$data" --prefix p \
-              --format parquet --compression none
-          {
-            echo "## $rows rows, uncompressed Parquet"
-            echo
-            python3 scripts/bench_ports_parquet.py \
-                "$data/p_a.unc.parquet" "$data/p_b.unc.parquet" --repeats "$reps"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          (cd c && bash test.sh --with-ports) 2>&1 | tee /tmp/c-ports.txt
+          if grep -qE '^\s*(skip|FAIL)' /tmp/c-ports.txt; then
+            echo "::error::a check skipped or failed"
+            exit 1
+          fi

@@ -4,15 +4,23 @@ Compare two tables on a composite key and get a self-contained HTML report. Key
 columns, compared columns and normalisation rules are parameters, so the same
 tool serves every recurring comparison.
 
-The same tool exists in five languages to one result contract, plus three
-byte-level parity ports. That is what makes the benchmark sections below a
+The tool is five byte-level ports to one result contract — **C**, **C++**,
+**Rust**, **Zig** and **Go** — which is what makes the benchmark sections below a
 like-for-like comparison rather than a collection of anecdotes.
+
+The project began as a DuckDB-backed Python implementation with Java,
+TypeScript and dataframe engines beside it for comparison. That comparison is
+settled: the byte-level ports are between one and two orders of magnitude
+faster, so those implementations no longer run in CI or in the benchmarks.
+Their results are kept in [the archive](#archive-implementations-no-longer-in-the-project)
+rather than deleted, because the reason they lost is the interesting part.
 
 **Jump to:** [Using it](#using-it) · [Four formats, one engine](#four-formats-one-engine) ·
 [Which engine at which size](#which-engine-at-which-size) ·
 [Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) ·
 [Formats](#input-formats-is-csv-the-problem) · [Techniques](#techniques) · [Ports](#ports) ·
-[Reproducing](#reproducing-the-numbers) · [Open questions](#open-questions)
+[Reproducing](#reproducing-the-numbers) · [Archive](#archive-implementations-no-longer-in-the-project) ·
+[Open questions](#open-questions)
 
 ---
 
@@ -24,8 +32,8 @@ field-by-field recipe. So a format comparison here involves nothing but this
 project: no third-party reader, no conversion step, no intermediate CSV.
 
 Measured on a stock 4-cpu GitHub Actions runner by
-[`.github/workflows/benchmark-formats.yml`](.github/workflows/benchmark-formats.yml),
-which runs on every push that touches `cpp/`. Every row is the same comparison:
+[`.github/workflows/benchmark-native.yml`](.github/workflows/benchmark-native.yml),
+which runs the two leading ports on every push and every port on demand. Every row is the same comparison:
 first-occurrence-wins on `(account_id, txn_id)`, inner join, per-cell diff over
 seventeen columns.
 
@@ -75,14 +83,19 @@ it is the input people actually receive, not because it is fast.
 
 ## Install
 
+Every port builds from its own directory with its own toolchain and no
+dependencies:
+
 ```bash
-pip install duckdb            # engine
-pip install -e .              # gives you the `csvdiff` command
+(cd c   && make)            # cc; also builds c/gen-data
+(cd cpp && make)            # clang++ or g++
+(cd rust && cargo build --release)
+(cd zig && zig build --release=fast)
+(cd go  && go build ./cmd/csvdiff)
 ```
 
-Python 3.14. Everything except the engine is standard library, and DuckDB is the
-only engine this implementation carries — the alternatives are the byte-level
-[ports](#ports), held to the same result contract.
+The C port is the quickest to build and, on every format measured, the quickest
+to run — see [the benchmarks](#benchmarks).
 
 ## Launch modes
 
@@ -152,13 +165,18 @@ missing fields read as absent and the extra ones are ignored. All five implement
 and the test suites hold them to it. The one exception is Java's `tablesaw` engine, whose reader has
 no option to allow it; it refuses such a file and says which engines will take it.
 
-## Why DuckDB is the default engine
+## What the engine does
 
-Both files are read as text (no type-inference surprises such as `1.0` vs `1`), hash-joined on the
-key in parallel, and spilled to disk when they don't fit in RAM. Multi-GB files compare in seconds to
-low minutes on a laptop, with one wheel as the only dependency. Polars is comparably fast in memory
-but not out-of-core. The [benchmarks](#benchmarks) below put numbers on both, and on the bespoke
-engines that beat them.
+Both files are `mmap`ed and read as bytes (no type-inference surprises such as
+`1.0` vs `1`). Rows are found and hashed on every core, joined on the key
+through an open-addressed table, and the compared columns are walked without
+ever building a string per cell. Parquet takes a different path again: the
+column store is joined on its key columns and diffed a column at a time, and
+never becomes rows at all.
+
+Nothing is installed and nothing is spilled to disk — the whole comparison is
+the files plus a working set that lands within about 130 MB of the input on the
+leanest port. The [benchmarks](#benchmarks) below put numbers on it.
 
 ## The report
 
@@ -182,33 +200,20 @@ always exact regardless of the cap.
 
 ## Running it in GitHub
 
+Five workflows, and the two that matter on every push finish in a couple of
+minutes because neither needs a toolchain other than its own.
+
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | push, PR | pytest, a 10k smoke comparison, and a check that the report has no external references |
-| `parity.yml` | push, PR | every implementation must return identical counts and column stats, and all five data generators must emit byte-identical files |
-| `benchmark.yml` | manual, weekly cron | generates 10k / 1M / 10M rows × 20 columns, compares, enforces time and memory budgets, uploads reports, writes a results table to the job summary |
-| `compare.yml` | manual, or `workflow_call` | compares two files given as repo paths or URLs and publishes the report as an artifact |
+| `ci-c.yml` | push, PR | builds the C port under gcc and clang, runs its fifteen self-contained checks, and puts CSV, ndjson and Parquet through ASan and UBSan. A second job adds the cross-port checks and the generator byte-parity check, which need Rust and C++ |
+| `parity.yml` | push, PR | one dataset from `c/gen-data`, every native port that reads each format, identical counts and column stats required |
+| `benchmark-native.yml` | push, manual | the two leading ports across all three formats on every push; Rust and Zig as well on demand, at any row count |
+| `ci-rust.yml`, `ci-go.yml` | push, PR | each port's own suite |
+| `benchmark-rust.yml`, `benchmark-go.yml` | manual | each port on its own |
 
 ```bash
-gh workflow run Benchmark -f scales=all -f engine=duckdb
-gh workflow run "Compare CSVs" -f file_a=data/july.csv -f file_b=data/august.csv \
-  -f key=account_id,txn_id -f ignore=updated_at -f fail_on_diff=true
+gh workflow run "Benchmark (native)" -f rows=10m -f formats=csv,json,parquet -f all_ports=true
 gh run watch
-```
-
-Call the comparison from another workflow:
-
-```yaml
-jobs:
-  nightly-reconciliation:
-    uses: <owner>/csvdiff/.github/workflows/compare.yml@main
-    with:
-      file_a: https://internal.example/exports/ledger_prev.csv
-      file_b: https://internal.example/exports/ledger_curr.csv
-      key: account_id,txn_id
-      ignore: updated_at
-      options: "--trim --tolerance 0.005"
-      fail_on_diff: true
 ```
 
 Set the repository variable `PUBLISH_PAGES=true` to publish benchmark reports to GitHub Pages
@@ -287,7 +292,7 @@ them would be the easiest way to publish a lie:
 **Compare rows within a table, never across tables.** Sets B and C ran on an otherwise idle machine
 with the page cache warmed before anything was timed; Set A did not.
 
-All sets use **byte-identical input** from `scripts/gen_data.py` — 20 columns keyed on
+All sets use **byte-identical input** from the generators — 20 columns keyed on
 `(account_id, txn_id)`, `--ignore updated_at`, with a known drift recipe (see
 [Test payloads](#test-payloads)).
 
@@ -297,7 +302,18 @@ mapped files" table.
 
 Input sizes: 10k = 3.7 MB · 1M = 368 MB · 10M = 3.68 GB · 20M = 7.36 GB.
 
-## Set A — five languages, nineteen engines
+## Set A — five languages, nineteen engines (archive)
+
+> **Archive.** The numbers below measure implementations the project no longer
+> carries — the DuckDB-backed Python engine, polars, Java, TypeScript, and the
+> dataframe tools they were compared against. They are kept because the reason
+> those engines lost is worth having written down, and because a claim like
+> "two orders of magnitude" is worth nothing without the row it is measured
+> against. Nothing here runs in CI any more, and
+> [`scripts/`](scripts/) no longer carries the harnesses that produced them;
+> `git log` has both. For what the project measures now, see
+> [Set B](#set-b--one-design-six-toolchains).
+
 
 | Engine | 10k | 1M | 10M |
 |---|---|---|---|
@@ -580,7 +596,18 @@ They are, in waves: N threads fill their own buffers, the buffers are written in
 is bounded by the wave rather than the file. At 17.7s against `dd`'s 16.6s there is nothing left to
 win — generation is now pure I/O.
 
-## Set C — against the field
+## Set C — against the field (archive)
+
+> **Archive.** The numbers below measure implementations the project no longer
+> carries — the DuckDB-backed Python engine, polars, Java, TypeScript, and the
+> dataframe tools they were compared against. They are kept because the reason
+> those engines lost is worth having written down, and because a claim like
+> "two orders of magnitude" is worth nothing without the row it is measured
+> against. Nothing here runs in CI any more, and
+> [`scripts/`](scripts/) no longer carries the harnesses that produced them;
+> `git log` has both. For what the project measures now, see
+> [Set B](#set-b--one-design-six-toolchains).
+
 
 Sets A and B compare this project with itself. That says which language and which technique is
 faster; it does not say whether the design is any good, because every one of those engines was
@@ -662,6 +689,32 @@ sort-merge join is the correct algorithm for data larger than memory. What it ca
 cell changed. That instinct is why the `sortmerge` engine exists.
 
 ---
+
+# Archive: implementations no longer in the project
+
+The project started as a DuckDB-backed Python implementation, with Java,
+TypeScript, polars and datacompy beside it to answer "is a bespoke engine even
+worth writing?". It is answered. On ten million rows the byte-level ports are
+between one and two orders of magnitude faster than the dataframe engines, and
+the C port holds its whole working set within about 130 MB of its input where
+the dataframe engines needed gigabytes.
+
+So those implementations no longer run: they are not in CI, not in the
+benchmarks, and not in the install instructions. What is kept is their
+**results** — [Set A](#set-a--five-languages-nineteen-engines-archive) and
+[Set C](#set-c--against-the-field-archive) above are unchanged, and the
+sections below that explain *why* a dataframe engine loses are the point of
+having measured it.
+
+| Was measured | Where its numbers are | Still in CI |
+|---|---|---|
+| Python + DuckDB | Sets A and C | no |
+| polars, datacompy | Set C | no |
+| Java (five execution modes) | Sets A and B | no |
+| TypeScript | Set A | no |
+| C, C++, Rust, Zig, Go | Set B, and the per-port READMEs | **yes** |
+
+The removed code is in `git log`, not in the working tree.
 
 # Techniques
 
@@ -956,7 +1009,7 @@ The table below is a different measurement from the [one at the
 top](#four-formats-one-engine): it exists to place us against DuckDB and polars
 on the same files, where that one exists to place the formats against each other
 with nothing but this project involved. Measured on one machine in one sitting,
-`python scripts/bench_parquet.py --polars`. Every row that finished returns
+a harness that is now in `git log` only. Every row that finished returns
 identical counts — matched 9,990,000,
 changed 599,320, added 10,000, removed 10,000 — so these are eight ways of doing
 exactly the same work.
@@ -1410,10 +1463,12 @@ a float, so byte-identity does not depend on any language's floating-point round
 
 ## Test payloads
 
-`scripts/gen_data.py` builds a deterministic pair with 20 columns keyed on `(account_id, txn_id)`.
-`cpp/build/gen-data` builds the same bytes far faster, and writes **CSV, newline-delimited JSON and
-Parquet** from one field-by-field recipe rather than converting one into another — so the four inputs
-of a format comparison hold the same rows by construction.
+`c/gen-data` builds a deterministic pair with 20 columns keyed on
+`(account_id, txn_id)`, as **CSV, newline-delimited JSON or uncompressed
+Parquet**, from one field-by-field recipe rather than converting one into
+another — so the three inputs of a format comparison hold the same rows by
+construction. `cpp/build/gen-data` writes the same bytes and adds Snappy;
+`c/test.sh --with-ports` checks the two agree byte for byte.
 
 File B drifts from A by a fixed recipe, so every run has a known answer:
 
@@ -1431,96 +1486,70 @@ File B drifts from A by a fixed recipe, so every run has a known answer:
 ## The harnesses
 
 ```bash
-# Set A — budgets, throughput, job-summary output
-python scripts/gen_data.py --rows 10m --out-dir data
-python scripts/bench.py --rows 10m --engine duckdb --threads 4 --memory-limit 8GB
+# the data, in any of the three formats
+(cd c && make)                                   # builds csvdiff and gen-data
+c/gen-data --rows 10m --out-dir data --prefix p                    # CSV
+c/gen-data --rows 10m --out-dir data --prefix p --format json      # ndjson
+c/gen-data --rows 10m --out-dir data --prefix p --format parquet   # Parquet
+c/gen-data --rows 20k --out-dir data --prefix p --format parquet \
+  --dict-limit 175 --row-group-size 300          # forces mixed-encoding columns
 
-# Set B — one design across toolchains
-python scripts/gen_data.py --rows 20m --out-dir bench/external/data --prefix 20m
+# every native port that reads the pair, interleaved, with a correctness gate
+python scripts/bench_ports.py data/p_a.unc.parquet data/p_b.unc.parquet --repeats 5
+
+# one design across toolchains, and C++ thread scaling
 python scripts/bench_native.py --rows 20m --repeats 2
-python scripts/bench_native.py --rows 1m --only jvm     # execution modes
-cpp/build/csvdiff compare a.csv b.csv -k id --threads 4  # C++ thread scaling
+cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
 
 # one engine across every size, generating and deleting each pair in turn
 python scripts/bench_scale.py --sizes 10k,1m,10m,20m,50m --threads 4
 
-# the generator that keeps up with the disk -- as CSV, or straight to Parquet
-(cd cpp && make gen-data) && cpp/build/gen-data --rows 10m --out-dir data --prefix 10m
-cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression snappy
-cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression none \
-  --dict-limit 175 --row-group-size 300   # forces mixed-encoding columns
-
 # the smallest memory limit a comparison finishes in
 scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
 
-# the four native formats against each other, nothing else involved
-#   -- this is what .github/workflows/benchmark-formats.yml runs
-(cd cpp && make && make gen-data)
-python scripts/bench_formats_native.py --rows 10m --data /tmp/bench --out formats.json
+# any port on any format it reads
+c/csvdiff compare a.ndjson b.ndjson -k id
+c/csvdiff compare a.parquet b.parquet -k id --threads 4
+CSVDIFF_PHASES=1 c/csvdiff compare a.parquet b.parquet -k id   # phase timings
 
-# the historical version: the same comparison from CSV, Parquet and JSON with a
-# third-party engine held constant
-python scripts/bench_formats.py
-
-# ours against DuckDB and polars, on CSV and on Parquet, in one sitting
-python scripts/bench_parquet.py --data bench/external/data --prefix 10m --polars
-
-# the same, generating everything natively first -- no DuckDB, no CSV in the middle
-python scripts/bench_parquet.py --native 10m --data /tmp/bench --prefix 10m
-
-# our own reader on any of the three formats
-cpp/build/csvdiff compare a.ndjson b.ndjson -k id --threads 4
-cpp/build/csvdiff compare a.parquet b.parquet -k id --threads 4
-CSVDIFF_PHASES=1 cpp/build/csvdiff compare a.parquet b.parquet -k id   # phase timings
-
-# the four Java byte-level engines head to head (Vector API needs the module)
-java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \
-  compare a.csv b.csv -k account_id,txn_id -i updated_at --engine shard -o /dev/null
-
-# Set C — the external field
-python scripts/bench_external.py --rows 1m --mem-cap-gb 12
-
-# smallest heap each Java engine finishes in
-scripts/min_heap.sh
+# the checks
+(cd c && bash test.sh)                # this port alone, a few seconds
+(cd c && bash test.sh --with-ports)   # plus the cross-port and generator checks
+(cd cpp && bash test.sh)
 ```
 
-`bench_formats_native.py` is the one to reach for when the question is about formats: it generates
-each of the four, measures it and deletes it before the next, because at ten million rows all four at
-once is about 15 GB. It exits non-zero if the four disagree about the counts, which is the point --
-four readers of the same rows that reach different answers is a bug, not a benchmark.
+`bench_ports.py` is the one to reach for. It runs every port **interleaved** —
+each once per round, rounds repeating — because a number taken now and one taken
+twenty minutes ago compare machine states rather than builds, and it exits
+non-zero if the ports disagree about the counts. That is the point: several
+readers of the same rows reaching different answers is a bug, not a benchmark. A
+port that cannot read the pair it is given is left out by name rather than
+counted as slow.
 
-`bench.py` records generation time, comparison wall time, throughput, peak RSS, report size and the
-counts, then fails if a scale exceeds its budget (10k: 20s / 1.5 GB, 1M: 120s / 6 GB, 10M: 900s /
-12 GB on a 4-vCPU runner).
+`bench_native.py` takes peak RSS from `wait4`'s rusage for that exact child —
+the kernel's own high-water mark rather than a poll that can miss a spike — and
+warms the page cache before timing anything. Toolchains that are missing are
+skipped **by name** rather than dropped, so a short table means a build is
+absent, not that it lost.
 
-`bench_native.py` and `bench_external.py` both take peak RSS from `wait4`'s rusage for that exact
-child — the kernel's own high-water mark rather than a poll that can miss a spike — and warm the page
-cache before timing anything. Alternative toolchains are looked for in `/tmp` and `/opt`, and
-external tools on `PATH` or in `bench/external/tools/`; whichever are missing are skipped **by name**
-rather than dropped, so a short table means a build is absent, not that it lost.
-
-`bench_external.py` caps each tool's address space, because at 10M several want more memory than the
-machine has and without a cap the kernel does not fail them — it kills whatever it likes. There is
-exactly one exemption, [explained above](#set-c--against-the-field).
+The harnesses that measured DuckDB, polars, Java and TypeScript are gone with
+those implementations; `git log` has them, and their results are in
+[the archive](#archive-implementations-no-longer-in-the-project).
 
 ## Project layout
 
 ```
-csvdiff/engine.py         comparison (DuckDB), result contract at top
-csvdiff/report.py         HTML renderer
-csvdiff/cli.py            compare / serve / mail
-csvdiff/server.py         drag-and-drop page
-csvdiff/mailbot.py        IMAP/SMTP watcher
-csvdiff/config.py         profiles (csvdiff.toml)
-c/ cpp/ zig/              byte-level parity ports (one file each, plus test.sh)
-go/ java/ rust/ ts/       full ports
-scripts/gen_data.py       deterministic payload generator (20 columns, known drift)
-scripts/bench.py          Set A harness, with budgets
-scripts/bench_native.py   Set B harness, byte-level builds and JVM execution modes
-scripts/bench_external.py Set C harness, the external field
-scripts/min_heap.sh       binary-searches the smallest heap each Java engine finishes in
+c/                        the leading port: CSV, ndjson and Parquet, plus its own
+                          generator (gen-data) and test.sh
+cpp/                      the C++ port, and the generator that also writes Snappy
+rust/ zig/ go/            the other byte-level ports, same result contract
+scripts/bench_ports.py    every port on one pair, interleaved, with a counts gate
+scripts/bench_native.py   one design across toolchains
+scripts/bench_scale.py    one engine across every size
+scripts/gen_data.py       the original Python generator, kept as the reference recipe
 tests/fixtures/awkward_*  every shape that has broken an engine here
-.github/workflows/        ci, parity, benchmark, on-demand comparison
+tests/fixtures/snappy.*   the file that proves the C port refuses a codec
+.github/workflows/        ci-c, ci-rust, ci-go, parity, benchmark-native
 CLAUDE.md, .claude/       project context, slash commands, report-editing skill
 ```
 
@@ -1530,8 +1559,9 @@ CLAUDE.md, .claude/       project context, slash commands, report-editing skill
 
 Sizes and shapes not yet answered, roughly in the order they would pay off:
 
-1. **Where is the crossover between `polars` and `turbo`?** Polars wins at 1M and cannot reach 10M.
-   The band between is unmeasured; 2M / 4M / 8M would find the exact point the recommendation
+1. **Where is the crossover between `polars` and the byte-level ports?** Polars won at 1M and could
+   not reach 10M. The band between was never measured, and now would need the archived harness back;
+   2M / 4M / 8M would have found the exact point the recommendation
    changes.
 2. **100M rows, and `sortmerge` at 50M.** 50M is now measured for the fastest build — see
    [How the fastest build scales](#how-the-fastest-build-scales) — and it is where the input stops

@@ -1,0 +1,127 @@
+name: Benchmark (native)
+
+# The one benchmark this project runs.
+#
+# It replaces four separate workflows that each measured one language against
+# DuckDB. That comparison is settled -- the byte-level ports are between one and
+# two orders of magnitude faster, and the numbers are in the archive section of
+# README.md -- so what is left worth measuring is the ports against each other,
+# on the same host, in one sitting.
+#
+# On a push it runs the two leaders across all three formats, which is a few
+# minutes. `workflow_dispatch` adds Rust and Zig, which need their toolchains
+# built and are worth waiting for only when you are asking that question.
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "c/**"
+      - "cpp/src/**"
+      - "cpp/Makefile"
+      - "scripts/bench_ports.py"
+      - ".github/workflows/benchmark-native.yml"
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Row count (2m, 10m, 20m ...)"
+        default: "2m"
+      formats:
+        description: "Comma-separated: csv, json, parquet"
+        default: "csv,json,parquet"
+      repeats:
+        description: "Interleaved rounds per port"
+        default: "5"
+      all_ports:
+        description: "Add Rust and Zig"
+        type: boolean
+        default: true
+
+concurrency:
+  group: bench-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: ${{ github.event.inputs.rows || '2m' }} rows, every format
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Rust and Zig, on demand only
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.all_ports == 'true'
+        run: echo "ALL_PORTS=1" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: env.ALL_PORTS == '1'
+      - uses: Swatinem/rust-cache@v2
+        if: env.ALL_PORTS == '1'
+        with:
+          workspaces: rust
+      - name: Install Zig
+        if: env.ALL_PORTS == '1'
+        run: |
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+            | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      # Ten million rows of ndjson is 8.5 GB, and the runner ships with tens of
+      # gigabytes of toolchains this job never opens.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h / | tail -1
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## Host"
+            echo '```'
+            lscpu | grep -E 'Model name|^CPU\(s\)|L3 cache'
+            free -g | head -2
+            echo "transparent_hugepage: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build
+        run: |
+          make -C c
+          make -C cpp
+          if [ "${ALL_PORTS:-}" = 1 ]; then
+            cargo build --release --manifest-path rust/Cargo.toml
+            (cd zig && zig build --release=fast)
+          fi
+
+      # Each format is generated, measured and deleted in turn: at ten million
+      # rows all three at once would be more than a runner has.
+      - name: Generate, measure, delete
+        run: |
+          set -u
+          rows="${{ github.event.inputs.rows || '2m' }}"
+          reps="${{ github.event.inputs.repeats || '5' }}"
+          formats="${{ github.event.inputs.formats || 'csv,json,parquet' }}"
+          data=$(mktemp -d)
+          echo "## $rows rows" >> "$GITHUB_STEP_SUMMARY"
+          for fmt in ${formats//,/ }; do
+            case "$fmt" in
+              csv)     ext=.csv;          gen="";; 
+              json)    ext=.ndjson;       gen="--format json";;
+              parquet) ext=.unc.parquet;  gen="--format parquet";;
+              *) echo "::error::unknown format $fmt"; exit 1;;
+            esac
+            rm -f "$data"/p_*
+            c/gen-data --rows "$rows" --out-dir "$data" --prefix p $gen
+            {
+              echo
+              echo "### $fmt"
+              echo
+              python3 scripts/bench_ports.py \
+                  "$data/p_a$ext" "$data/p_b$ext" --repeats "$reps" --tmp "$data"
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            rm -f "$data"/p_*
+          done

@@ -19,7 +19,6 @@ Both inputs are read once before anything is timed. A cold page cache costs more
 than every difference this table is trying to show.
 
   python scripts/bench_native.py --rows 20m --repeats 2
-  python scripts/bench_native.py --rows 1m --only jvm     # execution modes only
 """
 from __future__ import annotations
 
@@ -34,18 +33,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 KEY = ["-k", "account_id,txn_id", "-i", "updated_at"]
 
-# Where the alternative toolchains land if you install them. Missing ones are
-# skipped by name rather than silently dropped -- a build that is not there is
-# not the same result as a build that is slow.
-GRAAL = Path("/opt/graalvm/bin/java")
-JDK = Path("/opt/jdks")
-
-
-def jdk_java() -> Path | None:
-    newest = sorted(JDK.glob("jdk-*/bin/java"), reverse=True)
-    return newest[0] if newest else (Path(shutil.which("java")) if shutil.which("java") else None)
-
-
+# A build that is not there is skipped by name rather than silently dropped: it
+# is not the same result as a build that is slow.
 def builds(tmp: Path) -> list[tuple[str, list[str], list[str]]]:
     """(label, argv prefix, extra flags).
 
@@ -53,7 +42,6 @@ def builds(tmp: Path) -> list[tuple[str, list[str], list[str]]]:
     the HTML report, so they take no `-o`. The full ports are given `-o
     /dev/null` for the same reason: rendering is not what is being compared.
     """
-    java = jdk_java()
     out: list[tuple[str, list[str], list[str]]] = []
 
     for label, path in [
@@ -70,41 +58,6 @@ def builds(tmp: Path) -> list[tuple[str, list[str], list[str]]]:
 
     out.append(("Rust, turbo", [str(ROOT / "rust/target/release/csvdiff")],
                 ["--engine", "turbo", "-o", "/dev/null"]))
-    if java:
-        out.append((f"Java {java.parent.parent.name}, turbo (C2)",
-                    [str(java), "-jar", str(ROOT / "java/target/csvdiff.jar")],
-                    ["--engine", "turbo", "-o", "/dev/null"]))
-    if GRAAL.exists():
-        out.append(("Java, turbo (Graal JIT)", [str(GRAAL), "-jar", str(tmp / "csvdiff-graal.jar")],
-                    ["--engine", "turbo", "-o", "/dev/null"]))
-        out.append(("native-image, Serial GC", [str(tmp / "csvdiff-native")],
-                    ["--engine", "turbo", "-o", "/dev/null"]))
-        out.append(("native-image, G1 GC", [str(tmp / "csvdiff-native-g1")],
-                    ["--engine", "turbo", "-o", "/dev/null"]))
-    return out
-
-
-def jvm_modes(tmp: Path) -> list[tuple[str, list[str], list[str]]]:
-    """The same jar, executed six ways.
-
-    Separates the compiler from the class-file version: the GraalVM build
-    targets an older release than the JDK build does, so comparing them
-    directly would move two things at once.
-    """
-    java = jdk_java()
-    graal_jar = tmp / "csvdiff-graal.jar"
-    flags = ["--engine", "turbo", "-o", "/dev/null"]
-    out: list[tuple[str, list[str], list[str]]] = []
-    if java:
-        out.append(("HotSpot C2, JDK jar", [str(java), "-jar", str(ROOT / "java/target/csvdiff.jar")], flags))
-        out.append(("HotSpot C2, GraalVM jar", [str(java), "-jar", str(graal_jar)], flags))
-    if GRAAL.exists():
-        out += [
-            ("Graal JIT", [str(GRAAL), "-jar", str(graal_jar)], flags),
-            ("C2 inside GraalVM", [str(GRAAL), "-XX:-UseJVMCICompiler", "-jar", str(graal_jar)], flags),
-            ("native-image, Serial GC", [str(tmp / "csvdiff-native")], flags),
-            ("native-image, G1 GC", [str(tmp / "csvdiff-native-g1")], flags),
-        ]
     return out
 
 
@@ -156,8 +109,6 @@ def main() -> int:
     ap.add_argument("--tmp-dir", type=Path, default=Path("/tmp"),
                     help="where the alternative builds live")
     ap.add_argument("--repeats", type=int, default=2)
-    ap.add_argument("--only", choices=("all", "jvm"), default="all",
-                    help="jvm: the execution-mode table, one jar six ways")
     ap.add_argument("--timeout", type=float, default=1800,
                     help="seconds before a build is recorded as not finishing")
     args = ap.parse_args()
@@ -169,7 +120,7 @@ def main() -> int:
               f"--out-dir {args.data_dir} --prefix {args.rows}", file=sys.stderr)
         return 2
 
-    plan = jvm_modes(args.tmp_dir) if args.only == "jvm" else builds(args.tmp_dir)
+    plan = builds(args.tmp_dir)
     mapped = (a.stat().st_size + b.stat().st_size) / 1024**2
     warm(a, b)
     print(f"{args.rows}: inputs map {mapped:,.0f} MB, best of {args.repeats}\n")

@@ -57,7 +57,7 @@ jobs:
         run: cargo build --release
 
       - name: Smoke benchmark, 10k rows x 20 columns
-        run: ./target/release/bench --rows 10k --engine duckdb --out-dir bench
+        run: ./target/release/bench --rows 10k --engine turbo --out-dir bench
 
       - name: Check the report is self-contained
         run: |
@@ -98,16 +98,21 @@ jobs:
           workspaces: rust
       - run: cargo build --release
       - run: ./target/release/gen-data --rows 200k --out-dir data
+      # The duckdb and polars engines are no longer exercised here: this project
+      # compares byte-level engines now, and a CI job that spends minutes
+      # installing two dataframe libraries to re-confirm a superseded result is
+      # time taken from the checks that can still fail. Their recorded numbers
+      # are in the archive section of README.md.
       - name: Compare with every engine and diff the summaries
         run: |
-          for e in duckdb polars native; do
+          for e in turbo native; do
             ./target/release/csvdiff compare data/200k_a.csv data/200k_b.csv \
               -k account_id,txn_id -i updated_at --engine $e \
               -o /tmp/$e.html --json /tmp/$e.json || true
           done
           python3 - <<'PY'
           import json, sys
-          engines = ["duckdb", "polars", "native"]
+          engines = ["turbo", "native"]
           ref = ref_name = None
           for e in engines:
               n = json.load(open(f"/tmp/{e}.json"))
