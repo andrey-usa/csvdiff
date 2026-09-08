@@ -34,9 +34,9 @@ use crate::columns::{compare_keys, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
+use crate::parquet;
 use crate::rowstore::Joined;
 use crate::sections::assemble;
-use crate::parquet;
 
 /// True when both paths are Parquet, so the caller knows to come here.
 pub fn is_parquet(path: &Path) -> bool {
@@ -569,12 +569,18 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     });
 
     let mut a_keys = KeySide {
-        col: a_key_cols?.into_iter().map(|c| Col::new(c, &a_map)).collect(),
+        col: a_key_cols?
+            .into_iter()
+            .map(|c| Col::new(c, &a_map))
+            .collect(),
         id: vec![Vec::new(); key_size],
         rows: 0,
     };
     let mut b_keys = KeySide {
-        col: b_key_cols?.into_iter().map(|c| Col::new(c, &b_map)).collect(),
+        col: b_key_cols?
+            .into_iter()
+            .map(|c| Col::new(c, &b_map))
+            .collect(),
         id: vec![Vec::new(); key_size],
         rows: 0,
     };
@@ -589,11 +595,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     }
 
     let mut as_id = vec![false; key_size];
-    for j in 0..key_size {
+    for (j, coded) in as_id.iter_mut().enumerate() {
         if !a_keys.col[j].c.dictionary || !b_keys.col[j].c.dictionary {
             continue;
         }
-        as_id[j] = true;
+        *coded = true;
         let mut ids = Ids::default();
         let a_map_j = code(&a_keys.col[j], &mut ids, opt);
         let b_map_j = code(&b_keys.col[j], &mut ids, opt);
@@ -627,7 +633,13 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         held: Vec<i32>,
         total: i64,
     }
-    let split = |keys_here: usize| if keys_here < (1 << 14) { 1 } else { threads.max(1) };
+    let split = |keys_here: usize| {
+        if keys_here < (1 << 14) {
+            1
+        } else {
+            threads.max(1)
+        }
+    };
     let a_ways = split(ai.firsts.len());
     let b_ways = split(bi.firsts.len());
 
@@ -639,7 +651,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         out.pb.reserve(hi - lo);
         for at in lo..hi {
             let row = ai.firsts[at];
-            let mate = lookup(&as_id, &bi, &b_keys, &a_keys, row as usize, ai.hashes[at], opt);
+            let mate = lookup(
+                &as_id,
+                &bi,
+                &b_keys,
+                &a_keys,
+                row as usize,
+                ai.hashes[at],
+                opt,
+            );
             if mate < 0 {
                 out.total += 1;
                 if out.held.len() <= cap {
@@ -658,7 +678,16 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let hi = bi.firsts.len() * (p + 1) / b_ways;
         for at in lo..hi {
             let row = bi.firsts[at];
-            if lookup(&as_id, &ai, &a_keys, &b_keys, row as usize, bi.hashes[at], opt) >= 0 {
+            if lookup(
+                &as_id,
+                &ai,
+                &a_keys,
+                &b_keys,
+                row as usize,
+                bi.hashes[at],
+                opt,
+            ) >= 0
+            {
                 continue;
             }
             out.total += 1;
@@ -670,11 +699,19 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     };
 
     let (a_parts, b_parts) = std::thread::scope(|scope| {
-        let ah: Vec<_> = (0..a_ways).map(|p| scope.spawn(move || a_range(p))).collect();
-        let bh: Vec<_> = (0..b_ways).map(|p| scope.spawn(move || b_range(p))).collect();
+        let ah: Vec<_> = (0..a_ways)
+            .map(|p| scope.spawn(move || a_range(p)))
+            .collect();
+        let bh: Vec<_> = (0..b_ways)
+            .map(|p| scope.spawn(move || b_range(p)))
+            .collect();
         (
-            ah.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>(),
-            bh.into_iter().map(|h| h.join().unwrap()).collect::<Vec<_>>(),
+            ah.into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>(),
+            bh.into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>(),
         )
     });
 
@@ -832,7 +869,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let mut cols: Vec<ColOut> = (0..nc).map(|_| ColOut::default()).collect();
     {
         let gathered: Vec<Result<Vec<(usize, ColOut)>>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..lanes).map(|_| scope.spawn(&work)).collect();
+            let handles: Vec<_> = (0..lanes).map(|_| scope.spawn(work)).collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
         for got in gathered {
@@ -943,7 +980,10 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             .filter(|(_, n)| **n >= 2)
             .map(|(&r, &n)| (key_values(s, r), n as i64))
             .collect();
-        all.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| compare_keys(&x.0, &y.0, key_size)));
+        all.sort_by(|x, y| {
+            y.1.cmp(&x.1)
+                .then_with(|| compare_keys(&x.0, &y.0, key_size))
+        });
         let total = all.len();
         all.truncate(cap.min(total));
         let mut cols_out = opt.key.clone();

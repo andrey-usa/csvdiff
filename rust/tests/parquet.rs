@@ -137,14 +137,27 @@ fn snappy_matches_the_csv_it_was_written_from() {
 
 #[test]
 fn uncompressed_matches() {
-    same_report("20k", PLAIN, ".unc.parquet", &["account_id", "txn_id"], |_| {});
+    same_report(
+        "20k",
+        PLAIN,
+        ".unc.parquet",
+        &["account_id", "txn_id"],
+        |_| {},
+    );
 }
 
 #[test]
 fn many_small_row_groups() {
     same_report(
         "20k",
-        &["--format", "parquet", "--compression", "snappy", "--row-group-size", "512"],
+        &[
+            "--format",
+            "parquet",
+            "--compression",
+            "snappy",
+            "--row-group-size",
+            "512",
+        ],
         ".parquet",
         &["account_id", "txn_id"],
         |_| {},
@@ -160,8 +173,14 @@ fn a_column_the_dictionary_gives_up_on() {
     same_report(
         "20k",
         &[
-            "--format", "parquet", "--compression", "none",
-            "--dict-limit", "175", "--row-group-size", "300",
+            "--format",
+            "parquet",
+            "--compression",
+            "none",
+            "--dict-limit",
+            "175",
+            "--row-group-size",
+            "300",
         ],
         ".unc.parquet",
         &["account_id", "txn_id"],
@@ -173,7 +192,14 @@ fn a_column_the_dictionary_gives_up_on() {
 fn every_column_plain() {
     same_report(
         "20k",
-        &["--format", "parquet", "--compression", "snappy", "--dict-limit", "1"],
+        &[
+            "--format",
+            "parquet",
+            "--compression",
+            "snappy",
+            "--dict-limit",
+            "1",
+        ],
         ".parquet",
         &["account_id", "txn_id"],
         |_| {},
@@ -182,7 +208,13 @@ fn every_column_plain() {
 
 #[test]
 fn rows_that_do_not_fill_a_group() {
-    same_report("1k", PLAIN, ".unc.parquet", &["account_id", "txn_id"], |_| {});
+    same_report(
+        "1k",
+        PLAIN,
+        ".unc.parquet",
+        &["account_id", "txn_id"],
+        |_| {},
+    );
 }
 
 /// A key column both sides store as a dictionary takes the shared-id path,

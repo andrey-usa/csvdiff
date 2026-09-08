@@ -649,7 +649,7 @@ impl<'a> RleReader<'a> {
             // RLE run: a count and one value.
             self.packed = false;
             self.left = (h >> 1) as usize;
-            let bytes = ((self.width + 7) / 8) as usize;
+            let bytes = self.width.div_ceil(8) as usize;
             if self.at + bytes > self.d.len() {
                 return false;
             }
@@ -724,7 +724,13 @@ impl<'a> RleReader<'a> {
 
 /// PLAIN byte arrays: a four-byte little-endian length, then that many bytes,
 /// repeated. The slices point straight at `base`, so nothing is copied.
-fn plain_slices(page: &[u8], base: u64, count: i32, out: &mut Vec<Slice>, path: &str) -> Result<()> {
+fn plain_slices(
+    page: &[u8],
+    base: u64,
+    count: i32,
+    out: &mut Vec<Slice>,
+    path: &str,
+) -> Result<()> {
     let mut at = 0usize;
     for _ in 0..count {
         if at + 4 > page.len() {
@@ -820,7 +826,10 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                 owned.reserve(uncompressed as usize);
             }
         } else if codec != c.codec {
-            return fail("a parquet column changes compression between row groups", path);
+            return fail(
+                "a parquet column changes compression between row groups",
+                path,
+            );
         }
 
         let mut at = if c.dictionary_page_offset > 0 {
@@ -844,7 +853,10 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
             let (page_from, page_len, page_base, in_owned) = if c.codec == CODEC_SNAPPY {
                 let was = owned.len();
                 if !snappy_append(&data[h.after..h.after + body_len], &mut owned) {
-                    return fail("a snappy page in the parquet file will not decompress", path);
+                    return fail(
+                        "a snappy page in the parquet file will not decompress",
+                        path,
+                    );
                 }
                 (was, owned.len() - was, was as u64, true)
             } else {
@@ -892,7 +904,10 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
 
                 if h.encoding == ENC_PLAIN_DICTIONARY || h.encoding == ENC_RLE_DICTIONARY {
                     if dict.is_empty() {
-                        return fail("a parquet data page wants a dictionary there is none of", path);
+                        return fail(
+                            "a parquet data page wants a dictionary there is none of",
+                            path,
+                        );
                     }
                     if vat + 1 > page_len {
                         return fail("a parquet page has no bit width", path);
@@ -937,7 +952,11 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                         // copies eight-byte handles, not values.
                         values.reserve(fm.rows as usize);
                         for &k in &index {
-                            values.push(if k >= 0 { dict[k as usize] } else { Slice::null() });
+                            values.push(if k >= 0 {
+                                dict[k as usize]
+                            } else {
+                                Slice::null()
+                            });
                         }
                         index = Vec::new();
                         dictionary = false;
@@ -962,7 +981,10 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                         });
                     }
                 } else {
-                    return fail("only PLAIN and dictionary parquet encodings are read here", path);
+                    return fail(
+                        "only PLAIN and dictionary parquet encodings are read here",
+                        path,
+                    );
                 }
                 seen += h.num_values as i64;
             } else if h.ty == PAGE_DATA_V2 {
