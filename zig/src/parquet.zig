@@ -196,6 +196,12 @@ pub const Reader = struct {
     /// Decodes the wanted columns into row-major field words and the arena they
     /// point into. `wanted[i]` is the name whose values belong in slot `i`; a name
     /// this file does not have leaves that slot absent in every row.
+    ///
+    /// Columns are decoded a wave at a time — as many at once as there are
+    /// threads — and each wave is folded into the output before the next starts.
+    /// Decoding all of them first and stitching afterwards holds two copies of
+    /// every field word at the peak, which at ten million rows over nineteen
+    /// columns is 1.5 GB per file for nothing.
     pub fn project(
         self: *Reader,
         gpa: std.mem.Allocator,
@@ -210,85 +216,89 @@ pub const Reader = struct {
             if (leaf) |at| try jobs.append(gpa, .{ .slot = slot, .leaf = at });
         }
 
-        // Columns share nothing until they are stitched into rows, so they are
-        // decoded at the same time. One job at a time from a shared counter
-        // rather than a fixed split, because a dictionary column costs a fraction
-        // of what a plain one does and a fixed split would leave threads idle
-        // behind the slowest column.
-        var work = Work{
-            .reader = self,
-            .gpa = gpa,
-            .jobs = jobs.items,
-            .next = std.atomic.Value(usize).init(0),
-            .done = try gpa.alloc(?Decoded, jobs.items.len),
-            .failures = try gpa.alloc(?anyerror, jobs.items.len),
-        };
-        defer gpa.free(work.done);
-        defer gpa.free(work.failures);
-        @memset(work.done, null);
-        @memset(work.failures, null);
-        errdefer for (work.done) |maybe| {
-            if (maybe) |d| d.deinit(gpa);
-        };
-
-        const ways = @max(1, @min(threads, jobs.items.len));
-        var workers: [32]?std.Thread = undefined;
-        const spawned = @min(ways - 1, workers.len);
-        for (0..spawned) |i| {
-            workers[i] = std.Thread.spawn(.{}, Work.run, .{&work}) catch null;
-        }
-        work.run();
-        for (0..spawned) |i| {
-            if (workers[i]) |w| w.join() else work.run();
-        }
-        for (work.failures) |maybe| {
-            if (maybe) |e| return e;
-        }
-
-        // One arena for the file, so a field is an offset into a single run of
-        // bytes. Each column's words are shifted by where its own arena landed.
-        var total: usize = 0;
-        for (work.done) |maybe| {
-            if (maybe) |d| total += d.arena.len;
-        }
-        const arena = try gpa.alloc(u8, total);
-        errdefer gpa.free(arena);
-        const bases = try gpa.alloc(u64, width);
-        defer gpa.free(bases);
-        @memset(bases, 0);
-        var at: usize = 0;
-        for (work.done, 0..) |*maybe, i| {
-            const d = maybe.* orelse continue;
-            bases[jobs.items[i].slot] = at;
-            @memcpy(arena[at..][0..d.arena.len], d.arena);
-            at += d.arena.len;
-            // Released as it is copied rather than at the end, so the two copies
-            // of a column's bytes do not both stand at the peak.
-            gpa.free(d.arena);
-            maybe.* = .{ .fields = d.fields, .arena = &[_]u8{} };
-        }
-
         const fields = try gpa.alloc(Field, self.rows * width);
         errdefer gpa.free(fields);
         @memset(fields, f.ABSENT);
-        // Written a block of rows at a time rather than a column at a time: the
-        // destination is row-major, so a whole column would touch every cache
-        // line in the output once per column.
-        const BLOCK = 1024;
-        var from: usize = 0;
-        while (from < self.rows) : (from += BLOCK) {
-            const to = @min(from + BLOCK, self.rows);
-            for (work.done, 0..) |maybe, i| {
-                const d = maybe orelse continue;
-                const slot = jobs.items[i].slot;
-                const base = bases[slot];
-                for (from..to) |row| fields[row * width + slot] = f.shift(d.fields[row], base);
+        var arena: std.ArrayList(u8) = .empty;
+        errdefer arena.deinit(gpa);
+
+        const ways = @max(1, @min(threads, jobs.items.len));
+        var wave = Wave{ .reader = self, .gpa = gpa };
+        var at: usize = 0;
+        while (at < jobs.items.len) {
+            const batch = jobs.items[at..@min(at + ways, jobs.items.len)];
+            at += batch.len;
+            try wave.decode(batch);
+            defer wave.release();
+            if (wave.failure) |e| return e;
+
+            for (batch, wave.done[0..batch.len]) |job, maybe| {
+                const column = maybe orelse continue;
+                // The offset is the low bits of the word, so moving a column's
+                // bytes into the file's one arena is an addition — and only the
+                // two sentinels have to be left alone.
+                const base = arena.items.len;
+                try arena.appendSlice(gpa, column.arena);
+                // Written a block of rows at a time: the destination is
+                // row-major, so a whole column in one pass would touch every
+                // cache line of the output once per column.
+                const BLOCK = 1024;
+                var from: usize = 0;
+                while (from < self.rows) : (from += BLOCK) {
+                    const to = @min(from + BLOCK, self.rows);
+                    for (from..to) |row| {
+                        fields[row * width + job.slot] = f.shift(column.fields[row], base);
+                    }
+                }
             }
         }
-        for (work.done) |maybe| {
-            if (maybe) |d| gpa.free(d.fields);
+        return .{ .fields = fields, .arena = try arena.toOwnedSlice(gpa) };
+    }
+};
+
+/// One wave of columns, decoded at once. A thread per column beyond the first,
+/// each writing only its own slot of `done` and `failures`, which is why neither
+/// needs a lock: they are read after every thread has been joined.
+const Wave = struct {
+    reader: *Reader,
+    gpa: std.mem.Allocator,
+    done: [MAX]?Decoded = @splat(null),
+    failures: [MAX]?anyerror = @splat(null),
+    jobs: []const Job = &.{},
+    failure: ?anyerror = null,
+
+    const MAX = 64;
+
+    fn one(self: *Wave, i: usize) void {
+        self.done[i] = decodeColumn(self.reader, self.gpa, self.jobs[i].leaf) catch |e| {
+            self.failures[i] = e;
+            return;
+        };
+    }
+
+    fn decode(self: *Wave, jobs: []const Job) !void {
+        self.jobs = jobs;
+        self.failure = null;
+        var workers: [MAX]?std.Thread = @splat(null);
+        const spawned = @min(jobs.len - 1, MAX - 1);
+        for (0..spawned) |i| {
+            workers[i] = std.Thread.spawn(.{}, Wave.one, .{ self, i + 1 }) catch null;
         }
-        return .{ .fields = fields, .arena = arena };
+        self.one(0);
+        for (0..spawned) |i| {
+            if (workers[i]) |w| w.join() else self.one(i + 1);
+        }
+        for (self.failures[0..jobs.len]) |maybe| {
+            if (maybe) |e| self.failure = e;
+        }
+    }
+
+    fn release(self: *Wave) void {
+        for (&self.done) |*maybe| {
+            if (maybe.*) |d| d.deinit(self.gpa);
+            maybe.* = null;
+        }
+        @memset(&self.failures, null);
     }
 };
 
@@ -305,29 +315,6 @@ const Decoded = struct {
     }
 };
 
-/// The shared state of the parallel column decode.
-const Work = struct {
-    reader: *Reader,
-    gpa: std.mem.Allocator,
-    jobs: []const Job,
-    next: std.atomic.Value(usize),
-    done: []?Decoded,
-    /// One slot per job, written only by the thread that took that job and read
-    /// only once every thread has been joined -- which is why no lock is needed.
-    failures: []?anyerror,
-
-    fn run(self: *Work) void {
-        while (true) {
-            const i = self.next.fetchAdd(1, .monotonic);
-            if (i >= self.jobs.len) return;
-            const decoded = decodeColumn(self.reader, self.gpa, self.jobs[i].leaf) catch |e| {
-                self.failures[i] = e;
-                return;
-            };
-            self.done[i] = decoded;
-        }
-    }
-};
 
 // ---------------------------------------------------------------------------
 // The footer

@@ -27,7 +27,6 @@
 //! data exactly when the CSV spells its values that way.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::codec::{Codec, decompress};
 use super::encoding::{Hybrid, bit_width, delta_binary_packed};
@@ -186,14 +185,21 @@ impl Reader {
     }
 
     /// Decodes the wanted columns into row-major field words and the arena they
-    /// point into. `wanted[i]` is the name whose values belong in slot `i`; a
-    /// name this file does not have leaves that slot absent in every row.
+    /// point into. `wanted[i]` is the name whose values belong in slot `i`; a name
+    /// this file does not have leaves that slot absent in every row.
+    ///
+    /// Columns are decoded a wave at a time — as many at once as there are
+    /// threads — and each wave is folded into the output before the next starts.
+    /// Decoding all of them first and stitching afterwards holds two copies of
+    /// every field word at the peak, which at ten million rows over nineteen
+    /// columns is 1.5 GB per file for nothing.
     pub(super) fn project(
         &self,
         wanted: &[Option<&str>],
         threads: usize,
     ) -> Result<(Vec<Field>, Vec<u8>)> {
         let width = wanted.len();
+        let rows = self.rows;
         let jobs: Vec<(usize, usize)> = wanted
             .iter()
             .enumerate()
@@ -204,74 +210,44 @@ impl Reader {
             })
             .collect();
 
-        // Columns share nothing until they are stitched into rows, so they are
-        // decoded at the same time. One job at a time from a shared counter
-        // rather than a fixed split, because a dictionary column costs a
-        // fraction of what a plain one does and a fixed split would leave
-        // threads idle behind the slowest column.
-        let next = AtomicUsize::new(0);
-        let ways = threads.clamp(1, jobs.len().max(1));
-        let mut decoded: Vec<(usize, Decoded)> = Vec::with_capacity(jobs.len());
-        let mut failure: Option<Error> = None;
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for _ in 0..ways {
-                let next = &next;
-                let jobs = &jobs;
-                handles.push(scope.spawn(move || {
-                    let mut mine = Vec::new();
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(slot, leaf)) = jobs.get(i) else {
-                            return Ok(mine);
-                        };
-                        mine.push((slot, self.decode_column(leaf)?));
-                    }
-                }));
-            }
-            for handle in handles {
-                match handle.join() {
-                    Ok(Ok(mut mine)) => decoded.append(&mut mine),
-                    Ok(Err(e)) => {
-                        failure.get_or_insert(e);
-                    }
-                    Err(_) => {
-                        failure
-                            .get_or_insert_with(|| Error::new("a Parquet column decoder panicked"));
-                    }
-                }
-            }
-        });
-        if let Some(e) = failure {
-            return Err(e);
-        }
-
-        // One arena for the file, so a field is an offset into a single run of
-        // bytes. Each column's words are shifted by where its own arena landed;
-        // the offset is the low bits of the word, so adding to the word adds to
-        // the offset, and only the two sentinels have to be left alone.
-        let mut arena: Vec<u8> =
-            Vec::with_capacity(decoded.iter().map(|(_, d)| d.arena.len()).sum());
-        let mut bases = vec![0u64; width];
-        for (slot, column) in &mut decoded {
-            bases[*slot] = arena.len() as u64;
-            arena.extend_from_slice(&column.arena);
-            column.arena = Vec::new(); // released as it is copied, not at the end
-        }
-
-        let rows = self.rows;
         let mut fields = vec![ABSENT; rows * width];
-        // Written a block of rows at a time rather than a column at a time: the
-        // destination is row-major, so a whole column would touch every cache
-        // line in the output once per column.
-        const BLOCK: usize = 1024;
-        for from in (0..rows).step_by(BLOCK) {
-            let to = (from + BLOCK).min(rows);
-            for (slot, column) in &decoded {
-                let base = bases[*slot];
-                for row in from..to {
-                    let f = column.fields[row];
-                    fields[row * width + slot] = if is_real(f) { f + base } else { f };
+        let mut arena: Vec<u8> = Vec::new();
+        let ways = threads.clamp(1, jobs.len().max(1));
+
+        for wave in jobs.chunks(ways) {
+            let mut decoded: Vec<Result<Decoded>> = Vec::with_capacity(wave.len());
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = wave[1..]
+                    .iter()
+                    .map(|&(_, leaf)| scope.spawn(move || self.decode_column(leaf)))
+                    .collect();
+                decoded.push(self.decode_column(wave[0].1));
+                for handle in handles {
+                    decoded.push(
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| Err(Error::new("a Parquet column decoder panicked"))),
+                    );
+                }
+            });
+
+            for (&(slot, _), column) in wave.iter().zip(decoded) {
+                let column = column?;
+                // The offset is the low bits of the word, so moving a column's
+                // bytes into the file's one arena is an addition — and only the
+                // two sentinels have to be left alone.
+                let base = arena.len() as u64;
+                arena.extend_from_slice(&column.arena);
+                // Written a block of rows at a time: the destination is
+                // row-major, so a whole column in one pass would touch every
+                // cache line of the output once per column.
+                const BLOCK: usize = 1024;
+                for from in (0..rows).step_by(BLOCK) {
+                    let to = (from + BLOCK).min(rows);
+                    for row in from..to {
+                        let f = column.fields[row];
+                        fields[row * width + slot] = if is_real(f) { f + base } else { f };
+                    }
                 }
             }
         }
