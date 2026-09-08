@@ -63,6 +63,11 @@ const CHUNKING_THRESHOLD: usize = 4 << 20;
 /// How many keys make the join worth splitting.
 const JOIN_THRESHOLD: usize = 1 << 14;
 
+/// How many rows ahead a table probe is started. Enough misses in flight to
+/// cover the latency of one, and not so many that the lines are evicted before
+/// the loop reaches them.
+const PREFETCH_AHEAD: usize = 32;
+
 /// Keys per join chunk.
 ///
 /// Sized in rows rather than in threads so that the chunk boundaries -- and so
@@ -397,6 +402,9 @@ impl RowIndex {
         // 320 MB at ten million rows across both files.
         for chunk in &mut chunks {
             for i in 0..chunk.at.len() {
+                if let Some(&soon) = chunk.hash.get(i + PREFETCH_AHEAD) {
+                    idx.prefetch(soon);
+                }
                 idx.insert(
                     side,
                     chunk.at[i],
@@ -478,6 +486,26 @@ impl RowIndex {
     fn slot(&self, hash: u64) -> usize {
         // The high bits of an FNV hash are the well-mixed ones; fold them down.
         ((hash ^ (hash >> 32)) as usize) & self.mask
+    }
+
+    /// Starts the fetch of the slot `hash` will land in, without waiting for it.
+    ///
+    /// Every probe of this table is a random access into tens of megabytes, so
+    /// it misses to memory, and the row after it needs a different line: the loop
+    /// spends most of its time waiting on a load whose address was known long
+    /// before it was issued. Asking for the line `PREFETCH_AHEAD` rows early
+    /// turns that serial chain of misses into overlapping ones.
+    #[inline]
+    fn prefetch(&self, hash: u64) {
+        #[cfg(target_arch = "x86_64")]
+        // Safety: `slot` masks into the table's length, so the pointer is in
+        // bounds, and a prefetch has no architectural effect in any case.
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T0>(self.table.as_ptr().add(self.slot(hash)) as *const i8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = hash;
     }
 
     /// Only reached if the row count was underestimated: `build` sizes the table
@@ -899,7 +927,11 @@ fn join(
         );
         let lo = a_keys * p / a_ways;
         let hi = a_keys * (p + 1) / a_ways;
-        for &row in &ai.first_row[lo..hi] {
+        let keys = &ai.first_row[lo..hi];
+        for (i, &row) in keys.iter().enumerate() {
+            if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
+                bi.prefetch(ai.row_hash[soon as usize]);
+            }
             ai.fields_of(a, row, &mut fa);
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
@@ -965,7 +997,11 @@ fn join(
         let (mut fb, mut probe) = (vec![ABSENT; width], vec![ABSENT; width]);
         let lo = b_keys * p / b_ways;
         let hi = b_keys * (p + 1) / b_ways;
-        for &row in &bi.first_row[lo..hi] {
+        let keys = &bi.first_row[lo..hi];
+        for (i, &row) in keys.iter().enumerate() {
+            if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
+                ai.prefetch(bi.row_hash[soon as usize]);
+            }
             bi.fields_of(b, row, &mut fb);
             let hash = bi.row_hash[row as usize];
             if ai
