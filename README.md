@@ -722,13 +722,21 @@ where nothing else agreed. Two causes:
 
 The first was clearing twenty field words per row per file before parsing, when
 only the columns *after* a row runs out need blanking — and a well-formed row
-runs out of nothing. The second is the better story. `sameBytes` had a memcmp
-fast path, gated on `Logical.isPlain()`, which is `dialect == .raw`: true for
-Parquet and **false for every CSV file ever compared**. The fast path had never
-once run on the format the benchmark measures, so every cell of every row went
-through the byte-at-a-time escape iterator. The field word already records
-whether a field carries an escape, which is the question that was meant to be
-asked all along.
+runs out of nothing.
+
+The second is the better story, and it is one this write-up got wrong first
+time. It looked like a fast path that never ran: `sameBytes` took a memcmp only when
+`Logical.isPlain()`, which is `dialect == .raw`, and a CSV slab's dialect is
+`.csv`. But `logical()` hands back `.raw` for any field with no escape, so the
+memcmp *was* what a CSV file got. The cost was never the comparison — it was
+**asking the question**: two `Logical` values built, each slicing the slab and
+carrying a four-byte pending buffer, to decide something two bit tests decide,
+for every compared cell of every matched row. The field word already records
+whether a field carries an escape. Asking it directly took `sameBytes` from 0.76
+billion instructions to 0.53 billion without changing which path the bytes take.
+
+The same setup cost was in the Rust port, copied from the same design, and is
+fixed the same way.
 
 **Zig's columnar path read its key columns one side at a time.** They are the
 phase that decodes pages for ten million rows, and the two sides share nothing,

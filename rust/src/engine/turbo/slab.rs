@@ -265,11 +265,16 @@ impl LogicalBytes<'_> {
 
 /// Whether two fields hold the same logical bytes, without decoding either.
 pub(super) fn same_bytes(a: &Slab, x: Field, b: &Slab, y: Field) -> bool {
-    let (lx, ly) = (a.logical(x), b.logical(y));
-    if lx.is_plain() && ly.is_plain() {
+    // Ask the two field words directly rather than building two iterators to ask
+    // them. `logical()` already reports a field with no escape as plain, so the
+    // memcmp below was always the path a CSV file took -- but reaching it cost
+    // two `LogicalBytes` values, each slicing the slab and carrying a four-byte
+    // pending buffer, to answer a question two bit tests answer. For a
+    // nine-byte field that setup was most of the comparison.
+    if !is_escaped(x) && !is_escaped(y) {
         return a.raw(x) == b.raw(y);
     }
-    lx.eq(ly)
+    a.logical(x).eq(b.logical(y))
 }
 
 /// The field decoded. Only the report sections and the normalising paths call

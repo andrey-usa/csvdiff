@@ -150,6 +150,27 @@ fn same(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
     value(a, x, opt) == value(b, y, opt)
 }
 
+/// Whether a field is absent, when nothing has to be normalised first.
+///
+/// The general `is_absent` may decode the value; with no normalising it is two
+/// bit tests on the field word, and the join asks it three times per compared
+/// cell -- once inside `same`, then twice more for the blanked and filled
+/// counters, having thrown the first answer away.
+#[inline]
+fn plain_absent(f: Field) -> bool {
+    !field::is_real(f) || field::len_of(f) == 0
+}
+
+/// `cell_differs` for the common case, with each side's absence already known.
+/// Both absent is not a difference; exactly one is.
+#[inline]
+fn plain_differs(a: &Slab, x: Field, xa: bool, b: &Slab, y: Field, yb: bool) -> bool {
+    if xa || yb {
+        return xa != yb;
+    }
+    !same_bytes(a, x, b, y)
+}
+
 fn cell_differs(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
     if !needs_normalising(opt) {
         return !same(a, x, b, y, opt);
@@ -729,6 +750,9 @@ fn join(
     let nc = compared.len();
     let width = key_size + nc;
     let cap = opt.max_rows;
+    // Nothing to normalise: the cell comparison is two bit tests and a memcmp,
+    // and neither the absence checks nor the value decoding are reachable.
+    let plain = !needs_normalising(opt);
 
     // A's side is the long pole: every distinct key is looked up in B, both rows
     // are read, and every compared column is examined. B's side only asks whether
@@ -775,16 +799,37 @@ fn join(
             bi.fields_of(b, mate, &mut fb);
 
             let mut any = false;
-            for i in 0..nc {
-                let (x, y) = (fa[key_size + i], fb[key_size + i]);
-                if cell_differs(&a.slab, x, &b.slab, y, opt) {
-                    any = true;
-                    out.changed_per[i] += 1;
-                    if is_absent(&b.slab, y, opt) {
-                        out.blanked_per[i] += 1;
+            // Two loops rather than one with a flag inside it: `plain` cannot
+            // change between columns or between rows, and this is the innermost
+            // loop of the whole comparison.
+            if plain {
+                for i in 0..nc {
+                    let (x, y) = (fa[key_size + i], fb[key_size + i]);
+                    let (xa, yb) = (plain_absent(x), plain_absent(y));
+                    if plain_differs(&a.slab, x, xa, &b.slab, y, yb) {
+                        any = true;
+                        out.changed_per[i] += 1;
+                        // Absence is already known rather than asked for again.
+                        if yb {
+                            out.blanked_per[i] += 1;
+                        }
+                        if xa {
+                            out.filled_per[i] += 1;
+                        }
                     }
-                    if is_absent(&a.slab, x, opt) {
-                        out.filled_per[i] += 1;
+                }
+            } else {
+                for i in 0..nc {
+                    let (x, y) = (fa[key_size + i], fb[key_size + i]);
+                    if cell_differs(&a.slab, x, &b.slab, y, opt) {
+                        any = true;
+                        out.changed_per[i] += 1;
+                        if is_absent(&b.slab, y, opt) {
+                            out.blanked_per[i] += 1;
+                        }
+                        if is_absent(&a.slab, x, opt) {
+                            out.filled_per[i] += 1;
+                        }
                     }
                 }
             }

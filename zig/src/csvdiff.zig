@@ -233,6 +233,26 @@ fn asNumber(value: []const u8) ?f64 {
     return if (std.math.isFinite(v)) v else null;
 }
 
+/// Whether a field is absent, when nothing has to be normalised first.
+///
+/// The general `isAbsent` returns `Error!bool` because a normalising build can
+/// refuse a non-ASCII byte under `--ignore-case`. With no normalising there is
+/// no error to have, and the difference matters: the join asks this four times
+/// per compared cell -- twice in `cellDiffers` and twice more inside the `same`
+/// it calls -- so ten million rows over seventeen columns propagate an error
+/// union nearly seven hundred million times for a question that is two bit
+/// tests.
+inline fn plainAbsent(f: Field) bool {
+    return !fld.isReal(f) or fld.lenOf(f) == 0;
+}
+
+/// `cellDiffers` for the common case, computing each side's absence once and
+/// returning a plain `bool`. Both absent is not a difference; exactly one is.
+inline fn plainDiffers(a: Slab, x: Field, xa: bool, b: Slab, y: Field, yb: bool) bool {
+    if (xa or yb) return xa != yb;
+    return !slab_mod.sameBytes(a, x, b, y);
+}
+
 fn cellDiffers(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Error!bool {
     const xa = try isAbsent(a, x, o, &s.a);
     const yb = try isAbsent(b, y, o, &s.b);
@@ -957,6 +977,9 @@ const Join = struct {
         const keys = self.ai.first_row.items;
         const lo = keys.len * p / self.parts.len;
         const hi = keys.len * (p + 1) / self.parts.len;
+        // Nothing to normalise and no tolerance: the cell comparison cannot
+        // fail, so it need not be asked through an error union.
+        const plain = !needsNormalising(self.opt);
         for (keys[lo..hi]) |row| {
             self.ai.fieldsOf(row, fa);
             // The hash is the one the sweep computed for this row: the same
@@ -970,14 +993,35 @@ const Join = struct {
             out.matched += 1;
             self.bi.fieldsOf(mate, fb);
             var any = false;
-            for (0..self.nc) |i| {
-                const x = fa[self.key_size + i];
-                const y = fb[self.key_size + i];
-                if (try cellDiffers(self.a.slab, x, self.b.slab, y, self.opt, &s)) {
-                    any = true;
-                    out.columns[i].changed += 1;
-                    if (try isAbsent(self.b.slab, y, self.opt, &s.b)) out.columns[i].blanked += 1;
-                    if (try isAbsent(self.a.slab, x, self.opt, &s.a)) out.columns[i].filled += 1;
+            // Two loops rather than one with a flag inside it: `plain` cannot
+            // change between columns or between rows, and this is the innermost
+            // loop of the whole comparison -- seventeen columns of ten million
+            // matched rows.
+            if (plain) {
+                for (0..self.nc) |i| {
+                    const x = fa[self.key_size + i];
+                    const y = fb[self.key_size + i];
+                    const xa = plainAbsent(x);
+                    const yb = plainAbsent(y);
+                    if (plainDiffers(self.a.slab, x, xa, self.b.slab, y, yb)) {
+                        any = true;
+                        out.columns[i].changed += 1;
+                        // Absence is already known: the general path asks for it
+                        // twice more, having thrown away the answer.
+                        if (yb) out.columns[i].blanked += 1;
+                        if (xa) out.columns[i].filled += 1;
+                    }
+                }
+            } else {
+                for (0..self.nc) |i| {
+                    const x = fa[self.key_size + i];
+                    const y = fb[self.key_size + i];
+                    if (try cellDiffers(self.a.slab, x, self.b.slab, y, self.opt, &s)) {
+                        any = true;
+                        out.columns[i].changed += 1;
+                        if (try isAbsent(self.b.slab, y, self.opt, &s.b)) out.columns[i].blanked += 1;
+                        if (try isAbsent(self.a.slab, x, self.opt, &s.a)) out.columns[i].filled += 1;
+                    }
                 }
             }
             if (any) out.changed += 1;
