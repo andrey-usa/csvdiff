@@ -63,7 +63,7 @@ jobs:
           (cd go && go build -o /tmp/csvdiff-go ./cmd/csvdiff && go build -o /tmp/gen-data-go ./cmd/gen-data)
           (cd java && mvn -B --no-transfer-progress -DskipTests package)
           (cd rust && cargo build --release)
-          pip install "duckdb>=1.0" && pip install -e . --no-deps
+          pip install -e .
           (cd ts && npm ci && npm run build)
 
       # The five generators are meant to emit byte-identical files, which is what

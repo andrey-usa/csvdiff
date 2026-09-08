@@ -4,7 +4,7 @@ argument-hint: [10k|1m|10m]
 allowed-tools: Bash(python scripts/*), Bash(rm -rf data), Read
 ---
 
-Run `python scripts/bench.py --rows ${1:-10k} --engine ${2:-duckdb} --data-dir data --out-dir bench --threads $(nproc)`.
+Run `python scripts/bench.py --rows ${1:-10k} --data-dir data --out-dir bench --threads $(nproc)`.
 
 Then report compare time, throughput, peak RSS and report size, and say whether each is within the
 budget in `scripts/bench.py`. If a budget is exceeded, profile before changing anything: identify

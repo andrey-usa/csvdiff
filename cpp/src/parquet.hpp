@@ -2,9 +2,9 @@
 //
 // It reads exactly what this job needs and refuses the rest by name, which is
 // the same bargain the rest of this port makes: BYTE_ARRAY columns, PLAIN and
-// dictionary encodings, uncompressed or Snappy. That covers what DuckDB,
-// polars and pandas write for string columns, and it is the shape the
-// comparison actually meets.
+// dictionary encodings, uncompressed or Snappy. That covers what DuckDB and
+// polars write for string columns, and it is the shape the comparison actually
+// meets.
 //
 // Two things it does that a general reader would not.
 //

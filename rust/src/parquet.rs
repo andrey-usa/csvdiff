@@ -3,9 +3,9 @@
 //! This is the Rust twin of `cpp/src/parquet.cpp`, and it makes the same
 //! bargain: it reads exactly what this job needs and refuses the rest by name.
 //! `BYTE_ARRAY` columns, PLAIN and dictionary encodings, uncompressed and
-//! snappy, v1 data pages. That covers what DuckDB, polars, pandas and this
-//! project's own generator write for string columns, and it is the shape the
-//! comparison actually meets.
+//! snappy, v1 data pages. That covers what DuckDB, polars and this project's
+//! own generator write for string columns, and it is the shape the comparison
+//! actually meets.
 //!
 //! Two things it does that a general reader would not.
 //!

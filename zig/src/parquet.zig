@@ -3,7 +3,7 @@
 //! The Zig twin of `cpp/src/parquet.cpp` and `rust/src/parquet.rs`, and it makes
 //! the same bargain: it reads exactly what this job needs and refuses the rest
 //! by name. `BYTE_ARRAY` columns, PLAIN and dictionary encodings, uncompressed
-//! and snappy, v1 data pages. That covers what DuckDB, polars, pandas and this
+//! and snappy, v1 data pages. That covers what DuckDB, polars and this
 //! project's own generator write for string columns.
 //!
 //! Two things it does that a general reader would not.

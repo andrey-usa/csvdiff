@@ -139,7 +139,7 @@ per recurring comparison so nobody retypes them.
 | `--delimiter`, `--encoding` | override auto-detection |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--engine` | pick an engine explicitly — see [Which engine at which size](#which-engine-at-which-size) |
+| `--engine` | `duckdb`, which is the only one this implementation carries; the alternatives are the [ports](#ports) |
 | `--threads`, `--memory-limit` | DuckDB resource limits |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
@@ -594,8 +594,7 @@ run through the tools people actually reach for.
 | **DuckDB CLI** | a full outer join written by hand in SQL | yes |
 | **clickhouse-local** | the same join, on the fastest CSV reader in the survey | yes |
 | **daff** | the tabular-diff library behind `git daff`; alignment-based, `--id` pins a key | yes |
-| **datacompy** (Capital One) | the reconciliation library, on pandas or Polars | yes |
-| **pandas** | the outer merge people write before finding a library | yes |
+| **datacompy** (Capital One) | the reconciliation library, on Polars | yes |
 | **csv-diff** (Simon Willison) | small, popular, row dicts | **no** — one key column, no column-ignore |
 | **sort(1) + join(1)** | the shell pipeline | **no** — no idea what CSV quoting is |
 
@@ -612,9 +611,7 @@ transferring. **qsv** has no keyed diff subcommand of this shape.
 | clickhouse-local (SQL) | 0.19s · 191 MB | **2.23s** · 1,417 MB | 152.57s · 8,345 MB | +7 changed, +1 removed |
 | clickhouse-local (spilling join) | 0.22s · 197 MB | 6.71s · 1,954 MB | 507.21s · 6,711 MB | +7 changed, +1 removed |
 | daff (JS) | 0.48s · 121 MB | 46.87s · 4,134 MB | ✗ V8 512 MB string cap | dup keys only |
-| datacompy (pandas) | 1.06s · 188 MB | 38.70s · 2,274 MB | ✗ out of memory | +49 added, +99 removed |
-| datacompy (polars) | 0.79s · 178 MB | 5.64s · 2,685 MB | ✗ out of memory | +49 added, +99 removed |
-| pandas (hand-written merge) | 0.89s · 143 MB | 28.21s · 1,825 MB | ✗ out of memory | +7 changed, +1 removed |
+| datacompy (Polars) | 0.79s · 178 MB | 5.64s · 2,685 MB | ✗ out of memory | +49 added, +99 removed |
 | csv-diff (Python) | 0.34s · 67 MB | 25.26s · 3,420 MB | ✗ out of memory | agrees |
 | sort(1) + join(1) | 0.11s · **4 MB** | 10.58s · 251 MB | 118.47s · 2,483 MB | +7 changed, +1 removed |
 
@@ -627,22 +624,16 @@ Times alone hide what each tool gives you for them:
 | DuckDB / ClickHouse SQL | no — counts only | no | no |
 | daff | yes | no — a repeat reads as an insert | diff table |
 | datacompy | yes, plus per-column summary | no — pairs duplicates positionally | text summary |
-| pandas merge | counts unless you write more | no — duplicates multiply | no |
 | csv-diff | yes | no | no |
 | sort + join | no — counts only | no | no |
 
-**At ten million rows most of the field cannot run at all.** Six of the ten external entries fail on
-3.68 GB in a 12 GB budget. The interesting thing is not that they are slow — it is that "fastest"
+**At ten million rows most of the field cannot run at all.** Four of the eight external entries fail
+on 3.68 GB in a 12 GB budget. The interesting thing is not that they are slow — it is that "fastest"
 stops being the question.
 
 **daff's ceiling is not memory.** It reads the file with `readFileSync`, and V8 refuses to build a
 string longer than 512 MB. No amount of RAM moves that limit, so daff cannot open a file this size on
 any machine. Every other failure above is genuine memory exhaustion; this one is a wall.
-
-**The backend decides a dataframe's speed, not the library.** At 1M datacompy takes 38.70s on pandas
-and 5.64s on Polars — same library, same call, 6.9x apart. That gap is wider than any language
-difference in this whole project. If a dataframe reconciliation is slow, the first question is which
-backend it is on.
 
 **The dedicated tool is faster and hungrier.** csvdiff (Go) finishes 1M in 3.32s against our 6.26s
 and uses 1,519 MB against our 664 MB — while storing strictly less: two hashes per row, which is why
@@ -1337,7 +1328,7 @@ in B. Exactly one key here is duplicated on *both* sides (`ACC-00023757,TXN-0000
 that key the two leftovers cancel. Defensible — but it answers a question the tool never asks the
 user, and it makes the count depend on the order the duplicates appear in.
 
-**Tools that join** — the DuckDB SQL, the ClickHouse SQL, the pandas merge, the shell pipeline —
+**Tools that join** — the DuckDB SQL, the ClickHouse SQL, the shell pipeline —
 multiply them instead. A key twice in A and once in B joins to two rows; the one key twice on both
 sides joins to four. That is 151 extra rows at 1M, and each that happens to be a *changed* row is
 counted again, which is why `changed` lands 7 too high there and 91 too high at 10M. The number is

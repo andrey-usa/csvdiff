@@ -129,7 +129,7 @@ jobs:
       - run: npm ci && npm run build
       - name: Install the Python implementation
         working-directory: .
-        run: pip install "duckdb>=1.0" && pip install -e . --no-deps
+        run: pip install -e .
       - name: Same data, both implementations, identical counts and column stats
         working-directory: .
         run: |
