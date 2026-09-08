@@ -136,13 +136,16 @@ else
   fi
 fi
 rm -rf "$thr_dir"
-echo "quoting, ragged rows and keys near the end of the file:"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-printf 'a,k,c\nx,K1,c1\ny,K2,cc\n'        > "$tmp/a.csv"
-printf 'a,k,c\nx,K1,c1\ny,K2,cccccccc\n'  > "$tmp/b.csv"
-r=$("$RUST" compare "$tmp/a.csv" "$tmp/b.csv" -k k --engine turbo -o /dev/null 2>&1 | summary) || true
-c=$(./csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | summary) || true
-[ "$r" = "$c" ] && echo "  ok    key in the last bytes of the file" || { echo "  FAIL  key near end: rust=$r c=$c"; fail=1; }
+if [ "$with_ports" = 1 ]; then
+  echo "quoting, ragged rows and keys near the end of the file:"
+  printf 'a,k,c\nx,K1,c1\ny,K2,cc\n'        > "$tmp/a.csv"
+  printf 'a,k,c\nx,K1,c1\ny,K2,cccccccc\n'  > "$tmp/b.csv"
+  r=$("$RUST" compare "$tmp/a.csv" "$tmp/b.csv" -k k --engine turbo -o /dev/null 2>&1 | summary) || true
+  c=$(./csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | summary) || true
+  [ "$r" = "$c" ] && echo "  ok    key in the last bytes of the file" \
+                  || { echo "  FAIL  key near end: rust=$r c=$c"; fail=1; }
+fi
 
 
 

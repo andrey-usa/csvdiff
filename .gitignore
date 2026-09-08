@@ -36,6 +36,7 @@ replay_pid*.log
 
 # C build output.
 /c/csvdiff
+/c/gen-data
 
 # The C port builds objects beside its sources now, not just one binary.
 c/*.o
