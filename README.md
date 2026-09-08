@@ -255,7 +255,7 @@ Then the engine:
 | 100k – 2M rows | `polars` where you have it, else `turbo` | columnar wins this band outright; the byte-level engines are close behind on a quarter of the memory |
 | 2M – 20M rows, memory to spare | `turbo` | byte-level scanning; the only class that stays fast *and* still finishes at 10M+ |
 | 2M+ and you can build C++ | the [`cpp/`](cpp/) port, `--threads 4` | same design across every core: 2.5x the JVM on the same box and 1.5 GB lighter, and the only port that reads Parquet and JSON as well as CSV — but counts and JSON only, no HTML report |
-| 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design, two threads, lowest memory of anything here — counts and JSON only |
+| 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design, reads Parquet as well as CSV, lowest memory of anything here — counts and JSON only |
 | Any size, memory constrained | `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB in the Rust port |
 | Larger than tested, or unknown | `sortmerge` | the only engine whose memory does not grow with the input |
 | You need a hard guarantee | Zig port, `--max-memory MB` | a `FixedBufferAllocator`, so the bound is enforced rather than hoped for |
@@ -1148,6 +1148,33 @@ time where the distance allows it, and decompressing straight into the buffer th
 offsets refer to rather than into a scratch string that then gets appended, took
 the whole read phase from 2.24s to 0.68s.
 
+#### The same path in three languages
+
+The columnar design is now in C++, Rust and Zig, and all three return the same
+counts on the same files. One machine, one sitting, ten million rows:
+
+| Port | CSV | Parquet + snappy | Parquet uncompressed | Peak RSS (uncompressed) |
+|---|---:|---:|---:|---:|
+| **C++** | 25.17s | 7.91s | **5.15s** | 3,421 MB |
+| **Rust** | 58.66s | 8.58s | 6.22s | 3,409 MB |
+| **Zig** | 33.82s | 16.47s | 14.20s | 3,417 MB |
+
+**The format is worth more than the language.** Rust's own CSV engine takes
+58.66s on these rows and its Parquet path 6.22s — 9.4x from changing what the
+comparison reads, in one language, with the same rules and the same answer. C++
+gains 4.9x and Zig 2.4x, the difference being how well each port already
+threaded its CSV path.
+
+The three are much closer to each other on Parquet than on CSV, and their peak
+memory is within 12 MB of each other — the design, not the language, is what
+sets both.
+
+Where they still differ is threading, not code. Per core the three are close:
+15.4s, 16.1s and 18.5s of CPU on the uncompressed file. C++ and Rust spread the
+column pass and both directions of the join; Zig spreads only the column pass,
+so its key phases now dominate its run. That is the next thing to do to the Zig
+port, and it is worth about 2x.
+
 #### What it refuses
 
 There is a writer as well as a reader — `cpp/tools/pq_write.{hpp,cpp}`, used by
@@ -1352,7 +1379,7 @@ comparable with a number from another.
 | TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
 | Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, sortmerge, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM, plus an out-of-core sort-merge join |
 | Go | [`go/`](go/) | duckdb, sortmerge, native | Go 1.24 |
-| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024 |
+| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024; reads **Parquet** on a columnar path that never reconstructs a row |
 
 Three more carry the byte-level engine and the JSON counts only — benchmark and parity ports, so the
 same design can be measured in four languages without three more HTML renderers to keep in step:
@@ -1361,7 +1388,7 @@ same design can be measured in four languages without three more HTML renderers 
 |---|---|---|---|
 | C | [`c/`](c/) | `cc` or `clang`, C11 | one file, single-threaded on purpose — it exists to find the memory floor; no `--trim`, `--ignore-case` or `--tolerance` |
 | C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | reads CSV, **newline-delimited JSON** and **Parquet** — CSV and JSON compare against each other, Parquet against Parquet; `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
-| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | threaded; `--max-memory MB` is enforced, not advisory |
+| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | threaded; reads **CSV and Parquet**; `--max-memory MB` is enforced, not advisory, on both paths |
 
 The C++ and Zig ports build both indexes at once and run the two directions of the join at once,
 which is what Java's `turbo` has always done. C++ goes further, splitting each file into row-aligned
