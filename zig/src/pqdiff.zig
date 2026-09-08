@@ -473,6 +473,86 @@ fn buildIndex(
     return ix;
 }
 
+/// One side's index, built on its own thread. The two sides share nothing --
+/// not the mapping, not the key columns, not the table -- so the only reason
+/// this is a struct rather than a call is that a thread cannot return an error.
+const IndexBuild = struct {
+    gpa: std.mem.Allocator,
+    as_id: []const bool,
+    side: KeySide,
+    opt: Options,
+    index: Index = .{},
+    err: ?anyerror = null,
+
+    fn run(self: *IndexBuild) void {
+        self.index = buildIndex(self.gpa, self.as_id, self.side, self.opt) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+};
+
+/// One direction of the join: every distinct key on `from`'s side looked up in
+/// `into`'s table. The A direction keeps the pairs it finds; the B direction
+/// only counts the keys that find nothing, which is why `keep_pairs` exists and
+/// why the two can run at once without sharing an output.
+const MatchSweep = struct {
+    gpa: std.mem.Allocator,
+    as_id: []const bool,
+    into: *const Index,
+    into_keys: KeySide,
+    from: *const Index,
+    from_keys: KeySide,
+    opt: Options,
+    keep_pairs: bool,
+    pair_a: std.ArrayList(i32) = .empty,
+    pair_b: std.ArrayList(i32) = .empty,
+    /// Keys on this side with no mate on the other: removed for A, added for B.
+    missing: i64 = 0,
+    err: ?anyerror = null,
+
+    fn deinit(self: *MatchSweep, gpa: std.mem.Allocator) void {
+        self.pair_a.deinit(gpa);
+        self.pair_b.deinit(gpa);
+    }
+
+    fn run(self: *MatchSweep) void {
+        self.sweep() catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn sweep(self: *MatchSweep) !void {
+        var sc = Scratch{};
+        defer sc.deinit(self.gpa);
+        if (self.keep_pairs) {
+            try self.pair_a.ensureTotalCapacity(self.gpa, self.from.firsts.items.len);
+            try self.pair_b.ensureTotalCapacity(self.gpa, self.from.firsts.items.len);
+        }
+        for (self.from.firsts.items, self.from.hashes.items) |row, h| {
+            const mate = try lookup(
+                self.gpa,
+                self.as_id,
+                self.into.*,
+                self.into_keys,
+                self.from_keys,
+                @intCast(row),
+                h,
+                self.opt,
+                &sc,
+            );
+            if (mate < 0) {
+                self.missing += 1;
+                continue;
+            }
+            if (self.keep_pairs) {
+                self.pair_a.appendAssumeCapacity(row);
+                self.pair_b.appendAssumeCapacity(mate);
+            }
+        }
+    }
+};
+
 /// Looks one side's row up in the other side's table.
 fn lookup(
     gpa: std.mem.Allocator,
@@ -805,37 +885,64 @@ pub fn compare(
     }
 
     // --- the join ---------------------------------------------------------
-    var ai = try buildIndex(gpa, as_id, a_keys, opt);
-    defer ai.deinit(gpa);
-    var bi = try buildIndex(gpa, as_id, b_keys, opt);
-    defer bi.deinit(gpa);
+    //
+    // Two phases, and each is two independent halves, so each runs on two
+    // threads: the indexes share nothing, and once both exist the two
+    // directions of the join read them and write to different places. This is
+    // the same structure the CSV engine has had since it was threaded at all --
+    // one thread per file, one per direction -- and it is what this path was
+    // missing: it was building both indexes and walking both directions on one
+    // thread while the column pass below it used every core.
+    var build_a = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = a_keys, .opt = opt };
+    var build_b = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = b_keys, .opt = opt };
+    // A thread that cannot be spawned is not a reason to fail: the work runs
+    // here instead, which is slower and still right.
+    const build_thread = std.Thread.spawn(.{}, IndexBuild.run, .{&build_b}) catch null;
+    build_a.run();
+    if (build_thread) |t| t.join() else build_b.run();
 
-    var pair_a: std.ArrayList(i32) = .empty;
+    var ai = build_a.index;
+    defer ai.deinit(gpa);
+    var bi = build_b.index;
+    defer bi.deinit(gpa);
+    if (build_a.err) |e| return e;
+    if (build_b.err) |e| return e;
+
+    var pairs = MatchSweep{
+        .gpa = gpa,
+        .as_id = as_id,
+        .into = &bi,
+        .into_keys = b_keys,
+        .from = &ai,
+        .from_keys = a_keys,
+        .opt = opt,
+        .keep_pairs = true,
+    };
+    // The other direction only has to count the keys that find no mate, so it
+    // shares nothing with the first -- not even an output array.
+    var unmatched_b = MatchSweep{
+        .gpa = gpa,
+        .as_id = as_id,
+        .into = &ai,
+        .into_keys = a_keys,
+        .from = &bi,
+        .from_keys = b_keys,
+        .opt = opt,
+        .keep_pairs = false,
+    };
+    const join_thread = std.Thread.spawn(.{}, MatchSweep.run, .{&unmatched_b}) catch null;
+    pairs.run();
+    if (join_thread) |t| t.join() else unmatched_b.run();
+
+    var pair_a = pairs.pair_a;
     defer pair_a.deinit(gpa);
-    var pair_b: std.ArrayList(i32) = .empty;
+    var pair_b = pairs.pair_b;
     defer pair_b.deinit(gpa);
-    var removed_total: i64 = 0;
-    var added_total: i64 = 0;
-    {
-        var sc = Scratch{};
-        defer sc.deinit(gpa);
-        try pair_a.ensureTotalCapacity(gpa, ai.firsts.items.len);
-        try pair_b.ensureTotalCapacity(gpa, ai.firsts.items.len);
-        for (ai.firsts.items, ai.hashes.items) |row, h| {
-            const mate = try lookup(gpa, as_id, bi, b_keys, a_keys, @intCast(row), h, opt, &sc);
-            if (mate < 0) {
-                removed_total += 1;
-                continue;
-            }
-            try pair_a.append(gpa, row);
-            try pair_b.append(gpa, mate);
-        }
-        for (bi.firsts.items, bi.hashes.items) |row, h| {
-            if ((try lookup(gpa, as_id, ai, a_keys, b_keys, @intCast(row), h, opt, &sc)) < 0) {
-                added_total += 1;
-            }
-        }
-    }
+    defer unmatched_b.deinit(gpa);
+    if (pairs.err) |e| return e;
+    if (unmatched_b.err) |e| return e;
+    const removed_total: i64 = pairs.missing;
+    const added_total: i64 = unmatched_b.missing;
 
     const npairs = pair_a.items.len;
     const words = (npairs + 63) / 64;
