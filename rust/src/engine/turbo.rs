@@ -554,6 +554,11 @@ impl RowIndex {
     /// side those fields live in, which is the opposite file when this is a join
     /// probe. `probe` is scratch the caller owns: the join runs several ranges
     /// at once, and a buffer hanging off the index would be shared between them.
+    ///
+    /// On `Some`, `probe` holds that row's fields — it is what the key columns
+    /// were compared against. The join used to parse the row again on the line
+    /// after this one returned, which is a second parse of every matched row in
+    /// the file.
     #[allow(clippy::too_many_arguments)]
     fn lookup(
         &self,
@@ -945,11 +950,7 @@ fn join(
             changed_total: 0,
             removed_total: 0,
         };
-        let (mut fa, mut fb, mut probe) = (
-            vec![ABSENT; width],
-            vec![ABSENT; width],
-            vec![ABSENT; width],
-        );
+        let (mut fa, mut fb) = (vec![ABSENT; width], vec![ABSENT; width]);
         let lo = a_keys * p / a_ways;
         let hi = a_keys * (p + 1) / a_ways;
         let keys = &ai.first_row[lo..hi];
@@ -962,7 +963,9 @@ fn join(
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             let hash = ai.row_hash[row as usize];
-            let Some(mate) = bi.lookup(b, &a.slab, &fa, hash, key_size, opt, &mut probe) else {
+            // `fb` is the lookup's scratch, and on a hit it already holds the
+            // mate's fields: that is what the key columns were matched against.
+            let Some(mate) = bi.lookup(b, &a.slab, &fa, hash, key_size, opt, &mut fb) else {
                 out.removed_total += 1;
                 if exporting || out.removed.len() <= cap {
                     out.removed.push(Pick { row, mate: -1 });
@@ -970,7 +973,6 @@ fn join(
                 continue;
             };
             out.matched += 1;
-            bi.fields_of(b, mate, &mut fb);
 
             let mut any = false;
             // Two loops rather than one with a flag inside it: `plain` cannot

@@ -795,8 +795,13 @@ const RowIndex = struct {
 
     /// The row carrying `fields`' key, or null. `other` is the slab those fields
     /// live in, which is the opposite file when this is a join probe. `probe` is
-    /// scratch the caller owns: the join runs several ranges at once, and a buffer
+    /// scratch the caller owns: the join runs several chunks at once, and a buffer
     /// hanging off the index would be shared between them.
+    ///
+    /// On a hit, `probe` holds that row's fields — it is what the key columns were
+    /// compared against. The join used to read the row again on the line after
+    /// this one returned, which is a second parse of every matched row in the
+    /// file.
     fn lookup(
         self: *const RowIndex,
         other: Slab,
@@ -1105,10 +1110,10 @@ const Join = struct {
         const gpa = self.a.gpa;
         const fa = try gpa.alloc(Field, self.width);
         defer gpa.free(fa);
+        // The lookup's scratch, and on a hit it already holds the mate's fields:
+        // that is what the key columns were matched against.
         const fb = try gpa.alloc(Field, self.width);
         defer gpa.free(fb);
-        const probe = try gpa.alloc(Field, self.width);
-        defer gpa.free(probe);
         var s = Scratch{};
         var out = &self.parts[p];
 
@@ -1128,12 +1133,11 @@ const Join = struct {
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             const hash = self.ai.row_hash.items[@intCast(row)];
-            const mate = (try self.bi.lookup(self.a.slab, fa, hash, &s, probe)) orelse {
+            _ = (try self.bi.lookup(self.a.slab, fa, hash, &s, fb)) orelse {
                 out.removed += 1;
                 continue;
             };
             out.matched += 1;
-            self.bi.fieldsOf(mate, fb);
             var any = false;
             // Two loops rather than one with a flag inside it: `plain` cannot
             // change between columns or between rows, and this is the innermost
