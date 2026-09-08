@@ -210,6 +210,15 @@ Two million rows, interleaved, one sitting:
 removed work rather than spreading it, which is the only kind of saving that
 still helps when the cores run out.
 
+**At ten million rows on a four-core runner it is 3.65x** — 14.82s to 4.06s,
+CPU 57.3s to 14.5s. The gain grew with the size, which is the part worth
+understanding: past the point where the index stops fitting in cache, a parse
+that touches twenty fields instead of two is not only more instructions, it is
+memory it then has to fetch back. Two million rows underestimated it by a third.
+That run also put this port first on all three formats, and on CSV it now uses
+the least CPU of any build measured — 14.5s against the next one's 22.4 — so it
+is not winning on threading.
+
 ndjson gets 1.06x from the same change, and the reason is worth stating. A JSON
 object has to be walked to its closing brace whatever you want out of it, so
 reading only the keys saves the stores and not the scan. Stopping the walk once

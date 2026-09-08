@@ -19,13 +19,14 @@ is what makes a number from one directly comparable with a number from another.
 Ten million rows × 20 columns, keyed on `(account_id, txn_id)`, `--ignore
 updated_at`, a per-cell diff over seventeen columns. One GitHub Actions runner
 (4 vCPU / 16 GB), all builds interleaved in one sitting, five rounds each,
-2026-09-08. Each cell is **wall · CPU · memory above the mapped input**.
+2026-09-08. Each cell is **wall · CPU · memory above the mapped input**, for
+each port's fastest build.
 
 | Format | Input | C | C++ | Rust | Zig |
 |---|---:|---|---|---|---|
-| CSV | 3,509 MB | 14.82s · 57.3s · 716 MB | 10.09s · 32.1s · 893 MB | **8.56s** · 24.8s · 1,208 MB | 8.82s · 24.2s · 902 MB |
-| ndjson | 8,487 MB | 23.03s · 85.7s · 717 MB | 26.25s · 80.8s · 895 MB | **22.96s** · 70.4s · 1,208 MB | 23.39s · 70.9s · 916 MB |
-| Parquet | 2,074 MB | **1.67s** · 5.6s · 1,286 MB | 3.26s · 10.8s · 1,481 MB | 3.72s · 11.5s · 1,338 MB | 4.44s · 12.2s · 1,341 MB |
+| CSV | 3,509 MB | **4.06s** · 14.5s · 716 MB | 10.23s · 32.8s · 884 MB | 8.13s · 23.6s · 1,208 MB | 8.15s · 22.4s · 910 MB |
+| ndjson | 8,487 MB | **20.37s** · 74.8s · 716 MB | 26.12s · 80.7s · 884 MB | 22.85s · 70.7s · 1,208 MB | 22.14s · 67.5s · 929 MB |
+| Parquet | 2,074 MB | **1.55s** · 5.2s · 1,233 MB | 3.22s · 10.6s · 1,480 MB | 3.58s · 11.1s · 1,338 MB | 4.11s · 11.5s · 1,346 MB |
 
 All builds returned identical counts — matched 9,990,000, changed 599,320, added
 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B. That is the
@@ -34,25 +35,31 @@ mean a bug in one of them, so the run fails and names it.
 
 Three things this table says.
 
-**Parquet is a different problem.** 1.67s against 14.82s for the same rows in
-CSV, on three-fifths of the bytes, because with both dictionaries interned into one id
-space a cell comparison becomes `int32 != int32` rather than a string
+**Parquet is a different problem.** 1.55s against 4.06s for the same rows in
+CSV, on three-fifths of the bytes, because with both dictionaries interned into
+one id space a cell comparison becomes `int32 != int32` rather than a string
 comparison.
 
-**JSON costs what its bytes cost.** 2.4x the size of the CSV and 1.5x the time,
-every field carrying its name. It is worth having because it is the input people
-receive, not because it is fast.
+**JSON is the laggard now.** 2.4x the size of the CSV and **5x** the time. It
+used to be 1.5x; nothing about the JSON path got worse, CSV got out from under
+it. A JSON object must be walked to its closing brace whatever you want from
+it, which is the cost that stayed.
 
-**Wall time and CPU disagree, and CPU is the honest one.** On CSV the C port
-uses 3.87 cores against Rust's 2.90 and still loses, because it does 2.3x the
-work. Where a build wins on wall and loses on CPU, it is winning on threading.
+**Read the CPU column, not the wall column.** Wall time mixes work with how many
+cores a design manages to use; CPU seconds do not. C leads all three formats on
+both here — on CSV it uses 14.5 CPU-seconds where the next build uses 22.4 — but
+it was last-but-two on that row until [three hours
+earlier](BENCHMARKS.md#2026-09-08--ten-million-rows-seven-builds-three-formats),
+at 57.3, and it was the CPU column that said the problem was work rather than
+threading.
 
-> The CSV and ndjson columns for Rust and Zig come from
-> `claude/data-comparison-rust-zig-jam00m`, which carried those ports' newer
-> engines; the C, C++ and Parquet numbers come from this tree. The run built
-> both and gave each its own column rather than merging two branches to measure
-> them. Full tables, including both versions of every port, are in
-> [BENCHMARKS.md](BENCHMARKS.md).
+> Every Rust and Zig cell above, and the C++ cells on CSV and ndjson, come from
+> `claude/data-comparison-rust-zig-jam00m`, which carries those ports' newer
+> engines; the C cells and C++ on Parquet come from this tree. The run built
+> both trees and gave each its own column rather than merging two branches in
+> order to measure them — two builds compared across two sittings are not
+> compared at all. Full tables, with both versions of every port side by side,
+> are in [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -150,11 +157,13 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **The C CSV path is still second.** 2.66x faster than it was, and the
-   remaining gap to the fastest Rust build is the join, not the scan.
-2. **Stopping the ndjson walk once the keys are found.** Worth roughly the same
-   again on that format, but it needs the full and key-only parses to agree on
-   which value of a repeated JSON key wins.
+1. **ndjson, now that CSV has left it behind.** Stopping the object walk once
+   the keys are found is the obvious move, but it needs the full and key-only
+   parses to agree on which value of a repeated JSON key wins — the full parse
+   takes the last, an early exit takes the first, and a row whose key differs
+   between them is a row whose lookups miss.
+2. **Where the C CSV path stops scaling.** 14.5 CPU-seconds over 4.06s of wall
+   is 3.57 of four cores, and what is left sequential is the table insertion.
 3. **Reconciling the two Zig Parquet readers.** This tree and
    `claude/data-comparison-rust-zig-jam00m` each wrote one; `git merge` reports
    them as an add/add conflict.

@@ -71,7 +71,7 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Parallel join over key ranges** | the actual long pole: 20M from 54.60s (2 threads) to 33.32s (4), 2.53x cpu/wall |
 | **Sizing the hash table once** | thirteen rehashes at 10M, each a full pass of random probes, gone |
 | **Software prefetch at distance 24** | every insert is a cache miss on a table too big to hold, and the hash is already in hand |
-| **Reading only the key columns where only keys are read** | C's CSV path, 2.66x wall and 3.03x CPU at 2M |
+| **Reading only the key columns where only keys are read** | C's CSV path: 2.66x at two million rows, **3.65x at ten million** — the gain grows with the size, because past cache the parses removed were memory traffic and not only instructions |
 | **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries |
 
 ### Not worth it — measured, and recorded so it is not retried

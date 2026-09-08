@@ -34,6 +34,73 @@ a different question.
 
 ---
 
+## 2026-09-08 (later) — the same seven builds, after the C parse work
+
+Same workflow, same seven builds, same rows, one runner over.
+[Run 34282793806](https://github.com/andrey-usa/csvdiff/actions/runs/34282793806)
+at `c2d6aa4`, five interleaved rounds each. The alt ref was unchanged at
+`168ab59`, so its four columns are the same binaries as the run below and the
+5-8% they moved is this pair of runners disagreeing — which is the useful
+number to have when reading the one column that moved by 3.65x.
+
+### CSV — 3,509 MB
+
+| Build | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **4.06s** | 4.10s | 4.11s | **14.5s** | 4,225 MB | **716 MB** |
+| Rust (alt) | 8.13s | 8.20s | 8.24s | 23.6s | 4,717 MB | 1,208 MB |
+| Zig (alt) | 8.15s | 8.20s | 8.25s | 22.4s | 4,419 MB | 910 MB |
+| C++ (alt) | 10.23s | 10.26s | 10.36s | 32.8s | 4,393 MB | 884 MB |
+| C++ | 19.87s | 19.94s | 20.09s | 63.6s | 4,395 MB | 887 MB |
+| Zig | 20.12s | 20.17s | 20.31s | 34.7s | 4,235 MB | 726 MB |
+| Rust | 37.25s | 37.48s | 37.62s | 37.2s | 4,435 MB | 927 MB |
+
+### newline-delimited JSON — 8,487 MB
+
+| Build | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **20.37s** | 20.46s | 20.60s | 74.8s | 9,204 MB | **716 MB** |
+| Zig (alt) | 22.14s | 22.14s | 22.31s | **67.5s** | 9,417 MB | 929 MB |
+| Rust (alt) | 22.85s | 22.97s | 23.15s | 70.7s | 9,696 MB | 1,208 MB |
+| C++ (alt) | 26.12s | 26.14s | 26.40s | 80.7s | 9,371 MB | 884 MB |
+| C++ | 27.39s | 27.41s | 27.58s | 84.7s | 9,370 MB | 882 MB |
+
+`Rust` and `Zig` from this tree refused the pair again: they do not read ndjson.
+
+### uncompressed Parquet — 2,074 MB
+
+| Build | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **1.55s** | 1.66s | 1.68s | **5.2s** | 3,307 MB | **1,233 MB** |
+| C++ | 3.22s | 3.25s | 3.28s | 10.6s | 3,553 MB | 1,480 MB |
+| C++ (alt) | 3.25s | 3.28s | 3.32s | 10.7s | 3,554 MB | 1,480 MB |
+| Rust (alt) | 3.58s | 3.59s | 3.64s | 11.1s | 3,411 MB | 1,338 MB |
+| Rust | 3.96s | 3.98s | 4.02s | 11.5s | 3,411 MB | 1,337 MB |
+| Zig (alt) | 4.11s | 4.12s | 4.15s | 11.5s | 3,420 MB | 1,346 MB |
+| Zig | 6.86s | 6.91s | 6.96s | 11.5s | 3,385 MB | 1,312 MB |
+
+All seven agree, same counts as every run above.
+
+### What this run said
+
+**The C CSV path went 14.82s to 4.06s — 3.65x, where two million rows had
+predicted 2.66x.** CPU fell 57.3s to 14.5s. The gain grew with the size because
+the parses removed were not only instructions: at ten million rows the index no
+longer fits in cache, and a parse that touches twenty fields instead of two
+touches memory it then has to get back.
+
+**It is now first on all three formats,** and by the measure that is hardest to
+argue with: on CSV it uses 14.5 CPU-seconds where the next build uses 22.4, so
+it is not winning on threading. Three hours earlier it was last-but-two on CSV
+with 57.3.
+
+**JSON is now the laggard.** It is 2.42x the CSV's bytes and 5.0x its time,
+where before this change it was 1.55x. Nothing about the JSON path got worse —
+CSV got out from under it, and the object walk this change could not remove is
+what is left.
+
+---
+
 ## 2026-09-08 — ten million rows, seven builds, three formats
 
 GitHub Actions `ubuntu-latest`, 4 vCPU / 16 GB.
