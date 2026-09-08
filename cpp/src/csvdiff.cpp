@@ -1,4 +1,5 @@
 #include "csvdiff.hpp"
+#include "pqdiff.hpp"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1145,6 +1146,18 @@ std::vector<Val> row_values(const Slab& s, const RowIndex& idx, int row, std::si
 Result compare(const std::string& a_path, const std::string& b_path, const Options& opt) {
     const auto started = std::chrono::steady_clock::now();
     if (opt.key.empty()) throw Error("at least one key column is required");
+
+    // Parquet is not a text format and is not read as one: it goes to the
+    // columnar path in pqdiff.cpp, which never materialises a row. Both sides
+    // have to be Parquet -- comparing a column store against a byte stream
+    // would mean building rows out of one of them, and that is the cost the
+    // columnar path exists to avoid.
+    {
+        const bool ap = is_parquet(a_path), bp = is_parquet(b_path);
+        if (ap != bp)
+            throw Error("one file is parquet and the other is not; convert one of them first");
+        if (ap) return compare_parquet(a_path, b_path, opt);
+    }
 
     Slab a(a_path), b(b_path);
     // The two sides may be in different formats: comparing a CSV export against

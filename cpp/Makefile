@@ -2,13 +2,13 @@
 # ordinary C++ programmer would write and check against.
 CXX      ?= g++
 CXXFLAGS ?= -std=c++20 -O2 -march=native -Wall -Wextra -Wpedantic -Werror -pthread
-SRC       = src/csvdiff.cpp src/json.cpp src/main.cpp
+SRC       = src/csvdiff.cpp src/pqdiff.cpp src/parquet.cpp src/json.cpp src/main.cpp
 BIN       = build/csvdiff
 GEN       = build/gen-data
 
 all: $(BIN)
 
-$(BIN): $(SRC) src/csvdiff.hpp
+$(BIN): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
 
@@ -21,7 +21,16 @@ $(GEN): tools/gen_data.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ tools/gen_data.cpp
 
+# A verification tool for the Parquet reader: dumps a file's schema, or one
+# column's values as text, so what the reader decoded can be diffed against
+# what wrote the file.
+pq-dump: build/pq-dump
+
+build/pq-dump: tools/pq_dump.cpp src/parquet.cpp src/parquet.hpp
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -o $@ tools/pq_dump.cpp src/parquet.cpp
+
 clean:
 	rm -rf build
 
-.PHONY: all gen-data clean
+.PHONY: all gen-data pq-dump clean

@@ -6,10 +6,20 @@ the file is mapped, a field is an offset and a length packed into one word,
 delimiters are found eight bytes at a time with SWAR, and nothing becomes a
 `std::string` unless it reaches the report.
 
+It reads three formats on that one representation: CSV, newline-delimited JSON,
+and Parquet. CSV and JSON compare against each other, because both reduce a field
+to bytes in the mapping. Parquet compares against Parquet on a different path
+entirely — [columnar, and never reconstructing a
+row](../README.md#reading-parquet-natively) — which is 4.8x faster than the same
+data as CSV.
+
 ```bash
 make                     # g++ by default
 CXX=clang++ make         # or clang
 build/csvdiff compare a.csv b.csv -k id --json summary.json
+build/csvdiff compare a.parquet b.parquet -k account_id,txn_id --threads 4
+CSVDIFF_PHASES=1 build/csvdiff compare a.parquet b.parquet -k id   # where the time goes
+./test.sh                # against the Rust port, and Parquet against its own CSV
 ```
 
 ## What it is and is not
@@ -26,6 +36,10 @@ Two limitations, both stated rather than papered over:
   fold and unequal here, with nothing in the output to say why. A non-ASCII byte
   in a folded field is refused by name instead.
 - **No `--export-dir` and no `--profile`.** Neither affects the numbers.
+- **The Parquet reader implements what this job meets and refuses the rest by
+  name.** `BYTE_ARRAY` columns, PLAIN and dictionary encodings, uncompressed and
+  snappy, data page v1. Nested columns, other types, other codecs and page v2 are
+  errors that say which. Both sides of a comparison must be Parquet.
 
 ## The compiler is worth more than the language
 
@@ -49,6 +63,10 @@ including the ones in this repository's own README.
 | File | What it holds |
 |---|---|
 | `src/csvdiff.hpp` | the contract: options, counts, column stats, result |
-| `src/csvdiff.cpp` | SWAR scanning, the mapped slab, the parser, the index, the join |
+| `src/csvdiff.cpp` | SWAR scanning, the mapped slab, the CSV and JSON parsers, the index, the join |
+| `src/parquet.hpp` `src/parquet.cpp` | a Parquet reader shaped for comparing: Thrift footer, page decoder, RLE/bit-packed hybrid, snappy |
+| `src/pqdiff.hpp` `src/pqdiff.cpp` | the columnar comparison — key join first, then one column at a time, on shared dictionary ids |
 | `src/json.cpp` | the JSON half of the result contract, written by hand |
 | `src/main.cpp` | the command line; exit 0 identical, 1 differences, 2 error |
+| `tools/pq_dump.cpp` | `make pq-dump` — dumps a Parquet file's schema, or one column as text, to check the reader against whatever wrote the file |
+| `tools/gen_data.cpp` | `make gen-data` — the benchmark generator, same bytes as the other five |
