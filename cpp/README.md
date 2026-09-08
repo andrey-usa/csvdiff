@@ -19,6 +19,10 @@ CXX=clang++ make         # or clang
 build/csvdiff compare a.csv b.csv -k id --json summary.json
 build/csvdiff compare a.parquet b.parquet -k account_id,txn_id --threads 4
 CSVDIFF_PHASES=1 build/csvdiff compare a.parquet b.parquet -k id   # where the time goes
+
+make gen-data            # the benchmark generator: CSV, or Parquet directly
+build/gen-data --rows 10m --out-dir data --format parquet --compression snappy
+
 ./test.sh                # against the Rust port, and Parquet against its own CSV
 ```
 
@@ -69,4 +73,5 @@ including the ones in this repository's own README.
 | `src/json.cpp` | the JSON half of the result contract, written by hand |
 | `src/main.cpp` | the command line; exit 0 identical, 1 differences, 2 error |
 | `tools/pq_dump.cpp` | `make pq-dump` — dumps a Parquet file's schema, or one column as text, to check the reader against whatever wrote the file |
-| `tools/gen_data.cpp` | `make gen-data` — the benchmark generator, same bytes as the other five |
+| `tools/gen_data.cpp` | `make gen-data` — the benchmark generator: the same CSV bytes as the other five, or the same rows written straight to Parquet |
+| `tools/pq_write.hpp` `tools/pq_write.cpp` | the Parquet writer the generator uses — Thrift footer, dictionary and plain pages, RLE/bit-packing, snappy. Test scaffolding, not part of the engine |

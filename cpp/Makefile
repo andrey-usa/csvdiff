@@ -17,9 +17,9 @@ $(BIN): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 # the disk. See tools/gen_data.cpp.
 gen-data: $(GEN)
 
-$(GEN): tools/gen_data.cpp
+$(GEN): tools/gen_data.cpp tools/pq_write.cpp tools/pq_write.hpp
 	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -o $@ tools/gen_data.cpp
+	$(CXX) $(CXXFLAGS) -o $@ tools/gen_data.cpp tools/pq_write.cpp
 
 # A verification tool for the Parquet reader: dumps a file's schema, or one
 # column's values as text, so what the reader decoded can be diffed against

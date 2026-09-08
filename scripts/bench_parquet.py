@@ -23,11 +23,15 @@ the keys and that column. That is the same strategy this tool's Parquet path
 uses, so it is the fair thing to measure -- but it is a rewrite, not a flag, and
 it re-reads each file once per column.
 
-Parquet is written from the CSV pair with DuckDB, in both snappy and
-uncompressed form, and the conversion is timed too -- it is a real cost, and on
-a one-off comparison it is larger than everything it saves.
+Parquet comes from one of two places, and the difference is worth knowing. By
+default it is written from the CSV pair with DuckDB, which is a real cost and on
+a one-off comparison is larger than everything it saves. With --native it comes
+straight from cpp/build/gen-data, which writes the same rows column by column
+without a CSV in the middle -- about seven times quicker, and the way to make
+data for a future run.
 
     python scripts/bench_parquet.py --data bench/external/data --prefix 10m
+    python scripts/bench_parquet.py --native 10m --data /tmp/bench --polars
 
 Pass --keep to leave the Parquet files behind for a second run; by default they
 are deleted, because at ten million rows the two forms are another 3 GB.
@@ -163,6 +167,21 @@ def polars_row(a, b, label, cap_gb, convert_secs=None):
         f"added {c['added']:,} removed {c['removed']:,}", convert_secs)
 
 
+def generate(gen, rows, data, prefix, extra=()):
+    """Runs the native generator and returns what it cost.
+
+    Same binary, same recipe, same seed as the CSV beside it -- which is what
+    makes the CSV and Parquet rows of the table the same comparison rather than
+    two different ones.
+    """
+    started = time.monotonic()
+    cmd = [gen, "--rows", rows, "--out-dir", data, "--prefix", prefix, *extra]
+    done = subprocess.run(cmd, capture_output=True, text=True)
+    if done.returncode != 0:
+        raise RuntimeError((done.stderr or done.stdout).strip()[:200])
+    return time.monotonic() - started
+
+
 def convert(duck, a_csv, b_csv, codec, dest_a, dest_b):
     started = time.monotonic()
     for src, dest in ((a_csv, dest_a), (b_csv, dest_b)):
@@ -232,10 +251,20 @@ def main():
                     help="also run polars, column at a time (slow: ~2 minutes a row at 10M)")
     ap.add_argument("--cap-gb", type=float, default=14.0,
                     help="address-space cap for polars, so an out-of-memory is reportable")
+    ap.add_argument("--native", metavar="ROWS",
+                    help="generate the CSV and both Parquet forms with cpp/build/gen-data at "
+                         "this size, instead of converting existing CSV with DuckDB")
+    ap.add_argument("--gen", default="cpp/build/gen-data")
     args = ap.parse_args()
 
     a_csv = f"{args.data}/{args.prefix}_a.csv"
     b_csv = f"{args.data}/{args.prefix}_b.csv"
+    if args.native:
+        if not os.path.exists(args.gen):
+            sys.exit(f"missing {args.gen}; build it with: (cd cpp && make gen-data)")
+        os.makedirs(args.data, exist_ok=True)
+        print(f"generating {args.native} rows into {args.data} with {args.gen}\n")
+        generate(args.gen, args.native, args.data, args.prefix)
     for p in (a_csv, b_csv, args.binary):
         if not os.path.exists(p):
             sys.exit(f"missing {p}")
@@ -243,7 +272,7 @@ def main():
 
     print("Both files, the same comparison: first-occurrence-wins on the key, inner join,\n"
           "per-cell diff over 17 compared columns. Convert is what it cost to write the\n"
-          "Parquet from the CSV, and is charged once however many comparisons follow.\n"
+          "Parquet, and is charged once however many comparisons follow.\n"
           "polars is run one column at a time, because the way anyone would write it does\n"
           "not finish -- see the note at the top of this file.\n")
     print(f"{'engine and input':34} {'size':>9} {'convert':>8} {'compare':>10} "
@@ -263,8 +292,9 @@ def main():
     if have_polars:
         polars_row(a_csv, b_csv, "polars, CSV", args.cap_gb)
 
-    if not duck:
-        print("\n(no duckdb to write Parquet with; the Parquet rows are skipped)")
+    if not duck and not args.native:
+        print("\n(no duckdb to write Parquet with, and --native not asked for; "
+              "the Parquet rows are skipped)")
         return
 
     made = []
@@ -272,13 +302,20 @@ def main():
         a_pq = f"{args.data}/{args.prefix}_a.{ext}"
         b_pq = f"{args.data}/{args.prefix}_b.{ext}"
         try:
-            conv = convert(duck, a_csv, b_csv, codec, a_pq, b_pq)
+            if args.native:
+                conv = generate(args.gen, args.native, args.data, args.prefix,
+                                ("--format", "parquet", "--compression",
+                                 "snappy" if codec == "snappy" else "none"))
+            else:
+                conv = convert(duck, a_csv, b_csv, codec, a_pq, b_pq)
         except Exception as exc:
-            print(f"{'Parquet ' + codec:30} conversion failed: {exc}")
+            print(f"{'Parquet ' + codec:30} {'generation' if args.native else 'conversion'}"
+                  f" failed: {exc}")
             continue
         made += [a_pq, b_pq]
         ours(args.binary, a_pq, b_pq, f"ours (C++), Parquet {codec}", conv)
-        theirs(duck, a_pq, b_pq, f"DuckDB, Parquet {codec}", conv)
+        if duck:
+            theirs(duck, a_pq, b_pq, f"DuckDB, Parquet {codec}", conv)
         if have_polars:
             polars_row(a_pq, b_pq, f"polars, Parquet {codec}", args.cap_gb, conv)
 

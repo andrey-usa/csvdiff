@@ -62,6 +62,88 @@ r=$("$RUST" compare "$tmp/a.csv" "$tmp/b.csv" -k k --engine turbo -o /dev/null 2
 c=$(build/csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | head -1 | sed 's/ | turbo.*//') || true
 [ "$r" = "$c" ] && echo "  ok    key in the last bytes of the file" || { echo "  FAIL  key near end: rust=$r cpp=$c"; fail=1; }
 
+echo "parquet, written natively and read back:"
+# The generator writes Parquet from the same field-by-field recipe it writes CSV
+# from, so the two can be held against each other without a third tool in the
+# way -- and these checks run wherever the port builds, rather than only where
+# DuckDB happens to be installed.
+make gen-data >/dev/null
+tmpg=$(mktemp -d)
+gen() { build/gen-data --rows "$1" --out-dir "$tmpg" --prefix "$2" "${@:3}" >/dev/null; }
+gencheck() { # label, rows, prefix, then generator flags
+  local label=$1 rows=$2 prefix=$3; shift 3
+  gen "$rows" "$prefix"
+  gen "$rows" "$prefix" "$@"
+  local ext=.parquet
+  case " $* " in *" none "*) ext=.unc.parquet ;; esac
+  build/csvdiff compare "$tmpg/${prefix}_a.csv" "$tmpg/${prefix}_b.csv" \
+    -k account_id,txn_id -i updated_at --json "$tmpg/csv.json" >/dev/null 2>&1 || true
+  build/csvdiff compare "$tmpg/${prefix}_a$ext" "$tmpg/${prefix}_b$ext" \
+    -k account_id,txn_id -i updated_at --json "$tmpg/pq.json" >/dev/null 2>&1 || true
+  if python3 - "$tmpg/csv.json" "$tmpg/pq.json" <<'PYEOF'
+import json, sys
+def load(path):
+    d = json.load(open(path))
+    for gone in ("a", "b", "seconds"):
+        d["meta"].pop(gone, None)
+    return d
+sys.exit(0 if load(sys.argv[1]) == load(sys.argv[2]) else 1)
+PYEOF
+  then printf '  ok    %s\n' "$label"
+  else printf '  FAIL  %s: the parquet report differs from the csv one\n' "$label"; fail=1; fi
+  rm -f "$tmpg/${prefix}"_*
+}
+gencheck "snappy, one row group" 20k s1 --format parquet --compression snappy
+gencheck "uncompressed" 20k s2 --format parquet --compression none
+gencheck "many small row groups" 20k s3 --format parquet --compression snappy --row-group-size 512
+# A dictionary budget the data crosses partway makes a column that is dictionary
+# encoded in some row groups and plain in others -- the shape a real writer
+# produces on a high-cardinality string, and the one the reader has to fold into
+# a single form. With these numbers three of the twenty columns come out mixed.
+gencheck "a column the dictionary gives up on" 20k s4 \
+  --format parquet --compression none --dict-limit 175 --row-group-size 300
+gencheck "every column plain" 20k s5 --format parquet --compression snappy --dict-limit 1
+gencheck "rows that do not fill a group" 1k s6 --format parquet --compression none
+
+# Round-tripping the writer through the reader only proves they agree with each
+# other. Reading the file back with a tool that had no part in writing it is
+# what says it is Parquet rather than something that merely looks like it.
+DUCK=""
+for cand in ../bench/external/tools/duckdb "$(command -v duckdb || true)"; do
+  [ -n "$cand" ] && [ -x "$cand" ] && { DUCK=$cand; break; }
+done
+if [ -n "$DUCK" ]; then
+  gen 20k iop
+  gen 20k iop --format parquet --compression snappy
+  ours=$("$DUCK" -noheader -csv -c "
+    SELECT md5(string_agg(account_id||'|'||txn_id||'|'||coalesce(value_date,'')||'|'||
+                          currency||'|'||amount||'|'||note, ':'))
+    FROM read_parquet('$tmpg/iop_b.parquet');" 2>/dev/null)
+  csv=$("$DUCK" -noheader -csv -c "
+    SELECT md5(string_agg(account_id||'|'||txn_id||'|'||coalesce(value_date,'')||'|'||
+                          currency||'|'||amount||'|'||note, ':'))
+    FROM read_csv('$tmpg/iop_b.csv', all_varchar = true, header = true, sample_size = -1);" 2>/dev/null)
+  if [ -n "$ours" ] && [ "$ours" = "$csv" ]; then
+    echo "  ok    duckdb reads what we wrote, to the same digest as the csv"
+  else
+    echo "  FAIL  duckdb read our parquet differently from the csv"; fail=1
+  fi
+  # And the other way: our file against DuckDB's file of the same rows.
+  "$DUCK" -c "COPY (SELECT * FROM read_csv('$tmpg/iop_b.csv', all_varchar = true,
+              header = true, sample_size = -1)) TO '$tmpg/duck.parquet'
+              (FORMAT PARQUET, COMPRESSION snappy);" >/dev/null 2>&1
+  out=$(build/csvdiff compare "$tmpg/iop_b.parquet" "$tmpg/duck.parquet" \
+        -k account_id,txn_id 2>&1 | head -1 | sed "s/ | turbo.*//") || true
+  case "$out" in
+    *"(changed 0)"*"added 0 | removed 0"*)
+      echo "  ok    our parquet and duckdb's of the same rows are identical" ;;
+    *) echo "  FAIL  ours against duckdb's: $out"; fail=1 ;;
+  esac
+else
+  echo "  skip  no duckdb, so the interop checks did not run"
+fi
+rm -rf "$tmpg"
+
 echo "parquet, read natively and compared columnwise:"
 # The claim the columnar path has to earn is that it is the *same* comparison:
 # the same data, in a format that stores it as columns of dictionary indices

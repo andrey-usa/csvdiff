@@ -920,6 +920,33 @@ against 17-19s saved per comparison. It pays from the fifth comparison of the
 same file onward — which is the recurring-reconciliation case, but not the
 one-off one.
 
+But that is the cost of *converting*, and for benchmark data there is nothing to
+convert from. The generator writes Parquet column by column from the same recipe
+it writes CSV from, which makes the CSV in the middle unnecessary:
+
+| Making a 10M pair | Time | Needs |
+|---|---:|---|
+| CSV, natively | 20.9s | — |
+| …then DuckDB converts it to snappy Parquet | +67.9s | the 3.5 GB of CSV |
+| …then DuckDB converts it to uncompressed Parquet | +83.0s | the 3.5 GB of CSV |
+| **Parquet + snappy, natively** | **12.9s** | — |
+| **Parquet uncompressed, natively** | **15.2s** | — |
+
+`cpp/build/gen-data --rows 10m --format parquet --compression snappy`. **6.9x
+quicker than the route through DuckDB, and it never writes the CSV at all.** The
+files it makes are slightly smaller than DuckDB's (520 MB against 547 MB at
+snappy), DuckDB reads them to the same digest as the CSV, and comparing our file
+against DuckDB's file of the same ten million rows reports zero differences.
+
+It also gives the tests something they did not have: the Parquet checks in
+`cpp/test.sh` used to be skipped wherever DuckDB was not installed, because
+DuckDB was the only way to produce a Parquet file. Six of them now run anywhere
+the port builds, including the case where a column's dictionary gives up partway
+— `--dict-limit 175 --row-group-size 300` makes three of the twenty columns come
+out mixed. The two DuckDB checks that remain are the ones only a foreign writer
+can give: that DuckDB reads what we wrote, and that our file and DuckDB's file of
+the same rows compare as identical.
+
 #### What polars had to be rewritten into
 
 The polars rows come with an asterisk, and it is the most interesting result in
@@ -1043,6 +1070,11 @@ offsets refer to rather than into a scratch string that then gets appended, took
 the whole read phase from 2.24s to 0.68s.
 
 #### What it refuses
+
+There is a writer as well as a reader — `cpp/tools/pq_write.{hpp,cpp}`, used by
+the generator — but it is benchmark and test scaffolding, not part of the engine,
+and it writes only the envelope the reader accepts. Everything below is about the
+reader.
 
 The reader implements what this job meets and names the rest rather than guessing:
 `BYTE_ARRAY` columns, PLAIN and dictionary encodings, uncompressed and snappy,
@@ -1312,8 +1344,11 @@ cpp/build/csvdiff compare a.csv b.csv -k id --threads 4  # C++ thread scaling
 # one engine across every size, generating and deleting each pair in turn
 python scripts/bench_scale.py --sizes 10k,1m,10m,20m,50m --threads 4
 
-# the generator that keeps up with the disk
+# the generator that keeps up with the disk -- as CSV, or straight to Parquet
 (cd cpp && make gen-data) && cpp/build/gen-data --rows 10m --out-dir data --prefix 10m
+cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression snappy
+cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression none \
+  --dict-limit 175 --row-group-size 300   # forces mixed-encoding columns
 
 # the smallest memory limit a comparison finishes in
 scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
@@ -1323,6 +1358,9 @@ python scripts/bench_formats.py
 
 # ours against DuckDB and polars, on CSV and on Parquet, in one sitting
 python scripts/bench_parquet.py --data bench/external/data --prefix 10m --polars
+
+# the same, generating everything natively first -- no DuckDB, no CSV in the middle
+python scripts/bench_parquet.py --native 10m --data /tmp/bench --prefix 10m
 
 # our own reader on any of the three formats
 cpp/build/csvdiff compare a.ndjson b.ndjson -k id --threads 4
