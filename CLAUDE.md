@@ -1,36 +1,44 @@
 # csvdiff
 
-Composite-key CSV comparison producing a single self-contained HTML report.
-Key columns, compared columns and normalisation are runtime parameters — nothing about
-a specific dataset belongs in the code.
+Composite-key table comparison — CSV, newline-delimited JSON and Parquet — as byte-level ports in
+C, C++, Rust, Zig and Go, held to one result contract. Key columns, compared columns and
+normalisation are runtime parameters; nothing about a specific dataset belongs in the code.
+
+The DuckDB-backed Python implementation, and the Java, TypeScript and dataframe engines beside it,
+are no longer in the project. Their results are in README.md's archive section.
 
 ## Commands
 
 ```bash
-pip install -r requirements-dev.txt && pip install -e .
-pytest                                        # full suite, ~30s
-python scripts/gen_data.py --rows 10k --out-dir data
-python scripts/bench.py --rows 10k --engine duckdb
-csvdiff compare data/10k_a.csv data/10k_b.csv -k account_id,txn_id -i updated_at --open
-csvdiff serve                                 # drop page on :8765
-gh workflow run Benchmark -f scales=10k       # CI
+(cd c && make)                                # csvdiff and gen-data; the leading port
+(cd c && bash test.sh)                        # its own checks, a few seconds
+(cd c && bash test.sh --with-ports)           # plus cross-port and generator parity
+(cd cpp && make && make gen-data && bash test.sh)
+
+c/gen-data --rows 10k --out-dir data --prefix p              # CSV
+c/gen-data --rows 10k --out-dir data --prefix p --format json
+c/gen-data --rows 10k --out-dir data --prefix p --format parquet
+
+c/csvdiff compare data/p_a.csv data/p_b.csv -k account_id,txn_id -i updated_at
+python scripts/bench_ports.py data/p_a.csv data/p_b.csv --repeats 5
+gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 ```
 
 ## Layout
 
 | Path | Role |
 |---|---|
-| `csvdiff/engine.py` | comparison, on DuckDB. Result contract is documented at the top of the file |
-| `csvdiff/report.py` | HTML renderer — one template string, no build step |
-| `csvdiff/cli.py` | `compare` / `serve` / `mail` |
-| `csvdiff/server.py`, `mailbot.py` | drop page and mailbox launchers |
-| `csvdiff/config.py` | profiles from `csvdiff.toml` |
-| `scripts/gen_data.py`, `scripts/bench.py` | test payloads and benchmark harness |
+| `c/` | the leading port on every format measured. `csvdiff.c` (CSV and ndjson), `parquet.c` + `pqdiff.c` (the columnar path), `parallel.c`, `gen-data.c` + `pqwrite.c` (its own generator) |
+| `cpp/` | the C++ port, and the generator that also writes Snappy |
+| `rust/`, `zig/`, `go/` | the other byte-level ports, same result contract |
+| `scripts/bench_ports.py` | every port on one pair, interleaved, with a counts gate |
+| `scripts/gen_data.py` | the original Python generator, kept as the reference recipe |
 
 ## Invariants
 
-- **Both engines must return identical `counts` and `columns`.** CI asserts this on 200k rows.
-  Any change to one engine needs the matching change in the other.
+- **Every port must return identical `counts` and `columns`.** `parity.yml` asserts this on 200k
+  rows, for every format each port reads. A change to one port needs the matching change in the
+  others, or a reason it does not apply.
 - **The result contract is the API.** `engine.compare()` returns the dict documented in
   `engine.py`; `report.py`, the CLI, the server and the mailbot all consume only that. Add a
   field rather than reshaping an existing one.
@@ -44,8 +52,10 @@ gh workflow run Benchmark -f scales=10k       # CI
   says when a list is truncated. `--export-dir` writes the uncapped CSVs.
 - **SQL is built by string interpolation.** Column and table names go through `_q()`, string
   values and paths through `_lit()`. Never interpolate with `!r` — Python repr is not SQL.
-- **The generator's drift recipe is asserted in tests.** Changing rates in `scripts/gen_data.py`
-  means updating `tests/test_gen_data.py` deliberately, not to make it pass.
+- **The generators must emit byte-identical files.** `c/test.sh --with-ports` holds `c/gen-data`
+  against `cpp/build/gen-data` across every format and option. Changing the drift recipe means
+  changing it in both, deliberately — a benchmark number from one generator is only comparable with
+  a number from another if the bytes agree.
 
 ## Style
 
@@ -57,7 +67,7 @@ gh workflow run Benchmark -f scales=10k       # CI
 
 ## Gotchas
 
-- `resource.ru_maxrss` is KB on Linux, bytes on macOS — `scripts/bench.py` handles both.
+- `resource.ru_maxrss` is KB on Linux, bytes on macOS — the harnesses in `scripts/` handle both.
 - Duplicate keys: the first occurrence of each key joins, the rest are reported separately.
   Changing that changes the matched/added/removed counts, so it is a behaviour change, not a fix.
 - The report decodes its gzip payload with `DecompressionStream`, which needs a 2023+ browser.

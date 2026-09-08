@@ -12,7 +12,7 @@ base64s it into a `<script type="application/gzip">` block, and the page decodes
 
 ## Before editing
 
-Read the result contract at the top of `csvdiff/engine.py`. The report renders that dict and
+Read the result contract at the top of `rust/src/contract.rs`. The report renders that shape and
 nothing else. If the report needs data it does not have, add a field to the contract in **both**
 engines and assert it in `tests/test_engine.py` — never compute it in JavaScript from partial data.
 
@@ -51,7 +51,7 @@ Then check the generated `bench/10k-*.html`:
 ```bash
 python - <<'PY'
 import re, subprocess
-js = re.findall(r"<script>(.*?)</script>", open("bench/10k-duckdb.html").read(), re.S)[0]
+js = re.findall(r"<script>(.*?)</script>", open("bench/10k.html").read(), re.S)[0]
 open("/tmp/report.js", "w").write(js)
 print(subprocess.run(["node", "--check", "/tmp/report.js"], capture_output=True, text=True))
 PY

@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
-*.egg-info/
 /build/
 /dist/
 # Generated data and benchmark output, anchored per implementation. Unanchored,
@@ -9,12 +8,6 @@ __pycache__/
 /data/
 /bench/
 /out/
-/ts/data/
-/ts/bench/
-/ts/out/
-/java/data/
-/java/bench/
-/java/out/
 /go/data/
 /go/bench/
 /go/out/
