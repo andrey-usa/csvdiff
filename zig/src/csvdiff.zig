@@ -52,6 +52,54 @@ const CHUNKING_THRESHOLD: usize = 4 << 20;
 /// How many keys make the join worth splitting.
 const JOIN_THRESHOLD: usize = 1 << 14;
 
+/// Phase timings, on stderr, when `CSVDIFF_PHASES` is set — the same switch and
+/// the same output shape the other two ports use.
+///
+/// A comparison has costs that move independently: sweeping and hashing every
+/// row, inserting them into the index, and joining. Knowing which one grew is
+/// the difference between tuning and guessing, and the cores-busy column says
+/// only *that* something is serial, never which thing.
+/// Set once from `CSVDIFF_PHASES` before the comparison starts; read by every
+/// thread and written by none of them. `main.zig` owns the environment, so it
+/// does the reading.
+pub var phases_on: bool = false;
+
+const Phases = struct {
+    on: bool,
+    tag: []const u8,
+    last: i128,
+
+    /// `tag` prefixes every line, because the two files are read on two threads
+    /// and their phases would otherwise interleave unattributed.
+    /// The monotonic clock straight from the kernel: std's timing now wants an
+    /// `Io`, and threading one through the engine for a diagnostic that is off by
+    /// default would be a worse trade than this one call.
+    fn now() i128 {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+
+    fn start(tag: []const u8) Phases {
+        return .{
+            .on = phases_on,
+            .tag = tag,
+            .last = now(),
+        };
+    }
+
+    fn mark(self: *Phases, what: []const u8) void {
+        const at = now();
+        if (self.on) {
+            const seconds = @as(f64, @floatFromInt(at - self.last)) / 1e9;
+            var buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "{s}{s}", .{ self.tag, what }) catch what;
+            std.debug.print("  {s: <26} {d: >7.3}s\n", .{ name, seconds });
+        }
+        self.last = at;
+    }
+};
+
 /// How many rows ahead a table probe is started. Enough misses in flight to
 /// cover the latency of one, and not so many that the lines are evicted before
 /// the loop reaches them.
@@ -577,8 +625,11 @@ const RowIndex = struct {
         key_size: usize,
         opt: Options,
         threads: usize,
+        tag: []const u8,
     ) !RowIndex {
+        var phases = Phases.start(tag);
         const chunks = try sweep(gpa, side, key_size, opt, threads);
+        phases.mark("sweep (parallel)");
         defer {
             for (chunks) |*c| c.deinit(gpa);
             gpa.free(chunks);
@@ -639,6 +690,7 @@ const RowIndex = struct {
             chunk.deinit(gpa);
             chunk.* = .{};
         }
+        phases.mark("index insert (serial)");
         return self;
     }
 
@@ -1164,6 +1216,7 @@ const Prepare = struct {
     key_size: usize,
     opt: Options,
     threads: usize,
+    tag: []const u8,
     side: ?Side = null,
     index: ?RowIndex = null,
     failure: ?anyerror = null,
@@ -1182,6 +1235,7 @@ const Prepare = struct {
             self.key_size,
             self.opt,
             self.threads,
+            self.tag,
         );
     }
 
@@ -1255,6 +1309,7 @@ pub fn compare(
         .key_size = key_size,
         .opt = opt,
         .threads = per_file,
+        .tag = "A ",
     };
     var prepare_b = Prepare{
         .gpa = gpa,
@@ -1263,6 +1318,7 @@ pub fn compare(
         .key_size = key_size,
         .opt = opt,
         .threads = per_file,
+        .tag = "B ",
     };
     const reader: ?std.Thread = std.Thread.spawn(.{}, Prepare.run, .{&prepare_b}) catch null;
     if (reader == null) prepare_b.run();
@@ -1322,7 +1378,9 @@ pub fn compare(
         .a_ways = a_ways,
         .next = std.atomic.Value(usize).init(0),
     };
+    var phases = Phases.start("");
     try runOnThreads(&join, Join.run, total);
+    phases.mark("join chunks (par)");
     for (parts) |part| {
         if (part.failure) |e| return e;
     }

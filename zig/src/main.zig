@@ -53,6 +53,9 @@ pub fn main(init: std.process.Init) !u8 {
     // the runtime already cleans up rather than being freed by hand.
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+    // The other two ports take this from the environment too, and print the same
+    // shape of phase breakdown on stderr.
+    csvdiff.phases_on = init.minimal.environ.getPosix("CSVDIFF_PHASES") != null;
 
     const io = init.io;
     var stdout_buf: [4096]u8 = undefined;
