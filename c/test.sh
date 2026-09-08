@@ -9,6 +9,8 @@ set -e
 cd "$(dirname "$0")"
 make >/dev/null
 RUST=../rust/target/release/csvdiff
+GEN=../cpp/build/gen-data
+CPP=../cpp/build/csvdiff
 [ -x "$RUST" ] || { echo "build the Rust port first: (cd ../rust && cargo build --release)"; exit 2; }
 
 fail=0
@@ -127,6 +129,89 @@ c=$(./csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | summary) || true
 
 
 
+# --- newline-delimited JSON -------------------------------------------------
+#
+# The same rows in both shapes have to give the same answer, which is the whole
+# claim: a JSON reader that disagreed with the CSV one would be a second engine,
+# not a second parser.
+echo "newline-delimited json:"
+if [ -x "$GEN" ]; then
+  js_dir=$(mktemp -d)
+  "$GEN" --rows 20k --out-dir "$js_dir" --prefix j >/dev/null 2>&1
+  "$GEN" --rows 20k --out-dir "$js_dir" --prefix j --format json >/dev/null 2>&1
+  ./csvdiff compare "$js_dir/j_a.csv" "$js_dir/j_b.csv" -k account_id,txn_id -i updated_at \
+      --json "$js_dir/csv.json" >/dev/null 2>&1 || true
+  ./csvdiff compare "$js_dir/j_a.ndjson" "$js_dir/j_b.ndjson" -k account_id,txn_id -i updated_at \
+      --json "$js_dir/js.json" >/dev/null 2>&1 || true
+  if agree "$js_dir/csv.json" "$js_dir/js.json"; then
+    echo "  ok    ndjson finds what the same rows as csv find"
+  else
+    echo "  FAIL  ndjson disagrees with csv on the same rows"; fail=1
+  fi
+  # Against C++ rather than Rust here: on main the C++ port is the only other one
+  # that reads ndjson at all, and a check against a port that refuses the file
+  # would be a check that always passes.
+  if [ -x "$CPP" ]; then
+    "$CPP" compare "$js_dir/j_a.ndjson" "$js_dir/j_b.ndjson" -k account_id,txn_id \
+        -i updated_at --json "$js_dir/cpp.json" >/dev/null 2>&1 || true
+    if agree "$js_dir/js.json" "$js_dir/cpp.json"; then
+      echo "  ok    and what the c++ port finds on the same ndjson"
+    else
+      echo "  FAIL  ndjson disagrees with the c++ port"; fail=1
+    fi
+  else
+    echo "  skip  the c++ port is not built, so ndjson was not cross-checked"; fail=1
+  fi
+  rm -rf "$js_dir"
+else
+  echo "  skip  ndjson against csv needs $GEN"; fail=1
+fi
+
+# A JSON writer may escape a character or write it literally, and the two spell
+# the same value -- so they have to compare equal. This is the one place the two
+# dialects genuinely differ: CSV doubles a quote, JSON puts a backslash in front,
+# and \uXXXX has to become UTF-8 before anything is compared.
+esc_dir=$(mktemp -d)
+python3 - "$esc_dir" <<'PY'
+import json, sys
+out = sys.argv[1]
+BS = chr(92)                      # kept out of the literals below
+pairs = [
+    ("k1", BS + "u00e9" + BS + "u00e8", "éè"),   # two-byte utf-8
+    ("k2", BS + "ud83d" + BS + "ude00", "\U0001F600"),      # a surrogate pair is one code point
+    ("k3", "a" + BS + "/b",             "a/b"),             # the optional solidus escape
+    ("k4", "tab" + BS + "there",        "tab\there"),
+    ("k5", BS + "u0041BC",              "ABC"),             # ascii written as an escape
+    ("k6", "quote" + BS + '"in',        'quote"in'),
+    ("k7", "back" + BS + BS + "slash",  "back" + BS + "slash"),
+    ("k8", BS + "u4e2d" + BS + "u6587", "中文"),    # three-byte utf-8
+    ("k9", "line" + BS + "nbreak",      "line\nbreak"),
+]
+with open(f"{out}/a.ndjson", "w") as fa, open(f"{out}/b.ndjson", "w") as fb:
+    for k, escaped, literal in pairs:
+        fa.write('{"k":"%s","v":"%s"}\n' % (k, escaped))
+        fb.write(json.dumps({"k": k, "v": literal}, ensure_ascii=False) + "\n")
+# And a control: one value that really does differ, so the check above is known
+# to be capable of failing.
+open(f"{out}/c.ndjson", "w").write(
+    open(f"{out}/b.ndjson").read().replace('"éè"', '"éé"'))
+PY
+# `set -e` is on and a compare exits 1 when it finds differences, so the status
+# has to be caught rather than left to reach the shell -- which would end the
+# run here and call the negative control below a crash.
+code=0; ./csvdiff compare "$esc_dir/a.ndjson" "$esc_dir/b.ndjson" -k k >/dev/null 2>&1 || code=$?
+if [ "$code" -eq 0 ]; then
+  echo "  ok    an escaped value equals the same value written literally"
+else
+  echo "  FAIL  escaped and literal spellings of one value compare different"; fail=1
+fi
+code=0; ./csvdiff compare "$esc_dir/a.ndjson" "$esc_dir/c.ndjson" -k k >/dev/null 2>&1 || code=$?
+if [ "$code" -eq 1 ]; then
+  echo "  ok    and a value that really differs is still found"
+else
+  echo "  FAIL  the escape check cannot fail, so it proves nothing"; fail=1
+fi
+rm -rf "$esc_dir"
 # --- the Parquet path -------------------------------------------------------
 #
 # The claim the columnar path has to earn is that it is the *same* comparison:
@@ -138,7 +223,6 @@ c=$(./csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | summary) || true
 # The fixtures come from cpp/build/gen-data, which writes CSV and Parquet from
 # one field-by-field recipe. Where it is not built these skip by name rather
 # than silently passing: (cd ../cpp && make gen-data).
-GEN=../cpp/build/gen-data
 pq_dir=$(mktemp -d); trap 'rm -rf "$tmp" "$pq_dir"' EXIT
 
 same_report() { # label, key, then the generator flags for the parquet side

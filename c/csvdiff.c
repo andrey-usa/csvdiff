@@ -123,10 +123,21 @@ static size_t skip_quoted(const char *d, size_t from, size_t end) {
 /* The mapped file, and reading a field's logical bytes                         */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Which of the two text shapes a file is.
+ *
+ * It decides two things that cannot be decided separately: how a row is found,
+ * and how a value's bytes are read back. CSV doubles a quote to escape it; JSON
+ * puts a backslash in front. A field is stored as an offset and a length either
+ * way, so the dialect has to travel with the file rather than with the field.
+ */
+typedef enum { DIALECT_CSV = 0, DIALECT_JSON = 1 } Dialect;
+
 typedef struct {
     const char *data;
     size_t size;
     int fd;
+    Dialect dialect;
 } Slab;
 
 static bool slab_open(Slab *s, const char *path) {
@@ -150,6 +161,178 @@ static void slab_close(Slab *s) {
     if (s->fd >= 0) close(s->fd);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Newline-delimited JSON                                                      */
+/*                                                                             */
+/* One object per line. A value's bytes are contiguous in the file, so a JSON   */
+/* field stays an offset and a length into the mapping exactly as a CSV field   */
+/* does -- nothing here builds a string per cell either.                        */
+/* ------------------------------------------------------------------------- */
+
+static bool json_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
+/* Past the closing quote of the string starting at `at`. Sets *escaped when it
+ * holds a backslash, which is what says the value has to be decoded. */
+static size_t skip_json_string(const char *d, size_t at, size_t end, bool *escaped) {
+    at++;                                        /* the opening quote */
+    for (;;) {
+        size_t stop = next_of2(d, at, end, '"', '\\');
+        if (stop >= end) return end;
+        if (d[stop] == '"') return stop + 1;
+        *escaped = true;
+        at = stop + 2;                           /* the backslash and what it escapes */
+        if (at > end) return end;
+    }
+}
+
+/* Past a nested object or array. Not a cell value; skipped, not guessed at. */
+static size_t skip_json_nested(const char *d, size_t pos, size_t end) {
+    int depth = 0;
+    while (pos < end) {
+        char c = d[pos];
+        if (c == '"') {
+            bool ignored = false;
+            size_t next = skip_json_string(d, pos, end, &ignored);
+            if (next <= pos) return end;
+            pos = next;
+            continue;
+        }
+        if (c == '{' || c == '[') depth++;
+        if (c == '}' || c == ']') {
+            depth--;
+            pos++;
+            if (depth <= 0) return pos;
+            continue;
+        }
+        pos++;
+    }
+    return end;
+}
+
+/* Past the end of this object's line. Records are newline-delimited, so a
+ * newline outside a string ends the row. */
+static size_t end_of_json_row(const char *d, size_t pos, size_t end) {
+    while (pos < end) {
+        size_t stop = next_of2(d, pos, end, '\n', '"');
+        if (stop >= end) return end;
+        if (d[stop] == '\n') return stop + 1;
+        bool ignored = false;
+        size_t next = skip_json_string(d, stop, end, &ignored);
+        if (next <= stop) return end;
+        pos = next;
+    }
+    return end;
+}
+
+static size_t utf8_put(unsigned cp, char *buf, size_t cap, size_t at) {
+    unsigned char tmp[4];
+    size_t n;
+    if (cp < 0x80) { tmp[0] = (unsigned char)cp; n = 1; }
+    else if (cp < 0x800) {
+        tmp[0] = (unsigned char)(0xC0 | (cp >> 6));
+        tmp[1] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 2;
+    } else if (cp < 0x10000) {
+        tmp[0] = (unsigned char)(0xE0 | (cp >> 12));
+        tmp[1] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[2] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 3;
+    } else {
+        tmp[0] = (unsigned char)(0xF0 | (cp >> 18));
+        tmp[1] = (unsigned char)(0x80 | ((cp >> 12) & 0x3F));
+        tmp[2] = (unsigned char)(0x80 | ((cp >> 6) & 0x3F));
+        tmp[3] = (unsigned char)(0x80 | (cp & 0x3F));
+        n = 4;
+    }
+    for (size_t i = 0; i < n; i++)
+        if (buf && at + i < cap) buf[at + i] = (char)tmp[i];
+    return n;
+}
+
+static int hex_digit(char h) {
+    if (h >= '0' && h <= '9') return h - '0';
+    if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+    if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+    return -1;
+}
+
+/*
+ * Decodes a JSON string body, returning the decoded length and writing the
+ * first `cap` bytes of it when `buf` is given. One function rather than a
+ * length pass and a copy pass, so the two can never disagree about what a value
+ * is.
+ *
+ * `\uXXXX` becomes UTF-8 so that a value written escaped and the same value
+ * written literally compare equal -- which they must, because a JSON writer is
+ * free to escape either way.
+ */
+static size_t json_unescape(const char *p, size_t len, char *buf, size_t cap) {
+    size_t out = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (p[i] != '\\' || i + 1 >= len) {
+            if (buf && out < cap) buf[out] = p[i];
+            out++;
+            continue;
+        }
+        char e = p[++i];
+        char plain = 0;
+        switch (e) {
+            case 'n': plain = '\n'; break;
+            case 't': plain = '\t'; break;
+            case 'r': plain = '\r'; break;
+            case 'b': plain = '\b'; break;
+            case 'f': plain = '\f'; break;
+            case '"': plain = '"'; break;
+            case '\\': plain = '\\'; break;
+            case '/': plain = '/'; break;
+            default: break;
+        }
+        if (plain) {
+            if (buf && out < cap) buf[out] = plain;
+            out++;
+            continue;
+        }
+        if (e != 'u' || i + 4 >= len) {          /* not an escape we know: as written */
+            if (buf && out < cap) buf[out] = '\\';
+            out++;
+            if (buf && out < cap) buf[out] = e;
+            out++;
+            continue;
+        }
+        unsigned cp = 0;
+        bool ok = true;
+        for (int k = 1; k <= 4 && ok; k++) {
+            int dg = hex_digit(p[i + (size_t)k]);
+            if (dg < 0) ok = false;
+            else cp = cp * 16 + (unsigned)dg;
+        }
+        if (!ok) {                               /* not four hex digits: as written */
+            if (buf && out < cap) buf[out] = '\\';
+            out++;
+            if (buf && out < cap) buf[out] = e;
+            out++;
+            continue;
+        }
+        i += 4;
+        /* A surrogate pair is one code point written as two escapes. */
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < len && p[i + 1] == '\\' && p[i + 2] == 'u') {
+            unsigned lo = 0;
+            bool ok2 = true;
+            for (int k = 3; k <= 6 && ok2; k++) {
+                int dg = hex_digit(p[i + (size_t)k]);
+                if (dg < 0) ok2 = false;
+                else lo = lo * 16 + (unsigned)dg;
+            }
+            if (ok2 && lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                i += 6;
+            }
+        }
+        out += utf8_put(cp, buf, cap, out);
+    }
+    return out;
+}
+
 /*
  * A field's logical length: the raw span with the second quote of each doubled
  * pair dropped. Equality, hashing and printing all read a field through the same
@@ -160,6 +343,7 @@ static size_t logical_len(const Slab *s, Field f) {
     size_t len = field_len(f);
     if (!field_escaped(f)) return len;
     const char *p = s->data + field_off(f);
+    if (s->dialect == DIALECT_JSON) return json_unescape(p, len, NULL, 0);
     size_t n = 0;
     for (size_t i = 0; i < len; i++) {
         n++;
@@ -177,6 +361,10 @@ static size_t logical_copy(const Slab *s, Field f, char *buf, size_t cap) {
         size_t n = len < cap ? len : cap;
         memcpy(buf, p, n);
         return n;
+    }
+    if (s->dialect == DIALECT_JSON) {
+        size_t n = json_unescape(p, len, buf, cap);
+        return n < cap ? n : cap;
     }
     size_t n = 0;
     for (size_t i = 0; i < len && n < cap; i++) {
@@ -196,7 +384,8 @@ static bool same_bytes(const Slab *a, Field x, const Slab *b, Field y) {
         return lx == ly && memcmp(a->data + field_off(x), b->data + field_off(y), lx) == 0;
     }
     if (logical_len(a, x) != logical_len(b, y)) return false;
-    /* Rare: only a field holding a doubled quote reaches here. */
+    /* Rare: only an escaped field reaches here -- a doubled quote in CSV, a
+     * backslash in JSON. */
     size_t n = logical_len(a, x);
     char sx[4096], sy[4096];
     if (n > sizeof sx) return false; /* refused upstream by the length cap */
@@ -220,6 +409,14 @@ static uint64_t hash_field(const Slab *s, Field f, uint64_t seed) {
     uint64_t n = 0;
     if (!field_escaped(f)) {
         for (size_t i = 0; i < len; i++) { h = (h ^ (unsigned char)p[i]) * PRIME; n++; }
+    } else if (s->dialect == DIALECT_JSON) {
+        /* Hashed over the decoded bytes, because that is what equality compares.
+         * The buffer is the same one same_bytes uses, and a longer value is
+         * refused upstream by the length cap. */
+        char tmp[4096];
+        size_t m = json_unescape(p, len, tmp, sizeof tmp);
+        if (m > sizeof tmp) m = sizeof tmp;
+        for (size_t i = 0; i < m; i++) { h = (h ^ (unsigned char)tmp[i]) * PRIME; n++; }
     } else {
         for (size_t i = 0; i < len; i++) {
             h = (h ^ (unsigned char)p[i]) * PRIME;
@@ -236,10 +433,57 @@ static uint64_t hash_field(const Slab *s, Field f, uint64_t seed) {
 
 typedef struct {
     char delimiter;
-    int *source;   /* where each projected column sits in the file, or -1 */
+    int *source;   /* CSV: where each projected column sits in the file, or -1 */
     size_t width;
     int last_needed;
+    Dialect dialect;
+    /*
+     * JSON addresses a value by key where CSV addresses it by column number, so
+     * the wanted names live here. `want[i]` is the key whose value belongs in
+     * slot i, or NULL for a column this file does not have. `slot` is a small
+     * open-addressed table from name to slot, so a key in the file costs one
+     * hash rather than a walk of twenty names -- which at twenty columns would
+     * be four hundred comparisons a row.
+     */
+    char **want;
+    int32_t *slot;
+    size_t slot_mask;
 } RowParser;
+
+static uint64_t name_hash(const char *p, size_t n) {
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)p[i]) * UINT64_C(0x100000001b3);
+    return h;
+}
+
+/* Builds the name-to-slot table. `want` is borrowed, not owned. */
+static bool parser_index_names(RowParser *p, char **want, size_t width) {
+    p->want = want;
+    size_t n = 16;
+    while (n < width * 4) n <<= 1;
+    p->slot = malloc(n * sizeof *p->slot);
+    if (!p->slot) return false;
+    for (size_t i = 0; i < n; i++) p->slot[i] = -1;
+    p->slot_mask = n - 1;
+    for (size_t i = 0; i < width; i++) {
+        if (!want[i]) continue;
+        size_t at = name_hash(want[i], strlen(want[i])) & p->slot_mask;
+        while (p->slot[at] >= 0) at = (at + 1) & p->slot_mask;
+        p->slot[at] = (int32_t)i;
+    }
+    return true;
+}
+
+static int parser_slot_for(const RowParser *p, const char *key, size_t len) {
+    size_t at = name_hash(key, len) & p->slot_mask;
+    for (;;) {
+        int32_t i = p->slot[at];
+        if (i < 0) return -1;
+        const char *w = p->want[i];
+        if (w && strlen(w) == len && memcmp(w, key, len) == 0) return (int)i;
+        at = (at + 1) & p->slot_mask;
+    }
+}
 
 static size_t end_of_row(const char *d, size_t pos, size_t end) {
     size_t at = pos;
@@ -257,7 +501,67 @@ static size_t end_of_row(const char *d, size_t pos, size_t end) {
  * needed column has been read the rest of the row is skipped to its newline: on
  * twenty columns keyed on the first two, most of a row is never delimited.
  */
+/*
+ * Walks one JSON object, keeping the values of the keys wanted. One pass over
+ * the object, one hash per key it holds -- not a search per wanted column.
+ */
+static size_t parse_json_row(const RowParser *p, const char *d, size_t start, size_t end,
+                             Field *out) {
+    for (size_t i = 0; i < p->width; i++) out[i] = ABSENT;
+    size_t pos = start;
+    while (pos < end && json_space(d[pos])) pos++;
+    if (pos >= end) return end;
+    if (d[pos] != '{') return end_of_json_row(d, pos, end);   /* not an object: skip the line */
+    pos++;
+
+    for (;;) {
+        while (pos < end && json_space(d[pos])) pos++;
+        if (pos >= end) break;
+        if (d[pos] == '}') { pos++; break; }
+        if (d[pos] == ',') { pos++; continue; }
+        if (d[pos] != '"') break;                             /* malformed: stop this object */
+
+        bool key_escaped = false;
+        size_t key_from = pos + 1;
+        size_t key_end = skip_json_string(d, pos, end, &key_escaped);
+        if (key_end > end || key_end < 2 || key_end - 1 < key_from) break;
+        size_t key_len = key_end - 1 - key_from;
+        pos = key_end;
+        while (pos < end && json_space(d[pos])) pos++;
+        if (pos >= end || d[pos] != ':') break;
+        pos++;
+        while (pos < end && json_space(d[pos])) pos++;
+        if (pos >= end) break;
+
+        size_t from, to;
+        bool escaped = false, absent = false;
+        if (d[pos] == '"') {
+            from = pos + 1;
+            size_t close = skip_json_string(d, pos, end, &escaped);
+            to = close > pos + 1 ? close - 1 : pos + 1;
+            pos = close;
+        } else if (d[pos] == '{' || d[pos] == '[') {
+            /* Nested: not a cell value, and left absent rather than guessed at. */
+            from = to = pos;
+            pos = skip_json_nested(d, pos, end);
+            absent = true;
+        } else {
+            /* A number, true, false or null: to the next comma, brace or space. */
+            from = pos;
+            while (pos < end && d[pos] != ',' && d[pos] != '}' && !json_space(d[pos])) pos++;
+            to = pos;
+            absent = (to - from == 4 && memcmp(d + from, "null", 4) == 0);
+        }
+        if (!absent) {
+            int slot = parser_slot_for(p, d + key_from, key_len);
+            if (slot >= 0) out[slot] = pack(from, to - from, escaped);
+        }
+    }
+    return end_of_json_row(d, pos, end);
+}
+
 static size_t parse_row(const RowParser *p, const char *d, size_t start, size_t end, Field *out) {
+    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out);
     for (size_t i = 0; i < p->width; i++) out[i] = ABSENT;
     size_t pos = start;
     int column = 0;
@@ -771,6 +1075,62 @@ static char detect_delimiter(const char *line, size_t len) {
 }
 
 /* The header row's names, and where the first data row starts. */
+/*
+ * Which shape the file is, from its first non-space byte. A JSON record starts
+ * with `{`; nothing in a CSV header row can.
+ */
+static Dialect detect_dialect(const Slab *s) {
+    for (size_t i = 0; i < s->size; i++) {
+        if (json_space(s->data[i])) continue;
+        return s->data[i] == '{' ? DIALECT_JSON : DIALECT_CSV;
+    }
+    return DIALECT_CSV;
+}
+
+/*
+ * A JSON file has no header row, so the column names are the keys of its first
+ * object. That is the same rule the C++ port uses, and the same limitation: a
+ * key that appears only in later objects is not a column. It is the only rule
+ * that costs one line to establish rather than a pass over the file.
+ */
+static bool json_header(const Slab *s, Names *out) {
+    const char *d = s->data;
+    size_t end = s->size, pos = 0;
+    while (pos < end && json_space(d[pos])) pos++;
+    if (pos >= end || d[pos] != '{') return false;
+    pos++;
+    for (;;) {
+        while (pos < end && json_space(d[pos])) pos++;
+        if (pos >= end || d[pos] == '}') break;
+        if (d[pos] == ',') { pos++; continue; }
+        if (d[pos] != '"') break;
+        bool escaped = false;
+        size_t from = pos + 1;
+        size_t close = skip_json_string(d, pos, end, &escaped);
+        if (close > end || close < 2 || close - 1 < from) break;
+        size_t len = close - 1 - from;
+        pos = close;
+        while (pos < end && json_space(d[pos])) pos++;
+        if (pos >= end || d[pos] != ':') break;
+        pos++;
+        while (pos < end && json_space(d[pos])) pos++;
+        if (pos >= end) break;
+        /* The key name is stored decoded, because that is how the parser will
+         * see it and how --key spells it. */
+        char *name = malloc(len + 1);
+        if (!name) return false;
+        size_t n = escaped ? json_unescape(d + from, len, name, len) : len;
+        if (!escaped) memcpy(name, d + from, len);
+        name[n <= len ? n : len] = '\0';
+        if (!names_push(out, name)) { free(name); return false; }
+        /* Step over the value. */
+        if (d[pos] == '"') { bool ig = false; pos = skip_json_string(d, pos, end, &ig); }
+        else if (d[pos] == '{' || d[pos] == '[') pos = skip_json_nested(d, pos, end);
+        else while (pos < end && d[pos] != ',' && d[pos] != '}' && !json_space(d[pos])) pos++;
+    }
+    return out->len > 0;
+}
+
 static bool read_header(const Slab *s, char delimiter, Names *out, size_t *start) {
     const char *d = s->data;
     if (s->size == 0) return false;
@@ -939,6 +1299,11 @@ int main(int argc, char **argv) {
     Names a_head = {0}, b_head = {0}, compared = {0};
     RowIndex ai = {0}, bi = {0};
     int *a_src = NULL, *b_src = NULL;
+    char **want_a = NULL, **want_b = NULL;
+    /* Declared here rather than where they are filled: the cleanup below frees
+     * their name tables, and every `goto done` above that point would otherwise
+     * be freeing an uninitialised pointer. */
+    RowParser ap = {0}, bp = {0};
     Field *fa = NULL, *fb = NULL;
     int64_t *col_changed = NULL;
     int64_t *col_blanked = NULL;
@@ -946,10 +1311,17 @@ int main(int argc, char **argv) {
 
     if (!slab_open(&a, a_path) || !slab_open(&b, b_path)) { fail("cannot read one of the files"); goto done; }
 
+    a.dialect = detect_dialect(&a);
+    b.dialect = detect_dialect(&b);
     size_t a_nl = next_of1(a.data, 0, a.size, '\n'), b_nl = next_of1(b.data, 0, b.size, '\n');
     char a_delim = detect_delimiter(a.data, a_nl), b_delim = detect_delimiter(b.data, b_nl);
     size_t a_start = 0, b_start = 0;
-    if (!read_header(&a, a_delim, &a_head, &a_start) || !read_header(&b, b_delim, &b_head, &b_start)) {
+    /* A JSON file has no header row to skip, so its rows begin at byte zero. */
+    bool a_ok = a.dialect == DIALECT_JSON ? json_header(&a, &a_head)
+                                          : read_header(&a, a_delim, &a_head, &a_start);
+    bool b_ok = b.dialect == DIALECT_JSON ? json_header(&b, &b_head)
+                                          : read_header(&b, b_delim, &b_head, &b_start);
+    if (!a_ok || !b_ok) {
         fail("file has no header row");
         goto done;
     }
@@ -969,12 +1341,15 @@ int main(int argc, char **argv) {
     size_t key_size = key.len, nc = compared.len, width = key_size + nc;
     a_src = malloc(width * sizeof *a_src);
     b_src = malloc(width * sizeof *b_src);
+    want_a = calloc(width, sizeof *want_a);
+    want_b = calloc(width, sizeof *want_b);
     fa = malloc(width * sizeof *fa);
     fb = malloc(width * sizeof *fb);
     col_changed = calloc(nc ? nc : 1, sizeof *col_changed);
     col_blanked = calloc(nc ? nc : 1, sizeof *col_blanked);
     col_filled = calloc(nc ? nc : 1, sizeof *col_filled);
-    if (!a_src || !b_src || !fa || !fb || !col_changed || !col_blanked || !col_filled) {
+    if (!a_src || !b_src || !want_a || !want_b || !fa || !fb || !col_changed || !col_blanked ||
+        !col_filled) {
         fail("out of memory");
         goto done;
     }
@@ -984,10 +1359,25 @@ int main(int argc, char **argv) {
         b_src[i] = name_index(&b_head, n);
     }
 
-    RowParser ap = {a_delim, a_src, width, 0}, bp = {b_delim, b_src, width, 0};
+    ap.delimiter = a_delim; ap.source = a_src; ap.width = width; ap.dialect = a.dialect;
+    bp.delimiter = b_delim; bp.source = b_src; bp.width = width; bp.dialect = b.dialect;
     for (size_t i = 0; i < width; i++) {
         if (a_src[i] > ap.last_needed) ap.last_needed = a_src[i];
         if (b_src[i] > bp.last_needed) bp.last_needed = b_src[i];
+    }
+    /* JSON looks a value up by name, so each parser is told which names it
+     * wants and where each one belongs. A name the file does not have stays
+     * NULL and its slot stays absent, which is how a column present on one side
+     * only already behaves. */
+    for (size_t i = 0; i < width; i++) {
+        const char *n = i < key_size ? key.items[i] : compared.items[i - key_size];
+        if (a_src[i] >= 0) want_a[i] = (char *)n;
+        if (b_src[i] >= 0) want_b[i] = (char *)n;
+    }
+    if ((a.dialect == DIALECT_JSON && !parser_index_names(&ap, want_a, width)) ||
+        (b.dialect == DIALECT_JSON && !parser_index_names(&bp, want_b, width))) {
+        fail("out of memory");
+        goto done;
     }
 
     {
@@ -1060,7 +1450,8 @@ int main(int argc, char **argv) {
 done:
     index_free(&ai);
     index_free(&bi);
-    free(a_src); free(b_src); free(fa); free(fb);
+    free(a_src); free(b_src); free(want_a); free(want_b); free(fa); free(fb);
+    free(ap.slot); free(bp.slot);
     free(col_changed); free(col_blanked); free(col_filled);
     names_free(&a_head); names_free(&b_head); names_free(&compared);
     names_free(&key); names_free(&ignore);

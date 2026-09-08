@@ -16,15 +16,46 @@ CC=clang make              # or clang, which is worth 0.6s here
 ./csvdiff compare a.parquet b.parquet -k id --json summary.json
 ```
 
-## The CSV design, unchanged
+## The text design
 
-Both files are `mmap`ed with `MADV_SEQUENTIAL`. A field is one `uint64_t`:
-40 bits of offset, 23 bits of length, and the top bit set when the field
-contains a doubled quote and has to be unescaped before it is read. Delimiters
-are found eight bytes at a time — `diff = word ^ broadcast(c)`, then
-`(diff - 0x0101…) & ~diff & 0x8080…`, then `trailing_zeros >> 3`. Keys go into
-an open-addressing table sized to a power of two. Nothing becomes a
-heap-allocated string except the column names in the summary.
+Both files are `mmap`ed. A field is one `uint64_t`: 40 bits of offset, 23 bits
+of length, and the top bit set when the field is escaped and has to be decoded
+before it is read. Nothing becomes a heap-allocated string except the column
+names in the summary.
+
+**Rows are found on every core, and inserted on one.** A row's hash depends on
+nothing but that row, so finding and hashing divides perfectly; insertion does
+not, because first-occurrence-wins depends on the order rows arrive, and
+threading it would make the answer depend on the scheduler.
+
+The difficulty in dividing is that a thread starting mid-file cannot tell
+whether it is inside a quoted field, and a newline in one is not a row boundary.
+Parity settles it: every `"` toggles in-quote state — including both halves of a
+doubled quote, which toggles twice and so leaves it alone, which is exactly
+right — so counting quotes before a nominal split says whether it is inside a
+field, and the boundary walks forward from there to a real row start. Counting
+one byte is far cheaper than parsing.
+
+**CSV and JSON differ in two places and nowhere else.** How a row is found: CSV
+scans for an unquoted newline, JSON walks one object per line. And how a value
+is read back: CSV doubles a quote to escape it, JSON puts a backslash in front,
+and `\uXXXX` becomes UTF-8 — because a JSON writer may escape a character or
+write it literally, and the two spell the same value, so they must compare
+equal. Everything above that — the hash, the table, the join, the counts — does
+not know which it is reading.
+
+A JSON object is addressed by key where a CSV row is addressed by column number,
+so each parser holds the names it wants in a small open-addressed table: a key
+in the file costs one hash rather than a walk of twenty names, which at twenty
+columns would be four hundred comparisons a row. A JSON file has no header row,
+so its column names are the keys of its first object.
+
+## The CSV specifics
+
+Delimiters are found eight bytes at a time — `diff = word ^ broadcast(c)`, then
+`(diff - 0x0101…) & ~diff & 0x8080…`, then `trailing_zeros >> 3`. Once the last
+needed column has been read the rest of the row is skipped to its newline: on
+twenty columns keyed on the first two, most of a row is never delimited.
 
 ## The Parquet design
 
@@ -73,6 +104,11 @@ set:
 - **Uncompressed Parquet only, and BYTE_ARRAY columns only.** Snappy, zstd,
   gzip, data page v2 and nested columns are each refused by name. The C++ port
   carries Snappy; this one deliberately does not.
+- **A JSON file's columns are the keys of its first object**, so a key that
+  appears only in later objects is not a column. That is the rule the C++ port
+  uses too, and it is the only one that costs a line rather than a pass over the
+  file. A nested object or array is not a cell value and is left absent rather
+  than guessed at.
 
 `test.sh` holds it to the Rust port's answers on `tests/fixtures/awkward_*.csv`
 — the fixture assembled from every shape that has broken an engine in this
@@ -80,44 +116,74 @@ project — including the per-column `changed` / `blanked` / `filled` counts.
 
 ## What the floor turned out to be
 
-One million rows, best of three, one 4-core container. The two mapped inputs
-are 351 MB, and mapped pages count as resident, so the column that matters is
-the last one: what the engine allocates on top of the files it is reading.
+Two million rows of CSV, interleaved runs, one 4-core container. The two mapped
+inputs are 702 MB and mapped pages count as resident, so the column that
+carries information is the last one: what the engine allocates on top of the
+files it is reading.
 
-| Build | Compare | Peak RSS | Above the mapped files |
+| Port | Best | Median | CPU | Peak RSS | Above the mapped files |
+|---|---:|---:|---:|---:|---:|
+| **C** | **1.95s** | **2.01s** | **7.0s** | 827 MB | 126 MB |
+| C++ | 3.85s | 4.16s | 10.2s | 934 MB | 232 MB |
+| Zig | 4.53s | 4.57s | 7.9s | 827 MB | **125 MB** |
+| Rust | 9.45s | 10.13s | 9.4s | 999 MB | 298 MB |
+
+**C is not the floor — it ties with Zig.** 126 MB against 125 MB. That was the
+finding when this port was single-threaded and slowest of the four, and it
+survives the port becoming the fastest, which is the point: the floor belongs to
+the *design*, not to the language. Once the row index, the offset array and the
+hash table are sized the same way there is nothing left for a language to save.
+
+**The compiler moves more than it used to.** The table above is built with `cc`,
+which is gcc here. The same source under clang:
+
+| Build | Best | Median | CPU |
 |---|---:|---:|---:|
-| C, clang 18 | **4.77s** | 417 MB | 67 MB |
-| C, gcc 13 | 5.34s | 417 MB | 67 MB |
-| C++, clang 18 | 3.64s | 509 MB | 158 MB |
-| C++, gcc 13 | 6.27s | 509 MB | 158 MB |
-| Zig 0.16, ReleaseFast | 5.31s | 414 MB | 63 MB |
-| Rust, `--engine turbo` | 5.25s | 583 MB | 232 MB |
+| gcc 13.3 | 1.99s | 2.03s | 7.0s |
+| **clang 18.1** | **1.47s** | **1.56s** | **5.2s** |
 
-Ten million rows, best of two, mapped inputs 3679 MB:
+1.35x, where on the single-threaded version of this file it was 1.12x. Any
+single-number comparison of C against Rust against Zig that does not say which
+compiler produced each binary is reporting the toolchain and calling it the
+language — and the margin for that mistake grew when the code got harder to
+optimise.
 
-| Build | Compare | Peak RSS | Above the mapped files |
-|---|---:|---:|---:|
-| C, gcc 13 | 61.2s | 4224 MB | 545 MB |
-| C++, clang 18 | **37.8s** | 4334 MB | 655 MB |
-| Zig 0.16, ReleaseFast | 59.9s | 4224 MB | 545 MB |
-| Rust, `--engine turbo` | 49.1s | 4412 MB | 733 MB |
+## What threading the text path was worth
 
-Two things fell out of this that were not the point of writing it.
+The same two million rows, before and after, interleaved in one sitting:
 
-**C is not the floor — it ties with Zig.** 67 MB against 63 MB at a million
-rows, and identical at ten million. That is the honest answer: the floor
-belongs to the *design*, not to the language. Once the row index, the offset
-array and the hash table are sized the same way, there is nothing left for a
-language to save — the 4 MB between C and Zig at a million rows is allocator
-bookkeeping, not a structural difference, and it disappears entirely at ten
-million.
+| Build | Best | Median | Worst | CPU |
+|---|---:|---:|---:|---:|
+| serial | 8.08s | 8.23s | 8.58s | 8.1s |
+| rows found on every core | 6.01s | 6.20s | 6.39s | 7.6s |
+| **and compared on every core** | **1.91s** | **1.92s** | **2.15s** | **6.9s** |
 
-**The compiler moves more than the language does.** clang builds this source
-1.12x faster than gcc, and the same swap on the C++ port is worth 1.72x. The
-fastest and the slowest byte-level build in this whole table are both C++,
-from the same file, 1.7x apart. Any single-number comparison of C against Rust
-against Zig that does not say which compiler produced each binary is reporting
-the toolchain and calling it the language.
+**4.2x, and most of it is the second step rather than the first.** Splitting the
+sweep is the change that looks like the optimisation — it is where the parsing
+is — and on its own it was worth 1.34x. The comparison after it was still
+running on one thread, re-parsing two rows per key and re-hashing a key the
+sweep had already hashed, and that was three quarters of the run.
+
+CPU falls as well as wall clock, from 8.1s to 6.9s, which is a different saving:
+the table is now sized once from the row count instead of doubling from 4,096
+(thirteen rehashes at ten million rows, each a full pass of random probes), and
+each key is hashed once rather than twice.
+
+## Newline-delimited JSON
+
+The same rows, in the shape a log pipeline emits. Two million of them are 1,697
+MB against CSV's 702 MB, which is most of the difference in the numbers:
+
+| Port | Best | Median | CPU | Peak RSS |
+|---|---:|---:|---:|---:|
+| **C** | **3.17s** | **3.23s** | **10.8s** | **1,823 MB** |
+| C++ | 4.51s | 4.76s | 11.6s | 1,930 MB |
+
+Only these two ports read it — on `main` the Rust and Zig ports refuse an
+ndjson file — so this table has two rows rather than four, and `test.sh`
+cross-checks the JSON path against C++ rather than against Rust for the same
+reason. A check against a port that refuses the file would be a check that
+always passes.
 
 ## What Parquet turned out to be worth
 
@@ -262,18 +328,26 @@ per-value check it replaced caught that by accident, because the cast to
 
 ## Layout
 
-Three files. `csvdiff.c` is still one file in reading order; the Parquet path is
-beside it rather than inside it, because a reader and a join have nothing to say
-to a CSV parser.
+Four files. `csvdiff.c` is still one file in reading order; the Parquet reader
+and its join sit beside it rather than inside it, because neither has anything
+to say to a text parser.
 
 | Section of `csvdiff.c` | What it holds |
 |---|---|
-| `Slab` | the mapped file and its `madvise` hint |
+| `Slab` | the mapped file, its `madvise` hint, and which dialect it is |
 | SWAR helpers | `find_byte`, the packed `Field`, `logical_len`, `logical_copy` |
-| `RowParser` | quoted fields, CRLF, ragged rows, the last row without a newline |
+| JSON | object scanning, and `\uXXXX` and backslash escapes decoded to UTF-8 |
+| `RowParser` | quoted fields, CRLF, ragged rows, JSON objects addressed by key |
+| `chunk_bounds` / `sweep_part` | splitting a file at real row starts, by quote parity |
 | `RowIndex` | open addressing, first-occurrence-wins, duplicate counting |
-| `emit` | the report both paths end at, so the two cannot drift apart |
+| `compare_part` | the join and the per-column counts, over ranges of one side's keys |
+| `emit` | the report every path ends at, so they cannot drift apart |
 | `main` | the command line and the dispatch; exit 0 identical, 1 differences, 2 error |
+
+| Section of `parallel.c` | What it holds |
+|---|---|
+| `run_parts` | one shape for every parallel phase; a thread that will not spawn runs inline |
+| `alloc_huge` | 2 MB pages, for the rare long-lived allocation that is probed at random |
 
 | Section of `parquet.c` | What it holds |
 |---|---|

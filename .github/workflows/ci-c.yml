@@ -59,9 +59,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      # test.sh holds the C port to Rust's answers on CSV, to the C++ port's on
+      # ndjson (the only other port that reads it), and generates its Parquet and
+      # JSON fixtures with the C++ generator. All three have to exist.
       - name: Build the ports test.sh compares against
         run: |
           cargo build --release --manifest-path rust/Cargo.toml
+          make -C cpp
           make -C cpp gen-data
 
       - name: Build
@@ -96,6 +100,20 @@ jobs:
             /tmp/csvdiff-asan compare "$tmp/s_a.unc.parquet" "$tmp/s_b.unc.parquet" \
                 -k account_id,txn_id -i updated_at --json /dev/null || code=$?
             [ "$code" -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
+          done
+          # And the two text shapes, including the threaded sweep: 5k rows is
+          # under the four-megabyte split threshold, so `--threads` is what makes
+          # the boundary logic run under the sanitizers at all.
+          cpp/build/gen-data --rows 60k --out-dir "$tmp" --prefix t >/dev/null
+          cpp/build/gen-data --rows 60k --out-dir "$tmp" --prefix t --format json >/dev/null
+          for pair in "t_a.csv t_b.csv" "t_a.ndjson t_b.ndjson"; do
+            set -- $pair
+            for t in 1 4; do
+              code=0
+              /tmp/csvdiff-asan compare "$tmp/$1" "$tmp/$2" -k account_id,txn_id \
+                  -i updated_at --threads $t --json /dev/null || code=$?
+              [ "$code" -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
+            done
           done
 
   bench:
