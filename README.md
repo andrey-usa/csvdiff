@@ -618,46 +618,55 @@ numbers come from the same `wait4` rusage as the peak RSS beside them.
 
 | Build | Input | Compare | Rows/s | CPU | Cores | Peak RSS | Above the input |
 |---|---|---:|---:|---:|---:|---:|---:|
-| **Zig AVX2** | **CSV, 3,509 MB** | **7.62s** | **1,311,916** | **21.0s** | 2.76x | 4,394 MB | 885 MB |
-| Zig | CSV | 7.98s | 1,253,920 | 21.9s | 2.75x | 4,379 MB | **871 MB** |
-| C++ AVX2 | CSV | 8.48s | 1,179,351 | 26.0s | 3.07x | 4,390 MB | 881 MB |
-| Rust, engine only | CSV | 8.52s | 1,173,224 | 24.7s | 2.90x | 4,388 MB | 879 MB |
-| C++ | CSV | 8.73s | 1,144,988 | 26.7s | 3.05x | 4,386 MB | 878 MB |
-| C++ SWAR | CSV | 8.77s | 1,140,069 | 27.1s | 3.09x | 4,395 MB | 887 MB |
-| Rust AVX2 | CSV | 8.89s | 1,125,364 | 25.1s | 2.83x | 4,454 MB | 945 MB |
-| Rust | CSV | 9.23s | 1,083,492 | 25.7s | 2.79x | 4,454 MB | 945 MB |
-| **C++** | **Parquet, 1,535 MB** | **2.61s** | **3,827,081** | 8.5s | 3.25x | 2,853 MB | 1,318 MB |
-| Rust, engine only | Parquet | 2.87s | 3,481,812 | 9.7s | 3.38x | 2,860 MB | 1,326 MB |
-| Rust | Parquet | 3.32s | 3,008,531 | 10.2s | 3.08x | 2,869 MB | 1,334 MB |
-| Rust AVX2 | Parquet | 3.47s | 2,880,229 | 10.5s | 3.04x | 2,903 MB | 1,369 MB |
-| Zig AVX2 | Parquet | 3.76s | 2,659,769 | 10.2s | 2.72x | 2,737 MB | 1,203 MB |
-| Zig | Parquet | 3.77s | 2,653,725 | 10.4s | 2.75x | **2,742 MB** | **1,207 MB** |
+| **Zig AVX-512** | **CSV, 3,509 MB** | **7.07s** | **1,414,650** | **20.1s** | 2.84x | 4,440 MB | 931 MB |
+| Zig AVX2 | CSV | 7.23s | 1,384,073 | 20.6s | 2.85x | 4,442 MB | 933 MB |
+| C++ AVX2 | CSV | 7.38s | 1,355,664 | 21.9s | 2.97x | 4,398 MB | 889 MB |
+| Rust, engine only | CSV | 7.38s | 1,356,047 | 21.6s | 2.93x | 4,641 MB | 1,132 MB |
+| Rust AVX2 | CSV | 7.47s | 1,338,362 | 20.9s | 2.80x | 4,702 MB | 1,193 MB |
+| Zig | CSV | 7.72s | 1,294,833 | 21.9s | 2.84x | 4,432 MB | 923 MB |
+| C++ SWAR | CSV | 7.93s | 1,261,421 | 23.9s | 3.01x | 4,428 MB | 919 MB |
+| C++ AVX-512 | CSV | 8.02s | 1,246,891 | 23.9s | 2.98x | 4,388 MB | **879 MB** |
+| C++ | CSV | 8.07s | 1,238,533 | 24.2s | 3.00x | 4,389 MB | 881 MB |
+| Rust | CSV | 8.08s | 1,237,697 | 22.7s | 2.80x | 4,702 MB | 1,193 MB |
+| **C++** | **Parquet, 1,535 MB** | **2.67s** | **3,746,807** | 8.7s | 3.25x | 2,834 MB | 1,299 MB |
+| Rust, engine only | Parquet | 2.87s | 3,484,540 | 10.0s | 3.50x | 2,885 MB | 1,350 MB |
+| Rust | Parquet | 3.36s | 2,972,209 | 10.6s | 3.15x | 2,914 MB | 1,379 MB |
+| Rust AVX2 | Parquet | 3.37s | 2,963,859 | 10.6s | 3.13x | 2,910 MB | 1,375 MB |
+| Zig | Parquet | 3.41s | 2,932,789 | 9.1s | 2.67x | **2,744 MB** | **1,210 MB** |
+| Zig AVX2 | Parquet | 3.51s | 2,846,845 | 9.3s | 2.64x | 2,741 MB | 1,206 MB |
+| Zig AVX-512 | Parquet | 3.71s | 2,694,237 | 9.6s | 2.59x | 2,763 MB | 1,228 MB |
 
 Every row returns `matched 9,990,000 · changed 599,320 · added 10,000 ·
 removed 10,000`, and the harness refuses to print the table if any row disagrees.
-[The run.](https://github.com/andrey-usa/csvdiff/actions/runs/34255766040)
+[The run.](https://github.com/andrey-usa/csvdiff/actions/runs/34262369270) This
+one landed on an Intel Xeon Platinum 8573C — the first runner in this project's
+history to carry `avx512bw`, so the 64-byte builds finally ran instead of
+skipping themselves. It is also faster than the machine the previous table ran
+on, so **compare rows within this table, not across to the last one**; the CPU
+column is the one that carries between them.
 
-**Zig now leads on CSV and the C++ port on Parquet**, which is not what this
-branch set out to find out — it set out to see whether Rust and Zig could
-*match* C++, having started three times behind. Best build against best build,
-Zig's CSV is 10% quicker than the C++ port's on 19% less CPU, and the C++
-Parquet path is 9% quicker than the next one.
+**Zig leads on CSV and the C++ port on Parquet**, which is not what this branch
+set out to find out — it set out to see whether Rust and Zig could *match* C++,
+having started three times behind. Best build against best build, Zig's CSV is
+4% quicker than the C++ port's on 8% less CPU, and the C++ Parquet path is 7%
+quicker than the next one.
 
 **Two rows are not comparing like with like, and say so.** The Rust port renders
 the HTML report; the C++ and Zig ports produce counts and JSON only. `Rust,
 engine only` is the same comparison with `--max-rows 1`, which is the row to read
-against the other two ports. The difference between its rows — 1.2s on CSV and
-0.9s on Parquet — is the report: fifty thousand changed rows decoded into
+against the other two ports. The difference between its rows — 0.70s on CSV and
+0.49s on Parquet — is the report: fifty thousand changed rows decoded into
 strings, sorted, gzipped and embedded.
 
-**Parquet is now 3.3x quicker than CSV and holds 1.5 GB less**, where the first
-version of this table had it quicker and 4 GB *heavier*. That reversal is the
+**Parquet is 3.0x quicker than CSV in the same port and holds 1.6 GB less**
+(the C++ port: 8.07s and 4,389 MB against 2.67s and 2,834 MB), where the first
+version of this table had it slower and 4 GB *heavier*. That reversal is the
 whole of [the columnar path](#the-design-never-reconstruct-a-row): the earlier
 reader decoded the pages into rows and handed them to the same byte-level engine
 the CSV rows use, which meant every value had to exist somewhere at once. The
 columnar path never builds a row — it joins on the key columns and compares whole
 columns as `int32` ids, one column at a time — so 8.33s and 8,415 MB became
-2.72s and 2,855 MB on the same file. The row-materialising reader survives only
+2.67s and 2,834 MB on the same file. The row-materialising reader survives only
 as the fallback for `a.parquet` against `b.csv`, which has no column to compare
 a byte stream against.
 
@@ -665,35 +674,39 @@ a byte stream against.
 wall times suggest.** Three of the four cores are busy in almost every row, so
 these are not idle engines — but the two that trail do so for opposite reasons:
 
-* **Zig won CSV by doing less work, not by spreading it better.** It spends
-  21.0s of CPU against the C++ port's 26.7s — 21% less — at a *lower*
-  cores-busy ratio, 2.75x against 3.05x. Every one of the changes under
-  [What the CPU column found](#what-the-cpu-column-found) removed work rather
-  than adding threads, and this row is what they add up to: an earlier run of
-  this table had Zig last on CSV at 10.34s and 33.5s of CPU.
-* **Rust is now the slowest on CSV while spending less CPU than C++** — 25.7s
-  against 26.7s — because it runs at 2.79x cores against 3.05x. Its problem is
-  the one the CPU column has pointed at all along, and only partly fixed: the
-  report is 0.71s of it (`Rust, engine only` is 8.52s at 2.90x), and the rest is
-  a genuine parallelism gap that the same work in Zig does not have.
-* **Zig on Parquet is the least parallel row here**, 2.75x against the C++
-  port's 3.25x on comparable CPU, which is what keeps it last on that format
-  despite holding 110 MB less than anything else. Threading the key-column read
-  moved it from 2.52x; what is left is the dictionary interning, which is serial
-  by construction because the id space is shared.
+* **Zig leads CSV by doing less work, not by spreading it better.** It spends
+  21.9s of CPU against the C++ port's 24.2s at a *lower* cores-busy ratio, 2.84x
+  against 3.00x. Every change under [What the CPU column
+  found](#what-the-cpu-column-found) removed work rather than adding threads.
+* **Rust's index fix closed almost all of its gap to Zig, and the CPU column is
+  where it shows.** An earlier run had Rust at 25.7s of CPU against Zig's 21.9s,
+  a 17% gap; sizing the index once and tagging its slots brought it to 22.7s
+  against the same 21.9s — 3.7%. Wall time moved too, but this table ran on a
+  faster machine than that one, so the ratio within each run is the honest
+  comparison and the ratio is what changed.
+* **What Rust has left is parallelism and memory, not work.** It is the only
+  port under 2.9x cores on CSV while spending less CPU than C++ does, and it now
+  holds 1,193 MB above the input against Zig's 923 MB — the up-front table is
+  eight bytes a slot rather than four, which is what the hash tag costs and what
+  bought the CPU back.
+* **Zig on Parquet is the least parallel row here**, 2.67x against the C++
+  port's 3.25x, which is what keeps it behind on that format despite spending
+  the least CPU of any Parquet row — 9.1s against 8.7s and 10.6s — and holding
+  90 MB less than anything else. Threading the key-column read moved it from
+  2.52x; what is left is the dictionary interning, serial by construction
+  because the id space is shared.
 
 None of that is visible in a table of wall times, which is why every row here
 carries CPU.
 
-**The vector scanner still beats SWAR in all three ports, but by much less than
-it does at a million rows**: 3.3% in C++, 3.7% in Rust, 4.5% in Zig here,
-against 12.9% and 15.0% measured on a million. That gap is the interesting part.
-At ten million the working set is far past any cache and the scan is waiting on
-memory, so a wider register mostly waits faster; at a million it is not, and the
-register width shows. **A scanner benchmark measures the memory system it runs
-in**, which is the same lesson as [the one below](#swar-and-how-it-compares-to-real-simd)
-in a different key. Quote a scanner number without its scale and it means
-nothing.
+**This is the first run with a 64-byte scanner in it, and it is the fastest row
+in the table — in Zig, and only in Zig.** The runner carried `avx512bw`, which
+none before it had. Zig goes 7.72s → 7.23s → 7.07s as the register widens; the
+C++ port goes 7.93s → 7.38s → 8.02s, its 64-byte build losing to its own SWAR. A
+development container with an older Xeon says AVX-512 loses by 15% in both
+ports. All three of those are true at once, and [what actually varies is the CPU
+generation and whether anything amortises the wide
+load](#avx-512-measured-on-two-machines-that-disagree).
 
 **AVX2 buys nothing on the Parquet path, in either port that has it** — Zig
 4.06s against 4.06s, Rust 3.81s against 3.87s, both inside the noise. The
@@ -997,42 +1010,57 @@ wasted loads now sit on the critical path where they used to be hidden behind
 the hash. **A scanner benchmark measures the engine around it**, which is the
 part of this that generalises.
 
-#### AVX-512, measured at last, and it loses
+#### AVX-512, measured on two machines that disagree
 
-The 64-byte builds had never run: no hosted runner this project has landed on
-carries `avx512bw`, so they skip themselves by name. A development container
-did, so they were finally built and timed there. Different host from every other
-table here — a 4-core Intel Xeon at 2.80GHz with `avx512f`, `avx512bw` and
-`avx512vl` — so read down the columns, not across to Set D. Median of seven runs
-at a million and five at four million, interleaved:
+The 64-byte builds had never run: no hosted runner this project had landed on
+carried `avx512bw`, so they skipped themselves by name. Two things then happened
+within an hour of each other, and the second overturned the first.
+
+**A development container had AVX-512, and there the 64-byte scanner lost
+badly.** A 4-core Intel Xeon at 2.80GHz, median of seven runs at a million and
+five at four million, interleaved:
 
 | Port | Scanner | 1M | vs SWAR | 4M | vs SWAR |
 |---|---|---:|---:|---:|---:|
-| Zig | SWAR, 8 bytes | 1.186s | — | 5.203s | — |
-| Zig | AVX2, 32 bytes | **1.109s** | **+6.5%** | **4.846s** | **+6.9%** |
+| Zig | AVX2, 32 bytes | **1.109s** | +6.5% | **4.846s** | +6.9% |
 | Zig | AVX-512, 64 bytes | 1.345s | **−13.4%** | 5.996s | **−15.2%** |
-| Rust | SWAR, 8 bytes | 1.094s | — | 4.699s | — |
-| Rust | AVX2, 32 bytes | **1.010s** | **+7.6%** | **4.077s** | **+13.2%** |
+| Rust | AVX2, 32 bytes | **1.010s** | +7.6% | **4.077s** | +13.2% |
 | Rust | AVX-512, 64 bytes | 1.214s | −11.0% | 5.151s | −9.6% |
 
-**Sixty-four bytes is slower than eight**, in both ports, at both scales, by
-9-15%. It is not a measurement artefact of waiting on memory either: the CPU
-time goes *up* with it, 12.5s to 14.4s in Zig at four million, so the wider
-register is doing more work rather than the same work while stalled.
+That was written up here as a flat negative result. It was wrong, and the way it
+was wrong is worth more than the result would have been.
 
-This is the strongest form of the finding the section opens with, and it
-survives the correction that overturned the rest of it. The first table here
-concluded SIMD loses to SWAR and was measuring a byte-at-a-time key hash that
-hid the scan; with that fixed, 32 bytes won. 64 does not, and the reason is the
-same arithmetic that made the original claim plausible: **fields average 9.2
-bytes**, so a 64-byte load answers a nine-byte question by reading seven times
-what it needs. The [delimiter
-cursor](#swar-and-how-it-compares-to-real-simd) was built precisely to spread
-one wide load across the several fields it covers, and it is in these builds —
-it is what makes 32 bytes win — and even it cannot make 64 pay.
+**The next benchmark run landed on an Intel Xeon Platinum 8573C — the first
+hosted runner with `avx512bw` — and there Zig's 64-byte scanner is the fastest
+build in the whole table.** Same source, same flags, ten million rows:
 
-`make scanners` and `zig build -Dscan=64 -Dcpu=native` still build them, because
-a negative result is only worth as much as the ability to re-run it.
+| Port | SWAR, 8 bytes | AVX2, 32 bytes | AVX-512, 64 bytes |
+|---|---:|---:|---:|
+| **Zig** | 7.72s | 7.23s | **7.07s** — *best in the table* |
+| C++ | 7.93s | **7.38s** | 8.02s — *worse than its own SWAR* |
+
+**So the register width is not the variable. Two other things are.**
+
+*The CPU generation.* The container is an older Xeon, where issuing 512-bit
+instructions drops the core clock for everything around them; the 8573C is
+Emerald Rapids, where that penalty is largely gone. The same binary is 15%
+slower than SWAR on one machine and 8% faster on the other. **An AVX-512 number
+that does not name the CPU generation is not a result**, which is why the
+container measurements are kept above rather than deleted — they are what that
+hardware really does.
+
+*Whether anything amortises the wide load.* On the good CPU, Zig's 64-byte
+scanner wins while the C++ port's loses to its own SWAR. The difference between
+them is the [delimiter cursor](#swar-and-how-it-compares-to-real-simd): fields
+average 9.2 bytes, so one 64-byte load spans about seven of them, and the cursor
+is what lets a single load serve all seven rather than being reloaded per field.
+Zig has it; the C++ port's scanner does not. A wide register is worth nothing on
+its own here — only once the cost of the load is spread across the fields it
+covers, and on the older CPU not even then.
+
+`make scanners` and `zig build -Dscan=64 -Dcpu=native` build these anywhere, and
+the workflow runs them whenever a runner turns up with the instructions, which is
+now sometimes rather than never.
 
 **There are now two scanners, and the same question has to be asked of both.**
 The columnar Parquet path has no delimiters to find, but it produces a mismatch
