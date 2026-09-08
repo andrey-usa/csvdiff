@@ -17,6 +17,10 @@ const build_options = @import("build_options");
 /// instruction set should not be measuring a function pointer, and because each
 /// binary is then what you would actually ship for that target.
 const width = build_options.scan_width;
+
+/// Whether this build scans with a vector register rather than SWAR. The
+/// delimiter cursor below is worth having only here -- see [`Delims`].
+pub const wide_scan = build_options.scan_width > 8;
 const Vector = @Vector(width, u8);
 const Mask = std.meta.Int(.unsigned, width);
 
@@ -40,6 +44,23 @@ inline fn broadcast(b: u8) u64 {
 inline fn matchBits(word: u64, target: u64) u64 {
     const diff = word ^ target;
     return (diff -% ONES) & ~diff & HIGH;
+}
+
+/// The high bit of every byte of `word` equal to `target`, and of no other.
+///
+/// [`matchBits`] is the classic zero-byte trick, and it is exact only about the
+/// *lowest* matching byte: subtracting ones from the whole word lets a borrow
+/// out of a matching byte disturb the bytes above it. Everything that only ever
+/// took `@ctz` of the result was therefore right, and a cursor that wants every
+/// match in the word is not.
+///
+/// Forcing each byte's high bit before the subtraction is what stops the
+/// borrow: no byte is then less than 0x80, so subtracting one never carries
+/// into its neighbour. The result marks *non*-matching bytes, so it is
+/// complemented.
+inline fn matchBitsAll(word: u64, target: u64) u64 {
+    const diff = word ^ target;
+    return ~(diff | ((diff | HIGH) -% ONES)) & HIGH;
 }
 
 inline fn load64(data: []const u8, at: usize) u64 {
@@ -70,6 +91,123 @@ pub fn nextOf2(data: []const u8, from: usize, end: usize, a: u8, b: u8) usize {
     }
     return end;
 }
+
+/// A left-to-right cursor over the delimiters of one row.
+///
+/// `nextOf2` begins a fresh scan at every field, so a chunk straddling a field
+/// boundary is loaded once for the field that ends in it and again for the
+/// field that starts there. Fields are found strictly in order, so the scan can
+/// instead keep what it has -- the chunk it loaded and the matches in it that
+/// no field has claimed yet -- and read every byte of the row once.
+///
+/// **Only worth it for a vector step, which is why `wide_scan` gates its use.**
+/// Fields here average 9.2 bytes, so an eight-byte step rarely spans a boundary
+/// and there is almost nothing to reuse: measured interleaved against the plain
+/// scan, SWAR came out 0.7% slower in this port and 3.8% slower in Rust, the
+/// bookkeeping costing more than it saves. A thirty-two-byte step covers three
+/// and a half fields, so the plain scan loads the same bytes three or four
+/// times over, and the cursor is 12.9% faster here and 15.0% in Rust.
+///
+/// Instruction count says the opposite of all that -- the exact mask below is
+/// two more ALU operations per word, and callgrind reports the cursor as a
+/// regression. What it removes is *loads*. This one had to be settled by the
+/// clock.
+///
+/// `next` takes the position to resume from rather than assuming the previous
+/// result, because a quoted field is walked by `skipQuoted` and the cursor has
+/// to be told to seek past its body.
+pub const Delims = struct {
+    data: []const u8,
+    end: usize,
+    a: u8,
+    b: u8,
+    ba: u64,
+    bb: u64,
+    va: Vector = @splat(0),
+    vb: Vector = @splat(0),
+    /// Where the held chunk begins, and the matches in it not yet returned.
+    held: usize = 0,
+    bits: u64 = 0,
+    /// Whether `bits` came from a vector compare (one bit per byte) or from
+    /// SWAR (the high bit of each byte). Constant in a SWAR build.
+    wide: bool = false,
+    /// The first byte no chunk has covered yet.
+    scanned: usize,
+
+    pub fn init(data: []const u8, from: usize, end: usize, a: u8, b: u8) Delims {
+        var d = Delims{
+            .data = data,
+            .end = end,
+            .a = a,
+            .b = b,
+            .ba = broadcast(a),
+            .bb = broadcast(b),
+            .scanned = from,
+        };
+        if (width > 8) {
+            d.va = @splat(a);
+            d.vb = @splat(b);
+        }
+        return d;
+    }
+
+    inline fn lowest(self: Delims, bits: u64) usize {
+        return self.held + if (self.wide) @ctz(bits) else (@ctz(bits) >> 3);
+    }
+
+    /// The offset of the first byte at or after `from` that is `a` or `b`, or
+    /// `end` -- the same answer `nextOf2` gives, without rescanning.
+    pub fn next(self: *Delims, from: usize) usize {
+        // Matches already found and still ahead of the caller.
+        while (self.bits != 0) {
+            const at = self.lowest(self.bits);
+            self.bits &= self.bits - 1;
+            if (at >= from) return at;
+        }
+        var at = if (from > self.scanned) from else self.scanned;
+        if (width > 8) {
+            while (at + width <= self.end) : (at += width) {
+                const chunk = loadVector(self.data, at);
+                var hits: u64 = matches(chunk, self.va) | matches(chunk, self.vb);
+                self.held = at;
+                self.wide = true;
+                self.scanned = at + width;
+                while (hits != 0) {
+                    const idx = at + @ctz(hits);
+                    hits &= hits - 1;
+                    if (idx >= from) {
+                        self.bits = hits;
+                        return idx;
+                    }
+                }
+            }
+        }
+        while (at + 8 <= self.end) : (at += 8) {
+            const word = load64(self.data, at);
+            var hits = matchBitsAll(word, self.ba) | matchBitsAll(word, self.bb);
+            self.held = at;
+            self.wide = false;
+            self.scanned = at + 8;
+            while (hits != 0) {
+                const idx = at + (@ctz(hits) >> 3);
+                hits &= hits - 1;
+                if (idx >= from) {
+                    self.bits = hits;
+                    return idx;
+                }
+            }
+        }
+        var t = if (from > at) from else at;
+        while (t < self.end) : (t += 1) {
+            if (self.data[t] == self.a or self.data[t] == self.b) {
+                self.scanned = t + 1;
+                return t;
+            }
+        }
+        self.scanned = self.end;
+        return self.end;
+    }
+};
 
 /// The offset of the first `target` at or after `from`, or `end`.
 pub fn nextOf1(data: []const u8, from: usize, end: usize, target: u8) usize {
@@ -136,7 +274,8 @@ pub fn countByte(data: []const u8, from: usize, end: usize, target: u8) usize {
     }
     const bt = broadcast(target);
     while (at + 8 <= end) : (at += 8) {
-        n += @popCount(matchBits(load64(data, at), bt));
+        // Every match in the word, not just the lowest -- see `matchBitsAll`.
+        n += @popCount(matchBitsAll(load64(data, at), bt));
     }
     while (at < end) : (at += 1) {
         if (data[at] == target) n += 1;
@@ -153,5 +292,48 @@ test "countByte counts the same as one byte at a time" {
             if (b == '"') want += 1;
         }
         try std.testing.expectEqual(want, countByte(d, from, d.len, '"'));
+    }
+}
+
+test "a match followed by the next code point does not count twice" {
+    // The borrow out of a matching byte lands on the byte above it, and shows
+    // up exactly when that byte is `target ^ 1`. For a quote that is '#'; for a
+    // comma it is '-', which is every negative number in a CSV. The classic
+    // mask reports both bytes; this is the case that catches it.
+    const cases = [_]struct { d: []const u8, t: u8, want: usize }{
+        .{ .d = "\"#\"#\"#\"#abcdefgh", .t = '"', .want = 4 },
+        .{ .d = "12,-45.67,-8,-9abcd", .t = ',', .want = 3 },
+        .{ .d = ",-,-,-,-,-,-,-,-", .t = ',', .want = 8 },
+    };
+    for (cases) |c| {
+        var want: usize = 0;
+        for (c.d) |b| {
+            if (b == c.t) want += 1;
+        }
+        try std.testing.expectEqual(c.want, want);
+        try std.testing.expectEqual(want, countByte(c.d, 0, c.d.len, c.t));
+    }
+}
+
+test "the delimiter cursor gives the same answers as a fresh scan" {
+    // Deliberately full of `,-`, which is what makes a borrow-corrupted mask
+    // report a delimiter one byte late as well as on time.
+    const rows = [_][]const u8{
+        "a,b,c\n",
+        "12,-45.67,-8\n",
+        ",,,\n",
+        ",-,-,-,-,-,-,-,-,-,-\n",
+        "one,two,three,four,five,six,seven,eight,nine,ten\n",
+        "x\n",
+    };
+    for (rows) |d| {
+        var cursor = Delims.init(d, 0, d.len, ',', '\n');
+        var from: usize = 0;
+        while (from <= d.len) {
+            const want = nextOf2(d, from, d.len, ',', '\n');
+            try std.testing.expectEqual(want, cursor.next(from));
+            if (want >= d.len) break;
+            from = want + 1;
+        }
     }
 }

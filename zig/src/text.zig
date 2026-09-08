@@ -313,6 +313,13 @@ pub const RowParser = union(enum) {
     fn parseCsv(self: Csv, d: []const u8, start: usize, end: usize, out: []Field) usize {
         var pos = start;
         var column: usize = 0;
+        // One cursor for the row -- every byte scanned once, both delimiters
+        // broadcast once -- but only where a scan step spans several fields.
+        // On an eight-byte step it does not, and the plain scan is quicker.
+        var delims: scan.Delims = if (scan.wide_scan)
+            scan.Delims.init(d, start, end, self.delimiter, '\n')
+        else
+            undefined;
 
         while (pos <= end) {
             var field: Field = undefined;
@@ -320,10 +327,16 @@ pub const RowParser = union(enum) {
             if (pos < end and d[pos] == '"') {
                 const close = scan.skipQuoted(d, pos + 1, end);
                 const body_end = if (close > pos + 1) close - 1 else pos + 1;
-                next = scan.nextOf2(d, close, end, self.delimiter, '\n');
+                next = if (scan.wide_scan)
+                    delims.next(close)
+                else
+                    scan.nextOf2(d, close, end, self.delimiter, '\n');
                 field = quotedField(d, pos + 1, body_end);
             } else {
-                next = scan.nextOf2(d, pos, end, self.delimiter, '\n');
+                next = if (scan.wide_scan)
+                    delims.next(pos)
+                else
+                    scan.nextOf2(d, pos, end, self.delimiter, '\n');
                 field = plainField(d, pos, next);
             }
             if (column <= self.last_needed) self.store(out, column, field);

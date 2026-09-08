@@ -10,7 +10,7 @@
 //! the JSON the same pipeline emits, and the key order on each side is free to
 //! differ, because the JSON reader joins by name.
 
-use super::field::{ABSENT, Field, next_of1, next_of2, pack, skip_quoted};
+use super::field::{ABSENT, Delims, Field, WIDE_SCAN, next_of1, next_of2, pack, skip_quoted};
 use super::slab::{Dialect, Slab, text_of};
 use crate::error::{Error, Result};
 use std::path::Path;
@@ -398,17 +398,23 @@ impl RowParser {
         };
         let mut pos = start;
         let mut column = 0usize;
+        // One cursor for the row -- every byte scanned once, both delimiters
+        // broadcast once -- but only where a scan step spans several fields. On
+        // an eight-byte step it does not, and the plain scan is quicker; see
+        // `Delims`.
+        let mut delims = Delims::new(data, start, end, delimiter, b'\n');
 
         while pos <= end {
             let (field, next) = if pos < end && data[pos] == b'"' {
                 let close = skip_quoted(data, pos + 1, end);
                 let body_end = close.saturating_sub(1).max(pos + 1);
-                (
-                    quoted_field(data, pos + 1, body_end),
-                    next_of2(data, close, end, delimiter, b'\n'),
-                )
+                (quoted_field(data, pos + 1, body_end), delims.next(close))
             } else {
-                let next = next_of2(data, pos, end, delimiter, b'\n');
+                let next = if WIDE_SCAN {
+                    delims.next(pos)
+                } else {
+                    next_of2(data, pos, end, delimiter, b'\n')
+                };
                 (plain_field(data, pos, next), next)
             };
             if column <= last_needed {

@@ -117,6 +117,156 @@ fn match_bits(word: u64, target: u64) -> u64 {
     (diff.wrapping_sub(ONES)) & !diff & HIGH
 }
 
+/// The high bit of every byte of `word` equal to `target`, and of no other.
+///
+/// [`match_bits`] is the classic zero-byte trick, and it is exact only about
+/// the *lowest* matching byte: subtracting ones from the whole word lets a
+/// borrow out of a matching byte disturb the byte above it, which shows up
+/// exactly when that byte is `target ^ 1` -- after a comma, that is `-`, so
+/// every negative number in a CSV triggers it. Everything that only ever takes
+/// `trailing_zeros` of the result is therefore right; a cursor that wants every
+/// match in the word is not.
+///
+/// Forcing each byte's high bit before the subtraction stops the borrow: no
+/// byte is then below 0x80, so subtracting one never carries into its
+/// neighbour. The result marks *non*-matching bytes, so it is complemented.
+fn match_bits_all(word: u64, target: u64) -> u64 {
+    let diff = word ^ target;
+    !(diff | ((diff | HIGH).wrapping_sub(ONES))) & HIGH
+}
+
+/// Whether this build scans with a vector register rather than SWAR. The
+/// delimiter cursor is worth having only here -- see [`Delims`].
+pub(super) const WIDE_SCAN: bool = cfg!(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx2", target_feature = "avx512bw")
+));
+
+/// A left-to-right cursor over the delimiters of one row.
+///
+/// [`next_of2`] begins a fresh scan at every field, which costs twice over: a
+/// word straddling a field boundary is loaded once for the field that ends in
+/// it and again for the field that starts there, and the two broadcasts are
+/// recomputed for each of a row's twenty fields. Fields are found strictly in
+/// order, so the scan can keep what it has -- the chunk it loaded and the
+/// matches in it that no field has claimed yet -- and read every byte once.
+///
+/// **Only worth it for a vector step, which is why [`WIDE_SCAN`] gates its
+/// use.** Fields here average 9.2 bytes, so an eight-byte step rarely spans a
+/// boundary and there is almost nothing to reuse: measured interleaved against
+/// the plain scan, SWAR came out 3.8% slower in this port and 0.7% slower in
+/// Zig, the bookkeeping costing more than it saves. A thirty-two-byte step
+/// covers three and a half fields, so the plain scan loads the same bytes three
+/// or four times over, and the cursor is 15.0% faster here and 12.9% in Zig.
+///
+/// Instruction count says the opposite of all that -- the exact mask above is
+/// two more ALU operations per word, and callgrind reports the cursor as a
+/// regression. What it removes is *loads*. This one had to be settled by the
+/// clock.
+///
+/// `next` takes the position to resume from rather than assuming the previous
+/// result, because a quoted field is walked by `skip_quoted` and the cursor has
+/// to be told to seek past its body.
+pub(super) struct Delims<'a> {
+    data: &'a [u8],
+    a: u8,
+    b: u8,
+    ba: u64,
+    bb: u64,
+    /// Where the held chunk begins, and the matches in it not yet returned.
+    held: usize,
+    bits: u64,
+    /// Whether `bits` came from a vector compare (one bit per byte) or from
+    /// SWAR (the high bit of each byte).
+    wide: bool,
+    /// The first byte no chunk has covered yet.
+    scanned: usize,
+}
+
+impl<'a> Delims<'a> {
+    pub(super) fn new(data: &'a [u8], from: usize, end: usize, a: u8, b: u8) -> Self {
+        Delims {
+            data: &data[..end.min(data.len())],
+            a,
+            b,
+            ba: broadcast(a),
+            bb: broadcast(b),
+            held: 0,
+            bits: 0,
+            wide: false,
+            scanned: from,
+        }
+    }
+
+    #[inline]
+    fn lowest(&self, bits: u64) -> usize {
+        self.held
+            + if self.wide {
+                bits.trailing_zeros() as usize
+            } else {
+                (bits.trailing_zeros() >> 3) as usize
+            }
+    }
+
+    /// The offset of the first byte at or after `from` that is `a` or `b`, or
+    /// `end` -- the same answer [`next_of2`] gives, without rescanning.
+    pub(super) fn next(&mut self, from: usize) -> usize {
+        while self.bits != 0 {
+            let at = self.lowest(self.bits);
+            self.bits &= self.bits - 1;
+            if at >= from {
+                return at;
+            }
+        }
+        let mut at = from.max(self.scanned);
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_feature = "avx2", target_feature = "avx512bw")
+        ))]
+        while at + VECTOR_WIDTH <= self.data.len() {
+            let mut hits = vector_hits(self.data, at, self.a, self.b);
+            self.held = at;
+            self.wide = true;
+            self.scanned = at + VECTOR_WIDTH;
+            while hits != 0 {
+                let idx = at + hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                if idx >= from {
+                    self.bits = hits;
+                    return idx;
+                }
+            }
+            at += VECTOR_WIDTH;
+        }
+        while at + 8 <= self.data.len() {
+            let word = word_at(self.data, at);
+            let mut hits = match_bits_all(word, self.ba) | match_bits_all(word, self.bb);
+            self.held = at;
+            self.wide = false;
+            self.scanned = at + 8;
+            while hits != 0 {
+                let idx = at + (hits.trailing_zeros() >> 3) as usize;
+                hits &= hits - 1;
+                if idx >= from {
+                    self.bits = hits;
+                    return idx;
+                }
+            }
+            at += 8;
+        }
+        let mut t = from.max(at);
+        while t < self.data.len() {
+            if self.data[t] == self.a || self.data[t] == self.b {
+                self.scanned = t + 1;
+                return t;
+            }
+            t += 1;
+        }
+        self.scanned = self.data.len();
+        self.data.len()
+    }
+}
+
 fn word_at(data: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(data[at..at + 8].try_into().expect("eight bytes"))
 }
