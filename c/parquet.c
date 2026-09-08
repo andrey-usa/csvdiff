@@ -43,6 +43,17 @@ static int grow(void **p, size_t *cap, size_t need, size_t elem) {
         if (want > (size_t)-1 / 2) return fail_oom();
         want *= 2;
     }
+    /*
+     * Plain realloc, deliberately. These arrays were tried on huge pages too --
+     * they are the same eighty megabytes the slot table is, walked just as
+     * randomly -- and it cost 0.96s at ten million rows rather than saving
+     * anything. The difference is how often: the two slot tables are allocated
+     * once each, while a column buffer is allocated thirty-four times, on four
+     * threads at once, and with `transparent_hugepage=madvise` every one of
+     * those asks makes the kernel compact memory to find a 2 MB run. Huge pages
+     * are worth having where an allocation is rare and long-lived, and not
+     * where it is neither.
+     */
     void *bigger = realloc(*p, want * elem);
     if (!bigger) return fail_oom();
     *p = bigger;
@@ -500,15 +511,31 @@ static int rle_fill(Rle *r, int32_t *out, size_t want) {
         } else if (r->width == 0) {
             memset(out + done, 0, take * sizeof *out);
         } else {
-            for (size_t i = 0; i < take; i++) {
+            /*
+             * Whether an eight-byte window still fits inside the buffer is only
+             * in question for the last few values of the last run, so how many
+             * are safe is computed once and the common case runs with no test
+             * at all. The tail then reassembles its word a byte at a time.
+             */
+            size_t i = 0;
+            if (r->n >= 8) {
+                const size_t last = (r->n - 8) * 8;   /* highest bit with a whole word above it */
+                if (r->bit <= last) {
+                    size_t safe = (last - r->bit) / (size_t)r->width + 1;
+                    if (safe > take) safe = take;
+                    for (; i < safe; i++) {
+                        uint64_t w;
+                        memcpy(&w, r->d + (r->bit >> 3), 8);
+                        out[done + i] = (int32_t)((w >> (r->bit & 7)) & r->mask);
+                        r->bit += (size_t)r->width;
+                    }
+                }
+            }
+            for (; i < take; i++) {
                 const size_t byte = r->bit >> 3;
                 uint64_t w = 0;
-                if (byte + 8 <= r->n) {
-                    memcpy(&w, r->d + byte, 8);
-                } else {
-                    for (size_t k = 0; k < 8 && byte + k < r->n; k++)
-                        w |= (uint64_t)((uint8_t)r->d[byte + k]) << (8 * k);
-                }
+                for (size_t k = 0; k < 8 && byte + k < r->n; k++)
+                    w |= (uint64_t)((uint8_t)r->d[byte + k]) << (8 * k);
                 out[done + i] = (int32_t)((w >> (r->bit & 7)) & r->mask);
                 r->bit += (size_t)r->width;
             }
@@ -669,31 +696,77 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                     Rle r;
                     rle_init(&r, page + vat + 1, page_len - vat - 1, width);
                     if (!rle_fill(&r, idx, real)) { fail("a parquet page ran out of dictionary indices"); goto done; }
+                    /*
+                     * One bounds check for the page rather than one per value.
+                     * A max-reduction has no loop-carried dependency, so it
+                     * vectorises, where the per-value check it replaces sat in
+                     * the middle of a dependent load-modify-store.
+                     */
+                    uint32_t widest = 0;
                     for (size_t i = 0; i < real; i++) {
-                        const size_t k = dict_base + (size_t)idx[i];
-                        if (k >= out->dict_len) { fail("a parquet dictionary index is out of range"); goto done; }
-                        idx[i] = (int32_t)k;
+                        /* Unsigned on purpose. A width of 32 can decode to a
+                         * value with the top bit set, which as int32 is
+                         * negative -- it would pass a signed max but then index
+                         * the dictionary at a vast offset. Read as uint32 it is
+                         * simply enormous, and fails the one check below, which
+                         * is what the per-value check this replaced did. */
+                        const uint32_t v = (uint32_t)idx[i];
+                        if (v > widest) widest = v;
                     }
+                    if (real && dict_base + (size_t)widest >= out->dict_len) {
+                        fail("a parquet dictionary index is out of range");
+                        goto done;
+                    }
+                    /*
+                     * The push below used to be a second pass over the page,
+                     * after the one that rebased the indices, and it tested
+                     * `dictionary` and `optional` once per value although
+                     * neither changes inside a column. Rebasing now happens
+                     * where the value is stored, and the two invariants are
+                     * branched on once, outside.
+                     */
                     if (dictionary) {
                         if (grow((void **)&out->index, &index_cap, out->index_len + n_vals,
                                  sizeof *out->index) != 0) goto done;
+                        int32_t *dst = out->index + out->index_len;
+                        if (optional) {
+                            size_t k = 0;
+                            for (size_t i = 0; i < n_vals; i++)
+                                dst[i] = defs[i] ? (int32_t)(dict_base + (size_t)idx[k++])
+                                                 : PQ_NULL_INDEX;
+                        } else {
+                            for (size_t i = 0; i < n_vals; i++)
+                                dst[i] = (int32_t)(dict_base + (size_t)idx[i]);
+                        }
+                        out->index_len += n_vals;
                     } else {
                         if (grow((void **)&out->values, &values_cap, out->values_len + n_vals,
                                  sizeof *out->values) != 0) goto done;
-                    }
-                    size_t k = 0;
-                    for (size_t i = 0; i < n_vals; i++) {
-                        const int here = !optional || defs[i];
-                        if (dictionary)
-                            out->index[out->index_len++] = here ? idx[k++] : PQ_NULL_INDEX;
-                        else
-                            out->values[out->values_len++] =
-                                here ? out->dict[(size_t)idx[k++]] : PQ_SLICE_NULL;
+                        PqSlice *dst = out->values + out->values_len;
+                        if (optional) {
+                            size_t k = 0;
+                            for (size_t i = 0; i < n_vals; i++)
+                                dst[i] = defs[i]
+                                             ? out->dict[dict_base + (size_t)idx[k++]]
+                                             : PQ_SLICE_NULL;
+                        } else {
+                            for (size_t i = 0; i < n_vals; i++)
+                                dst[i] = out->dict[dict_base + (size_t)idx[i]];
+                        }
+                        out->values_len += n_vals;
                     }
                 } else if (h.encoding == E_PLAIN) {
                     if (dictionary) {                     /* degrade */
+                        /* Sized from the footer's row count, not from what has
+                         * been decoded so far. Growing by doubling from the
+                         * first plain page means reallocating an eighty-megabyte
+                         * array eighteen times on a ten-million-row column, and
+                         * copying it every time -- which is most of what reading
+                         * a plain column used to cost. */
+                        const size_t want = (size_t)(fm.rows > 0 ? fm.rows : 1);
                         if (grow((void **)&out->values, &values_cap,
-                                 out->index_len ? out->index_len : 1, sizeof *out->values) != 0)
+                                 want > out->index_len ? want : out->index_len,
+                                 sizeof *out->values) != 0)
                             goto done;
                         for (size_t i = 0; i < out->index_len; i++) {
                             const int32_t k = out->index[i];
@@ -712,10 +785,15 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                         goto done;
                     if (grow((void **)&out->values, &values_cap, out->values_len + n_vals,
                              sizeof *out->values) != 0) goto done;
-                    size_t k = 0;
-                    for (size_t i = 0; i < n_vals; i++)
-                        out->values[out->values_len++] =
-                            (!optional || defs[i]) ? got[k++] : PQ_SLICE_NULL;
+                    PqSlice *dst = out->values + out->values_len;
+                    if (optional) {
+                        size_t k = 0;
+                        for (size_t i = 0; i < n_vals; i++)
+                            dst[i] = defs[i] ? got[k++] : PQ_SLICE_NULL;
+                    } else {
+                        memcpy(dst, got, n_vals * sizeof *dst);
+                    }
+                    out->values_len += n_vals;
                 } else {
                     fail("only PLAIN and dictionary parquet encodings are read here");
                     goto done;

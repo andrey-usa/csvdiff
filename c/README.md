@@ -129,68 +129,92 @@ produce the same counts and the same per-column statistics on every run.
 
 | Build | Best | Median | Worst | CPU | Peak RSS |
 |---|---:|---:|---:|---:|---:|
-| **C** | **0.92s** | **0.93s** | 1.01s | **2.5s** | 754 MB |
-| C++ | 1.03s | 1.06s | 1.13s | 2.8s | 765 MB |
+| **C** | **0.53s** | **0.74s** | **0.85s** | **1.5s** | **740 MB** |
+| C++ | 1.02s | 1.06s | 1.13s | 2.8s | 769 MB |
 
 **Ten million rows** (2,074 MB of input), five runs each:
 
 | Build | Best | Median | Worst | CPU | Peak RSS |
 |---|---:|---:|---:|---:|---:|
-| **C** | **4.78s** | 5.87s | 8.27s | **13.1s** | 3,438 MB |
-| C++ | 4.88s | **5.19s** | **5.63s** | 14.5s | 3,402 MB |
+| **C** | **3.86s** | **4.02s** | **5.22s** | **10.6s** | **3,280 MB** |
+| C++ | 5.18s | 5.23s | 5.34s | 15.2s | 3,394 MB |
 
-**C is about 12% faster at two million rows, and does about 10% less work at
-both sizes.** 2.5s of CPU against 2.8s, and 13.1s against 14.5s. That is the
-one measurement here that is stable across sizes and runs.
-
-**At ten million rows the two are even, and C is much more variable** — 8.27s at
-worst against C++'s 5.63s. That spread is memory, not code: 2 GB of mapped input
-plus 3.4 GB of working set, run back to back, evicts page cache, and whichever
-binary runs against a cold cache pays for it. At two million rows, where nothing
-is under pressure, C's spread is 0.09s. Reporting the ten-million best as a win
-for C would be reporting the noise.
-
-**The format is worth 4.6x, and it is the same 4.6x in both languages.** The
-same two million rows as CSV, same machine, same runs:
+**The format is worth about 4.6x, and it is the same 4.6x in both languages.**
+The same two million rows as CSV, same machine:
 
 | Build | Format | Compare | CPU |
 |---|---|---:|---:|
 | C | CSV | 11.55s | 11.5s |
-| C | Parquet | **0.92s** | **2.5s** |
+| C | Parquet | **0.53s** | **1.5s** |
 | C++ | CSV | 5.05s | 13.2s |
 | C++ | Parquet | **1.03s** | **2.8s** |
 
-Wall clock says Parquet is worth 12.6x in C and 4.9x in C++, but that comparison
+Wall clock says Parquet is worth 21x in C and 4.9x in C++, but that comparison
 is contaminated: the C **CSV** path is single-threaded and the C **Parquet**
-path is not, so most of that 12.6x is threads. CPU time removes the threading
-and leaves the format on its own — 11.5s to 2.5s in C, 13.2s to 2.8s in C++.
-**4.6x and 4.7x: the format is worth the same in both languages, which is
-another way of saying it is not a language question at all.**
+path is not. CPU time takes the threading back out and leaves the format on its
+own — 11.5s to 1.5s and 13.2s to 2.8s. **7.7x and 4.7x**, and the part of the
+gap that is not the format is the tuning below.
 
-Where the time goes, ten million rows, uncompressed Parquet:
+## Where the time went, and what moved it
 
-| Phase | C | C++ |
+The first working version of this path took **4.84s** on ten million rows
+(uncontended, best of five, warm cache). It now takes **2.65s**. Every step was
+measured rather than reasoned about, and one of them was reverted:
+
+| Change | Phase | Before | After |
+|---|---|---:|---:|
+| Pre-size the plain-value array from the footer's row count | compared columns | 1.31s | 1.17s |
+| Fold eight bytes at a time instead of one | build key indexes | 1.77s | 1.79s |
+| Prefetch the slot an insert or probe will land on | build + join | 1.79s / 1.21s | 1.39s / 0.88s |
+| Fuse the index-rebase pass into the push; hoist two invariant branches | compared columns | 1.11s | 1.06s |
+| **Put the slot table on huge pages** | build key indexes | 1.38s | **0.59s** |
+| Put the column arrays on huge pages too | compared columns | 1.00s | 1.96s — **reverted** |
+
+Uncontended phase profile, before and after:
+
+| Phase | Before | After |
 |---|---:|---:|
-| read key columns | 0.32s | 0.23s |
+| read key columns | 0.26s | 0.22s |
 | code key dictionaries | 0.00s | 0.00s |
-| build key indexes | 2.00s | 1.21s |
-| join | 1.50s | 1.92s |
-| compared columns | 2.79s | 2.24s |
+| build key indexes | 1.77s | **0.59s** |
+| join | 1.16s | **0.76s** |
+| compared columns | 1.31s | **0.95s** |
+| **wall** | **4.84s** | **2.65s** |
 
-The two split the join differently — C spends more building the indexes and less
-probing them — but index plus join is 3.50s against 3.13s, and the phase
-boundary between them is partly a question of which phase pays for faulting the
-pages in. `code key dictionaries` is zero in both because `account_id` and
-`txn_id` are high-cardinality enough that the writer gives up on a dictionary
-for them, so there is nothing to intern; on `currency` and `status` it is the
-whole comparison.
+Four things are worth writing down.
 
-One bug worth naming, because it cost a second and looked like a language gap.
-The two key indexes were built one after the other, each on half the cores. The
-hash sweep inside a build is parallel but the insertion after it is serial, so
-run in sequence the machine sits half idle through both serial tails. Overlapped
-— one side's insertion against the other side's sweep — that phase went from
-2.18s to 2.00s and the port went from losing to even.
+**The hash was never the problem.** Widening `fold_bytes` to eight bytes a step
+is the obvious optimisation for a phase that hashes twenty million keys, and it
+did nothing at all — 1.77s to 1.79s. Splitting the phase said why: the parallel
+hash sweep is 0.17s of it and the serial insertion is 1.23s. The wide fold is
+still in the code because it costs nothing and helps a longer key, but it is
+kept as a fact rather than as a saving.
+
+**The insertion was a page-table problem, not a memory-latency one.** Prefetching
+the next slot helped, as it should when every insert is a cache miss, but an
+insert still cost 123 ns afterwards — far more than a DRAM access. At ten
+million keys the table is 128 MB, which is 32,768 pages of 4 KB against a TLB
+holding perhaps 1,500, so nearly every probe took a page walk *on top of* its
+cache miss. Asking for 2 MB pages makes the same table 64 entries, and the phase
+went from 1.38s to 0.59s. This was the single largest change here, and it is
+three lines.
+
+**Huge pages are about how often, not how big.** The column buffers are the same
+eighty megabytes the slot table is, walked just as randomly, and putting them on
+huge pages made things *worse* — 1.00s to 1.96s. The two slot tables are
+allocated once each; a column buffer is allocated thirty-four times, on four
+threads at once, and with `transparent_hugepage` set to `madvise` every one of
+those asks makes the kernel compact memory to find a 2 MB run. The change was
+reverted and the reason left in `grow()` so nobody tries it again.
+
+**A hand-rolled bounds check is easy to get subtly wrong.** Replacing a
+per-value dictionary-index check with one max-reduction over the page is a real
+saving — a max has no loop-carried dependency, so it vectorises — but the first
+version reduced over `int32_t`. A bit width of 32 can decode a value with the
+top bit set, which is negative as `int32_t`, passes a signed max, and then
+indexes the dictionary at a vast offset. The per-value check it replaced caught
+that by accident, because the cast to `size_t` made it enormous. The reduction
+is unsigned now.
 
 ## Layout
 

@@ -81,11 +81,34 @@ static inline int cell_same(Cell x, Cell y) {
     return x.n == y.n && memcmp(x.p, y.p, x.n) == 0;
 }
 
-/* FNV-1a over exactly the bytes equality compares, folded the same way the CSV
- * path folds a field, so a key hashes alike on both sides. */
+/*
+ * FNV-1a widened to eight bytes a step.
+ *
+ * Interning a dictionary calls this once per *distinct* value and does not care.
+ * A key column the writer gave up on a dictionary for -- which a high-cardinality
+ * key column usually is -- is hashed once per row, on both sides, and that is
+ * the sweep that dominates building the indexes.
+ *
+ * Only the hash changes, never the answer: two keys are compared with memcmp
+ * either way, so this decides how work is bucketed and nothing else. The
+ * xor-shift at the end is not decoration -- the table takes its slot from the
+ * low bits and its tag from the top twenty-four, so a multiply's weakly-mixed
+ * low half would cost probes at one end or false tag hits at the other.
+ */
 static inline uint64_t fold_bytes(uint64_t h, const char *p, size_t n) {
-    for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)p[i]) * FNV_PRIME;
-    return (h ^ n) * FNV_PRIME;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * FNV_PRIME;
+    }
+    if (i < n) {
+        uint64_t w = 0;
+        memcpy(&w, p + i, n - i);      /* the tail, zero-padded */
+        h = (h ^ w) * FNV_PRIME;
+    }
+    h = (h ^ n) * FNV_PRIME;
+    return h ^ (h >> 29);
 }
 static inline uint64_t fold_absent(uint64_t h) {
     return (h ^ UINT64_C(0x9e3779b97f4a7c15)) * FNV_PRIME;
@@ -240,9 +263,47 @@ static int row_eq(const Keys *k, const KeySide *x, size_t rx, const KeySide *y, 
 
 #define POS_MASK ((UINT64_C(1) << 40) - 1)
 
+/*
+ * How many rows ahead to start the load for. Measured, not reasoned: at ten
+ * million rows the index build is flat within noise from 8 to 64, but the join
+ * is not -- it is best at 8 to 24 and decays steadily past 32, because a probe
+ * touches a second table and reaching too far ahead evicts what the current one
+ * is still using. A distance of 0 prefetches the slot about to be loaded anyway,
+ * which is the control: it reproduces the un-prefetched timings exactly.
+ */
+#define PREFETCH_AHEAD 24
+
 static inline uint64_t slot_for(uint64_t h, size_t pos) { return (h & ~POS_MASK) | (pos + 1); }
 static inline int      tag_is(uint64_t slot, uint64_t h) { return ((slot ^ h) & ~POS_MASK) == 0; }
 static inline size_t   pos_of(uint64_t slot) { return (size_t)(slot & POS_MASK) - 1; }
+
+/*
+ * The slot table, zeroed, on huge pages where the kernel will give them.
+ *
+ * At ten million keys this array is 128 MB and every probe lands in a different
+ * part of it. On 4 KB pages that is 32,768 pages against a TLB that holds
+ * something like 1,500 entries, so essentially every probe takes a page walk on
+ * top of its cache miss -- which is why an insert cost 123 ns here even with the
+ * next slot already prefetched. On 2 MB pages the same table is 64 entries and
+ * the walk disappears.
+ *
+ * This machine's transparent_hugepage is set to `madvise`, so they have to be
+ * asked for, and the allocation has to be aligned for the ask to be honoured.
+ * Where the kernel declines, this is an ordinary aligned allocation and
+ * everything still works, only slower.
+ */
+static uint64_t *alloc_slots(size_t n) {
+    const size_t huge = (size_t)2 << 20;
+    const size_t bytes = n * sizeof(uint64_t);
+    const size_t rounded = (bytes + huge - 1) & ~(huge - 1);
+    void *p = NULL;
+    if (posix_memalign(&p, huge, rounded) != 0) return NULL;
+#ifdef MADV_HUGEPAGE
+    madvise(p, rounded, MADV_HUGEPAGE);
+#endif
+    memset(p, 0, bytes);
+    return p;
+}
 
 typedef struct {
     uint64_t *slots;
@@ -363,7 +424,7 @@ static int build_index(const Keys *k, const KeySide *s, unsigned threads, Index 
      * actually limited by. */
     size_t cap = 1u << 12;
     while (cap * 2 < s->rows * 3 + 16) cap <<= 1;
-    ix->slots = calloc(cap, sizeof *ix->slots);
+    ix->slots = alloc_slots(cap);
     ix->firsts = malloc((s->rows ? s->rows : 1) * sizeof *ix->firsts);
     ix->counts = malloc((s->rows ? s->rows : 1) * sizeof *ix->counts);
     ix->hashes = malloc((s->rows ? s->rows : 1) * sizeof *ix->hashes);
@@ -374,7 +435,20 @@ static int build_index(const Keys *k, const KeySide *s, unsigned threads, Index 
     }
     ix->mask = cap - 1;
 
+    /*
+     * Insertion is one DRAM miss per row and nothing else.
+     *
+     * The table is a quarter of a gigabyte at ten million keys, the slot a row
+     * lands in is a hash away from anything the last row touched, and the loop
+     * is serial because first-occurrence-wins depends on the order rows arrive.
+     * So the processor spends the phase stalled on loads it could have started
+     * earlier -- and it *could* have, because `hs` already holds every hash. A
+     * fixed distance ahead is enough to cover a memory latency without evicting
+     * what the current row is using.
+     */
     for (size_t r = 0; r < s->rows; r++) {
+        if (r + PREFETCH_AHEAD < s->rows)
+            __builtin_prefetch(&ix->slots[hs[r + PREFETCH_AHEAD] & ix->mask], 1, 0);
         const uint64_t h = hs[r];
         size_t at = h & ix->mask;
         for (;;) {
@@ -573,6 +647,11 @@ static void join_part(void *vctx, unsigned p) {
         out->pb = malloc((hi - lo + 1) * sizeof *out->pb);
         if (!out->pa || !out->pb) { pq_set_error("out of memory"); note_failure(&out->fail); return; }
         for (size_t at = lo; at < hi; at++) {
+            /* The same stall as the insertion above, in the other table: the
+             * hash of the key this side will probe with is already in hand. */
+            if (at + PREFETCH_AHEAD < hi)
+                __builtin_prefetch(&c->bi->slots[c->ai->hashes[at + PREFETCH_AHEAD] &
+                                                 c->bi->mask], 0, 0);
             const int32_t row = c->ai->firsts[at];
             const int32_t mate = lookup(c->k, c->bi, &c->k->b, &c->k->a, (size_t)row,
                                         c->ai->hashes[at]);
@@ -588,6 +667,9 @@ static void join_part(void *vctx, unsigned p) {
     const size_t lo = c->bi->unique * q / c->b_ways;
     const size_t hi = c->bi->unique * (q + 1) / c->b_ways;
     for (size_t at = lo; at < hi; at++) {
+        if (at + PREFETCH_AHEAD < hi)
+            __builtin_prefetch(&c->ai->slots[c->bi->hashes[at + PREFETCH_AHEAD] &
+                                             c->ai->mask], 0, 0);
         const int32_t row = c->bi->firsts[at];
         if (lookup(c->k, c->ai, &c->k->a, &c->k->b, (size_t)row, c->bi->hashes[at]) < 0)
             out->missing++;
