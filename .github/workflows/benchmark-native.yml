@@ -125,7 +125,12 @@ jobs:
         run: |
           set -x
           make -C alt/cpp || true
-          cargo build --release --manifest-path alt/rust/Cargo.toml || true
+          # The benchmark runs `--engine turbo` and calls neither DuckDB nor
+          # polars, but that tree has them as default features and building
+          # them costs twenty minutes of a job whose measurement takes four.
+          # Falls back to a plain build for a ref that has no such features.
+          cargo build --release --no-default-features --manifest-path alt/rust/Cargo.toml \
+              || cargo build --release --manifest-path alt/rust/Cargo.toml || true
           (cd alt/zig && zig build --release=fast) || true
           ls -l alt/cpp/build/csvdiff alt/rust/target/release/csvdiff \
                 alt/zig/zig-out/bin/csvdiff || true
