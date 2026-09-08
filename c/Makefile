@@ -8,6 +8,11 @@ CC     ?= cc
 CFLAGS ?= -std=c11 -O2 -march=native -Wall -Wextra -Werror -pthread
 LDFLAGS ?= -pthread
 BIN     = csvdiff
+# Two programs live here, each with its own main, so the sources are named
+# rather than globbed. `c/*.c` would put both mains in one link -- which is
+# exactly how CI broke when the generator arrived.
+ENGINE  = csvdiff.c parquet.c pqdiff.c parallel.c
+GEN     = gen-data.c pqwrite.c
 OBJ     = csvdiff.o parquet.o pqdiff.o parallel.o
 
 all: $(BIN) gen-data
@@ -23,10 +28,17 @@ parallel.o: parallel.c parallel.h
 # The generator writes this port's own fixtures and benchmark inputs, byte for
 # byte the same files the other generators write. Having it here is what lets a
 # check run without a second toolchain built first.
-gen-data: gen-data.c pqwrite.c pqwrite.h
-	$(CC) $(CFLAGS) -o $@ gen-data.c pqwrite.c
+gen-data: $(GEN) pqwrite.h
+	$(CC) $(CFLAGS) -o $@ $(GEN)
+
+# The engine under AddressSanitizer and UndefinedBehaviorSanitizer. It is a
+# target rather than a command in the workflow so that the source list has one
+# home: a second copy in CI is a copy that goes stale, and did.
+asan: $(ENGINE)
+	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -pthread \
+	    -o csvdiff-asan $(ENGINE)
 
 clean:
-	rm -f $(BIN) gen-data $(OBJ)
+	rm -f $(BIN) gen-data csvdiff-asan $(OBJ)
 
-.PHONY: all clean
+.PHONY: all asan clean

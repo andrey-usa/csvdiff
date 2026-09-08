@@ -73,14 +73,13 @@ jobs:
       # anything else is a crash or a sanitizer report.
       - name: Sanitizers
         run: |
-          ${{ matrix.cc }} -std=c11 -O1 -g -fsanitize=address,undefined \
-              -Wall -Wextra -pthread -o /tmp/csvdiff-asan c/*.c
+          CC=${{ matrix.cc }} make -C c asan
           tmp=$(mktemp -d)
           for flags in "" "--dict-limit 1" "--dict-limit 175 --row-group-size 300"; do
             c/gen-data --rows 5k --out-dir "$tmp" --prefix s \
                 --format parquet $flags >/dev/null
             code=0
-            /tmp/csvdiff-asan compare "$tmp/s_a.unc.parquet" "$tmp/s_b.unc.parquet" \
+            c/csvdiff-asan compare "$tmp/s_a.unc.parquet" "$tmp/s_b.unc.parquet" \
                 -k account_id,txn_id -i updated_at --json /dev/null || code=$?
             [ "$code" -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
           done
@@ -93,7 +92,7 @@ jobs:
             set -- $pair
             for t in 1 4; do
               code=0
-              /tmp/csvdiff-asan compare "$tmp/$1" "$tmp/$2" -k account_id,txn_id \
+              c/csvdiff-asan compare "$tmp/$1" "$tmp/$2" -k account_id,txn_id \
                   -i updated_at --threads $t --json /dev/null || code=$?
               [ "$code" -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
             done
