@@ -488,7 +488,28 @@ const Input = union(enum) {
 // The index
 // ---------------------------------------------------------------------------
 
-const EMPTY: i32 = -1;
+/// A slot holds the top bits of its key's hash and the position in `first_row`
+/// plus one, so zero means empty.
+///
+/// Carrying the tag is what makes a failed probe cheap: the word already loaded
+/// settles it. A table of bare positions has to follow each one into `first_row`
+/// and then into `row_hash` — two dependent random loads, over arrays far too big
+/// to cache at ten million keys — only to reject it.
+const POS_MASK: u64 = (1 << 40) - 1;
+const TAG_MASK: u64 = ~POS_MASK;
+const EMPTY_SLOT: u64 = 0;
+
+fn slotFor(hash: u64, pos: usize) u64 {
+    return (hash & TAG_MASK) | (@as(u64, pos) + 1);
+}
+
+fn tagIs(slot: u64, hash: u64) bool {
+    return (slot ^ hash) & TAG_MASK == 0;
+}
+
+fn posOf(slot: u64) usize {
+    return @intCast((slot & POS_MASK) - 1);
+}
 
 /// One chunk's rows, in the order they appear in it.
 const Chunk = struct {
@@ -514,7 +535,7 @@ const RowIndex = struct {
     opt: Options,
     row_at: std.ArrayList(u64),
     row_hash: std.ArrayList(u64),
-    table: []i32,
+    table: []u64,
     mask: usize,
     first_row: std.ArrayList(i32),
     occurrences: std.ArrayList(u32),
@@ -545,8 +566,22 @@ const RowIndex = struct {
             gpa.free(chunks);
         }
 
-        const table = try gpa.alloc(i32, 1 << 12);
-        @memset(table, EMPTY);
+        var total: usize = 0;
+        for (chunks) |c| total += c.at.items.len;
+        // Sized once for the rows about to be inserted, at about a two-thirds
+        // load. Starting at four thousand and doubling meant twelve rehashes at
+        // ten million rows, each one a full random-access pass over a table
+        // already too big to cache — work that grows with the file and is
+        // entirely avoidable, since the row count is known before the first
+        // insert.
+        //
+        // Two thirds and not a half: sizing for a half load also removes the
+        // rehash, but the table it leaves is twice as big, and at ten million
+        // keys the misses that costs are worth more than the probes it saves.
+        var cap: usize = 1 << 12;
+        while (cap * 2 < total * 3 + 16) cap <<= 1;
+        const table = try gpa.alloc(u64, cap);
+        @memset(table, EMPTY_SLOT);
         var self = RowIndex{
             .gpa = gpa,
             .side = side,
@@ -563,10 +598,12 @@ const RowIndex = struct {
         };
         errdefer self.deinit();
 
-        var total: usize = 0;
-        for (chunks) |c| total += c.at.items.len;
         try self.row_at.ensureTotalCapacity(gpa, total);
         try self.row_hash.ensureTotalCapacity(gpa, total);
+        // One entry per distinct key, and every key is distinct until proven
+        // otherwise.
+        try self.first_row.ensureTotalCapacity(gpa, total);
+        try self.occurrences.ensureTotalCapacity(gpa, total);
 
         var s = Scratch{};
         // Each chunk is released as soon as it has been inserted. Holding all of
@@ -602,39 +639,44 @@ const RowIndex = struct {
         var slot = self.slotOf(hash);
         var mine_parsed = false;
         while (true) {
-            const key = self.table[slot];
-            if (key == EMPTY) {
-                self.table[slot] = @intCast(self.first_row.items.len);
+            const word = self.table[slot];
+            if (word == EMPTY_SLOT) {
+                self.table[slot] = slotFor(hash, self.first_row.items.len);
                 try self.first_row.append(self.gpa, row);
                 try self.occurrences.append(self.gpa, 1);
-                if (self.first_row.items.len * 2 > self.table.len) try self.rehash();
+                // Two thirds, which is what `build` sizes the table for.
+                if (self.first_row.items.len * 3 > self.table.len * 2) try self.rehash();
                 return;
             }
-            const candidate = self.first_row.items[@intCast(key)];
-            if (self.row_hash.items[@intCast(candidate)] == hash) {
-                // This row's fields are re-read rather than carried over from the
-                // sweep because the sweep produced ten million of them and this
-                // branch wants one.
-                if (!mine_parsed) {
-                    self.side.fieldsAt(at, self.mine);
-                    mine_parsed = true;
-                }
-                self.fieldsOf(candidate, self.probe);
-                var ok = true;
-                for (0..self.key_size) |i| {
-                    if (!(try same(self.side.slab, self.probe[i], self.side.slab, self.mine[i], self.opt, s))) {
-                        ok = false;
-                        break;
+            // The tag rejects almost every collision without leaving this word.
+            if (tagIs(word, hash)) {
+                const key = posOf(word);
+                const candidate = self.first_row.items[key];
+                if (self.row_hash.items[@intCast(candidate)] == hash) {
+                    // This row's fields are re-read rather than carried over from
+                    // the sweep because the sweep produced ten million of them and
+                    // this branch wants one.
+                    if (!mine_parsed) {
+                        self.side.fieldsAt(at, self.mine);
+                        mine_parsed = true;
                     }
-                }
-                if (ok) {
-                    self.occurrences.items[@intCast(key)] += 1;
-                    if (self.occurrences.items[@intCast(key)] == 2) {
-                        self.dup_keys += 1;
-                        self.dup_rows += 1; // the first occurrence counts once the key repeats
+                    self.fieldsOf(candidate, self.probe);
+                    var ok = true;
+                    for (0..self.key_size) |i| {
+                        if (!(try same(self.side.slab, self.probe[i], self.side.slab, self.mine[i], self.opt, s))) {
+                            ok = false;
+                            break;
+                        }
                     }
-                    self.dup_rows += 1;
-                    return;
+                    if (ok) {
+                        self.occurrences.items[key] += 1;
+                        if (self.occurrences.items[key] == 2) {
+                            self.dup_keys += 1;
+                            self.dup_rows += 1; // the first occurrence counts once the key repeats
+                        }
+                        self.dup_rows += 1;
+                        return;
+                    }
                 }
             }
             slot = (slot + 1) & self.mask;
@@ -650,16 +692,19 @@ const RowIndex = struct {
         return @as(usize, @intCast((hash ^ (hash >> 32)) & 0xffff_ffff)) & self.mask;
     }
 
+    /// Only reached if the row count was underestimated: `build` sizes the table
+    /// for the rows it is about to insert, so the common path never grows it.
     fn rehash(self: *RowIndex) !void {
-        const table = try self.gpa.alloc(i32, self.table.len * 2);
-        @memset(table, EMPTY);
+        const table = try self.gpa.alloc(u64, self.table.len * 2);
+        @memset(table, EMPTY_SLOT);
         self.gpa.free(self.table);
         self.table = table;
         self.mask = table.len - 1;
         for (self.first_row.items, 0..) |row, key| {
-            var slot = self.slotOf(self.row_hash.items[@intCast(row)]);
-            while (self.table[slot] != EMPTY) slot = (slot + 1) & self.mask;
-            self.table[slot] = @intCast(key);
+            const hash = self.row_hash.items[@intCast(row)];
+            var slot = self.slotOf(hash);
+            while (self.table[slot] != EMPTY_SLOT) slot = (slot + 1) & self.mask;
+            self.table[slot] = slotFor(hash, key);
         }
     }
 
@@ -677,19 +722,22 @@ const RowIndex = struct {
     ) !?i32 {
         var slot = self.slotOf(hash);
         while (true) {
-            const key = self.table[slot];
-            if (key == EMPTY) return null;
-            const candidate = self.first_row.items[@intCast(key)];
-            if (self.row_hash.items[@intCast(candidate)] == hash) {
-                self.fieldsOf(candidate, probe);
-                var ok = true;
-                for (0..self.key_size) |i| {
-                    if (!(try same(self.side.slab, probe[i], other, fields[i], self.opt, s))) {
-                        ok = false;
-                        break;
+            const word = self.table[slot];
+            if (word == EMPTY_SLOT) return null;
+            // The tag rejects almost every collision without leaving this word.
+            if (tagIs(word, hash)) {
+                const candidate = self.first_row.items[posOf(word)];
+                if (self.row_hash.items[@intCast(candidate)] == hash) {
+                    self.fieldsOf(candidate, probe);
+                    var ok = true;
+                    for (0..self.key_size) |i| {
+                        if (!(try same(self.side.slab, probe[i], other, fields[i], self.opt, s))) {
+                            ok = false;
+                            break;
+                        }
                     }
+                    if (ok) return candidate;
                 }
-                if (ok) return candidate;
             }
             slot = (slot + 1) & self.mask;
         }
