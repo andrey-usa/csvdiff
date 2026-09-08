@@ -9,8 +9,14 @@
  * can a correct answer be had in? It is the baseline the rest are measured
  * against, not a recommendation.
  *
- * Build:  cc -std=c11 -O2 -march=native -Wall -Wextra -o csvdiff csvdiff.c
- * Usage:  csvdiff compare A B -k COLS [-i COLS] [--json PATH]
+ * It reads CSV, and -- through parquet.c and pqdiff.c -- uncompressed Parquet,
+ * which is a different comparison rather than a different parser: a column
+ * store is joined on its key columns and then diffed a column at a time, and
+ * never becomes rows at all. Both paths produce the same counts on the same
+ * data, which is what test.sh checks.
+ *
+ * Build:  make            (see Makefile; it is three files now, not one)
+ * Usage:  csvdiff compare A B -k COLS [-i COLS] [--json PATH] [--threads N]
  * Exit:   0 identical, 1 differences found, 2 error
  */
 #define _GNU_SOURCE
@@ -24,6 +30,9 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "parquet.h"
+#include "pqdiff.h"
 
 /* ------------------------------------------------------------------------- */
 /* A field packed into one word: offset, length, and whether it needs           */
@@ -552,10 +561,89 @@ static int fail(const char *message) {
     return 2;
 }
 
+/* ------------------------------------------------------------------------- */
+/* The report                                                                  */
+/*                                                                             */
+/* Both paths end here, because the whole claim of the Parquet path is that it  */
+/* is the same comparison on the same rows -- if it could print its own summary */
+/* the two could drift apart without anything noticing.                         */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    const char *name;
+    long long   changed, blanked, filled;
+} OutCol;
+
+typedef struct {
+    const char   *engine;
+    long long     a_rows, b_rows, a_keys, b_keys;
+    long long     matched, changed, added, removed;
+    long long     a_dup_keys, a_dup_rows, b_dup_keys, b_dup_rows;
+    const OutCol *cols;
+    size_t        ncols;
+} Summary;
+
+/* Returns the process exit status: 0 identical, 1 differences, 2 error. */
+static int emit(const Summary *s, const char *json_path) {
+    if (json_path) {
+        FILE *out = fopen(json_path, "w");
+        if (!out) return fail("cannot write the JSON summary");
+        fprintf(out,
+                "{\"counts\":{\"a_rows\":%lld,\"b_rows\":%lld,\"a_keys\":%lld,\"b_keys\":%lld,"
+                "\"matched\":%lld,\"unchanged\":%lld,\"changed\":%lld,\"added\":%lld,"
+                "\"removed\":%lld,\"a_dup_keys\":%lld,\"a_dup_rows\":%lld,"
+                "\"b_dup_keys\":%lld,\"b_dup_rows\":%lld},\"columns\":[",
+                s->a_rows, s->b_rows, s->a_keys, s->b_keys, s->matched,
+                s->matched - s->changed, s->changed, s->added, s->removed,
+                s->a_dup_keys, s->a_dup_rows, s->b_dup_keys, s->b_dup_rows);
+        for (size_t i = 0; i < s->ncols; i++)
+            fprintf(out, "%s{\"name\":\"%s\",\"changed\":%lld,\"blanked\":%lld,\"filled\":%lld}",
+                    i ? "," : "", s->cols[i].name, s->cols[i].changed, s->cols[i].blanked,
+                    s->cols[i].filled);
+        fprintf(out, "]}");
+        fclose(out);
+    }
+
+    printf("A %lld rows | B %lld rows | matched %lld (changed %lld) | added %lld | removed %lld"
+           " | dup keys A %lld B %lld | %s\n",
+           s->a_rows, s->b_rows, s->matched, s->changed, s->added, s->removed,
+           s->a_dup_keys, s->b_dup_keys, s->engine);
+    return (s->changed == 0 && s->added == 0 && s->removed == 0) ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* The Parquet path                                                            */
+/* ------------------------------------------------------------------------- */
+
+static int compare_parquet(const char *a_path, const char *b_path, const Names *key,
+                           const Names *ignore, unsigned threads, const char *json_path) {
+    PqResult r;
+    if (pq_compare(a_path, b_path, key->items, key->len, ignore->items, ignore->len,
+                   threads, &r) != 0)
+        return fail(pq_error());
+
+    OutCol *cols = calloc(r.ncols ? r.ncols : 1, sizeof *cols);
+    if (!cols) { pq_result_free(&r); return fail("out of memory"); }
+    for (size_t i = 0; i < r.ncols; i++) {
+        cols[i].name = r.cols[i].name;
+        cols[i].changed = r.cols[i].changed;
+        cols[i].blanked = r.cols[i].blanked;
+        cols[i].filled = r.cols[i].filled;
+    }
+    const Summary s = { "parquet", r.a_rows, r.b_rows, r.a_keys, r.b_keys, r.matched,
+                        r.changed, r.added, r.removed, r.a_dup_keys, r.a_dup_rows,
+                        r.b_dup_keys, r.b_dup_rows, cols, r.ncols };
+    const int status = emit(&s, json_path);
+    free(cols);
+    pq_result_free(&r);
+    return status;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
-        printf("csvdiff - composite-key CSV comparison, byte-level, in C\n\n"
-               "usage:\n  csvdiff compare A B -k COLS [-i COLS] [--json PATH]\n\n"
+        printf("csvdiff - composite-key comparison, byte-level, in C\n\n"
+               "usage:\n  csvdiff compare A B -k COLS [-i COLS] [--json PATH] [--threads N]\n\n"
+               "CSV, and uncompressed Parquet when both files are Parquet.\n"
                "exit codes: 0 identical, 1 differences found, 2 error\n");
         return argc < 2 ? 2 : 0;
     }
@@ -563,11 +651,14 @@ int main(int argc, char **argv) {
 
     Names key = {0}, ignore = {0};
     const char *a_path = NULL, *b_path = NULL, *json_path = NULL;
+    unsigned threads = 0;   /* 0 means one per core, on the Parquet path */
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i];
         if ((!strcmp(f, "-k") || !strcmp(f, "--key")) && i + 1 < argc) key = split_commas(argv[++i]);
         else if ((!strcmp(f, "-i") || !strcmp(f, "--ignore")) && i + 1 < argc) ignore = split_commas(argv[++i]);
         else if (!strcmp(f, "--json") && i + 1 < argc) json_path = argv[++i];
+        else if ((!strcmp(f, "-t") || !strcmp(f, "--threads")) && i + 1 < argc)
+            threads = (unsigned)strtoul(argv[++i], NULL, 10);
         else if ((!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) && i + 1 < argc) i++;
         else if (f[0] == '-') { names_free(&key); names_free(&ignore); return fail("unknown option"); }
         else if (!a_path) a_path = f;
@@ -575,6 +666,25 @@ int main(int argc, char **argv) {
     }
     if (!a_path || !b_path) { names_free(&key); names_free(&ignore); return fail("compare needs two files"); }
     if (key.len == 0) { names_free(&key); names_free(&ignore); return fail("--key is required"); }
+
+    /* A column store and a byte stream have no common ground to be compared on:
+     * one of them would have to be turned into the other, which is the cost the
+     * columnar path exists to avoid. So a mixed pair is refused by name rather
+     * than half-answered. */
+    {
+        const int ap = pq_is_parquet(a_path), bp = pq_is_parquet(b_path);
+        if (ap != bp) {
+            names_free(&key);
+            names_free(&ignore);
+            return fail("one file is parquet and the other is not; convert one of them first");
+        }
+        if (ap) {
+            const int st = compare_parquet(a_path, b_path, &key, &ignore, threads, json_path);
+            names_free(&key);
+            names_free(&ignore);
+            return st;
+        }
+    }
 
     int status = 2;
     Slab a = {0}, b = {0};
@@ -670,32 +780,22 @@ int main(int argc, char **argv) {
         if (index_lookup(&ai, &b, fb, hash) < 0) added++;
     }
 
-    if (json_path) {
-        FILE *out = fopen(json_path, "w");
-        if (!out) { fail("cannot write the JSON summary"); goto done; }
-        fprintf(out,
-                "{\"counts\":{\"a_rows\":%zu,\"b_rows\":%zu,\"a_keys\":%zu,\"b_keys\":%zu,"
-                "\"matched\":%lld,\"unchanged\":%lld,\"changed\":%lld,\"added\":%lld,"
-                "\"removed\":%lld,\"a_dup_keys\":%lld,\"a_dup_rows\":%lld,"
-                "\"b_dup_keys\":%lld,\"b_dup_rows\":%lld},\"columns\":[",
-                ai.rows, bi.rows, ai.keys, bi.keys, (long long)matched,
-                (long long)(matched - changed), (long long)changed, (long long)added,
-                (long long)removed, (long long)ai.dup_keys, (long long)ai.dup_rows,
-                (long long)bi.dup_keys, (long long)bi.dup_rows);
-        for (size_t i = 0; i < nc; i++)
-            fprintf(out,
-                    "%s{\"name\":\"%s\",\"changed\":%lld,\"blanked\":%lld,\"filled\":%lld}",
-                    i ? "," : "", compared.items[i], (long long)col_changed[i],
-                    (long long)col_blanked[i], (long long)col_filled[i]);
-        fprintf(out, "]}");
-        fclose(out);
+    {
+        OutCol *out_cols = calloc(nc ? nc : 1, sizeof *out_cols);
+        if (!out_cols) { fail("out of memory"); goto done; }
+        for (size_t i = 0; i < nc; i++) {
+            out_cols[i].name = compared.items[i];
+            out_cols[i].changed = (long long)col_changed[i];
+            out_cols[i].blanked = (long long)col_blanked[i];
+            out_cols[i].filled = (long long)col_filled[i];
+        }
+        const Summary s = { "turbo", (long long)ai.rows, (long long)bi.rows,
+                            (long long)ai.keys, (long long)bi.keys, matched, changed, added,
+                            removed, (long long)ai.dup_keys, (long long)ai.dup_rows,
+                            (long long)bi.dup_keys, (long long)bi.dup_rows, out_cols, nc };
+        status = emit(&s, json_path);
+        free(out_cols);
     }
-
-    printf("A %zu rows | B %zu rows | matched %lld (changed %lld) | added %lld | removed %lld"
-           " | dup keys A %lld B %lld | turbo\n",
-           ai.rows, bi.rows, (long long)matched, (long long)changed, (long long)added,
-           (long long)removed, (long long)ai.dup_keys, (long long)bi.dup_keys);
-    status = (changed == 0 && added == 0 && removed == 0) ? 0 : 1;
 
 done:
     index_free(&ai);
