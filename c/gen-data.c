@@ -50,7 +50,13 @@ enum { CHG_STATUS = 300, CHG_AMOUNT = 150, CHG_BALANCE = 150, CHG_VALUE_DATE = 3
  * library; this one only needs the same strings out. */
 static char g_days[240][11];
 
+/* Column-name lengths, computed once. Writing a JSON row calls for all twenty
+ * of them, so taking strlen each time is forty million calls on a two-million
+ * row file. */
+static size_t g_name_len[COLUMNS];
+
 static void build_days(void) {
+    for (int i = 0; i < COLUMNS; i++) g_name_len[i] = strlen(kNames[i]);
     static const int len[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
     int month = 0, day = 1;
     for (int i = 0; i < 240; i++) {
@@ -227,62 +233,84 @@ static char *put_json(char *p, const char *v, size_t n) {
 /* The three writers                                                           */
 /* ------------------------------------------------------------------------- */
 
-typedef struct { FILE *fh; Row scratch; int64_t seed; bool b; } TextOut;
+/*
+ * A megabyte of output at a time, written with one `fwrite` per buffer rather
+ * than one per row. A row is a couple of hundred bytes, so the per-call cost --
+ * the lock, the branch on the stream's state, the memcpy into libc's own buffer
+ * -- was being paid two million times for work that is a memcpy either way.
+ */
+#define OUT_CAP (1 << 20)
+
+typedef struct { FILE *fh; char *buf; size_t n; } Out;
+
+static int out_flush(Out *o) {
+    if (o->n && fwrite(o->buf, 1, o->n, o->fh) != o->n) return -1;
+    o->n = 0;
+    return 0;
+}
+
+/* Room for one more row. Rows are bounded well under 4 KB. */
+static inline int out_room(Out *o) {
+    return o->n + 4096 <= OUT_CAP ? 0 : out_flush(o);
+}
 
 static int write_csv(const char *path, bool b, int64_t rows, int64_t seed) {
     FILE *fh = fopen(path, "w");
     if (!fh) return -1;
-    static char buf[1 << 20];
-    setvbuf(fh, buf, _IOFBF, sizeof buf);
+    static char obuf[OUT_CAP];
+    Out o = { fh, obuf, 0 };
     fputs("account_id,txn_id,posting_date,value_date,currency,amount,fee,balance,status,channel,"
           "region,branch_code,product_code,counterparty,quantity,rate,category,risk_flag,note,"
           "updated_at\n", fh);
     Row r;
-    char line[1024];
 #define EMIT_CSV(i)                                                        \
     do {                                                                   \
+        if (out_room(&o) != 0) { fclose(fh); return -1; }                  \
         fields(&r, (i), b, seed);                                          \
-        char *p = line;                                                    \
+        char *p = o.buf + o.n;                                             \
         for (int c = 0; c < COLUMNS; c++) {                                \
             if (c) *p++ = ',';                                             \
             memcpy(p, r.f[c], r.n[c]);                                     \
             p += r.n[c];                                                   \
         }                                                                  \
         *p++ = '\n';                                                       \
-        fwrite(line, 1, (size_t)(p - line), fh);                           \
+        o.n = (size_t)(p - o.buf);                                         \
     } while (0)
     EACH_ROW(b, rows, EMIT_CSV);
 #undef EMIT_CSV
+    if (out_flush(&o) != 0) { fclose(fh); return -1; }
     return fclose(fh) == 0 ? 0 : -1;
 }
 
 static int write_json(const char *path, bool b, int64_t rows, int64_t seed) {
     FILE *fh = fopen(path, "w");
     if (!fh) return -1;
-    static char buf[1 << 20];
-    setvbuf(fh, buf, _IOFBF, sizeof buf);
+    static char obuf[OUT_CAP];
+    Out o = { fh, obuf, 0 };
     Row r;
-    char line[2048];
 #define EMIT_JSON(i)                                                       \
     do {                                                                   \
+        if (out_room(&o) != 0) { fclose(fh); return -1; }                  \
         fields(&r, (i), b, seed);                                          \
-        char *p = line;                                                    \
+        char *p = o.buf + o.n;                                             \
         *p++ = '{';                                                        \
         for (int c = 0; c < COLUMNS; c++) {                                \
             if (c) *p++ = ',';                                             \
             *p++ = '"';                                                    \
-            p = put(p, kNames[c]);                                         \
+            memcpy(p, kNames[c], g_name_len[c]);                           \
+            p += g_name_len[c];                                            \
             *p++ = '"'; *p++ = ':';                                        \
-            if (r.n[c] == 0) { p = put(p, "null"); continue; }              \
+            if (r.n[c] == 0) { memcpy(p, "null", 4); p += 4; continue; }    \
             *p++ = '"';                                                    \
             p = put_json(p, r.f[c], r.n[c]);                               \
             *p++ = '"';                                                    \
         }                                                                  \
         *p++ = '}'; *p++ = '\n';                                           \
-        fwrite(line, 1, (size_t)(p - line), fh);                           \
+        o.n = (size_t)(p - o.buf);                                         \
     } while (0)
     EACH_ROW(b, rows, EMIT_JSON);
 #undef EMIT_JSON
+    if (out_flush(&o) != 0) { fclose(fh); return -1; }
     return fclose(fh) == 0 ? 0 : -1;
 }
 

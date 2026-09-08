@@ -216,6 +216,12 @@ static int width_for(size_t distinct) {
 /* Columns, row groups, and the file                                           */
 /* ------------------------------------------------------------------------- */
 
+static uint64_t value_hash(const char *p, size_t n) {
+    uint64_t h = UINT64_C(0xcbf29ce484222325);
+    for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)p[i]) * UINT64_C(0x100000001b3);
+    return h ^ (h >> 29);
+}
+
 /* parquet.thrift constants, named as the reader names them. */
 enum { PT_BYTE_ARRAY = 6 };
 enum { PE_PLAIN = 0, PE_PLAIN_DICTIONARY = 2, PE_RLE = 3, PE_RLE_DICTIONARY = 8 };
@@ -334,8 +340,16 @@ static int flush_group(PqWriter *w) {
     int32_t *defs = malloc(n * sizeof *defs);
     int32_t *idx = malloc(n * sizeof *idx);
     size_t  *dict = malloc(n * sizeof *dict);      /* row indices of distinct values */
+    /* Sized to at least twice what can go in it, so probes stay short and it
+     * can never fill; one table serves every column in the group. */
+    size_t   seen_cap = 16;
+    while (seen_cap < (w->dict_limit < n ? w->dict_limit : n) * 2 + 16) seen_cap <<= 1;
+    int32_t *seen = malloc(seen_cap * sizeof *seen);
     Buf      group = {0};
-    if (!bytes || !dict_at || !data_at || !defs || !idx || !dict) { fail("out of memory"); goto done; }
+    if (!bytes || !dict_at || !data_at || !defs || !idx || !dict || !seen) {
+        fail("out of memory");
+        goto done;
+    }
 
     for (size_t c = 0; c < w->columns; c++) {
         Column *col = &w->col[c];
@@ -348,22 +362,39 @@ static int flush_group(PqWriter *w) {
         for (size_t i = 0; i < n; i++) defs[i] = col->isnull[i] ? 0 : 1;
         rle_hybrid(&levels, defs, n, 1);
 
-        /* Distinct values in first-seen order, abandoned once the column is too
-         * varied for a dictionary to be worth it. */
+        /*
+         * Distinct values in first-seen order, abandoned once the column is too
+         * varied for a dictionary to be worth it.
+         *
+         * Through an open-addressed table, not a scan of what has been seen. A
+         * scan is O(rows x distinct), which at a hundred and twenty thousand
+         * rows a group and a dictionary of eight thousand is a billion
+         * comparisons per column -- it made this generator fifty-eight times
+         * slower than the C++ one it is meant to match, all of it in here.
+         */
         size_t distinct = 0;
         int use_dict = 1;
+        memset(seen, 0xFF, seen_cap * sizeof *seen);      /* -1 is empty */
         for (size_t i = 0; i < n && use_dict; i++) {
             if (col->isnull[i]) { idx[i] = 0; continue; }
             const char *v = col->bytes.p + col->off[i];
-            size_t vn = col->len[i];
-            size_t found = distinct;
-            for (size_t k = 0; k < distinct; k++) {
-                const char *d = col->bytes.p + col->off[dict[k]];
-                if (col->len[dict[k]] == vn && memcmp(d, v, vn) == 0) { found = k; break; }
+            const size_t vn = col->len[i];
+            size_t at = value_hash(v, vn) & (seen_cap - 1);
+            int32_t found = -1;
+            for (;;) {
+                const int32_t k = seen[at];
+                if (k < 0) break;
+                const size_t o = dict[k];
+                if (col->len[o] == vn && memcmp(col->bytes.p + col->off[o], v, vn) == 0) {
+                    found = k;
+                    break;
+                }
+                at = (at + 1) & (seen_cap - 1);
             }
-            if (found < distinct) { idx[i] = (int32_t)found; continue; }
+            if (found >= 0) { idx[i] = found; continue; }
             if (distinct >= w->dict_limit) { use_dict = 0; break; }
             dict[distinct] = i;
+            seen[at] = (int32_t)distinct;
             idx[i] = (int32_t)distinct;
             distinct++;
         }
@@ -474,7 +505,7 @@ static int flush_group(PqWriter *w) {
 
 done:
     for (size_t c = 0; bytes && c < w->columns; c++) buf_free(&bytes[c]);
-    free(bytes); free(dict_at); free(data_at); free(defs); free(idx); free(dict);
+    free(bytes); free(dict_at); free(data_at); free(defs); free(idx); free(dict); free(seen);
     buf_free(&group);
     return status;
 }

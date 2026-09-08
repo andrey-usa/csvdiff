@@ -169,6 +169,46 @@ the table is now sized once from the row count instead of doubling from 4,096
 (thirteen rehashes at ten million rows, each a full pass of random probes), and
 each key is hashed once rather than twice.
 
+## The generator against the C++ one
+
+Both write the same bytes, so this is a clean measurement of two
+implementations of one recipe. Two million rows, interleaved, on one four-core
+container:
+
+| Format | C | C++ | C CPU | C++ CPU |
+|---|---:|---:|---:|---:|
+| CSV | 2.53s | **1.83s** | **2.5s** | 3.3s |
+| ndjson | 5.55s | **3.19s** | 5.5s | 5.4s |
+| Parquet | 4.80s | **1.74s** | 4.8s | 4.6s |
+
+**C++ is 1.4x to 2.8x faster on wall clock, and the whole of it is threading.**
+Per CPU-second the two are within a few per cent on every format, and on CSV the
+C generator does slightly less work. The C++ generator formats rows in waves
+across every core and spreads a row group's per-column work the same way; this
+one runs on one thread, because generating fixtures is not the thing this port
+exists to be fast at and a second threading design is a second thing to get
+wrong.
+
+Two defects turned up in writing that table, both mine, neither visible from
+the output because the bytes were right the whole time:
+
+**The dictionary was built by scanning what had been seen.** O(rows x distinct),
+which at 122,880 rows a row group and a dictionary of 8,192 is a billion
+comparisons per column. Parquet generation took **113 seconds** at two million
+rows against the C++ generator's 1.9. Through an open-addressed table it is
+4.8s -- **24x** -- and the files are byte for byte what they were.
+
+**The text writers called `fwrite` once per row**, and looked up each column
+name's length with `strlen` twenty times a row. A row is a couple of hundred
+bytes, so the per-call cost was being paid two million times for a memcpy either
+way. One megabyte of output per write, and the name lengths computed once, took
+ndjson from 8.29s to 5.55s.
+
+The lesson is the one the rest of this file keeps finding: `cmp` said the
+generator was correct from the first commit, and correctness said nothing at all
+about whether it was fast. Neither did the test suite, which generates at most
+sixty thousand rows -- where the quadratic dictionary costs 40 ms and hides.
+
 ## Newline-delimited JSON
 
 The same rows, in the shape a log pipeline emits. Two million of them are 1,697
