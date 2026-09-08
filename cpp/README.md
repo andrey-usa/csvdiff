@@ -10,7 +10,7 @@ It reads three formats on that one representation: CSV, newline-delimited JSON,
 and Parquet. CSV and JSON compare against each other, because both reduce a field
 to bytes in the mapping. Parquet compares against Parquet on a different path
 entirely — [columnar, and never reconstructing a
-row](../README.md#reading-parquet-natively) — which is 4.8x faster than the same
+row](../ARCHIVE.md#techniques) — which is 4.8x faster than the same
 data as CSV.
 
 ```bash

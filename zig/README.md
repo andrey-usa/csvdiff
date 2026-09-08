@@ -8,7 +8,7 @@ bytes at a time with SWAR, and nothing becomes a string unless it reaches the
 report.
 
 It reads **CSV and Parquet**. A Parquet pair takes a different path entirely —
-[columnar, and never reconstructing a row](../README.md#reading-parquet-natively)
+[columnar, and never reconstructing a row](../ARCHIVE.md#techniques)
 — and the budget bounds that path exactly as it bounds this one.
 
 ```bash

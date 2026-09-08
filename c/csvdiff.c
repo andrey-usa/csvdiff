@@ -438,6 +438,25 @@ typedef struct {
     int last_needed;
     Dialect dialect;
     /*
+     * The key columns are the first `key_size` slots, and most of the parsing
+     * this program does wants only those: the sweep hashes them, and a probe
+     * that lands on a matching hash confirms them. `key_last` is the file
+     * column the last of them sits at, so a key-only parse of a twenty-column
+     * row delimits two fields and then scans once to the newline.
+     */
+    size_t key_size;
+    int key_last;
+    /*
+     * CSV addresses a value by column number, and the projection has to get
+     * from that number to the slot it fills. Scanning `source` for it cost
+     * `width` comparisons per column and so `width * width` per row -- four
+     * hundred at twenty columns, which is the same four hundred the JSON path
+     * has a hash table to avoid. `col_first[c]` is the first slot fed by file
+     * column c and `slot_next` chains the rest, so a column costs one load.
+     */
+    int32_t *col_first;
+    int32_t *slot_next;
+    /*
      * JSON addresses a value by key where CSV addresses it by column number, so
      * the wanted names live here. `want[i]` is the key whose value belongs in
      * slot i, or NULL for a column this file does not have. `slot` is a small
@@ -449,6 +468,30 @@ typedef struct {
     int32_t *slot;
     size_t slot_mask;
 } RowParser;
+
+/*
+ * Inverts `source` into the column-to-slot chains. One file column can in
+ * principle feed several slots, so this is a chain rather than an array, and it
+ * is built back to front so those slots are visited in slot order -- the order
+ * the scan it replaces filled them in. This port's flags cannot produce that
+ * case today (the compared set is the common columns minus the keys, so a
+ * column is never both), which is precisely why the chain is here rather than
+ * an assumption that it cannot happen.
+ */
+static bool parser_index_columns(RowParser *p) {
+    const size_t n = p->last_needed >= 0 ? (size_t)p->last_needed + 1 : 1;
+    p->col_first = malloc(n * sizeof *p->col_first);
+    p->slot_next = malloc((p->width ? p->width : 1) * sizeof *p->slot_next);
+    if (!p->col_first || !p->slot_next) return false;
+    for (size_t i = 0; i < n; i++) p->col_first[i] = -1;
+    for (size_t i = p->width; i-- > 0;) {
+        p->slot_next[i] = -1;
+        if (p->source[i] < 0 || p->source[i] > p->last_needed) continue;
+        p->slot_next[i] = p->col_first[p->source[i]];
+        p->col_first[p->source[i]] = (int32_t)i;
+    }
+    return true;
+}
 
 static uint64_t name_hash(const char *p, size_t n) {
     uint64_t h = UINT64_C(0xcbf29ce484222325);
@@ -506,8 +549,8 @@ static size_t end_of_row(const char *d, size_t pos, size_t end) {
  * the object, one hash per key it holds -- not a search per wanted column.
  */
 static size_t parse_json_row(const RowParser *p, const char *d, size_t start, size_t end,
-                             Field *out) {
-    for (size_t i = 0; i < p->width; i++) out[i] = ABSENT;
+                             Field *out, size_t slots) {
+    for (size_t i = 0; i < slots; i++) out[i] = ABSENT;
     size_t pos = start;
     while (pos < end && json_space(d[pos])) pos++;
     if (pos >= end) return end;
@@ -554,15 +597,15 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
         }
         if (!absent) {
             int slot = parser_slot_for(p, d + key_from, key_len);
-            if (slot >= 0) out[slot] = pack(from, to - from, escaped);
+            if (slot >= 0 && (size_t)slot < slots) out[slot] = pack(from, to - from, escaped);
         }
     }
     return end_of_json_row(d, pos, end);
 }
 
-static size_t parse_row(const RowParser *p, const char *d, size_t start, size_t end, Field *out) {
-    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out);
-    for (size_t i = 0; i < p->width; i++) out[i] = ABSENT;
+static size_t parse_csv_row(const RowParser *p, const char *d, size_t start, size_t end,
+                            Field *out, int last_needed, size_t slots) {
+    for (size_t i = 0; i < slots; i++) out[i] = ABSENT;
     size_t pos = start;
     int column = 0;
 
@@ -581,20 +624,36 @@ static size_t parse_row(const RowParser *p, const char *d, size_t start, size_t 
             if (stop > pos && d[stop - 1] == '\r') stop--; /* CRLF behaves like LF */
             field = pack(pos, stop - pos, false);
         }
-        if (column <= p->last_needed)
-            for (size_t i = 0; i < p->width; i++)
-                if (p->source[i] == column) out[i] = field;
+        if (column <= last_needed)
+            for (int32_t sl = p->col_first[column]; sl >= 0; sl = p->slot_next[sl])
+                if ((size_t)sl < slots) out[sl] = field;
         column++;
 
         if (next >= end) return end;
         if (d[next] == '\n') return next + 1;
         pos = next + 1;
-        if (column > p->last_needed) {
+        if (column > last_needed) {
             size_t eol = end_of_row(d, pos, end);
             return eol >= end ? end : eol + 1;
         }
     }
     return end;
+}
+
+static size_t parse_row(const RowParser *p, const char *d, size_t start, size_t end, Field *out) {
+    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out, p->width);
+    return parse_csv_row(p, d, start, end, out, p->last_needed, p->width);
+}
+
+/*
+ * The key columns alone, into the first `key_size` slots. Everything that only
+ * needs a key -- the sweep, and the probe that confirms a hash match -- goes
+ * through this rather than parsing twenty columns to look at two.
+ */
+static size_t parse_keys(const RowParser *p, const char *d, size_t start, size_t end,
+                         Field *out) {
+    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out, p->key_size);
+    return parse_csv_row(p, d, start, end, out, p->key_last, p->key_size);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -628,6 +687,10 @@ static size_t slot_of(const RowIndex *ix, uint64_t hash) {
 
 static void index_fields(const RowIndex *ix, int32_t row, Field *out) {
     parse_row(ix->parser, ix->slab->data, (size_t)ix->row_start[row], ix->slab->size, out);
+}
+
+static void index_keys(const RowIndex *ix, int32_t row, Field *out) {
+    parse_keys(ix->parser, ix->slab->data, (size_t)ix->row_start[row], ix->slab->size, out);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -735,9 +798,20 @@ static void sweep_part(void *vctx, unsigned p) {
     while (pos < stop) {
         if (d[pos] == '\n') { pos++; continue; }            /* an empty line is not a row */
         if (d[pos] == '\r' && pos + 1 < end && d[pos + 1] == '\n') { pos += 2; continue; }
-        const size_t next = parse_row(c->parser, d, pos, end, fields);
-        for (size_t i = 0; i < c->parser->width; i++)
+        const size_t next = parse_keys(c->parser, d, pos, end, fields);
+        for (size_t i = 0; i < c->key_size; i++)
             if (fields[i] == TOO_LONG) out->failed = true;
+        /*
+         * A field can only be longer than the packed length if its row is, and
+         * a row that long is a once-in-a-file event -- so the columns this
+         * sweep no longer reads are still checked, exactly rather than
+         * conservatively, by re-parsing just those rows in full.
+         */
+        if (!out->failed && next - pos > MAX_FIELD) {
+            parse_row(c->parser, d, pos, end, fields);
+            for (size_t i = 0; i < c->parser->width; i++)
+                if (fields[i] == TOO_LONG) out->failed = true;
+        }
         if (out->failed) break;
         uint64_t hash = UINT64_C(0xcbf29ce484222325);
         for (size_t i = 0; i < c->key_size; i++) hash = hash_field(c->slab, fields[i], hash);
@@ -846,8 +920,8 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
             }
             const int32_t candidate = ix->first_row[at];
             if (ix->row_hash[candidate] == hash) {
-                index_fields(ix, candidate, ix->probe);
-                index_fields(ix, (int32_t)r, ix->probe2);
+                index_keys(ix, candidate, ix->probe);
+                index_keys(ix, (int32_t)r, ix->probe2);
                 bool same = true;
                 for (size_t i = 0; i < key_size && same; i++) {
                     const bool xa = is_absent(slab, ix->probe[i]);
@@ -900,7 +974,7 @@ static int32_t index_lookup(const RowIndex *ix, const Slab *other, const Field *
         if (at == TABLE_EMPTY) return -1;
         int32_t candidate = ix->first_row[at];
         if (ix->row_hash[candidate] == hash) {
-            index_fields(ix, candidate, probe);
+            index_keys(ix, candidate, probe);
             bool ok = true;
             for (size_t i = 0; i < ix->key_size && ok; i++) {
                 bool xa = is_absent(ix->slab, probe[i]), ya = is_absent(other, fields[i]);
@@ -999,7 +1073,7 @@ static void compare_part(void *vctx, unsigned p) {
                 &c->ai->table[slot_of(c->ai,
                                       c->bi->row_hash[c->bi->first_row[k + PREFETCH_AHEAD]])],
                 0, 0);
-        index_fields(c->bi, row, out->fb);
+        index_keys(c->bi, row, out->fb);
         if (index_lookup(c->ai, c->b, out->fb, hash, out->probe) < 0) out->added++;
     }
 }
@@ -1250,7 +1324,8 @@ int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         printf("csvdiff - composite-key comparison, byte-level, in C\n\n"
                "usage:\n  csvdiff compare A B -k COLS [-i COLS] [--json PATH] [--threads N]\n\n"
-               "CSV, and uncompressed Parquet when both files are Parquet.\n"
+               "CSV, newline-delimited JSON, and uncompressed Parquet when both files\n"
+               "are Parquet. The dialect is detected from the bytes.\n"
                "exit codes: 0 identical, 1 differences found, 2 error\n");
         return argc < 2 ? 2 : 0;
     }
@@ -1361,9 +1436,19 @@ int main(int argc, char **argv) {
 
     ap.delimiter = a_delim; ap.source = a_src; ap.width = width; ap.dialect = a.dialect;
     bp.delimiter = b_delim; bp.source = b_src; bp.width = width; bp.dialect = b.dialect;
+    ap.key_size = bp.key_size = key_size;
+    ap.last_needed = bp.last_needed = ap.key_last = bp.key_last = -1;
     for (size_t i = 0; i < width; i++) {
         if (a_src[i] > ap.last_needed) ap.last_needed = a_src[i];
         if (b_src[i] > bp.last_needed) bp.last_needed = b_src[i];
+        if (i < key_size) {
+            if (a_src[i] > ap.key_last) ap.key_last = a_src[i];
+            if (b_src[i] > bp.key_last) bp.key_last = b_src[i];
+        }
+    }
+    if (!parser_index_columns(&ap) || !parser_index_columns(&bp)) {
+        fail("out of memory");
+        goto done;
     }
     /* JSON looks a value up by name, so each parser is told which names it
      * wants and where each one belongs. A name the file does not have stays
@@ -1452,6 +1537,8 @@ done:
     index_free(&bi);
     free(a_src); free(b_src); free(want_a); free(want_b); free(fa); free(fb);
     free(ap.slot); free(bp.slot);
+    free(ap.col_first); free(bp.col_first);
+    free(ap.slot_next); free(bp.slot_next);
     free(col_changed); free(col_blanked); free(col_filled);
     names_free(&a_head); names_free(&b_head); names_free(&compared);
     names_free(&key); names_free(&ignore);

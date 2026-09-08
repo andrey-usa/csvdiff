@@ -307,6 +307,45 @@ fi
 # the bytes are the same bytes. A generator that drifted would not fail any
 # check above -- both sides of every comparison would drift together -- so the
 # drift has to be caught here, against the generator this one replaced.
+# The sweep and the probes read only the key columns now, and the projection
+# gets from a file column to its slot through a precomputed chain. Both make
+# assumptions about where the key sits and which slots a column feeds, and
+# neither is exercised by a fixture whose key is column zero.
+echo "the key-only parse, where the key is not the first column:"
+kdir=$(mktemp -d)
+{
+  echo 'x,y,id,z2'
+  echo 'a1,b1,k1,z1'
+  echo 'a2,b2,k2,z2'
+  echo 'a3,b3,k3,z3'
+} > "$kdir/a.csv"
+{
+  echo 'x,y,id,z2'
+  echo 'a1,b1,k1,z1'
+  echo 'a2,CHANGED,k2,z2'
+  echo 'a9,b9,k9,z9'
+} > "$kdir/b.csv"
+kcase() { # label, expected "changed added removed", then the flags
+  local label=$1 want=$2; shift 2
+  # Removed first, and a missing one is a failure: the first version of this
+  # helper read the previous case's report when a run refused its flags, and
+  # reported the previous case's answer as this one's.
+  rm -f "$kdir/o.json"
+  ./csvdiff compare "$kdir/a.csv" "$kdir/b.csv" "$@" --json "$kdir/o.json" >/dev/null 2>&1 || true
+  local got
+  got=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["counts"]; print(c["changed"], c["added"], c["removed"])' "$kdir/o.json" 2>/dev/null) || got="(no report)"
+  if [ "$got" = "$want" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    printf '  FAIL  %s\n    want: %s\n    got : %s\n' "$label" "$want" "$got"; fail=1
+  fi
+}
+kcase "key in the third of four columns"      "1 1 1" -k id
+kcase "with everything after the key ignored" "0 1 1" -k id -i x,y,z
+kcase "key in the last column"                "1 1 1" -k z2
+kcase "two key columns, first and last"       "1 1 1" -k x,z2
+rm -rf "$kdir"
+
 if [ "$with_ports" = 1 ]; then
   echo "generator bytes, c against c++:"
   gen_dir=$(mktemp -d)

@@ -169,6 +169,64 @@ the table is now sized once from the row count instead of doubling from 4,096
 (thirteen rehashes at ten million rows, each a full pass of random probes), and
 each key is hashed once rather than twice.
 
+## Parsing what is read, and nothing else
+
+Threading made the text path fast enough to see what it was actually doing, and
+what it was doing was parsing the same row about seven times per key. Two of
+those were the sweep; three more were the A side of the join — the row, the
+probe that confirms a hash match, and the mate; two more were the added-key
+pass over B. Every one of them delimited all twenty columns.
+
+Most of them did not need twenty. The sweep hashes the key and remembers where
+the row starts; the probe compares keys. Only the two parses that feed the
+per-cell diff want the whole row. So there is a **key-only parse** now: it reads
+to the last key column and then scans once to the newline, which on a
+twenty-column file keyed on the first two is two delimiters instead of twenty.
+Five of the seven parses go through it.
+
+The second one is smaller in the source and was worth about as much. Placing a
+parsed field meant finding which slot wanted it:
+
+```c
+for (size_t i = 0; i < p->width; i++)
+    if (p->source[i] == column) out[i] = field;
+```
+
+That is `width` comparisons per column and so `width * width` per row — four
+hundred at twenty columns, eight billion over a ten-million-row pair. It is
+also, exactly, the four hundred comparisons the JSON path already had a hash
+table to avoid; the CSV path had simply never been given the same treatment.
+`source` is inverted once into `col_first[column]` plus a chain, and a column
+costs one load.
+
+Two million rows, interleaved, one sitting:
+
+| Build | Best | Median | Worst | CPU |
+|---|---:|---:|---:|---:|
+| **after** | **1.01s** | **1.19s** | **1.23s** | **3.2s** |
+| before | 2.69s | 2.89s | 3.15s | 9.7s |
+
+**2.66x on wall, 3.03x on CPU.** The CPU figure is the one that matters: this
+removed work rather than spreading it, which is the only kind of saving that
+still helps when the cores run out.
+
+ndjson gets 1.06x from the same change, and the reason is worth stating. A JSON
+object has to be walked to its closing brace whatever you want out of it, so
+reading only the keys saves the stores and not the scan. Stopping the walk once
+the keys are found would save the rest — but the full parse takes the *last*
+value of a repeated key and an early exit would take the first, and the two have
+to agree on what a row's key is or the lookups miss. That is a deliberate
+change, not a tweak.
+
+**What did not change: the answer.** Counts are identical to the previous
+binary's on every fixture, and `test.sh` grew four checks that the old code
+would have passed and that the new code could plausibly have broken — a key in
+the third of four columns, a key in the last, two keys at both ends, and
+everything after the key ignored. The first version of that helper read the
+previous case's report when a run refused its flags, and reported the previous
+case's answer as this one's; it deletes the file first now and treats a missing
+one as a failure.
+
 ## The generator against the C++ one
 
 Both write the same bytes, so this is a clean measurement of two
