@@ -113,19 +113,27 @@ instead, silently. See [ARCHIVE.md](ARCHIVE.md#the-field-measured-once-2026-surv
 
 ```bash
 (cd c && bash test.sh)                # 18 checks, a few seconds, no other toolchain
-(cd c && bash test.sh --with-ports)   # adds the cross-port oracles: 30
+(cd c && bash test.sh --with-ports)   # adds the cross-port oracles: 36
 
-# the data, in any of the three formats
-c/gen-data --rows 10m --out-dir /tmp/d --prefix p [--format json|parquet]
+# the data, in any of the three formats, on every core
+c/gen-data --rows 10m --out-dir /tmp/d --prefix p [--format json|parquet] [--threads N]
 
 # every port that reads the pair, interleaved, with a counts gate
 python3 scripts/bench_ports.py A.csv B.csv --repeats 5
 ```
 
+`c/gen-data` writes the same bytes as the C++ generator and is checked against
+it on sixteen shapes, including every thread count — it renders rows in waves
+across all cores, and a threading bug that shifted one row would produce a file
+that is still valid, still parses, and is wrong. Five million rows of CSV take
+3.94s on four cores; the numbers are in [BENCHMARKS.md](BENCHMARKS.md).
+
 `scripts/bench_ports.py` also takes ports built elsewhere, through
 `CSVDIFF_PORTS_EXTRA` — a JSON array of `[label, path, flags]`. That is how a
 branch's build gets measured against this one on the same rows in the same
-sitting, which is the only way two builds can be compared at all.
+sitting, which is the only way two builds can be compared at all. The benchmark
+workflow uses it: `alt_ref` checks a second branch out beside this one, builds
+its ports, and gives each its own column.
 
 Every port has a `test.sh` holding it to the Rust port's answers on
 `tests/fixtures/awkward_*.csv` — a fixture built from every shape that has
