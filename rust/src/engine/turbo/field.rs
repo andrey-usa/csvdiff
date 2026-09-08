@@ -54,8 +54,57 @@ pub(super) fn is_real(f: Field) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// SWAR scanning
+// Scanning: SWAR, or a vector register where the build targets one
 // ---------------------------------------------------------------------------
+//
+// The vector paths are compiled in only when the build says the target has the
+// instructions -- `RUSTFLAGS=-C target-feature=+avx2`, or `+avx512bw` -- so one
+// source produces both binaries and neither pays for a runtime check. SWAR is
+// what a stock `cargo build` gets, because it needs no CPU feature at all.
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+const VECTOR_WIDTH: usize = 64;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(target_feature = "avx512bw")
+))]
+const VECTOR_WIDTH: usize = 32;
+#[cfg(not(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx2", target_feature = "avx512bw")
+)))]
+const VECTOR_WIDTH: usize = 0;
+
+/// The bytes of the sixteen-to-sixty-four at `at` that equal `a` or `b`, one bit
+/// each, or `None` where this build has no vector unit to ask.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx2", target_feature = "avx512bw")
+))]
+#[inline(always)]
+fn vector_hits(data: &[u8], at: usize, a: u8, b: u8) -> u64 {
+    #[cfg(target_feature = "avx512bw")]
+    // Safety: the caller has checked `at + 64 <= data.len()`, and the build
+    // targets a CPU with AVX-512BW or this function is not compiled at all.
+    unsafe {
+        use std::arch::x86_64::*;
+        let chunk = _mm512_loadu_si512(data.as_ptr().add(at) as *const _);
+        _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(a as i8))
+            | _mm512_cmpeq_epi8_mask(chunk, _mm512_set1_epi8(b as i8))
+    }
+    #[cfg(not(target_feature = "avx512bw"))]
+    // Safety: as above, with AVX2 and thirty-two bytes.
+    unsafe {
+        use std::arch::x86_64::*;
+        let chunk = _mm256_loadu_si256(data.as_ptr().add(at) as *const _);
+        let equal = _mm256_or_si256(
+            _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(a as i8)),
+            _mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b as i8)),
+        );
+        _mm256_movemask_epi8(equal) as u32 as u64
+    }
+}
 
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
@@ -86,8 +135,21 @@ fn word_at(data: &[u8], at: usize) -> u64 {
 /// otherwise emit on every step of a scan over gigabytes.
 pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> usize {
     let data = &data[..end.min(data.len())];
-    let (ba, bb) = (broadcast(a), broadcast(b));
     let mut at = from;
+    if VECTOR_WIDTH > 0 {
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_feature = "avx2", target_feature = "avx512bw")
+        ))]
+        while at + VECTOR_WIDTH <= data.len() {
+            let hits = vector_hits(data, at, a, b);
+            if hits != 0 {
+                return at + hits.trailing_zeros() as usize;
+            }
+            at += VECTOR_WIDTH;
+        }
+    }
+    let (ba, bb) = (broadcast(a), broadcast(b));
     while at + 8 <= data.len() {
         let word = word_at(data, at);
         let hits = match_bits(word, ba) | match_bits(word, bb);
@@ -108,8 +170,21 @@ pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> us
 /// The offset of the first `target` at or after `from`, or `end`.
 pub(super) fn next_of1(data: &[u8], from: usize, end: usize, target: u8) -> usize {
     let data = &data[..end.min(data.len())];
-    let bt = broadcast(target);
     let mut at = from;
+    if VECTOR_WIDTH > 0 {
+        #[cfg(all(
+            target_arch = "x86_64",
+            any(target_feature = "avx2", target_feature = "avx512bw")
+        ))]
+        while at + VECTOR_WIDTH <= data.len() {
+            let hits = vector_hits(data, at, target, target);
+            if hits != 0 {
+                return at + hits.trailing_zeros() as usize;
+            }
+            at += VECTOR_WIDTH;
+        }
+    }
+    let bt = broadcast(target);
     while at + 8 <= data.len() {
         let hits = match_bits(word_at(data, at), bt);
         if hits != 0 {

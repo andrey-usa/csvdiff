@@ -6,9 +6,32 @@
 //! matching bytes.
 
 const std = @import("std");
+const build_options = @import("build_options");
+
+/// How many bytes a scan step takes. Eight is SWAR -- ordinary 64-bit
+/// arithmetic, no CPU feature at all -- and 32 or 64 puts the same question to a
+/// vector register, which on x86 is AVX2 or AVX-512 as long as the build targets
+/// a CPU that has them (`zig build -Dscan=32 -Dcpu=native`).
+///
+/// It is a build option rather than a runtime switch because a benchmark of an
+/// instruction set should not be measuring a function pointer, and because each
+/// binary is then what you would actually ship for that target.
+const width = build_options.scan_width;
+const Vector = @Vector(width, u8);
+const Mask = std.meta.Int(.unsigned, width);
 
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
+
+/// The bytes of `chunk` equal to `target`, as one bit each.
+inline fn matches(chunk: Vector, target: Vector) Mask {
+    const equal: @Vector(width, bool) = chunk == target;
+    return @bitCast(equal);
+}
+
+inline fn loadVector(data: []const u8, at: usize) Vector {
+    return @bitCast(data[at..][0..width].*);
+}
 
 inline fn broadcast(b: u8) u64 {
     return @as(u64, b) *% ONES;
@@ -25,9 +48,18 @@ inline fn load64(data: []const u8, at: usize) u64 {
 
 /// The offset of the first byte at or after `from` that is `a` or `b`, or `end`.
 pub fn nextOf2(data: []const u8, from: usize, end: usize, a: u8, b: u8) usize {
+    var at = from;
+    if (width > 8) {
+        const va: Vector = @splat(a);
+        const vb: Vector = @splat(b);
+        while (at + width <= end) : (at += width) {
+            const chunk = loadVector(data, at);
+            const hits = matches(chunk, va) | matches(chunk, vb);
+            if (hits != 0) return at + @ctz(hits);
+        }
+    }
     const ba = broadcast(a);
     const bb = broadcast(b);
-    var at = from;
     while (at + 8 <= end) : (at += 8) {
         const word = load64(data, at);
         const hits = matchBits(word, ba) | matchBits(word, bb);
@@ -41,8 +73,15 @@ pub fn nextOf2(data: []const u8, from: usize, end: usize, a: u8, b: u8) usize {
 
 /// The offset of the first `target` at or after `from`, or `end`.
 pub fn nextOf1(data: []const u8, from: usize, end: usize, target: u8) usize {
-    const bt = broadcast(target);
     var at = from;
+    if (width > 8) {
+        const vt: Vector = @splat(target);
+        while (at + width <= end) : (at += width) {
+            const hits = matches(loadVector(data, at), vt);
+            if (hits != 0) return at + @ctz(hits);
+        }
+    }
+    const bt = broadcast(target);
     while (at + 8 <= end) : (at += 8) {
         const word = load64(data, at);
         const hits = matchBits(word, bt);
@@ -87,9 +126,15 @@ test "skipQuoted treats a doubled quote as content" {
 /// inside a quoted field. Counting whole words at a time keeps it far cheaper
 /// than the parsing it makes parallel.
 pub fn countByte(data: []const u8, from: usize, end: usize, target: u8) usize {
-    const bt = broadcast(target);
     var n: usize = 0;
     var at = from;
+    if (width > 8) {
+        const vt: Vector = @splat(target);
+        while (at + width <= end) : (at += width) {
+            n += @popCount(matches(loadVector(data, at), vt));
+        }
+    }
+    const bt = broadcast(target);
     while (at + 8 <= end) : (at += 8) {
         n += @popCount(matchBits(load64(data, at), bt));
     }

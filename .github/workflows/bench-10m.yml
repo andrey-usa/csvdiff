@@ -1,0 +1,122 @@
+name: Benchmark 10M
+
+# Ten million rows, every native port, every scanner, with peak RSS on every row.
+#
+# It runs here rather than on a laptop for the reason every table in the README
+# gives: a comparison between builds only means something when they ran on one
+# host in one sitting, and a hosted runner is the one host anyone reading this
+# can reproduce. The runner's own vector units are printed into the summary,
+# because "SWAR beat AVX-512" means nothing without knowing whether the machine
+# had AVX-512 to lose with.
+#
+# Parquet is written uncompressed: this is a question about readers, and a codec
+# in the middle would be answering a different one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Row count (10m, 20m, 1m ...)"
+        default: "10m"
+      formats:
+        description: "Comma-separated: csv, ndjson, parquet"
+        default: "csv,parquet"
+      repeats:
+        description: "Runs per build; the best is kept"
+        default: "2"
+      matrix:
+        description: "Include the scanner builds (SWAR against AVX2 and AVX-512)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: bench-10m-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: ${{ github.event.inputs.rows }} rows, ${{ github.event.inputs.formats }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ten million rows of CSV is 3.5 GB and of JSON 8.5 GB, and the runner
+      # ships with about 25 GB of toolchains this job never touches.
+      - name: Free disk space
+        run: |
+          before=$(df --output=avail -m / | tail -1)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          after=$(df --output=avail -m / | tail -1)
+          echo "freed $(( (after - before) / 1024 )) GB, $(( after / 1024 )) GB now available"
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## Host"
+            echo
+            echo '```'
+            grep -m1 "model name" /proc/cpuinfo
+            echo "cores: $(nproc)"
+            free -g | head -2
+            echo -n "vector units: "
+            grep -o -m1 -E "avx2|avx512f|avx512bw" /proc/cpuinfo | sort -u | tr '\n' ' '
+            echo
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install Zig
+        run: |
+          pip install ziglang==0.16.0
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+          zig version
+
+      - name: Build every port and every scanner
+        run: |
+          (cd rust && cargo build --release)
+          (cd zig && zig build --release=fast)
+          (cd cpp && CXX=clang++ make && CXX=clang++ make gen-data)
+          if [ "${{ github.event.inputs.matrix }}" = "true" ]; then
+            (cd cpp && CXX=clang++ make scanners)
+            (cd zig && zig build --release=fast -Dscan=32 --prefix zig-out-v32)
+            if grep -q avx512bw /proc/cpuinfo; then
+              (cd zig && zig build --release=fast -Dscan=64 --prefix zig-out-v64)
+            else
+              echo "no AVX-512 on this runner: the 64-byte builds are skipped"
+              rm -f cpp/build/csvdiff-avx512
+            fi
+          fi
+
+      - name: Run the matrix
+        run: |
+          python3 scripts/bench_formats_ports.py \
+            --rows "${{ github.event.inputs.rows }}" \
+            --formats "${{ github.event.inputs.formats }}" \
+            --repeats "${{ github.event.inputs.repeats }}" \
+            ${{ github.event.inputs.matrix == 'true' && '--matrix' || '' }} \
+            | tee /tmp/bench.txt
+
+      - name: Publish the table
+        if: always()
+        run: |
+          {
+            echo "## ${{ github.event.inputs.rows }} rows — ${{ github.event.inputs.formats }}"
+            echo
+            echo '```'
+            cat /tmp/bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.event.inputs.rows }}
+          path: /tmp/bench.txt
+          retention-days: 30

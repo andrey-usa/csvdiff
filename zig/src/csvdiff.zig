@@ -246,6 +246,34 @@ fn cellDiffers(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Er
     return !(try same(a, x, b, y, o, s));
 }
 
+/// FNV-1a over eight bytes at a time.
+///
+/// A hash is internal — nothing outside this engine can see one — so the only
+/// property it owes anyone is that the index build and the join probe compute
+/// the same number for the same bytes. That is what lets the common path read a
+/// word at a time: a key of twenty-six bytes costs four multiplies instead of
+/// twenty-six, and the key hash is computed four times over at every row (both
+/// files, indexed then probed), which made byte-at-a-time FNV about a billion
+/// dependent multiply-xor steps of a ten-million-row run.
+fn hashBytes(bytes: []const u8, seed: u64) u64 {
+    const PRIME: u64 = 0x100_0000_01b3;
+    var h = seed;
+    var at: usize = 0;
+    while (at + 8 <= bytes.len) : (at += 8) {
+        h = (h ^ std.mem.readInt(u64, bytes[at..][0..8], .little)) *% PRIME;
+        // The xor-shift is what spreads a whole word into the low bits, which is
+        // where the table's slot comes from.
+        h ^= h >> 29;
+    }
+    if (at < bytes.len) {
+        var tail: [8]u8 = @splat(0);
+        @memcpy(tail[0 .. bytes.len - at], bytes[at..]);
+        h = (h ^ std.mem.readInt(u64, &tail, .little)) *% PRIME;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
 /// FNV-1a over exactly the bytes equality compares, by the same route.
 fn hashField(slab: Slab, f: Field, o: Options, seed: u64, buf: []u8) Error!u64 {
     const PRIME: u64 = 0x100_0000_01b3;
@@ -261,13 +289,11 @@ fn hashField(slab: Slab, f: Field, o: Options, seed: u64, buf: []u8) Error!u64 {
     } else {
         var it = slab.logical(f);
         if (it.isPlain()) {
-            // Nothing to unescape, so the bytes are the value and the loop is a
-            // read: this is the path every key in a well-formed file takes,
-            // twice per row across both files.
-            for (slab.raw(f)) |b| {
-                h = (h ^ b) *% PRIME;
-                len += 1;
-            }
+            // Nothing to unescape, so the bytes are the value and eight of them
+            // can be taken at a time. See `hashBytes`.
+            const raw = slab.raw(f);
+            h = hashBytes(raw, h);
+            len = raw.len;
         } else {
             while (it.next()) |b| {
                 h = (h ^ b) *% PRIME;

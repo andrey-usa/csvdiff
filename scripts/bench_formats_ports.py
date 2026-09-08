@@ -45,20 +45,45 @@ ZIG = ROOT / "zig/zig-out/bin/csvdiff"
 GEN = ROOT / "rust/target/release/gen-data"
 
 
-def ports(threads: int | None) -> list[tuple[str, list[str], list[str], set[str]]]:
+TEXT = {"csv", "ndjson"}
+ALL = {"csv", "ndjson", "parquet"}
+
+
+def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[str], set[str]]]:
     """(label, argv prefix, extra flags, the formats it can read).
 
-    The C++ port reads CSV and JSON; Parquet is the one this branch added to the
-    Rust and Zig ports and not to it, so it is absent from that row rather than
-    slow in it.
+    The C++ port reads CSV and JSON; Parquet is the one the Rust and Zig ports
+    added and it did not, so it is absent from that row rather than slow in it.
+
+    `matrix` adds the scanner builds -- SWAR against a vector register, one
+    binary each so nothing is measuring a branch -- and the Rust engine without
+    its report, which is the only row here that is not comparing like with like:
+    the Rust port renders the HTML the other two do not produce at all.
     """
     thread_flag = ["--threads", str(threads)] if threads else []
-    return [
-        ("C++", [str(CPP)], thread_flag, {"csv", "ndjson"}),
-        ("Rust", [str(RUST)], ["--engine", "turbo", "-o", "/dev/null"] + thread_flag,
-         {"csv", "ndjson", "parquet"}),
-        ("Zig", [str(ZIG)], thread_flag, {"csv", "ndjson", "parquet"}),
+    report = ["--engine", "turbo", "-o", "/dev/null"]
+    rows: list[tuple[str, list[str], list[str], set[str]]] = [
+        ("C++", [str(CPP)], thread_flag, TEXT),
+        ("Rust", [str(RUST)], report + thread_flag, ALL),
+        ("Zig", [str(ZIG)], thread_flag, ALL),
     ]
+    if not matrix:
+        return rows
+    rows.append(("Rust engine", [str(RUST)], report + ["--max-rows", "1"] + thread_flag, ALL))
+    for label, path, flags, formats in [
+        ("C++ swar", CPP.with_name("csvdiff-swar"), thread_flag, TEXT),
+        ("C++ avx2", CPP.with_name("csvdiff-avx2"), thread_flag, TEXT),
+        ("C++ avx512", CPP.with_name("csvdiff-avx512"), thread_flag, TEXT),
+        ("Rust avx2", ROOT / "rust/target-avx2/release/csvdiff", report + thread_flag, ALL),
+        ("Zig v32", ROOT / "zig/zig-out-v32/bin/csvdiff", thread_flag, ALL),
+        ("Zig v64", ROOT / "zig/zig-out-v64/bin/csvdiff", thread_flag, ALL),
+    ]:
+        # A variant that was not built is left out by name rather than reported
+        # as slow, and an AVX-512 binary on a runner without AVX-512 will not
+        # start at all -- which the run records as a failure rather than a time.
+        if path.exists():
+            rows.append((label, [str(path)], flags, formats))
+    return rows
 
 
 def run(argv: list[str], timeout: float) -> tuple[float, float, int]:
@@ -122,6 +147,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--data-dir", default=str(ROOT / "data/bench"))
     parser.add_argument("--keep", action="store_true", help="do not delete the payloads")
+    parser.add_argument("--matrix", action="store_true",
+                        help="also run the scanner builds and the Rust engine without its report")
     args = parser.parse_args(argv)
 
     for tool in (RUST, ZIG, GEN):
@@ -141,7 +168,7 @@ def main(argv: list[str]) -> int:
         print(f"\n{fmt}: {size:,.0f} MB, generated in {generated:.1f}s", flush=True)
         warm(a, b)
 
-        for label, prefix, flags, can_read in ports(args.threads):
+        for label, prefix, flags, can_read in ports(args.threads, args.matrix):
             if fmt not in can_read:
                 print(f"  {label:5s} -- does not read {fmt}", flush=True)
                 results.append({"format": fmt, "port": label, "seconds": None})
@@ -168,7 +195,7 @@ def main(argv: list[str]) -> int:
             seconds, rss = best
             results.append({
                 "format": fmt, "port": label, "seconds": seconds, "rss": rss,
-                "input": size, "above": rss - size,
+                "input": size, "above": rss - size, "rows": got["a_rows"],
             })
             print(f"  {label:5s} {seconds:8.2f}s  {rss:9,.0f} MB peak  "
                   f"{rss - size:8,.0f} MB above the input", flush=True)
@@ -187,13 +214,14 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"  {json.dumps(json.loads(distinct.pop()))}")
 
-    print(f"\n| Port | Format | Compare | Peak RSS | Above the input |")
-    print(f"|---|---|---:|---:|---:|")
+    print("\n| Build | Format | Compare | Rows/s | Peak RSS | Above the input |")
+    print("|---|---|---:|---:|---:|---:|")
     for row in results:
         if row.get("seconds") is None:
-            print(f"| {row['port']} | {row['format']} | — | — | — |")
+            print(f"| {row['port']} | {row['format']} | — | — | — | — |")
             continue
-        print(f"| {row['port']} | {row['format']} | {row['seconds']:.2f}s | "
+        rate = row["rows"] / row["seconds"]
+        print(f"| {row['port']} | {row['format']} | {row['seconds']:.2f}s | {rate:,.0f} | "
               f"{row['rss']:,.0f} MB | {row['above']:,.0f} MB |")
     return 0
 

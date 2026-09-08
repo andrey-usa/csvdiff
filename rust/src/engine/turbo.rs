@@ -157,6 +157,36 @@ fn cell_differs(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
     differs(&value(a, x, opt), &value(b, y, opt), opt)
 }
 
+/// FNV-1a over eight bytes at a time.
+///
+/// A hash is internal — nothing outside this engine can see one — so the only
+/// property it owes anyone is that the index build and the join probe compute
+/// the same number for the same bytes. That is what lets the common path read a
+/// word at a time: a key of twenty-six bytes costs four multiplies instead of
+/// twenty-six, and the key hash is computed four times over at every row (both
+/// files, indexed then probed), which made byte-at-a-time FNV about a billion
+/// dependent multiply-xor steps of a ten-million-row run.
+fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
+    const PRIME: u64 = 0x100_0000_01b3;
+    let mut h = seed;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+        h = (h ^ word).wrapping_mul(PRIME);
+        // The xor-shift is what spreads a whole word into the low bits, which
+        // is where the table's slot comes from.
+        h ^= h >> 29;
+    }
+    let tail = chunks.remainder();
+    if !tail.is_empty() {
+        let mut word = [0u8; 8];
+        word[..tail.len()].copy_from_slice(tail);
+        h = (h ^ u64::from_le_bytes(word)).wrapping_mul(PRIME);
+        h ^= h >> 29;
+    }
+    h
+}
+
 /// FNV-1a over the bytes equality would compare, so the two cannot disagree.
 fn hash_field(slab: &Slab, f: Field, opt: &Options, seed: u64) -> u64 {
     const PRIME: u64 = 0x100_0000_01b3;
@@ -175,13 +205,11 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, seed: u64) -> u64 {
             len += 1;
         }
     } else if slab.logical(f).is_plain() {
-        // Nothing to unescape, so the bytes are the value and the loop is a
-        // read: this is the path every key in a well-formed file takes, twice
-        // per row across both files.
-        for b in slab.raw(f) {
-            h = (h ^ (*b as u64)).wrapping_mul(PRIME);
-            len += 1;
-        }
+        // Nothing to unescape, so the bytes are the value and eight of them can
+        // be taken at a time. See `hash_bytes`.
+        let raw = slab.raw(f);
+        h = hash_bytes(raw, h);
+        len = raw.len() as u64;
     } else {
         for b in slab.logical(f) {
             h = (h ^ (b as u64)).wrapping_mul(PRIME);
