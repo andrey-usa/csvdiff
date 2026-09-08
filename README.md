@@ -883,37 +883,79 @@ don't have to.
 
 | | Predicted | Measured |
 |---|---:|---:|
-| Peak RSS, Parquet uncompressed | 2.75 GB | **3.37 GB** |
+| Peak RSS, Parquet uncompressed | 2.75 GB | **3.41 GB** |
 | Peak RSS, our CSV path | 4.41 GB | 4.37 GB |
-| Time saved | ≤15% | **79%** |
+| Time saved | ≤15% | **80%** |
 
-Measured on one machine in one sitting, `python scripts/bench_parquet.py`. Every
-row below returns identical counts — matched 9,990,000, changed 599,320, added
-10,000, removed 10,000 — so these are six ways of doing exactly the same work.
+Measured on one machine in one sitting, `python scripts/bench_parquet.py
+--polars`. Every row that finished returns identical counts — matched 9,990,000,
+changed 599,320, added 10,000, removed 10,000 — so these are eight ways of doing
+exactly the same work.
 
 | Engine and input | Size | Convert | **Compare** | CPU | Peak RSS |
 |---|---:|---:|---:|---:|---:|
-| ours (C++), CSV | 3,509 MB | — | 23.25s | 62.7s | 4,366 MB |
-| DuckDB, CSV | 3,509 MB | — | 82.14s | 159.6s | 11,330 MB |
-| ours (C++), Parquet + snappy | 1,044 MB | 74.3s | 7.55s | 21.1s | 3,850 MB |
-| DuckDB, Parquet + snappy | 1,044 MB | 74.3s | 24.16s | 90.9s | 11,597 MB |
-| **ours (C++), Parquet uncompressed** | 2,088 MB | 78.8s | **4.89s** | **14.4s** | **3,367 MB** |
-| DuckDB, Parquet uncompressed | 2,088 MB | 78.8s | 22.22s | 82.4s | 11,443 MB |
+| ours (C++), CSV | 3,509 MB | — | 23.78s | 63.7s | 4,370 MB |
+| DuckDB, CSV | 3,509 MB | — | 86.25s | 171.6s | 11,708 MB |
+| polars, CSV | 3,509 MB | — | *out of memory* | 91.8s | 5,670 MB |
+| ours (C++), Parquet + snappy | 1,043 MB | 67.9s | 6.85s | 19.0s | 3,840 MB |
+| DuckDB, Parquet + snappy | 1,043 MB | 67.9s | 25.73s | 96.3s | 11,707 MB |
+| polars, Parquet + snappy | 1,043 MB | 67.9s | 129.83s | 479.7s | 4,238 MB |
+| **ours (C++), Parquet uncompressed** | 2,088 MB | 83.0s | **4.83s** | **14.1s** | **3,412 MB** |
+| DuckDB, Parquet uncompressed | 2,088 MB | 83.0s | 22.71s | 84.8s | 11,985 MB |
+| polars, Parquet uncompressed | 2,088 MB | 83.0s | 121.31s | 452.5s | 4,328 MB |
 
 > This table is a fresh sitting on a slower machine than the tables above it —
-> our CSV path reads 23.25s here and 12.34s there. Compare rows *within* the
-> table, not across tables.
+> our CSV path reads 23.78s here and 12.34s there. Compare rows *within* the
+> table, not across tables. polars is capped at 14 GB of address space on a 15 GB
+> machine, so an out-of-memory is a reported failure rather than an OOM kill.
 
-**4.8x our own CSV path, 4.5x DuckDB on the same file, and a third of DuckDB's
-memory.** The format is worth 4.8x to us and 3.7x to DuckDB, which inverts the
-earlier finding — when the parser was the only thing the format could improve,
-CSV was 15% of the run; when the format changes the *shape* of the comparison,
-it is most of it.
+**4.9x our own CSV path, 4.7x DuckDB on the same file, 25x polars, and a third of
+DuckDB's memory.** The format is worth 4.9x to us and 3.8x to DuckDB, which
+inverts the earlier finding — when the parser was the only thing the format could
+improve, CSV was 15% of the run; when the format changes the *shape* of the
+comparison, it is most of it.
 
-**Converting still costs more than it saves, once.** 74-79s to write the Parquet
-against 15-18s saved per comparison. It pays from the fifth comparison of the
+**Converting still costs more than it saves, once.** 68-83s to write the Parquet
+against 17-19s saved per comparison. It pays from the fifth comparison of the
 same file onward — which is the recurring-reconciliation case, but not the
 one-off one.
+
+#### What polars had to be rewritten into
+
+The polars rows come with an asterisk, and it is the most interesting result in
+the table. Written the way anyone would write it — join the two frames, compare
+every compared cell, sum — **polars cannot finish this at ten million rows on
+either Parquet form**, and no amount of pushing helps: streaming engine, threads
+turned down to two, a cap just under the whole machine. It dies at 7-11 GB. On
+CSV it was killed by the OOM killer twice before any of this, which is why DuckDB
+is the constant in the format table above.
+
+Taking it apart says exactly where:
+
+| polars, 10M, Parquet + snappy | Wall | Peak RSS | |
+|---|---:|---:|---|
+| First-occurrence-wins on the key | 1.79s | 1,584 MB | fine |
+| Inner join, count the rows | 2.74s | 2,560 MB | fine |
+| …and compare 17 columns per cell | — | 7,091 MB | **out of memory** |
+
+The join is not the problem and the dedup is not the problem. The per-cell diff
+is — which is the one thing this tool exists to do.
+
+What polars *can* finish is the columnar shape: dedup, join and diff **one column
+at a time**, projecting only the keys and that column, then union the keys of the
+rows that differed. Peak drops to 4.2 GB and the answer is exactly right. That is
+the same strategy this port's Parquet path uses — so the table is measuring
+polars doing our design by hand, and it is still 19-25x slower, at 24-32x the CPU,
+because each pass re-reads the file.
+
+On CSV even that is not enough: forty passes over a 1.8 GB text file, each
+re-parsing and re-deduplicating it, runs out of memory too. The polars CSV row in
+the table is the columnar version failing, not the naive one.
+
+Which is also why polars is the one engine here that is *slower* on uncompressed
+Parquet than on snappy: forty passes over twice the bytes costs more than
+decompressing them once. We read each column exactly once, so for us the ranking
+goes the other way.
 
 #### The design: never reconstruct a row
 
@@ -1279,8 +1321,8 @@ scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
 # the same comparison from CSV, Parquet and JSON, engine held constant
 python scripts/bench_formats.py
 
-# ours against DuckDB, on CSV and on Parquet, in one sitting
-python scripts/bench_parquet.py --data bench/external/data --prefix 10m
+# ours against DuckDB and polars, on CSV and on Parquet, in one sitting
+python scripts/bench_parquet.py --data bench/external/data --prefix 10m --polars
 
 # our own reader on any of the three formats
 cpp/build/csvdiff compare a.ndjson b.ndjson -k id --threads 4
