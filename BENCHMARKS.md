@@ -34,6 +34,49 @@ a different question.
 
 ---
 
+## 2026-09-08 (later still) — the C generator, on every core
+
+One 4-core / 16 GB container, 2,000,000 rows, nine interleaved rounds, both
+binaries built from the same tree minutes apart.
+
+| Format | Bytes written | Before | After | | CPU before | CPU after |
+|---|---:|---:|---:|---:|---:|---:|
+| CSV | 702 MB | 2.67s | **1.17s** | 2.28x | 2.66s | **2.61s** |
+| ndjson | 1,697 MB | 5.39s | **1.91s** | 2.82x | 5.37s | **4.70s** |
+| Parquet | 415 MB | 6.06s | **2.61s** | 2.32x | 6.06s | 6.22s |
+
+Where the Parquet parallelism actually is, measured separately in one sitting:
+
+| Parquet, what is threaded | Wall |
+|---|---:|
+| nothing | 6.49s |
+| the columns of a row group | 5.28s |
+| the two sides | 3.26s |
+| both | **2.91s** |
+
+**2.3-2.8x with CPU flat or down.** Threading normally buys elapsed time with
+total work; this did not, because the restructure also stopped the row loop
+fetching its parameters from a struct on every row — at one thread the new code
+already beats the old serial code.
+
+**Splitting a row group's columns is worth only 1.28x**, which is a quarter of
+what is there: most of a Parquet run is the serial feeding of forty million cell
+values into the column arenas, not the encoding of them. The two sides at once
+are worth 2.0x on their own.
+
+**No C++ column, deliberately.** This host cannot measure that generator
+consistently — the same binary writing the same CSV came out anywhere from 0.78s
+to 3.84s across sittings. The earlier C-against-C++ generator table published in
+`c/README.md` is withdrawn for that reason and for a second one: its Parquet row
+compared C++'s snappy output against this port's uncompressed, 199 MB against
+415 MB, because snappy is that generator's default.
+
+Byte identity against the C++ generator holds across sixteen shapes, including
+thread counts of 1, 3, 4 and 7, a row count ending inside a wave, and a single
+row. Eight are in `c/test.sh --with-ports`.
+
+---
+
 ## 2026-09-08 (later) — the same seven builds, after the C parse work
 
 Same workflow, same seven builds, same rows, one runner over.

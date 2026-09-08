@@ -1,6 +1,7 @@
 /* The writer. See pqwrite.h for what it does and does not carry. */
 #define _GNU_SOURCE
 
+#include "parallel.h"
 #include "pqwrite.h"
 
 #include <fcntl.h>
@@ -244,6 +245,7 @@ struct PqWriter {
     char   **names;
     size_t   columns;
     size_t   group_rows, dict_limit;
+    unsigned ways;                /* parts to split a group's columns into */
     Column  *col;
     size_t   held;                /* rows in the current group */
     int64_t  rows;                /* rows in the file so far */
@@ -322,6 +324,137 @@ static void page_header(Buf *out, int type, int32_t raw, int32_t values, int enc
 }
 
 /*
+ * One part's share of a row group's columns.
+ *
+ * A column depends on nothing outside itself -- its dictionary, its definition
+ * levels and its pages are its own -- so the columns of a group are the natural
+ * unit of parallel work here, and there are twenty of them against four cores.
+ * Parts stride rather than take blocks, which balances them without a queue.
+ *
+ * The scratch is per part because it used to be per group: one definition-level
+ * array, one index array and one dictionary table served every column in turn,
+ * which is exactly what cannot be shared once the turns overlap.
+ */
+typedef struct {
+    PqWriter    *w;
+    size_t       n;
+    Buf         *bytes;
+    int64_t     *dict_at, *data_at;
+    size_t       seen_cap;
+    unsigned     ways;
+    const char **why;      /* one slot per part; NULL when it went fine */
+} ColParts;
+
+static void column_part(void *vctx, unsigned part) {
+    ColParts *g = vctx;
+    PqWriter *w = g->w;
+    const size_t n = g->n;
+    const size_t seen_cap = g->seen_cap;
+    int64_t *dict_at = g->dict_at, *data_at = g->data_at;
+
+    int32_t *defs = malloc(n * sizeof *defs);
+    int32_t *idx  = malloc(n * sizeof *idx);
+    size_t  *dict = malloc(n * sizeof *dict);   /* row indices of distinct values */
+    int32_t *seen = malloc(seen_cap * sizeof *seen);
+    if (!defs || !idx || !dict || !seen) {
+        g->why[part] = "out of memory";
+    } else {
+        for (size_t c = part; c < w->columns; c += g->ways) {
+            Column *col = &w->col[c];
+            Buf *out = &g->bytes[c];
+            Buf body = {0}, levels = {0}, header = {0};
+            dict_at[c] = -1;
+            /* Definition levels: one per row, 1 present and 0 null, RLE, with a
+             * four-byte length in front. The same however the values are encoded. */
+            for (size_t i = 0; i < n; i++) defs[i] = col->isnull[i] ? 0 : 1;
+            rle_hybrid(&levels, defs, n, 1);
+
+            /*
+             * Distinct values in first-seen order, abandoned once the column is too
+             * varied for a dictionary to be worth it.
+             *
+             * Through an open-addressed table, not a scan of what has been seen. A
+             * scan is O(rows x distinct), which at a hundred and twenty thousand
+             * rows a group and a dictionary of eight thousand is a billion
+             * comparisons per column -- it made this generator fifty-eight times
+             * slower than the C++ one it is meant to match, all of it in here.
+             */
+            size_t distinct = 0;
+            int use_dict = 1;
+            memset(seen, 0xFF, seen_cap * sizeof *seen);      /* -1 is empty */
+            for (size_t i = 0; i < n && use_dict; i++) {
+                if (col->isnull[i]) { idx[i] = 0; continue; }
+                const char *v = col->bytes.p + col->off[i];
+                const size_t vn = col->len[i];
+                size_t at = value_hash(v, vn) & (seen_cap - 1);
+                int32_t found = -1;
+                for (;;) {
+                    const int32_t k = seen[at];
+                    if (k < 0) break;
+                    const size_t o = dict[k];
+                    if (col->len[o] == vn && memcmp(col->bytes.p + col->off[o], v, vn) == 0) {
+                        found = k;
+                        break;
+                    }
+                    at = (at + 1) & (seen_cap - 1);
+                }
+                if (found >= 0) { idx[i] = found; continue; }
+                if (distinct >= w->dict_limit) { use_dict = 0; break; }
+                dict[distinct] = i;
+                seen[at] = (int32_t)distinct;
+                idx[i] = (int32_t)distinct;
+                distinct++;
+            }
+
+            if (use_dict) {
+                /* The dictionary page, then the indices as a data page. */
+                body.n = 0;
+                for (size_t k = 0; k < distinct; k++)
+                    plain_put(&body, col->bytes.p + col->off[dict[k]], col->len[dict[k]]);
+                page_header(&header, PG_DICTIONARY, (int32_t)body.n, (int32_t)distinct, PE_PLAIN);
+                dict_at[c] = (int64_t)out->n;
+                buf_put(out, header.p, header.n);
+                buf_put(out, body.p, body.n);
+
+                const int width = width_for(distinct ? distinct : 1);
+                body.n = 0;
+                uint32_t dl = (uint32_t)levels.n;
+                buf_put(&body, &dl, 4);
+                buf_put(&body, levels.p, levels.n);
+                buf_byte(&body, (unsigned char)width);
+                {
+                    /* Only the present rows carry an index. */
+                    size_t m = 0;
+                    for (size_t i = 0; i < n; i++)
+                        if (!col->isnull[i]) idx[m++] = idx[i];
+                    if (m) rle_hybrid(&body, idx, m, width);
+                }
+                header.n = 0;
+                page_header(&header, PG_DATA, (int32_t)body.n, (int32_t)n, PE_RLE_DICTIONARY);
+                data_at[c] = (int64_t)out->n;
+                buf_put(out, header.p, header.n);
+                buf_put(out, body.p, body.n);
+            } else {
+                body.n = 0;
+                uint32_t dl = (uint32_t)levels.n;
+                buf_put(&body, &dl, 4);
+                buf_put(&body, levels.p, levels.n);
+                for (size_t i = 0; i < n; i++)
+                    if (!col->isnull[i]) plain_put(&body, col->bytes.p + col->off[i], col->len[i]);
+                page_header(&header, PG_DATA, (int32_t)body.n, (int32_t)n, PE_PLAIN);
+                data_at[c] = (int64_t)out->n;
+                buf_put(out, header.p, header.n);
+                buf_put(out, body.p, body.n);
+            }
+            int oops = body.bad || levels.bad || header.bad || out->bad;
+            buf_free(&body); buf_free(&levels); buf_free(&header);
+            if (oops) { g->why[part] = "out of memory"; break; }
+        }
+    }
+    free(defs); free(idx); free(dict); free(seen);
+}
+
+/*
  * Writes every column of the current row group, then records the group.
  *
  * A column depends on nothing outside itself -- its dictionary and its
@@ -337,111 +470,28 @@ static int flush_group(PqWriter *w) {
     Buf     *bytes = calloc(w->columns, sizeof *bytes);
     int64_t *dict_at = malloc(w->columns * sizeof *dict_at);
     int64_t *data_at = malloc(w->columns * sizeof *data_at);
-    int32_t *defs = malloc(n * sizeof *defs);
-    int32_t *idx = malloc(n * sizeof *idx);
-    size_t  *dict = malloc(n * sizeof *dict);      /* row indices of distinct values */
     /* Sized to at least twice what can go in it, so probes stay short and it
-     * can never fill; one table serves every column in the group. */
+     * can never fill. One per part, not one per group: the parts run at once. */
     size_t   seen_cap = 16;
     while (seen_cap < (w->dict_limit < n ? w->dict_limit : n) * 2 + 16) seen_cap <<= 1;
-    int32_t *seen = malloc(seen_cap * sizeof *seen);
     Buf      group = {0};
-    if (!bytes || !dict_at || !data_at || !defs || !idx || !dict || !seen) {
+    if (!bytes || !dict_at || !data_at) {
         fail("out of memory");
         goto done;
     }
 
-    for (size_t c = 0; c < w->columns; c++) {
-        Column *col = &w->col[c];
-        Buf *out = &bytes[c];
-        Buf body = {0}, levels = {0}, header = {0};
-        dict_at[c] = -1;
-
-        /* Definition levels: one per row, 1 present and 0 null, RLE, with a
-         * four-byte length in front. The same however the values are encoded. */
-        for (size_t i = 0; i < n; i++) defs[i] = col->isnull[i] ? 0 : 1;
-        rle_hybrid(&levels, defs, n, 1);
-
-        /*
-         * Distinct values in first-seen order, abandoned once the column is too
-         * varied for a dictionary to be worth it.
-         *
-         * Through an open-addressed table, not a scan of what has been seen. A
-         * scan is O(rows x distinct), which at a hundred and twenty thousand
-         * rows a group and a dictionary of eight thousand is a billion
-         * comparisons per column -- it made this generator fifty-eight times
-         * slower than the C++ one it is meant to match, all of it in here.
-         */
-        size_t distinct = 0;
-        int use_dict = 1;
-        memset(seen, 0xFF, seen_cap * sizeof *seen);      /* -1 is empty */
-        for (size_t i = 0; i < n && use_dict; i++) {
-            if (col->isnull[i]) { idx[i] = 0; continue; }
-            const char *v = col->bytes.p + col->off[i];
-            const size_t vn = col->len[i];
-            size_t at = value_hash(v, vn) & (seen_cap - 1);
-            int32_t found = -1;
-            for (;;) {
-                const int32_t k = seen[at];
-                if (k < 0) break;
-                const size_t o = dict[k];
-                if (col->len[o] == vn && memcmp(col->bytes.p + col->off[o], v, vn) == 0) {
-                    found = k;
-                    break;
-                }
-                at = (at + 1) & (seen_cap - 1);
-            }
-            if (found >= 0) { idx[i] = found; continue; }
-            if (distinct >= w->dict_limit) { use_dict = 0; break; }
-            dict[distinct] = i;
-            seen[at] = (int32_t)distinct;
-            idx[i] = (int32_t)distinct;
-            distinct++;
-        }
-
-        if (use_dict) {
-            /* The dictionary page, then the indices as a data page. */
-            body.n = 0;
-            for (size_t k = 0; k < distinct; k++)
-                plain_put(&body, col->bytes.p + col->off[dict[k]], col->len[dict[k]]);
-            page_header(&header, PG_DICTIONARY, (int32_t)body.n, (int32_t)distinct, PE_PLAIN);
-            dict_at[c] = (int64_t)out->n;
-            buf_put(out, header.p, header.n);
-            buf_put(out, body.p, body.n);
-
-            const int width = width_for(distinct ? distinct : 1);
-            body.n = 0;
-            uint32_t dl = (uint32_t)levels.n;
-            buf_put(&body, &dl, 4);
-            buf_put(&body, levels.p, levels.n);
-            buf_byte(&body, (unsigned char)width);
-            {
-                /* Only the present rows carry an index. */
-                size_t m = 0;
-                for (size_t i = 0; i < n; i++)
-                    if (!col->isnull[i]) idx[m++] = idx[i];
-                if (m) rle_hybrid(&body, idx, m, width);
-            }
-            header.n = 0;
-            page_header(&header, PG_DATA, (int32_t)body.n, (int32_t)n, PE_RLE_DICTIONARY);
-            data_at[c] = (int64_t)out->n;
-            buf_put(out, header.p, header.n);
-            buf_put(out, body.p, body.n);
-        } else {
-            body.n = 0;
-            uint32_t dl = (uint32_t)levels.n;
-            buf_put(&body, &dl, 4);
-            buf_put(&body, levels.p, levels.n);
-            for (size_t i = 0; i < n; i++)
-                if (!col->isnull[i]) plain_put(&body, col->bytes.p + col->off[i], col->len[i]);
-            page_header(&header, PG_DATA, (int32_t)body.n, (int32_t)n, PE_PLAIN);
-            data_at[c] = (int64_t)out->n;
-            buf_put(out, header.p, header.n);
-            buf_put(out, body.p, body.n);
-        }
-        int oops = body.bad || levels.bad || header.bad || out->bad;
-        buf_free(&body); buf_free(&levels); buf_free(&header);
-        if (oops) { fail("out of memory"); goto done; }
+    {
+        ColParts cp = { w, n, bytes, dict_at, data_at, seen_cap, w->ways, NULL };
+        cp.why = calloc(w->ways, sizeof *cp.why);
+        if (!cp.why) { fail("out of memory"); goto done; }
+        run_parts(column_part, &cp, w->ways);
+        const char *why = NULL;
+        for (unsigned q = 0; q < w->ways; q++) if (cp.why[q]) why = cp.why[q];
+        free(cp.why);
+        /* `fail` writes a thread-local buffer, so a part's message never
+         * reaches here on its own; parts hand back the reason and it is set
+         * once, on this thread. */
+        if (why) { fail(why); goto done; }
     }
 
     /* Where each column's bytes land is known once every buffer's size is. */
@@ -505,7 +555,7 @@ static int flush_group(PqWriter *w) {
 
 done:
     for (size_t c = 0; bytes && c < w->columns; c++) buf_free(&bytes[c]);
-    free(bytes); free(dict_at); free(data_at); free(defs); free(idx); free(dict); free(seen);
+    free(bytes); free(dict_at); free(data_at);
     buf_free(&group);
     return status;
 }
@@ -518,6 +568,11 @@ PqWriter *pqw_open(const char *path, char *const *names, size_t columns,
     w->columns = columns;
     w->group_rows = row_group_rows ? row_group_rows : 1;
     w->dict_limit = dict_limit;
+    /* Never more parts than columns: a part with nothing to do is a thread
+     * created, joined, and paid for. */
+    w->ways = cpu_count();
+    if (w->ways > columns) w->ways = (unsigned)columns;
+    if (w->ways < 1) w->ways = 1;
     w->names = malloc(columns * sizeof *w->names);
     w->col = calloc(columns, sizeof *w->col);
     if (w->fd < 0 || !w->names || !w->col) {

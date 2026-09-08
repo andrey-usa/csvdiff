@@ -19,6 +19,7 @@
  */
 #define _GNU_SOURCE
 
+#include "parallel.h"
 #include "pqwrite.h"
 
 #include <stdbool.h>
@@ -196,17 +197,34 @@ static void fields(Row *out, int64_t i, bool b, int64_t seed) {
  * some of the first half, and gains a tail of rows A never had. That is what
  * puts added, removed and duplicate keys into every comparison.
  */
-#define EACH_ROW(b, rows, EMIT)                                                     \
+/*
+ * Rows `lo` to `hi` of the main sequence, in the order they appear in the file.
+ * Split out from EACH_ROW so that a thread can be given a range of it: whether
+ * a row is emitted depends on nothing but its own index, so any contiguous
+ * range can be rendered without having seen the rows before it.
+ */
+#define RANGE_ROWS(b, rows, lo, hi, EMIT)                                           \
     do {                                                                            \
-        const int64_t dup_extra_ = (rows) / DUP_MOD > 1 ? (rows) / DUP_MOD : 1;      \
-        const int64_t added_ = (rows) / ADDED_RATIO > 1 ? (rows) / ADDED_RATIO : 1;  \
-        for (int64_t i_ = 0; i_ < (rows); i_++) {                                   \
+        for (int64_t i_ = (lo); i_ < (hi); i_++) {                                  \
             if (!(b)) { EMIT(i_); continue; }                                       \
             if (i_ % REMOVED_MOD != 7) EMIT(i_);                                    \
             if (i_ % DUP_MOD == 3 && i_ < (rows) / 2) EMIT(i_);                     \
         }                                                                           \
+    } while (0)
+
+/* The rows appended after the main sequence: A's repeats, B's tail of new ones. */
+#define TAIL_ROWS(b, rows, EMIT)                                                    \
+    do {                                                                            \
+        const int64_t dup_extra_ = (rows) / DUP_MOD > 1 ? (rows) / DUP_MOD : 1;      \
+        const int64_t added_ = (rows) / ADDED_RATIO > 1 ? (rows) / ADDED_RATIO : 1;  \
         if (!(b)) { for (int64_t i_ = 0; i_ < dup_extra_; i_++) EMIT(i_); }          \
         else { for (int64_t i_ = (rows); i_ < (rows) + added_; i_++) EMIT(i_); }     \
+    } while (0)
+
+#define EACH_ROW(b, rows, EMIT)                                                     \
+    do {                                                                            \
+        RANGE_ROWS(b, rows, 0, (rows), EMIT);                                       \
+        TAIL_ROWS(b, rows, EMIT);                                                   \
     } while (0)
 
 /* A JSON string body. None of the generated values need escaping, but a
@@ -239,79 +257,149 @@ static char *put_json(char *p, const char *v, size_t n) {
  * the lock, the branch on the stream's state, the memcpy into libc's own buffer
  * -- was being paid two million times for work that is a memcpy either way.
  */
-#define OUT_CAP (1 << 20)
+#define CSV_HEADER                                                                    \
+    "account_id,txn_id,posting_date,value_date,currency,amount,fee,balance,status," \
+    "channel,region,branch_code,product_code,counterparty,quantity,rate,category,"  \
+    "risk_flag,note,updated_at\n"
 
-typedef struct { FILE *fh; char *buf; size_t n; } Out;
+/* One row's bytes. A row is bounded well under 4 KB, so a caller only has to
+ * guarantee that much room. */
+static char *render_csv(char *p, const Row *r) {
+    for (int c = 0; c < COLUMNS; c++) {
+        if (c) *p++ = ',';
+        memcpy(p, r->f[c], r->n[c]);
+        p += r->n[c];
+    }
+    *p++ = '\n';
+    return p;
+}
 
-static int out_flush(Out *o) {
-    if (o->n && fwrite(o->buf, 1, o->n, o->fh) != o->n) return -1;
-    o->n = 0;
+static char *render_json(char *p, const Row *r) {
+    *p++ = '{';
+    for (int c = 0; c < COLUMNS; c++) {
+        if (c) *p++ = ',';
+        *p++ = '"';
+        memcpy(p, kNames[c], g_name_len[c]);
+        p += g_name_len[c];
+        *p++ = '"';
+        *p++ = ':';
+        if (r->n[c] == 0) { memcpy(p, "null", 4); p += 4; continue; }
+        *p++ = '"';
+        p = put_json(p, r->f[c], r->n[c]);
+        *p++ = '"';
+    }
+    *p++ = '}';
+    *p++ = '\n';
+    return p;
+}
+
+/*
+ * The text formats, on every core.
+ *
+ * A row is a pure function of its index and whether a row is emitted at all
+ * depends on nothing but that index, so any contiguous range of the sequence
+ * can be rendered by itself. Threads take ranges of one wave, each into its own
+ * buffer; the buffers are written in wave order, so the bytes are the bytes a
+ * single thread would have produced. Memory is bounded by the wave rather than
+ * by the file, which is what makes this work at fifty million rows.
+ */
+typedef struct { char *p; size_t n, cap; } Blob;
+
+static int blob_room(Blob *b, size_t more) {
+    if (b->n + more <= b->cap) return 0;
+    size_t next = b->cap ? b->cap : (size_t)1 << 20;
+    while (next < b->n + more) next *= 2;
+    char *q = realloc(b->p, next);
+    if (!q) return -1;
+    b->p = q;
+    b->cap = next;
     return 0;
 }
 
-/* Room for one more row. Rows are bounded well under 4 KB. */
-static inline int out_room(Out *o) {
-    return o->n + 4096 <= OUT_CAP ? 0 : out_flush(o);
+typedef struct {
+    Blob    *blob;
+    int64_t  lo, hi;      /* this wave's slice of the main sequence */
+    int64_t  rows, seed;
+    bool     b, json;
+    unsigned ways;
+    bool     oom;
+} Wave;
+
+/*
+ * Renders one row into `out`, growing it. `b`, `seed` and the renderer are
+ * taken as names rather than read out of the wave, because reading them per row
+ * and calling through a branch cost more than the threading saved: the first
+ * version of this did that and spent 3.5 CPU-seconds on the CSV the serial one
+ * had written with 1.9.
+ */
+#define EMIT_ONE(out, b, seed, RENDER, i)                                      \
+    do {                                                                       \
+        if (blob_room((out), 4096) != 0) { oom = true; break; }                 \
+        Row r_;                                                                \
+        fields(&r_, (i), (b), (seed));                                         \
+        (out)->n = (size_t)(RENDER((out)->p + (out)->n, &r_) - (out)->p);       \
+    } while (0)
+
+#define EMIT_CSV_ROW(i)  EMIT_ONE(out, b, seed, render_csv, (i))
+#define EMIT_JSON_ROW(i) EMIT_ONE(out, b, seed, render_json, (i))
+
+static void wave_part(void *vctx, unsigned part) {
+    Wave *w = vctx;
+    Blob *out = &w->blob[part];
+    out->n = 0;
+    const int64_t span = w->hi - w->lo;
+    const int64_t lo = w->lo + span * part / w->ways;
+    const int64_t hi = w->lo + span * (part + 1) / w->ways;
+    /* In registers for the loop, not fields fetched once a row. */
+    const bool b = w->b;
+    const int64_t rows = w->rows, seed = w->seed;
+    bool oom = false;
+    if (w->json) RANGE_ROWS(b, rows, lo, hi, EMIT_JSON_ROW);
+    else         RANGE_ROWS(b, rows, lo, hi, EMIT_CSV_ROW);
+    if (oom) w->oom = true;
 }
 
-static int write_csv(const char *path, bool b, int64_t rows, int64_t seed) {
-    FILE *fh = fopen(path, "w");
-    if (!fh) return -1;
-    static char obuf[OUT_CAP];
-    Out o = { fh, obuf, 0 };
-    fputs("account_id,txn_id,posting_date,value_date,currency,amount,fee,balance,status,channel,"
-          "region,branch_code,product_code,counterparty,quantity,rate,category,risk_flag,note,"
-          "updated_at\n", fh);
-    Row r;
-#define EMIT_CSV(i)                                                        \
-    do {                                                                   \
-        if (out_room(&o) != 0) { fclose(fh); return -1; }                  \
-        fields(&r, (i), b, seed);                                          \
-        char *p = o.buf + o.n;                                             \
-        for (int c = 0; c < COLUMNS; c++) {                                \
-            if (c) *p++ = ',';                                             \
-            memcpy(p, r.f[c], r.n[c]);                                     \
-            p += r.n[c];                                                   \
-        }                                                                  \
-        *p++ = '\n';                                                       \
-        o.n = (size_t)(p - o.buf);                                         \
-    } while (0)
-    EACH_ROW(b, rows, EMIT_CSV);
-#undef EMIT_CSV
-    if (out_flush(&o) != 0) { fclose(fh); return -1; }
-    return fclose(fh) == 0 ? 0 : -1;
-}
+static int write_text(const char *path, bool b, int64_t rows, int64_t seed, bool json,
+                      unsigned ways) {
+    /* Rows per wave, across all parts. Bounded by the wave rather than the
+     * file, so this is the same however many rows are being written. */
+#ifndef WAVE_ROWS_SHIFT
+#define WAVE_ROWS_SHIFT 13
+#endif
+    const int64_t WAVE_ROWS = (int64_t)1 << WAVE_ROWS_SHIFT;
 
-static int write_json(const char *path, bool b, int64_t rows, int64_t seed) {
     FILE *fh = fopen(path, "w");
     if (!fh) return -1;
-    static char obuf[OUT_CAP];
-    Out o = { fh, obuf, 0 };
-    Row r;
-#define EMIT_JSON(i)                                                       \
-    do {                                                                   \
-        if (out_room(&o) != 0) { fclose(fh); return -1; }                  \
-        fields(&r, (i), b, seed);                                          \
-        char *p = o.buf + o.n;                                             \
-        *p++ = '{';                                                        \
-        for (int c = 0; c < COLUMNS; c++) {                                \
-            if (c) *p++ = ',';                                             \
-            *p++ = '"';                                                    \
-            memcpy(p, kNames[c], g_name_len[c]);                           \
-            p += g_name_len[c];                                            \
-            *p++ = '"'; *p++ = ':';                                        \
-            if (r.n[c] == 0) { memcpy(p, "null", 4); p += 4; continue; }    \
-            *p++ = '"';                                                    \
-            p = put_json(p, r.f[c], r.n[c]);                               \
-            *p++ = '"';                                                    \
-        }                                                                  \
-        *p++ = '}'; *p++ = '\n';                                           \
-        o.n = (size_t)(p - o.buf);                                         \
-    } while (0)
-    EACH_ROW(b, rows, EMIT_JSON);
-#undef EMIT_JSON
-    if (out_flush(&o) != 0) { fclose(fh); return -1; }
-    return fclose(fh) == 0 ? 0 : -1;
+    if (!json && fputs(CSV_HEADER, fh) < 0) { fclose(fh); return -1; }
+
+    Blob *blob = calloc(ways, sizeof *blob);
+    if (!blob) { fclose(fh); return -1; }
+    Wave wave = { blob, 0, 0, rows, seed, b, json, ways, false };
+    Wave *w = &wave;   /* a pointer, because EMIT_ROW is shared with the parts */
+    int bad = 0;
+
+    for (int64_t at = 0; at < rows && !bad; at += WAVE_ROWS) {
+        w->lo = at;
+        w->hi = at + WAVE_ROWS < rows ? at + WAVE_ROWS : rows;
+        run_parts(wave_part, w, ways);
+        if (w->oom) { bad = 1; break; }
+        for (unsigned p = 0; p < ways; p++)
+            if (blob[p].n && fwrite(blob[p].p, 1, blob[p].n, fh) != blob[p].n) { bad = 1; break; }
+    }
+
+    if (!bad) {   /* the rows appended after the sequence, on this thread */
+        Blob *out = &blob[0];
+        out->n = 0;
+        bool oom = false;
+        if (json) TAIL_ROWS(b, rows, EMIT_JSON_ROW);
+        else      TAIL_ROWS(b, rows, EMIT_CSV_ROW);
+        if (oom || (out->n && fwrite(out->p, 1, out->n, fh) != out->n)) bad = 1;
+    }
+
+    for (unsigned p = 0; p < ways; p++) free(blob[p].p);
+    free(blob);
+    if (fclose(fh) != 0) bad = 1;
+    return bad ? -1 : 0;
 }
 
 static int write_parquet(const char *path, bool b, int64_t rows, int64_t seed,
@@ -335,6 +423,24 @@ static int write_parquet(const char *path, bool b, int64_t rows, int64_t seed,
     EACH_ROW(b, rows, EMIT_PQ);
 #undef EMIT_PQ
     return pqw_close(w) != 0 || bad ? -1 : 0;
+}
+
+/* One side of the pair, so that both can be written at once. */
+typedef struct {
+    char     path[2][4096];
+    int      ok[2];
+    int64_t  rows, seed;
+    size_t   group_rows, dict_limit;
+    bool     parquet, json;
+    unsigned threads;
+} Sides;
+
+static void write_side(void *vctx, unsigned side) {
+    Sides *s = vctx;
+    const bool b = side == 1;
+    s->ok[side] = s->parquet
+        ? write_parquet(s->path[side], b, s->rows, s->seed, s->group_rows, s->dict_limit)
+        : write_text(s->path[side], b, s->rows, s->seed, s->json, s->threads);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -366,6 +472,7 @@ static int usage(void) {
 
 int main(int argc, char **argv) {
     int64_t rows = 0, seed = 7;   /* the same default every generator here uses */
+    unsigned threads = 0;         /* 0 means as many as there are cores */
     const char *out_dir = NULL, *prefix = NULL, *format = "csv";
     size_t group_rows = 122880, dict_limit = 8192;   /* the same defaults as the other generators */
 
@@ -378,7 +485,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(f, "--seed") && i + 1 < argc) seed = parse_rows(argv[++i]);
         else if (!strcmp(f, "--row-group-size") && i + 1 < argc) group_rows = (size_t)parse_rows(argv[++i]);
         else if (!strcmp(f, "--dict-limit") && i + 1 < argc) dict_limit = (size_t)parse_rows(argv[++i]);
-        else if (!strcmp(f, "--threads") && i + 1 < argc) i++;   /* accepted and ignored */
+        else if (!strcmp(f, "--threads") && i + 1 < argc) threads = (unsigned)parse_rows(argv[++i]);
         else if (!strcmp(f, "--compression") && i + 1 < argc) {
             const char *c = argv[++i];
             if (strcmp(c, "none") != 0) {
@@ -397,19 +504,36 @@ int main(int argc, char **argv) {
     else if (!strcmp(format, "parquet")) ext = ".unc.parquet";
     else return usage();
 
-    for (int side = 0; side < 2; side++) {
-        char path[4096];
-        snprintf(path, sizeof path, "%s/%s_%c%s", out_dir, prefix, side ? 'b' : 'a', ext);
-        const bool b = side == 1;
-        int ok;
-        if (!strcmp(format, "csv")) ok = write_csv(path, b, rows, seed);
-        else if (!strcmp(format, "json")) ok = write_json(path, b, rows, seed);
-        else ok = write_parquet(path, b, rows, seed, group_rows, dict_limit);
-        if (ok != 0) {
-            fprintf(stderr, "error: cannot write %s: %s\n", path,
-                    strcmp(format, "parquet") ? "write failed" : pqw_error());
+    if (threads == 0) threads = cpu_count();
+    if (threads == 0) threads = 1;
+
+    Sides sd = { { { 0 }, { 0 } }, { -1, -1 }, rows, seed, group_rows, dict_limit,
+                 !strcmp(format, "parquet"), !strcmp(format, "json"), threads };
+    for (int side = 0; side < 2; side++)
+        snprintf(sd.path[side], sizeof sd.path[side], "%s/%s_%c%s", out_dir, prefix,
+                 side ? 'b' : 'a', ext);
+
+    /*
+     * Parquet writes both sides at once; the text formats divide inside the
+     * file instead and running the sides together as well would only
+     * oversubscribe the same cores.
+     *
+     * That split is measured, not assumed. Parquet's columns do divide -- they
+     * are independent by construction and pqwrite splits them -- but that alone
+     * was worth only 1.28x, because most of a Parquet run is the serial feeding
+     * of rows into the column arenas rather than the encoding of them. Two
+     * sides at once is worth 2.0x, and the two together 2.2x. So both are on
+     * here, oversubscribed on purpose, and the column split earns its 12% on
+     * top rather than being the main event it looks like it should be.
+     */
+    if (sd.parquet) run_parts(write_side, &sd, 2);
+    else for (unsigned side = 0; side < 2; side++) write_side(&sd, side);
+
+    for (int side = 0; side < 2; side++)
+        if (sd.ok[side] != 0) {
+            fprintf(stderr, "error: cannot write %s: %s\n", sd.path[side],
+                    sd.parquet ? pqw_error() : "write failed");
             return 1;
         }
-    }
     return 0;
 }

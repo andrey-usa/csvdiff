@@ -71,6 +71,7 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Parallel join over key ranges** | the actual long pole: 20M from 54.60s (2 threads) to 33.32s (4), 2.53x cpu/wall |
 | **Sizing the hash table once** | thirteen rehashes at 10M, each a full pass of random probes, gone |
 | **Software prefetch at distance 24** | every insert is a cache miss on a table too big to hold, and the hash is already in hand |
+| **Threading the generator** | 2.3x to 2.8x on wall for no more CPU -- flat on CSV, 12% *down* on ndjson. This was in the "not worth it" table above on the strength of a comparison that turned out to be unsound; it was a scope decision recorded as a measurement |
 | **Reading only the key columns where only keys are read** | C's CSV path: 2.66x at two million rows, **3.65x at ten million** — the gain grows with the size, because past cache the parses removed were memory traffic and not only instructions |
 | **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries |
 
@@ -81,7 +82,6 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Huge pages in a loop** | each request makes the kernel compact memory. Two allocations win; six lose; sixteen lose badly. Column arrays 1.00s → 1.96s, key columns 2.03s → 2.79s (measured twice) |
 | **Sharding the index insertion** | 2.84s against 1.95s, CPU 9.2s against 5.8s — the routing costs more than the serial insertion it parallelises |
 | **Widening the hash to 8 bytes at a time** | no measurable effect |
-| **Threading the generator (C port)** | the C++ generator is 1.4-2.8x faster on wall and within a few per cent per CPU-second; generating fixtures is not what this port exists to be fast at |
 | **GPU offload** | not attempted. Per-row cost doubles between 1M and 3M as the index leaves L3, putting the plausible crossover at 370k-4M rows — but every GPU-side number would have been an estimate, since there is no GPU here |
 
 ### Things that were true and stopped being true

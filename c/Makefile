@@ -12,7 +12,7 @@ BIN     = csvdiff
 # rather than globbed. `c/*.c` would put both mains in one link -- which is
 # exactly how CI broke when the generator arrived.
 ENGINE  = csvdiff.c parquet.c pqdiff.c parallel.c
-GEN     = gen-data.c pqwrite.c
+GEN     = gen-data.c pqwrite.c parallel.c
 OBJ     = csvdiff.o parquet.o pqdiff.o parallel.o
 
 all: $(BIN) gen-data
@@ -28,7 +28,7 @@ parallel.o: parallel.c parallel.h
 # The generator writes this port's own fixtures and benchmark inputs, byte for
 # byte the same files the other generators write. Having it here is what lets a
 # check run without a second toolchain built first.
-gen-data: $(GEN) pqwrite.h
+gen-data: $(GEN) pqwrite.h parallel.h
 	$(CC) $(CFLAGS) -o $@ $(GEN)
 
 # The engine under AddressSanitizer and UndefinedBehaviorSanitizer. It is a

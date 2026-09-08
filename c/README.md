@@ -236,45 +236,97 @@ previous case's report when a run refused its flags, and reported the previous
 case's answer as this one's; it deletes the file first now and treats a missing
 one as a failure.
 
-## The generator against the C++ one
+## The generator, on every core
 
-Both write the same bytes, so this is a clean measurement of two
-implementations of one recipe. Two million rows, interleaved, on one four-core
-container:
+Every row is a pure function of its index, and whether a row is emitted at all
+depends on nothing but that index, so any contiguous range of the sequence can
+be rendered without having seen the rows before it. The text writers take
+ranges of a wave -- 8,192 rows across all parts -- each into its own buffer,
+and the buffers are written in wave order. The bytes are the bytes one thread
+would have produced, and memory is bounded by the wave rather than the file,
+which is what lets the same code write fifty million rows.
 
-| Format | C | C++ | C CPU | C++ CPU |
-|---|---:|---:|---:|---:|
-| CSV | 2.53s | **1.83s** | **2.5s** | 3.3s |
-| ndjson | 5.55s | **3.19s** | 5.5s | 5.4s |
-| Parquet | 4.80s | **1.74s** | 4.8s | 4.6s |
+Parquet divides twice: its two sides are written at once, and within a row group
+the columns are split across parts, each with its own definition-level array,
+index array and dictionary table. Those were one set per group before, served to
+each column in turn, which is exactly what cannot be shared once the turns
+overlap.
 
-**C++ is 1.4x to 2.8x faster on wall clock, and the whole of it is threading.**
-Per CPU-second the two are within a few per cent on every format, and on CSV the
-C generator does slightly less work. The C++ generator formats rows in waves
-across every core and spreads a row group's per-column work the same way; this
-one runs on one thread, because generating fixtures is not the thing this port
-exists to be fast at and a second threading design is a second thing to get
-wrong.
+Two million rows, nine interleaved rounds, one four-core container:
 
-Two defects turned up in writing that table, both mine, neither visible from
-the output because the bytes were right the whole time:
+| Format | Before | After | | CPU before | CPU after |
+|---|---:|---:|---:|---:|---:|
+| CSV | 2.67s | **1.17s** | 2.28x | 2.66s | **2.61s** |
+| ndjson | 5.39s | **1.91s** | 2.82x | 5.37s | **4.70s** |
+| Parquet | 6.06s | **2.61s** | 2.32x | 6.06s | 6.22s |
+
+**2.3x to 2.8x, and CPU did not go up to buy it** -- flat on CSV, 12% *down* on
+ndjson, 2.6% up on Parquet. Threading usually trades total work for elapsed
+time; this did not, because the restructure also stopped the row loop reading
+its parameters out of a struct on every row. At one thread the new code is
+already faster than the old serial code.
+
+Where the parallelism actually is, though, is not where it looks:
+
+| Parquet, what is threaded | Wall |
+|---|---:|
+| nothing | 6.49s |
+| the columns of a row group | 5.28s |
+| the two sides | 3.26s |
+| both | **2.91s** |
+
+Splitting a row group's twenty columns across four cores is worth only 1.28x,
+because most of a Parquet run is not the encoding -- it is the serial feeding of
+forty million cell values into the column arenas. Two sides at once is worth
+2.0x on its own. Both together oversubscribe four cores on purpose and the
+column split earns 12% on top. Had I stopped at the column split, which is the
+one the file's design points at, I would have taken a quarter of what was there.
+
+**The check that matters is `cmp`.** Sixteen shapes against the C++ generator,
+byte for byte: three formats, thread counts of 1, 3, 4 and 7, a row count that
+ends inside a wave, a single row, a non-default seed, small row groups, a
+dictionary budget the data crosses partway, and all-plain columns. Eight of
+those are in `test.sh --with-ports` now, including every threaded shape --
+because a threading bug that shifts one row would produce a file that is still
+valid, still parses, and is wrong.
+
+### What the first pass at this generator got wrong
+
+Two defects, both found by measuring rather than by any check failing, because
+the bytes were right the whole time.
 
 **The dictionary was built by scanning what had been seen.** O(rows x distinct),
 which at 122,880 rows a row group and a dictionary of 8,192 is a billion
 comparisons per column. Parquet generation took **113 seconds** at two million
-rows against the C++ generator's 1.9. Through an open-addressed table it is
-4.8s -- **24x** -- and the files are byte for byte what they were.
+rows. Through an open-addressed table it was 4.8s -- 24x -- and every file byte
+for byte what it had been.
 
-**The text writers called `fwrite` once per row**, and looked up each column
-name's length with `strlen` twenty times a row. A row is a couple of hundred
-bytes, so the per-call cost was being paid two million times for a memcpy either
-way. One megabyte of output per write, and the name lengths computed once, took
+**The text writers called `fwrite` once per row**, and took each column name's
+length with `strlen` twenty times a row -- forty million calls on a two-million
+row file. One megabyte of output per write and the lengths computed once took
 ndjson from 8.29s to 5.55s.
 
-The lesson is the one the rest of this file keeps finding: `cmp` said the
-generator was correct from the first commit, and correctness said nothing at all
-about whether it was fast. Neither did the test suite, which generates at most
-sixty thousand rows -- where the quadratic dictionary costs 40 ms and hides.
+The lesson is the one this file keeps finding: `cmp` said the generator was
+correct from its first commit and said nothing whatever about whether it was
+fast. Neither did the suite, which generates at most sixty thousand rows --
+where a quadratic dictionary costs 40 ms and hides.
+
+### A withdrawn table
+
+An earlier version of this section published a C-against-C++ generator
+comparison and concluded the gap "stays". Both halves were unsound.
+
+Its Parquet row compared the C++ generator's **snappy** output against this
+one's uncompressed -- 199 MB against 415 MB at two million rows -- because
+snappy is that generator's default and `--compression none` was never passed.
+A tenth of the bytes through a different encoder is not the same work.
+
+And the C++ column cannot be measured on this host at all: across sittings the
+same C++ generator writing the same CSV came out anywhere from 0.78s to 3.84s,
+a five-fold swing on a four-core shared container. Numbers that unstable cannot
+support a claim in either direction, so there is no C++ column here. The
+before-and-after above is one binary against another in one interleaved sitting,
+which is the comparison this host can actually make.
 
 ## Newline-delimited JSON
 

@@ -367,6 +367,15 @@ if [ "$with_ports" = 1 ]; then
   }
   gen_case "csv"                    --rows 5k
   gen_case "ndjson"                 --rows 5k --format json
+  # The generator formats rows on every core, in waves, so these are the shapes
+  # where a threaded writer differs from a serial one: a thread count that does
+  # not divide the wave, a row count that ends inside one, and one row.
+  gen_case "csv, one thread"        --rows 20k --threads 1
+  gen_case "csv, three threads"     --rows 20k --threads 3
+  gen_case "csv, seven threads"     --rows 20k --threads 7
+  gen_case "csv, ending mid-wave"   --rows 8193
+  gen_case "csv, a single row"      --rows 1
+  gen_case "ndjson, three threads"  --rows 20k --format json --threads 3
   gen_case "parquet"                --rows 5k --format parquet --compression none
   gen_case "parquet, small groups"  --rows 5k --format parquet --compression none --row-group-size 512
   gen_case "parquet, dict gives up" --rows 5k --format parquet --compression none --dict-limit 175 --row-group-size 300
