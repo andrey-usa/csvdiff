@@ -52,6 +52,24 @@ const CHUNKING_THRESHOLD: usize = 4 << 20;
 /// How many keys make the join worth splitting.
 const JOIN_THRESHOLD: usize = 1 << 14;
 
+/// How many rows ahead a table probe is started. Enough misses in flight to
+/// cover the latency of one, and not so many that the lines are evicted before
+/// the loop reaches them.
+const PREFETCH_AHEAD: usize = 32;
+
+/// Keys per join chunk. Sized in rows rather than in threads so that a chunk is
+/// small enough that no single one of them is the last thing four cores are
+/// waiting on: at ten million keys this is a couple of hundred chunks of a few
+/// hundredths of a second each.
+const JOIN_CHUNK: usize = 1 << 16;
+
+/// How many chunks `keys` divides into. One below the threshold, where finding
+/// the boundaries would cost more than the join it splits.
+fn waysFor(keys: usize) usize {
+    if (keys < JOIN_THRESHOLD) return 1;
+    return @max(1, std.math.divCeil(usize, keys, JOIN_CHUNK) catch 1);
+}
+
 pub const Options = struct {
     key: []const []const u8,
     compare: []const []const u8 = &.{},
@@ -610,7 +628,11 @@ const RowIndex = struct {
         // them to the end would keep two copies of every row's address and hash
         // alive at once, which is sixteen bytes a row of pure duplication.
         for (chunks) |*chunk| {
-            for (chunk.at.items, chunk.hash.items) |at, hash| try self.insert(at, hash, &s);
+            const hashes = chunk.hash.items;
+            for (chunk.at.items, hashes, 0..) |at, hash, i| {
+                if (i + PREFETCH_AHEAD < hashes.len) self.prefetch(hashes[i + PREFETCH_AHEAD]);
+                try self.insert(at, hash, &s);
+            }
             // Emptied rather than only released, because the caller frees the
             // chunks too and a list deinitialised twice frees a pointer it no
             // longer owns.
@@ -690,6 +712,17 @@ const RowIndex = struct {
     /// The high bits of an FNV hash are the well-mixed ones; fold them down.
     fn slotOf(self: RowIndex, hash: u64) usize {
         return @as(usize, @intCast((hash ^ (hash >> 32)) & 0xffff_ffff)) & self.mask;
+    }
+
+    /// Starts the fetch of the slot `hash` will land in, without waiting for it.
+    ///
+    /// Every probe of this table is a random access into tens of megabytes, so it
+    /// misses to memory, and the row after it needs a different line: the loop
+    /// spends most of its time waiting on a load whose address was known long
+    /// before it was issued. Asking for the line `PREFETCH_AHEAD` rows early turns
+    /// that serial chain of misses into overlapping ones.
+    fn prefetch(self: *const RowIndex, hash: u64) void {
+        @prefetch(&self.table[self.slotOf(hash)], .{ .rw = .read, .locality = 3, .cache = .data });
     }
 
     /// Only reached if the row count was underestimated: `build` sizes the table
@@ -975,13 +1008,15 @@ pub const Result = struct {
     }
 };
 
-/// One range of A's keys, joined on its own thread. Each range keeps its own
-/// counts and column stats; the merge is a sum, and the ranges are contiguous, so
-/// the answer does not depend on how many there are.
+/// One chunk of the join queue. A chunk of A's keys fills the matched, changed
+/// and removed counts and the column stats; a chunk of B's fills `added`. The
+/// merge is a sum, so the answer does not depend on how many chunks there are or
+/// on which thread took which.
 const Part = struct {
     matched: i64 = 0,
     changed: i64 = 0,
     removed: i64 = 0,
+    added: i64 = 0,
     columns: []ColumnStat,
     /// Written only by the thread that owns this range, read only once every
     /// thread has been joined.
@@ -998,13 +1033,16 @@ const Join = struct {
     nc: usize,
     width: usize,
     parts: []Part,
+    /// Chunk `i` is A's chunk `i` below this and B's above it.
+    a_ways: usize,
     next: std.atomic.Value(usize),
 
     fn run(self: *Join) void {
         while (true) {
             const i = self.next.fetchAdd(1, .monotonic);
             if (i >= self.parts.len) return;
-            self.range(i) catch |e| {
+            const work = if (i < self.a_ways) self.range(i) else self.added(i);
+            work catch |e| {
                 self.parts[i].failure = e;
                 return;
             };
@@ -1023,12 +1061,16 @@ const Join = struct {
         var out = &self.parts[p];
 
         const keys = self.ai.first_row.items;
-        const lo = keys.len * p / self.parts.len;
-        const hi = keys.len * (p + 1) / self.parts.len;
+        const lo = keys.len * p / self.a_ways;
+        const hi = keys.len * (p + 1) / self.a_ways;
         // Nothing to normalise and no tolerance: the cell comparison cannot
         // fail, so it need not be asked through an error union.
         const plain = !needsNormalising(self.opt);
-        for (keys[lo..hi]) |row| {
+        const mine = keys[lo..hi];
+        for (mine, 0..) |row, at| {
+            if (at + PREFETCH_AHEAD < mine.len) {
+                self.bi.prefetch(self.ai.row_hash.items[@intCast(mine[at + PREFETCH_AHEAD])]);
+            }
             self.ai.fieldsOf(row, fa);
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
@@ -1075,41 +1117,41 @@ const Join = struct {
             if (any) out.changed += 1;
         }
     }
-};
 
-/// B's side of the join: which of B's keys are not in A at all. It reads both
-/// indexes and writes only this count, so it runs beside A's ranges.
-const Added = struct {
-    a: *const Side,
-    b: *const Side,
-    ai: *const RowIndex,
-    bi: *const RowIndex,
-    opt: Options,
-    key_size: usize,
-    width: usize,
-    count: i64 = 0,
-    failure: ?anyerror = null,
-
-    fn run(self: *Added) void {
-        self.go() catch |e| {
-            self.failure = e;
-        };
-    }
-
-    fn go(self: *Added) !void {
+    /// B's side of the join: which of B's keys are not in A at all.
+    ///
+    /// It looked like the cheap half -- it asks one question per key where A's
+    /// side reads both rows and every compared column -- and so it was given one
+    /// thread while A got the rest. Timing each task says otherwise: at four
+    /// million rows B's single thread took 3.1s where A's three ranges took 1.6s
+    /// each, and the join sat waiting on B with three cores idle. A key does cost
+    /// B less than it costs A, about two thirds, but B has just as many of them,
+    /// and no ratio like that makes "one thread" the right unit for either side.
+    /// So B is chunked into the same queue, and chunks do not care which side
+    /// they came from.
+    fn added(self: *Join, i: usize) !void {
+        const p = i - self.a_ways;
         const gpa = self.b.gpa;
         const fb = try gpa.alloc(Field, self.width);
         defer gpa.free(fb);
         const probe = try gpa.alloc(Field, self.width);
         defer gpa.free(probe);
         var s = Scratch{};
-        var n: i64 = 0;
-        for (self.bi.first_row.items) |row| {
+        var out = &self.parts[i];
+
+        const keys = self.bi.first_row.items;
+        const b_ways = self.parts.len - self.a_ways;
+        const lo = keys.len * p / b_ways;
+        const hi = keys.len * (p + 1) / b_ways;
+        const mine = keys[lo..hi];
+        for (mine, 0..) |row, j| {
+            if (j + PREFETCH_AHEAD < mine.len) {
+                self.ai.prefetch(self.bi.row_hash.items[@intCast(mine[j + PREFETCH_AHEAD])]);
+            }
             self.bi.fieldsOf(row, fb);
             const hash = self.bi.row_hash.items[@intCast(row)];
-            if ((try self.ai.lookup(self.b.slab, fb, hash, &s, probe)) == null) n += 1;
+            if ((try self.ai.lookup(self.b.slab, fb, hash, &s, probe)) == null) out.added += 1;
         }
-        self.count = n;
     }
 };
 
@@ -1249,14 +1291,11 @@ pub fn compare(
         made += 1;
     }
 
-    // A's side is the long pole: every distinct key is looked up in B, both rows
-    // are read, and every compared column is examined. B's side only asks whether
-    // each of its keys exists in A. So A splits over ranges and B gets a thread of
-    // its own; the two write different outputs and read both indexes without
-    // writing either.
-    var ways = if (total > 1) total - 1 else 1;
-    if (ai.first_row.items.len < JOIN_THRESHOLD) ways = 1;
-    const parts = try gpa.alloc(Part, ways);
+    // Both sides are chunked into one queue and every thread pulls from it; see
+    // `Join.added` for why B is not worth a thread of its own.
+    const a_ways = waysFor(ai.first_row.items.len);
+    const b_ways = waysFor(bi.first_row.items.len);
+    const parts = try gpa.alloc(Part, a_ways + b_ways);
     defer {
         for (parts) |p| gpa.free(p.columns);
         gpa.free(parts);
@@ -1280,31 +1319,20 @@ pub fn compare(
         .nc = nc,
         .width = width,
         .parts = parts,
+        .a_ways = a_ways,
         .next = std.atomic.Value(usize).init(0),
     };
-    var added = Added{
-        .a = a,
-        .b = b,
-        .ai = ai,
-        .bi = bi,
-        .opt = opt,
-        .key_size = key_size,
-        .width = width,
-    };
-    const adder: ?std.Thread = std.Thread.spawn(.{}, Added.run, .{&added}) catch null;
-    if (adder == null) added.run();
-    try runOnThreads(&join, Join.run, ways);
-    if (adder) |w| w.join();
+    try runOnThreads(&join, Join.run, total);
     for (parts) |part| {
         if (part.failure) |e| return e;
     }
-    if (added.failure) |e| return e;
 
-    var counts = Counts{ .added = added.count };
+    var counts = Counts{};
     for (parts) |part| {
         counts.matched += part.matched;
         counts.changed += part.changed;
         counts.removed += part.removed;
+        counts.added += part.added;
         for (columns, part.columns) |*into, from| {
             into.changed += from.changed;
             into.blanked += from.blanked;
