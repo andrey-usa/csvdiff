@@ -899,6 +899,9 @@ class RowIndex {
         }
     }
 
+    /// The key hash the sweep computed for this row.
+    std::uint64_t hash_of(int row) const { return row_hash_[static_cast<std::size_t>(row)]; }
+
     const std::vector<int>& first_rows() const { return first_row_; }
     const std::vector<std::uint32_t>& occurrences() const { return occurrences_; }
     std::int64_t rows() const { return rows_; }
@@ -1387,8 +1390,10 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
             ai.fields_of(row, fa.data());
-            const int mate =
-                bi.lookup(a, fa.data(), key_hash(a, fa.data(), key_size, opt), probe.data());
+            // The hash is the one the sweep computed for this row: the same
+            // bytes through the same function, so computing it again here would
+            // be a second pass over every key in the file for the same number.
+            const int mate = bi.lookup(a, fa.data(), ai.hash_of(row), probe.data());
             if (mate < 0) {
                 ++out.removed_total;
                 if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
@@ -1455,8 +1460,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         std::vector<Field> fb(width), probe(width);
         for (int row : bi.first_rows()) {
             bi.fields_of(row, fb.data());
-            if (ai.lookup(b, fb.data(), key_hash(b, fb.data(), key_size, opt), probe.data()) < 0)
-                added.push(row, -1);
+            if (ai.lookup(b, fb.data(), bi.hash_of(row), probe.data()) < 0) added.push(row, -1);
         }
     };
     {

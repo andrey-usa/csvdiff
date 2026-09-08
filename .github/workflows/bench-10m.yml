@@ -107,6 +107,11 @@ jobs:
           if [ "$MATRIX" = "true" ]; then
             (cd cpp && CXX=clang++ make scanners)
             (cd zig && zig build --release=fast -Dscan=32 --prefix zig-out-v32)
+            # Rust's vector path is a target feature rather than a source
+            # switch, and changing RUSTFLAGS invalidates everything cargo has
+            # cached -- hence its own target directory and its own build.
+            (cd rust && RUSTFLAGS="-C target-feature=+avx2" \
+                cargo build --release --target-dir target-avx2)
             if grep -q avx512bw /proc/cpuinfo; then
               (cd zig && zig build --release=fast -Dscan=64 --prefix zig-out-v64)
             else

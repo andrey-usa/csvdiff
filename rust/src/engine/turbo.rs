@@ -719,7 +719,10 @@ fn join(
         let hi = ai.first_row.len() * (p + 1) / ways;
         for &row in &ai.first_row[lo..hi] {
             ai.fields_of(a, row, &mut fa);
-            let hash = key_hash(&a.slab, &fa, key_size, opt);
+            // The hash is the one the sweep computed for this row: the same
+            // bytes through the same function, so computing it again here would
+            // be a second pass over every key in the file for the same number.
+            let hash = ai.row_hash[row as usize];
             let Some(mate) = bi.lookup(b, &a.slab, &fa, hash, key_size, opt, &mut probe) else {
                 out.removed_total += 1;
                 if exporting || out.removed.len() <= cap {
@@ -759,7 +762,7 @@ fn join(
         let (mut fb, mut probe) = (vec![ABSENT; width], vec![ABSENT; width]);
         for &row in &bi.first_row {
             bi.fields_of(b, row, &mut fb);
-            let hash = key_hash(&b.slab, &fb, key_size, opt);
+            let hash = bi.row_hash[row as usize];
             if ai
                 .lookup(a, &b.slab, &fb, hash, key_size, opt, &mut probe)
                 .is_none()

@@ -958,7 +958,10 @@ const Join = struct {
         const hi = keys.len * (p + 1) / self.parts.len;
         for (keys[lo..hi]) |row| {
             self.ai.fieldsOf(row, fa);
-            const hash = try keyHash(self.a.slab, fa, self.key_size, self.opt, &s.a);
+            // The hash is the one the sweep computed for this row: the same
+            // bytes through the same function, so computing it again here would
+            // be a second pass over every key in the file for the same number.
+            const hash = self.ai.row_hash.items[@intCast(row)];
             const mate = (try self.bi.lookup(self.a.slab, fa, hash, &s, probe)) orelse {
                 out.removed += 1;
                 continue;
@@ -1010,7 +1013,7 @@ const Added = struct {
         var n: i64 = 0;
         for (self.bi.first_row.items) |row| {
             self.bi.fieldsOf(row, fb);
-            const hash = try keyHash(self.b.slab, fb, self.key_size, self.opt, &s.b);
+            const hash = self.bi.row_hash.items[@intCast(row)];
             if ((try self.ai.lookup(self.b.slab, fb, hash, &s, probe)) == null) n += 1;
         }
         self.count = n;
