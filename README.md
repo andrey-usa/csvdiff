@@ -997,9 +997,42 @@ wasted loads now sit on the critical path where they used to be hidden behind
 the hash. **A scanner benchmark measures the engine around it**, which is the
 part of this that generalises.
 
-AVX-512 is still unmeasured rather than lost: none of the runners this has run on
-have it, so the 64-byte builds skip themselves by name. `make scanners` and
-`zig build -Dscan=64 -Dcpu=native` build them for a machine that does.
+#### AVX-512, measured at last, and it loses
+
+The 64-byte builds had never run: no hosted runner this project has landed on
+carries `avx512bw`, so they skip themselves by name. A development container
+did, so they were finally built and timed there. Different host from every other
+table here — a 4-core Intel Xeon at 2.80GHz with `avx512f`, `avx512bw` and
+`avx512vl` — so read down the columns, not across to Set D. Median of seven runs
+at a million and five at four million, interleaved:
+
+| Port | Scanner | 1M | vs SWAR | 4M | vs SWAR |
+|---|---|---:|---:|---:|---:|
+| Zig | SWAR, 8 bytes | 1.186s | — | 5.203s | — |
+| Zig | AVX2, 32 bytes | **1.109s** | **+6.5%** | **4.846s** | **+6.9%** |
+| Zig | AVX-512, 64 bytes | 1.345s | **−13.4%** | 5.996s | **−15.2%** |
+| Rust | SWAR, 8 bytes | 1.094s | — | 4.699s | — |
+| Rust | AVX2, 32 bytes | **1.010s** | **+7.6%** | **4.077s** | **+13.2%** |
+| Rust | AVX-512, 64 bytes | 1.214s | −11.0% | 5.151s | −9.6% |
+
+**Sixty-four bytes is slower than eight**, in both ports, at both scales, by
+9-15%. It is not a measurement artefact of waiting on memory either: the CPU
+time goes *up* with it, 12.5s to 14.4s in Zig at four million, so the wider
+register is doing more work rather than the same work while stalled.
+
+This is the strongest form of the finding the section opens with, and it
+survives the correction that overturned the rest of it. The first table here
+concluded SIMD loses to SWAR and was measuring a byte-at-a-time key hash that
+hid the scan; with that fixed, 32 bytes won. 64 does not, and the reason is the
+same arithmetic that made the original claim plausible: **fields average 9.2
+bytes**, so a 64-byte load answers a nine-byte question by reading seven times
+what it needs. The [delimiter
+cursor](#swar-and-how-it-compares-to-real-simd) was built precisely to spread
+one wide load across the several fields it covers, and it is in these builds —
+it is what makes 32 bytes win — and even it cannot make 64 pay.
+
+`make scanners` and `zig build -Dscan=64 -Dcpu=native` still build them, because
+a negative result is only worth as much as the ability to re-run it.
 
 **There are now two scanners, and the same question has to be asked of both.**
 The columnar Parquet path has no delimiters to find, but it produces a mismatch

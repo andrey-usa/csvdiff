@@ -252,6 +252,30 @@ fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u6
 // The index
 // ---------------------------------------------------------------------------
 
+/// A slot holds the top bits of its key's hash and the position in `first_row`
+/// plus one, so zero means empty.
+///
+/// Carrying the tag is what makes a failed probe cheap: the word already loaded
+/// settles it. A table of bare positions has to follow each one into
+/// `first_row` and then into `row_hash` -- two dependent random loads, over
+/// arrays far too big to cache at ten million keys -- only to reject it. The
+/// Zig and C++ ports both do this; this port did not, and it cost more the
+/// larger the file got.
+const POS_MASK: u64 = (1 << 40) - 1;
+const EMPTY_SLOT: u64 = 0;
+
+fn slot_for(hash: u64, pos: usize) -> u64 {
+    (hash & !POS_MASK) | (pos as u64 + 1)
+}
+
+fn tag_is(slot: u64, hash: u64) -> bool {
+    (slot ^ hash) & !POS_MASK == 0
+}
+
+fn pos_of(slot: u64) -> usize {
+    ((slot & POS_MASK) - 1) as usize
+}
+
 /// One chunk's rows, in the order they appear in it.
 struct Chunk {
     at: Vec<u64>,
@@ -266,7 +290,7 @@ struct Chunk {
 struct RowIndex {
     row_at: Vec<u64>,
     row_hash: Vec<u64>,
-    table: Vec<i32>,
+    table: Vec<u64>,
     mask: usize,
     /// The row that first carried each distinct key, in first-appearance order.
     first_row: Vec<i32>,
@@ -275,8 +299,6 @@ struct RowIndex {
     dup_keys: i64,
     dup_rows: i64,
 }
-
-const EMPTY: i32 = -1;
 
 impl RowIndex {
     /// Finds and hashes every row in parallel, then inserts them on one thread in
@@ -291,13 +313,25 @@ impl RowIndex {
         let mut chunks = sweep(side, key_size, opt, threads)?;
 
         let total: usize = chunks.iter().map(|c| c.at.len()).sum();
+        // Sized once for the rows about to be inserted, at about a two-thirds
+        // load. Starting at four thousand and doubling meant twelve rehashes at
+        // ten million rows, each one a full random-access pass over a table
+        // already too big to cache -- work that grows with the file and is
+        // entirely avoidable, since the row count is known before the first
+        // insert. `first_row` and `occurrences` are sized the same way: they end
+        // up one entry per distinct key, and every key is distinct until proven
+        // otherwise.
+        let mut cap: usize = 1 << 12;
+        while cap * 2 < total * 3 + 16 {
+            cap <<= 1;
+        }
         let mut idx = RowIndex {
             row_at: Vec::with_capacity(total),
             row_hash: Vec::with_capacity(total),
-            table: vec![EMPTY; 1 << 12],
-            mask: (1 << 12) - 1,
-            first_row: Vec::new(),
-            occurrences: Vec::new(),
+            table: vec![EMPTY_SLOT; cap],
+            mask: cap - 1,
+            first_row: Vec::with_capacity(total),
+            occurrences: Vec::with_capacity(total),
             rows: 0,
             dup_keys: 0,
             dup_rows: 0,
@@ -345,9 +379,9 @@ impl RowIndex {
         let mut slot = self.slot(hash);
         let mut mine_parsed = false;
         loop {
-            let key = self.table[slot];
-            if key == EMPTY {
-                self.table[slot] = self.first_row.len() as i32;
+            let word = self.table[slot];
+            if word == EMPTY_SLOT {
+                self.table[slot] = slot_for(hash, self.first_row.len());
                 self.first_row.push(row);
                 self.occurrences.push(1);
                 if self.first_row.len() * 2 > self.table.len() {
@@ -355,24 +389,28 @@ impl RowIndex {
                 }
                 return;
             }
-            let candidate = self.first_row[key as usize];
-            if self.row_hash[candidate as usize] == hash {
-                // This row's fields are re-parsed rather than carried over from
-                // the sweep because the sweep produced ten million of them and
-                // this branch wants one.
-                if !mine_parsed {
-                    side.fields_at(at, mine);
-                    mine_parsed = true;
-                }
-                self.fields_of(side, candidate, probe);
-                if (0..key_size).all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt)) {
-                    self.occurrences[key as usize] += 1;
-                    if self.occurrences[key as usize] == 2 {
-                        self.dup_keys += 1;
-                        self.dup_rows += 1; // the first occurrence counts once the key repeats
+            // The tag rejects almost every collision without leaving this word.
+            if tag_is(word, hash) {
+                let key = pos_of(word);
+                let candidate = self.first_row[key];
+                if self.row_hash[candidate as usize] == hash {
+                    // This row's fields are re-parsed rather than carried over from
+                    // the sweep because the sweep produced ten million of them and
+                    // this branch wants one.
+                    if !mine_parsed {
+                        side.fields_at(at, mine);
+                        mine_parsed = true;
                     }
-                    self.dup_rows += 1;
-                    return;
+                    self.fields_of(side, candidate, probe);
+                    if (0..key_size).all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt)) {
+                        self.occurrences[key] += 1;
+                        if self.occurrences[key] == 2 {
+                            self.dup_keys += 1;
+                            self.dup_rows += 1; // the first occurrence counts once the key repeats
+                        }
+                        self.dup_rows += 1;
+                        return;
+                    }
                 }
             }
             slot = (slot + 1) & self.mask;
@@ -388,18 +426,20 @@ impl RowIndex {
         ((hash ^ (hash >> 32)) as usize) & self.mask
     }
 
+    /// Only reached if the row count was underestimated: `build` sizes the table
+    /// for the rows it is about to insert, so the common path never grows it.
     fn rehash(&mut self) {
         let size = self.table.len() * 2;
-        self.table = vec![EMPTY; size];
+        self.table = vec![EMPTY_SLOT; size];
         self.mask = size - 1;
         for key in 0..self.first_row.len() {
             let row = self.first_row[key];
             let hash = self.row_hash[row as usize];
             let mut slot = self.slot(hash);
-            while self.table[slot] != EMPTY {
+            while self.table[slot] != EMPTY_SLOT {
                 slot = (slot + 1) & self.mask;
             }
-            self.table[slot] = key as i32;
+            self.table[slot] = slot_for(hash, key);
         }
     }
 
@@ -420,15 +460,17 @@ impl RowIndex {
     ) -> Option<i32> {
         let mut slot = self.slot(hash);
         loop {
-            let key = self.table[slot];
-            if key == EMPTY {
+            let word = self.table[slot];
+            if word == EMPTY_SLOT {
                 return None;
             }
-            let candidate = self.first_row[key as usize];
-            if self.row_hash[candidate as usize] == hash {
-                self.fields_of(side, candidate, probe);
-                if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
-                    return Some(candidate);
+            if tag_is(word, hash) {
+                let candidate = self.first_row[pos_of(word)];
+                if self.row_hash[candidate as usize] == hash {
+                    self.fields_of(side, candidate, probe);
+                    if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
+                        return Some(candidate);
+                    }
                 }
             }
             slot = (slot + 1) & self.mask;
