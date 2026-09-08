@@ -41,7 +41,7 @@ def budget_for(rows: int):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rows", "-n", default="10k")
-    ap.add_argument("--engine", choices=["auto", "duckdb", "pandas"], default="auto")
+    ap.add_argument("--engine", choices=["auto", "duckdb"], default="auto")
     ap.add_argument("--out-dir", "-o", default="bench")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--keep-data", action="store_true", help="Do not delete the CSVs afterwards")

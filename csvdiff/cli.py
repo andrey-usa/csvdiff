@@ -33,7 +33,7 @@ def _add_compare_options(p: argparse.ArgumentParser):
     p.add_argument("--max-rows", type=int, help="Rows embedded per section (default 50000)")
     p.add_argument("--delimiter", help="Force delimiter (default: auto)")
     p.add_argument("--encoding")
-    p.add_argument("--engine", choices=["auto", "duckdb", "pandas"])
+    p.add_argument("--engine", choices=["auto", "duckdb"])
     p.add_argument("--threads", type=int)
     p.add_argument("--memory-limit", help="DuckDB memory limit, e.g. 4GB")
     p.add_argument("--export-dir", help="Write full changed/added/removed CSVs here")

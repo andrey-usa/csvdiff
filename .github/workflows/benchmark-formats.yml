@@ -2,7 +2,7 @@ name: Benchmark formats
 
 # One comparison, four input formats, nothing but this project involved: the
 # generator writes CSV, newline-delimited JSON and Parquet from one recipe, and
-# the engine reads all four natively. No DuckDB, no pandas, no conversion step
+# the engine reads all four natively. No third-party reader, no conversion step
 # and no intermediate CSV -- so what this measures is the formats and the engine
 # rather than whichever third-party reader happened to be installed.
 #
@@ -33,6 +33,12 @@ jobs:
     outputs:
       scales: ${{ steps.pick.outputs.scales }}
     steps:
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - id: pick
         run: |
           raw='${{ inputs.scales || 'all' }}'
@@ -50,6 +56,12 @@ jobs:
         scale: ${{ fromJSON(needs.plan.outputs.scales) }}
     steps:
       - uses: actions/checkout@v4
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
 
       - name: Build the engine and the generator
         run: |
@@ -95,6 +107,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - uses: actions/download-artifact@v4
         with:
           path: all

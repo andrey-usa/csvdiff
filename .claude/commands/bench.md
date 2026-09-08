@@ -1,6 +1,6 @@
 ---
 description: Run a benchmark scale and report the numbers
-argument-hint: [10k|1m|10m] [duckdb|pandas]
+argument-hint: [10k|1m|10m]
 allowed-tools: Bash(python scripts/*), Bash(rm -rf data), Read
 ---
 

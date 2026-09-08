@@ -1,6 +1,6 @@
 /**
  * Native engine: dependency-free, in-memory, same result contract as DuckDB.
- * The analogue of the Python implementation's pandas fallback. Use it for
+ * The dependency-free fallback of this implementation. Use it for
  * files that fit comfortably in RAM; DuckDB for anything large.
  */
 import { mkdirSync, writeFileSync } from "node:fs";

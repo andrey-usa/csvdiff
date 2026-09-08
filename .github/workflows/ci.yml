@@ -12,36 +12,29 @@ concurrency:
 
 jobs:
   test:
-    name: test py${{ matrix.python }} / ${{ matrix.engine }}
+    name: test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.11", "3.12", "3.13"]
-        engine: [duckdb]
-        include:
-          - python: "3.12"
-            engine: pandas          # fallback path, DuckDB deliberately not installed
     steps:
       - uses: actions/checkout@v4
 
+      # One interpreter, the current one. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.14"
           cache: pip
 
       - name: Install
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
-          if [ "${{ matrix.engine }}" = "duckdb" ]; then pip install "duckdb>=1.0"; else pip install "pandas>=2.0"; fi
-          pip install -e . --no-deps
+          pip install -e .
 
       - name: Unit tests
         run: pytest -q
 
       - name: Smoke benchmark, 10k rows x 20 columns
-        run: python scripts/bench.py --rows 10k --engine ${{ matrix.engine }} --out-dir bench
+        run: python scripts/bench.py --rows 10k --out-dir bench
 
       - name: Check the report is self-contained
         run: |
@@ -56,38 +49,9 @@ jobs:
           PY
 
       - uses: actions/upload-artifact@v4
-        if: matrix.python == '3.12'
         with:
-          name: report-10k-${{ matrix.engine }}
+          name: report-10k
           path: |
             bench/10k-*.html
             bench/10k-*.json
           retention-days: 14
-
-  engines-agree:
-    name: engines produce identical counts
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - run: |
-          pip install "duckdb>=1.0" "pandas>=2.0"
-          pip install -e . --no-deps
-      - run: python scripts/gen_data.py --rows 200k --out-dir data
-      - name: Compare with both engines and diff the summaries
-        run: |
-          for e in duckdb pandas; do
-            csvdiff compare data/200k_a.csv data/200k_b.csv \
-              -k account_id,txn_id -i updated_at --engine $e \
-              -o /tmp/$e.html --json /tmp/$e.json || true
-          done
-          python - <<'PY'
-          import json
-          a = json.load(open("/tmp/duckdb.json")); b = json.load(open("/tmp/pandas.json"))
-          assert a["counts"] == b["counts"], (a["counts"], b["counts"])
-          assert a["columns"] == b["columns"], (a["columns"], b["columns"])
-          print("engines agree:", a["counts"])
-          PY

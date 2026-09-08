@@ -21,7 +21,7 @@ like-for-like comparison rather than a collection of anecdotes.
 The C++ port reads **CSV, newline-delimited JSON and Parquet natively** — no
 library between it and the bytes — and the generator *writes* all three from one
 field-by-field recipe. So a format comparison here involves nothing but this
-project: no DuckDB, no pandas, no conversion step, no intermediate CSV.
+project: no third-party reader, no conversion step, no intermediate CSV.
 
 Measured on a stock 4-cpu GitHub Actions runner by
 [`.github/workflows/benchmark-formats.yml`](.github/workflows/benchmark-formats.yml),
@@ -80,8 +80,9 @@ pip install duckdb            # engine
 pip install -e .              # gives you the `csvdiff` command
 ```
 
-Python 3.11+. Everything except the engine is standard library. If DuckDB is not
-installed the tool falls back to pandas (same results, in-memory only).
+Python 3.14. Everything except the engine is standard library, and DuckDB is the
+only engine this implementation carries — the alternatives are the byte-level
+[ports](#ports), held to the same result contract.
 
 ## Launch modes
 
@@ -156,8 +157,8 @@ no option to allow it; it refuses such a file and says which engines will take i
 Both files are read as text (no type-inference surprises such as `1.0` vs `1`), hash-joined on the
 key in parallel, and spilled to disk when they don't fit in RAM. Multi-GB files compare in seconds to
 low minutes on a laptop, with one wheel as the only dependency. Polars is comparably fast in memory
-but not out-of-core; pandas is 5-20x slower and memory-bound. The [benchmarks](#benchmarks) below put
-numbers on all three, and on the bespoke engines that beat them.
+but not out-of-core. The [benchmarks](#benchmarks) below put numbers on both, and on the bespoke
+engines that beat them.
 
 ## The report
 
@@ -183,7 +184,7 @@ always exact regardless of the cap.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | push, PR | pytest on Python 3.11/3.12/3.13, a 10k smoke comparison on both engines, a check that the report has no external references, and a job asserting DuckDB and pandas return identical counts on 200k rows |
+| `ci.yml` | push, PR | pytest, a 10k smoke comparison, and a check that the report has no external references |
 | `parity.yml` | push, PR | every implementation must return identical counts and column stats, and all five data generators must emit byte-identical files |
 | `benchmark.yml` | manual, weekly cron | generates 10k / 1M / 10M rows × 20 columns, compares, enforces time and memory budgets, uploads reports, writes a results table to the job summary |
 | `compare.yml` | manual, or `workflow_call` | compares two files given as repo paths or URLs and publishes the report as an artifact |
@@ -225,9 +226,8 @@ file with a sparse payload, and SQL identifiers go through `_q()` / `_lit()` rat
 
 | Slash command | What it does |
 |---|---|
-| `/bench [10k\|1m\|10m] [duckdb\|pandas]` | runs a scale and reports time, throughput, peak RSS against budget |
+| `/bench [10k\|1m\|10m]` | runs a scale and reports time, throughput, peak RSS against budget |
 | `/compare <a> <b> <key> [flags]` | runs a comparison and summarises the discrepancies, flagging setup mistakes such as a non-unique key |
-| `/engines-agree` | checks DuckDB and pandas still produce identical counts on 200k rows |
 | `/ci-fix` | pulls the latest failing run's logs, reproduces locally, fixes the cause |
 
 `.claude/settings.json` pre-approves the test, benchmark and `gh run` commands, asks before
@@ -324,7 +324,6 @@ Input sizes: 10k = 3.7 MB · 1M = 368 MB · 10M = 3.68 GB · 20M = 7.36 GB.
 | **Other libraries** | | | |
 | Java `tablesaw` | 1.31s · 183 MB | 8.53s · 2,054 MB | ✗ heap OOM at 64.3s |
 | TypeScript `arquero` | 0.34s · 152 MB | 17.22s · 3,487 MB | ✗ V8 512 MB string cap at 0.5s |
-| Python `pandas` | 0.82s · 100 MB | 52.89s · 2,748 MB | ✗ runner killed (OOM) |
 
 **Nine of nineteen engines do not finish at 10M.** That is where the design decisions show, and it is
 why the recommendation table turns on memory rather than speed.
@@ -1375,7 +1374,7 @@ comparable with a number from another.
 
 | | Directory | Engines | Notes |
 |---|---|---|---|
-| Python | `.` (this) | duckdb, pandas | the reference; also has `serve` and `mail` |
+| Python | `.` (this) | duckdb | the reference; also has `serve` and `mail` |
 | TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
 | Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, sortmerge, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM, plus an out-of-core sort-merge join |
 | Go | [`go/`](go/) | duckdb, sortmerge, native | Go 1.24 |
@@ -1516,7 +1515,7 @@ exactly one exemption, [explained above](#set-c--against-the-field).
 ## Project layout
 
 ```
-csvdiff/engine.py         comparison (DuckDB + pandas fallback), result contract at top
+csvdiff/engine.py         comparison (DuckDB), result contract at top
 csvdiff/report.py         HTML renderer
 csvdiff/cli.py            compare / serve / mail
 csvdiff/server.py         drag-and-drop page
