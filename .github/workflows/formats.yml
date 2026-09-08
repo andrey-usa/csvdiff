@@ -1,0 +1,127 @@
+name: Formats (Rust, Zig, C++)
+
+# The three native ports read CSV, newline-delimited JSON and Parquet, and the
+# only claim worth CI time is that they cannot disagree: every port, on every
+# format, has to return the same counts and the same per-column stats for the
+# same rows. The payloads come from this project's own generator, so a
+# disagreement is a reader bug rather than a converter's.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - "zig/**"
+      - "cpp/**"
+      - "tests/fixtures/formats/**"
+      - "scripts/bench_formats_ports.py"
+      - ".github/workflows/formats.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "zig/**"
+      - "cpp/**"
+      - "tests/fixtures/formats/**"
+      - "scripts/bench_formats_ports.py"
+      - ".github/workflows/formats.yml"
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "How many rows the benchmark uses"
+        default: "1m"
+
+concurrency:
+  group: formats-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agree:
+    name: every port reads every format the same way
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Zig comes from PyPI rather than ziglang.org: it is the same release,
+      # and it needs no network beyond the one the runner already trusts.
+      - name: Install Zig
+        run: |
+          pip install ziglang==0.16.0
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+          zig version
+
+      - name: Build the three ports
+        run: |
+          (cd rust && cargo build --release)
+          (cd zig && zig build --release=fast)
+          (cd cpp && CXX=clang++ make)
+
+      # The dev profile, deliberately: the release profile links with LTO and
+      # a bundled DuckDB, which costs twenty minutes to compile seven test
+      # binaries and buys nothing a correctness test can use.
+      - name: Rust format tests
+        run: cd rust && cargo test --test formats
+
+      - name: Zig test suite, against the Rust port
+        run: cd zig && ZIG=zig ./test.sh
+
+      - name: Every port, every format, one answer
+        run: |
+          ROWS=${{ github.event.inputs.rows || '1m' }}
+          mkdir -p data
+          for f in csv ndjson parquet; do
+            ./rust/target/release/gen-data --rows "$ROWS" --out-dir data --prefix fmt --format $f
+          done
+          run() {  # port, binary, extra flags, format
+            ext=$4
+            $2 compare data/fmt_a.$ext data/fmt_b.$ext -k account_id,txn_id -i updated_at \
+              $3 --json "/tmp/$1-$ext.json" >/dev/null || true
+          }
+          for ext in csv ndjson; do
+            run cpp ./cpp/build/csvdiff "" $ext
+          done
+          for ext in csv ndjson parquet; do
+            run rust "./rust/target/release/csvdiff" "--engine turbo -o /dev/null" $ext
+            run zig ./zig/zig-out/bin/csvdiff "" $ext
+          done
+          python3 - <<'PY'
+          import glob, json, sys
+          answers = {}
+          for path in sorted(glob.glob("/tmp/*-*.json")):
+              name = path.split("/")[-1][:-5]
+              summary = json.load(open(path))
+              answers[name] = (summary["counts"],
+                               [(c["name"], c["changed"], c["blanked"], c["filled"])
+                                for c in summary["columns"]])
+          if not answers:
+              sys.exit("no run produced a summary")
+          reference = next(iter(answers))
+          for name, value in answers.items():
+              if value != answers[reference]:
+                  sys.exit(f"{name} disagrees with {reference}:\n  {value}\n  {answers[reference]}")
+          print(f"{len(answers)} runs agree:", json.dumps(answers[reference][0]))
+          print("| run | rows | matched | changed | added | removed |")
+          print("|---|---:|---:|---:|---:|---:|")
+          c = answers[reference][0]
+          for name in answers:
+              print(f"| {name} | {c['a_rows']} | {c['matched']} | {c['changed']} "
+                    f"| {c['added']} | {c['removed']} |")
+          PY
+
+      - name: Benchmark the three ports across the three formats
+        run: |
+          python3 scripts/bench_formats_ports.py \
+            --rows ${{ github.event.inputs.rows || '1m' }} --repeats 2 \
+            | tee /tmp/bench.txt
+          {
+            echo "## Ports and formats — ${{ github.event.inputs.rows || '1m' }} rows"
+            echo
+            echo '```'
+            cat /tmp/bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -174,6 +174,14 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, seed: u64) -> u64 {
             h = (h ^ (*b as u64)).wrapping_mul(PRIME);
             len += 1;
         }
+    } else if slab.logical(f).is_plain() {
+        // Nothing to unescape, so the bytes are the value and the loop is a
+        // read: this is the path every key in a well-formed file takes, twice
+        // per row across both files.
+        for b in slab.raw(f) {
+            h = (h ^ (*b as u64)).wrapping_mul(PRIME);
+            len += 1;
+        }
     } else {
         for b in slab.logical(f) {
             h = (h ^ (b as u64)).wrapping_mul(PRIME);

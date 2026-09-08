@@ -254,9 +254,10 @@ fn end_of_row(data: &[u8], pos: usize, end: usize) -> usize {
 pub(super) enum RowParser {
     Csv {
         delimiter: u8,
-        /// Where each projected column sits in the file, or `None` when absent.
-        source: Vec<Option<usize>>,
         last_needed: usize,
+        /// Which slots each column of the file feeds. Inverted from the wanted
+        /// list once, so storing a field is a lookup rather than a walk.
+        slots_for: Vec<Vec<u16>>,
     },
     Json {
         /// The key whose value belongs in each slot; `None` for a column this
@@ -279,10 +280,21 @@ fn name_hash(s: &[u8]) -> u64 {
 impl RowParser {
     pub(super) fn csv(delimiter: u8, source: Vec<Option<usize>>) -> Self {
         let last_needed = source.iter().flatten().copied().max().unwrap_or(0);
+        // Inverted once, so storing a field is a lookup rather than a walk of
+        // every wanted column: twenty columns against twenty slots is four
+        // hundred comparisons a row otherwise. A column can feed more than one
+        // slot -- `--compare` may name a key column -- so each entry is a list,
+        // and it is one element deep in every case but that one.
+        let mut slots_for: Vec<Vec<u16>> = vec![Vec::new(); last_needed + 1];
+        for (slot, at) in source.iter().enumerate() {
+            if let Some(column) = at {
+                slots_for[*column].push(slot as u16);
+            }
+        }
         RowParser::Csv {
             delimiter,
-            source,
             last_needed,
+            slots_for,
         }
     }
 
@@ -316,9 +328,10 @@ impl RowParser {
         match self {
             RowParser::Csv {
                 delimiter,
-                source,
                 last_needed,
-            } => self.parse_csv(*delimiter, source, *last_needed, data, start, end, out),
+                slots_for,
+                ..
+            } => self.parse_csv(*delimiter, slots_for, *last_needed, data, start, end, out),
             RowParser::Json { .. } => self.parse_json(data, start, end, out),
         }
     }
@@ -327,7 +340,7 @@ impl RowParser {
     fn parse_csv(
         &self,
         delimiter: u8,
-        source: &[Option<usize>],
+        slots_for: &[Vec<u16>],
         last_needed: usize,
         data: &[u8],
         start: usize,
@@ -351,10 +364,8 @@ impl RowParser {
                 (plain_field(data, pos, next), next)
             };
             if column <= last_needed {
-                for (i, at) in source.iter().enumerate() {
-                    if *at == Some(column) {
-                        out[i] = field;
-                    }
+                for slot in &slots_for[column] {
+                    out[*slot as usize] = field;
                 }
             }
             column += 1;

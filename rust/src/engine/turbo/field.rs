@@ -79,17 +79,24 @@ fn word_at(data: &[u8], at: usize) -> u64 {
 }
 
 /// The offset of the first byte at or after `from` that is `a` or `b`, or `end`.
+///
+/// The slice is cut to `end` first, which is not tidiness: it makes `at + 8 <=
+/// data.len()` the loop condition, so the compiler can see that the eight-byte
+/// read inside cannot be out of range and drops the bounds check it would
+/// otherwise emit on every step of a scan over gigabytes.
 pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> usize {
+    let data = &data[..end.min(data.len())];
     let (ba, bb) = (broadcast(a), broadcast(b));
     let mut at = from;
-    while at + 8 <= end {
-        let hits = match_bits(word_at(data, at), ba) | match_bits(word_at(data, at), bb);
+    while at + 8 <= data.len() {
+        let word = word_at(data, at);
+        let hits = match_bits(word, ba) | match_bits(word, bb);
         if hits != 0 {
             return at + (hits.trailing_zeros() >> 3) as usize;
         }
         at += 8;
     }
-    while at < end {
+    while at < data.len() {
         if data[at] == a || data[at] == b {
             return at;
         }
@@ -100,16 +107,17 @@ pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> us
 
 /// The offset of the first `target` at or after `from`, or `end`.
 pub(super) fn next_of1(data: &[u8], from: usize, end: usize, target: u8) -> usize {
+    let data = &data[..end.min(data.len())];
     let bt = broadcast(target);
     let mut at = from;
-    while at + 8 <= end {
+    while at + 8 <= data.len() {
         let hits = match_bits(word_at(data, at), bt);
         if hits != 0 {
             return at + (hits.trailing_zeros() >> 3) as usize;
         }
         at += 8;
     }
-    while at < end {
+    while at < data.len() {
         if data[at] == target {
             return at;
         }
@@ -125,14 +133,15 @@ pub(super) fn next_of1(data: &[u8], from: usize, end: usize, target: u8) -> usiz
 /// inside a quoted field. Counting whole words at a time keeps it far cheaper
 /// than the parsing it makes parallel.
 pub(super) fn count_byte(data: &[u8], from: usize, end: usize, target: u8) -> usize {
+    let data = &data[..end.min(data.len())];
     let bt = broadcast(target);
     let mut n = 0usize;
     let mut at = from;
-    while at + 8 <= end {
+    while at + 8 <= data.len() {
         n += match_bits(word_at(data, at), bt).count_ones() as usize;
         at += 8;
     }
-    while at < end {
+    while at < data.len() {
         if data[at] == target {
             n += 1;
         }

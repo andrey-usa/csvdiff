@@ -5,6 +5,11 @@ report as the Python implementation in the repository root, the TypeScript one i
 one in `../java` and the Go one in `../go` — CI asserts all five produce identical counts and column
 stats on the same input, and that their five data generators emit byte-identical files.
 
+It also carries the fastest engine in this project. `turbo` reads **CSV, newline-delimited JSON and
+Parquet**, decodes Parquet's pages itself rather than through a library, and splits the whole
+comparison across every core. The two sides need not be in the same format: a CSV export compares
+against the Parquet a warehouse emits, joined on the same key.
+
 Rust **edition 2024**, stable toolchain. `cargo fmt --check`, `cargo clippy -D warnings` and
 `cargo test` all gate CI.
 
@@ -46,11 +51,12 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 | `--ignore` | columns to skip (timestamps, run ids) |
 | `--trim`, `--ignore-case`, `--empty-is-null` | normalisation before comparing (applies to key and values) |
 | `--tolerance` | absolute numeric tolerance where both sides parse as numbers |
-| `--delimiter`, `--encoding` | override auto-detection |
+| `--delimiter`, `--encoding` | override auto-detection (CSV only) |
+| `--threads` | how wide `turbo` runs, and DuckDB's thread limit; the default is every core |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
 | `--engine` | `auto` (default), `duckdb`, `polars`, `turbo`, `sortmerge`, or `native` |
-| `--threads`, `--memory-limit` | DuckDB resource limits |
+| `--memory-limit` | DuckDB memory limit |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
@@ -65,12 +71,38 @@ rows. `--engine auto` takes the first one that can actually load, in the order b
 |---|---|---|---|
 | `duckdb` | DuckDB through `duckdb-rs` (bundled C++) | out-of-core, spills to disk | the default; anything that does not fit in RAM |
 | `polars` | Polars, natively | in-memory, columnar, multi-threaded | the dataframe comparison point |
-| `turbo` | mapped file, byte-level index | off-heap bytes, index in memory | **the fastest here** |
+| `turbo` | mapped file, byte-level index; CSV, JSON and Parquet | off-heap bytes, index in memory | **the fastest here** |
 | `sortmerge` | external sort, merge join | bounded memory, spills to disk | files past what memory can index |
 | `native` | this project, over the `csv` crate | in-memory, row-oriented | the dependency-light baseline |
 
-All three read CSV values as text — no type inference, so `1.0` and `1` stay different unless a
-tolerance is set — and all three treat an empty field as absent whether or not it is quoted. Polars
+### Input formats
+
+`turbo` decides what a file is by what is in it rather than by its name: a Parquet magic number, a
+leading `{`, or a CSV header. Every other engine reads CSV only, so a JSON or Parquet input selects
+`turbo` when you name it with `--engine turbo`.
+
+| Format | How it is read |
+|---|---|
+| CSV | mapped, scanned eight bytes at a time, a field is an offset and a length |
+| newline-delimited JSON | the same, addressed by key rather than by column number; `\uXXXX` is decoded, so a character written escaped and the same character written literally compare equal |
+| Parquet | pages decoded into an arena, a field is an offset into it; dictionary-encoded columns point *at the dictionary entry*, so a repeated value costs eight bytes a row |
+
+The Parquet reader is written here rather than taken from a crate, because the point is to keep the
+representation: `parquet` + `arrow` would hand back Arrow arrays, and a row would become a gather
+across twenty of them plus a string per cell — which is the design this engine exists to avoid. What
+it reads: PLAIN, dictionary (`PLAIN_DICTIONARY` and `RLE_DICTIONARY`), RLE booleans, and the
+version-2 delta encodings; uncompressed, snappy, gzip, zstd and LZ4-raw pages; data pages v1 and v2;
+definition levels for optional columns. What it refuses, by name rather than by wrong answer: nested
+or repeated schemas, `BYTE_STREAM_SPLIT`, LZO and Brotli.
+
+Because the comparison is textual, a typed Parquet value has to be rendered, and the rule is fixed:
+byte arrays are their bytes, booleans `true`/`false`, integers and decimals written out in full,
+floats in the shortest round-trip form laid out the way JavaScript lays it out, dates `YYYY-MM-DD`,
+timestamps ISO 8601. The Zig port implements the same rule, and `tests/fixtures/formats/typed.csv`
+is that rule written down, so a change to it fails a test rather than passing quietly in both ports.
+
+All three formats are read as text — no type inference, so `1.0` and `1` stay different unless a
+tolerance is set — and an empty field is absent whether or not it is quoted. Polars
 needs help with that last rule: it reads an unquoted empty field as null but keeps a *quoted* empty
 as a zero-length string, so the engine normalises it back before any user-supplied normalisation
 runs. A test pins that behaviour.
@@ -91,7 +123,10 @@ cargo run --release --bin bench -- --rows 10k --engine duckdb
 
 `gen-data` builds the same deterministic 20-column pair as the Python, TypeScript, Java and Go
 generators, keyed on `(account_id, txn_id)` with the same splitmix hash and the same drift recipe.
-Money is carried in integer cents and the drift is applied to those integers, never to a float, so
+`--format csv|ndjson|parquet` writes those same rows in any of the three formats — the Parquet
+writer is this project's own, dictionary-encoding a column chunk where that is smaller and writing
+it plain where it is not — so a format benchmark compares readers rather than converters, and the
+payloads need neither DuckDB nor a Python install. Money is carried in integer cents and the drift is applied to those integers, never to a float, so
 the files come out byte for byte identical without depending on any language's rounding rule:
 
 | Drift | Share of rows |
@@ -131,6 +166,15 @@ src/engine.rs             compare() entry point and the engine registry
 src/engine/duckdb.rs      DuckDB over duckdb-rs
 src/engine/polars.rs      Polars frames, joins and expressions
 src/engine/native.rs      csv-crate parse, RowStore join
+src/engine/turbo.rs       the byte-level engine: threading, the index, the join
+src/engine/turbo/field.rs the packed field word and the SWAR scan
+src/engine/turbo/slab.rs  the bytes a field points into, and how they are unescaped
+src/engine/turbo/text.rs  the CSV and newline-delimited JSON readers
+src/engine/turbo/parquet.rs   the Parquet reader: metadata, pages, values as text
+src/engine/turbo/thrift.rs    the compact protocol the Parquet footer is written in
+src/engine/turbo/codec.rs     snappy and LZ4 by hand, gzip and zstd through their crates
+src/engine/turbo/encoding.rs  the RLE/bit-packed hybrid and the delta encodings
+src/gendata/parquet.rs    the generator's Parquet writer
 src/rowstore.rs           de-duplication, join and sparse cell diffs for the in-memory engine
 src/columns.rs            column resolution, normalisation, cell equality, key ordering
 src/sections.rs           capping and the uncapped CSV exports

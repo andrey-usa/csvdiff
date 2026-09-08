@@ -260,9 +260,19 @@ fn hashField(slab: Slab, f: Field, o: Options, seed: u64, buf: []u8) Error!u64 {
         }
     } else {
         var it = slab.logical(f);
-        while (it.next()) |b| {
-            h = (h ^ b) *% PRIME;
-            len += 1;
+        if (it.isPlain()) {
+            // Nothing to unescape, so the bytes are the value and the loop is a
+            // read: this is the path every key in a well-formed file takes,
+            // twice per row across both files.
+            for (slab.raw(f)) |b| {
+                h = (h ^ b) *% PRIME;
+                len += 1;
+            }
+        } else {
+            while (it.next()) |b| {
+                h = (h ^ b) *% PRIME;
+                len += 1;
+            }
         }
     }
     return (h ^ len) *% PRIME;
@@ -402,7 +412,7 @@ const Input = union(enum) {
                     for (wanted, 0..) |n, i| source[i] = indexOf(t.names, n);
                     side.wanted_source = source;
                     side.rows = .{ .text = .{
-                        .parser = text.RowParser.initCsv(t.delimiter, source),
+                        .parser = try text.RowParser.initCsv(gpa, t.delimiter, source),
                         .from = t.from,
                     } };
                 }

@@ -187,7 +187,9 @@ settings. `.claude/skills/csvdiff-report/` covers changes to the HTML report spe
 | 100k – 2M rows | `polars` where you have it, else `turbo` | columnar wins this band outright; the byte-level engines are close behind on a quarter of the memory |
 | 2M – 20M rows, memory to spare | `turbo` | byte-level scanning; the only class that stays fast *and* still finishes at 10M+ |
 | 2M+ and you can build C++ | the [`cpp/`](cpp/) port, `--threads 4` | same design across every core: 2.5x the JVM on the same box and 1.5 GB lighter — but counts and JSON only, no HTML report |
-| 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design, two threads, lowest memory of anything here — counts and JSON only |
+| 2M+ and you want the report too | Rust `turbo` | the same threading as the C++ port, and the only build here that produces the HTML report at that speed |
+| Your input is JSON or Parquet | Rust `turbo` or the [`zig/`](zig/) port | the only engines here that read either natively; either side of the comparison may be in any of the three formats |
+| 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design and threading, lowest memory of anything here — counts and JSON only |
 | Any size, memory constrained | `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB in the Rust port |
 | Larger than tested, or unknown | `sortmerge` | the only engine whose memory does not grow with the input |
 | You need a hard guarantee | Zig port, `--max-memory MB` | a `FixedBufferAllocator`, so the bound is enforced rather than hoped for |
@@ -786,7 +788,13 @@ and doubled quotes inside quoted fields, above the 4 MB threshold where splittin
 counts at 1, 2, 3, 4 and 8 threads, matching the Rust port, the Python reference and the awkward
 fixture.
 
-The Zig port has the structural two-thread version only; chunking it is open.
+**The Rust and Zig ports now do the same.** Both were single-threaded or structurally two-threaded
+when the paragraph above was written; both now split each file into row-aligned chunks and A's side
+of the join into ranges, with the same rule about what may not be reordered — the index insert stays
+in file order, because first occurrence of a key wins and the duplicate counts follow from that, and
+the join's ranges are merged in order so the rows surviving `--max-rows` are the rows one thread
+would have kept. Each port's test suite asserts one answer at 1, 2, 3, 4 and 8 threads on the same
+awkward file.
 
 ## Input formats: is CSV the problem?
 
@@ -1076,7 +1084,7 @@ comparable with a number from another.
 | TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
 | Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, sortmerge, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM, plus an out-of-core sort-merge join |
 | Go | [`go/`](go/) | duckdb, sortmerge, native | Go 1.24 |
-| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024 |
+| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024; `turbo` reads CSV, JSON **and Parquet**, and threads the whole comparison |
 
 Three more carry the byte-level engine and the JSON counts only — benchmark and parity ports, so the
 same design can be measured in four languages without three more HTML renderers to keep in step:
@@ -1085,7 +1093,7 @@ same design can be measured in four languages without three more HTML renderers 
 |---|---|---|---|
 | C | [`c/`](c/) | `cc` or `clang`, C11 | one file, single-threaded on purpose — it exists to find the memory floor; no `--trim`, `--ignore-case` or `--tolerance` |
 | C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | reads CSV **and newline-delimited JSON**, including one of each; `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
-| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | threaded; `--max-memory MB` is enforced, not advisory |
+| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | reads CSV, JSON **and Parquet**; `--threads N`; `--max-memory MB` is enforced, not advisory — including the arena Parquet decodes into |
 
 The C++ and Zig ports build both indexes at once and run the two directions of the join at once,
 which is what Java's `turbo` has always done. C++ goes further, splitting each file into row-aligned
@@ -1118,6 +1126,10 @@ a float, so byte-identity does not depend on any language's floating-point round
 ## Test payloads
 
 `scripts/gen_data.py` builds a deterministic pair with 20 columns keyed on `(account_id, txn_id)`.
+`rust/target/release/gen-data` writes the same rows and takes `--format csv|ndjson|parquet`, so a
+format comparison uses payloads this project wrote rather than a converter's idea of them — its
+Parquet writer is in [`rust/src/gendata/parquet.rs`](rust/src/gendata/parquet.rs), and pyarrow and
+DuckDB both read what it produces.
 File B drifts from A by a fixed recipe, so every run has a known answer:
 
 | Drift | Share of rows |
@@ -1156,8 +1168,14 @@ scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
 # the same comparison from CSV, Parquet and JSON, engine held constant
 python scripts/bench_formats.py
 
-# our own reader on either format
+# our own readers on all three formats, in all three native ports, one host
+rust/target/release/gen-data --rows 10m --out-dir data --format parquet
+python3 scripts/bench_formats_ports.py --rows 10m --repeats 2
+
+# our own reader on any one format
 cpp/build/csvdiff compare a.ndjson b.ndjson -k id --threads 4
+rust/target/release/csvdiff compare a.parquet b.csv -k id --engine turbo -o /dev/null
+zig/zig-out/bin/csvdiff compare a.parquet b.parquet -k id --threads 4
 
 # the four Java byte-level engines head to head (Vector API needs the module)
 java --add-modules jdk.incubator.vector -jar java/target/csvdiff.jar \

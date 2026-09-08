@@ -160,6 +160,14 @@ pub const RowParser = union(enum) {
         /// Where each projected column sits in the file, or null when absent.
         source: []const ?usize,
         last_needed: usize,
+        /// The inverse: which slots each column of the file feeds, laid out as
+        /// one flat array with a start per column, so storing a field is a
+        /// lookup rather than a walk of every wanted column -- twenty columns
+        /// against twenty slots is four hundred comparisons a row otherwise.
+        /// A column can feed more than one slot, because `--compare` may name a
+        /// key column, so the run is a range rather than a single entry.
+        slots: []const u16,
+        starts: []const u32,
     };
 
     pub const Json = struct {
@@ -182,12 +190,36 @@ pub const RowParser = union(enum) {
         }
     };
 
-    pub fn initCsv(delimiter: u8, source: []const ?usize) RowParser {
+    pub fn initCsv(gpa: std.mem.Allocator, delimiter: u8, source: []const ?usize) !RowParser {
         var last: usize = 0;
         for (source) |s| if (s) |c| {
             if (c > last) last = c;
         };
-        return .{ .csv = .{ .delimiter = delimiter, .source = source, .last_needed = last } };
+        // Counting sort into the flat inverse: how many slots each column feeds,
+        // then where each column's run starts, then the slots themselves.
+        const starts = try gpa.alloc(u32, last + 2);
+        @memset(starts, 0);
+        for (source) |s| if (s) |c| {
+            starts[c + 1] += 1;
+        };
+        for (1..starts.len) |i| starts[i] += starts[i - 1];
+        const slots = try gpa.alloc(u16, starts[starts.len - 1]);
+        var filled = try gpa.alloc(u32, last + 1);
+        defer gpa.free(filled);
+        @memset(filled, 0);
+        for (source, 0..) |s, slot| {
+            if (s) |c| {
+                slots[starts[c] + filled[c]] = @intCast(slot);
+                filled[c] += 1;
+            }
+        }
+        return .{ .csv = .{
+            .delimiter = delimiter,
+            .source = source,
+            .last_needed = last,
+            .slots = slots,
+            .starts = starts,
+        } };
     }
 
     pub fn initJson(gpa: std.mem.Allocator, wanted: []const ?[]const u8) !RowParser {
@@ -208,7 +240,10 @@ pub const RowParser = union(enum) {
     pub fn deinit(self: RowParser, gpa: std.mem.Allocator) void {
         switch (self) {
             .json => |j| gpa.free(j.slots),
-            .csv => {},
+            .csv => |c| {
+                gpa.free(c.slots);
+                gpa.free(c.starts);
+            },
         }
     }
 
@@ -240,8 +275,8 @@ pub const RowParser = union(enum) {
                 field = plainField(d, pos, next);
             }
             if (column <= self.last_needed) {
-                for (self.source, 0..) |s, i| {
-                    if (s != null and s.? == column) out[i] = field;
+                for (self.slots[self.starts[column]..self.starts[column + 1]]) |slot| {
+                    out[slot] = field;
                 }
             }
             column += 1;

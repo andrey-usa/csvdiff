@@ -36,7 +36,7 @@ compare options:
       --delimiter D       Force delimiter (default: auto)
       --encoding ENC
       --engine E          auto | duckdb | polars | turbo | sortmerge | native
-      --threads N
+      --threads N         Threads for turbo, and DuckDB's thread limit
       --memory-limit S    DuckDB memory limit, e.g. 4GB
       --export-dir DIR    Write full changed/added/removed CSVs here
   -o, --out PATH          Report path (default: <a>__vs__<b>.html)
