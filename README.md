@@ -1,16 +1,73 @@
 # csvdiff
 
-Compare two CSV files on a composite key and get a self-contained HTML report.
-Key columns, compared columns and normalisation rules are parameters, so the same
+Compare two tables on a composite key and get a self-contained HTML report. Key
+columns, compared columns and normalisation rules are parameters, so the same
 tool serves every recurring comparison.
 
-The same tool exists in five languages to one result contract, plus three byte-level
-parity ports. That is what makes the benchmark section below a like-for-like
-comparison rather than a collection of anecdotes.
+The same tool exists in five languages to one result contract, plus three
+byte-level parity ports. That is what makes the benchmark sections below a
+like-for-like comparison rather than a collection of anecdotes.
 
-**Jump to:** [Using it](#using-it) · [Which engine at which size](#which-engine-at-which-size) ·
-[Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) · [Formats](#input-formats-is-csv-the-problem) · [Techniques](#techniques) · [Ports](#ports) ·
+**Jump to:** [Using it](#using-it) · [Four formats, one engine](#four-formats-one-engine) ·
+[Which engine at which size](#which-engine-at-which-size) ·
+[Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) ·
+[Formats](#input-formats-is-csv-the-problem) · [Techniques](#techniques) · [Ports](#ports) ·
 [Reproducing](#reproducing-the-numbers) · [Open questions](#open-questions)
+
+---
+
+# Four formats, one engine
+
+The C++ port reads **CSV, newline-delimited JSON and Parquet natively** — no
+library between it and the bytes — and the generator *writes* all three from one
+field-by-field recipe. So a format comparison here involves nothing but this
+project: no DuckDB, no pandas, no conversion step, no intermediate CSV.
+
+Measured on a stock 4-cpu GitHub Actions runner by
+[`.github/workflows/benchmark-formats.yml`](.github/workflows/benchmark-formats.yml),
+which runs on every push that touches `cpp/`. Every row is the same comparison:
+first-occurrence-wins on `(account_id, txn_id)`, inner join, per-cell diff over
+seventeen columns.
+
+### 10,000,000 rows × 20 columns
+
+| Input | Size | Generate | **Compare** | Rows/s | CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| CSV | 3,509 MB | 9.07s | **10.51s** | 951,238/s | 31.4s | 4,389 MB |
+| JSON (ndjson) | 8,488 MB | 31.83s | **14.44s** | 692,409/s | 42.1s | 9,363 MB |
+| Parquet + snappy | 992 MB | 6.37s | **2.81s** | 3,555,956/s | 9.1s | 4,006 MB |
+| **Parquet uncompressed** | 2,074 MB | **4.87s** | **2.35s** | **4,250,766/s** | 7.2s | **3,468 MB** |
+
+### 100,000 rows × 20 columns
+
+| Input | Size | Generate | **Compare** | Rows/s | CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| CSV | 35 MB | 0.05s | **0.24s** | 424,367/s | 0.6s | 58 MB |
+| JSON (ndjson) | 85 MB | 0.10s | **0.29s** | 341,462/s | 0.8s | 108 MB |
+| Parquet + snappy | 10 MB | 0.16s | **0.08s** | 1,298,720/s | 0.2s | 47 MB |
+| **Parquet uncompressed** | 21 MB | 0.17s | **0.04s** | **2,260,539/s** | 0.1s | 47 MB |
+
+**All four formats return identical counts** — at 10M: matched 9,990,000,
+changed 599,320, added 10,000, removed 10,000, duplicate rows 2,000 in A and
+1,000 in B. That is the workflow's correctness gate, not a footnote: four
+readers that disagree about how many rows changed is a bug, so the run fails and
+names the format that disagreed.
+
+Three things worth taking from these tables.
+
+**Parquet is 4.5x CSV and 6.1x JSON at ten million rows**, on a fifth of the
+bytes and 21% less memory. Not because the parser got faster — because the
+comparison stops being a comparison of strings. See
+[Reading Parquet natively](#reading-parquet-natively).
+
+**Writing Parquet is quicker than writing CSV.** 4.87s against 9.07s, because
+there are 1.4 GB fewer bytes to put on disk and the encoding is cheaper than
+formatting text. The route this project used to take — write the CSV, then have
+DuckDB convert it — cost 20.9s + 67.9s on a comparable machine.
+
+**JSON costs what its bytes cost.** 2.4x the size of the CSV and 1.4x the
+comparison time, with every field carrying its name. It is worth having because
+it is the input people actually receive, not because it is fast.
 
 ---
 
@@ -181,12 +238,23 @@ settings. `.claude/skills/csvdiff-report/` covers changes to the HTML report spe
 
 # Which engine at which size
 
+First, the format, because it is worth more than the engine choice below it:
+
+| Your input arrives as | Do this | Why |
+|---|---|---|
+| Parquet | compare it as Parquet, with the [`cpp/`](cpp/) port | 4.5x CSV at ten million rows, on a fifth of the bytes — [why](#reading-parquet-natively) |
+| CSV, compared once | compare the CSV | converting costs more than the one comparison saves |
+| CSV, compared again and again | convert once, then compare Parquet | the conversion pays back from about the fifth comparison |
+| newline-delimited JSON | compare it as JSON, or as one side against a CSV | the two formats meet at the join; it is 1.4x slower than CSV and 2.4x the bytes |
+
+Then the engine:
+
 | Your input | Use | Why |
 |---|---|---|
 | Up to ~100k rows | anything | every engine finishes well under a second; startup cost dominates, so pick on convenience |
 | 100k – 2M rows | `polars` where you have it, else `turbo` | columnar wins this band outright; the byte-level engines are close behind on a quarter of the memory |
 | 2M – 20M rows, memory to spare | `turbo` | byte-level scanning; the only class that stays fast *and* still finishes at 10M+ |
-| 2M+ and you can build C++ | the [`cpp/`](cpp/) port, `--threads 4` | same design across every core: 2.5x the JVM on the same box and 1.5 GB lighter — but counts and JSON only, no HTML report |
+| 2M+ and you can build C++ | the [`cpp/`](cpp/) port, `--threads 4` | same design across every core: 2.5x the JVM on the same box and 1.5 GB lighter, and the only port that reads Parquet and JSON as well as CSV — but counts and JSON only, no HTML report |
 | 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design, two threads, lowest memory of anything here — counts and JSON only |
 | Any size, memory constrained | `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB in the Rust port |
 | Larger than tested, or unknown | `sortmerge` | the only engine whose memory does not grow with the input |
@@ -799,10 +867,17 @@ DuckDB is the constant because it reads all of them natively and spills rather
 than dying. Polars was tried first and was killed by the OOM killer at ten
 million rows on CSV alone, twice.
 
-The C++ port now reads two of the three natively as well —
+**This section is the historical one**, kept because the reasoning in it is
+instructive and because one of its conclusions turned out to be wrong. The
+current answer, measured on our own reader and our own generator with no third
+party involved, is at the top: [Four formats, one
+engine](#four-formats-one-engine).
+
+What follows is what the question looked like when the only way to read Parquet
+here was to ask DuckDB. The C++ port now reads all three natively —
 [JSON](#reading-json-natively) and [Parquet](#reading-parquet-natively) — and the
 Parquet answer turned out to be the opposite of what the table below predicts for
-us, for reasons the format table cannot see. Read both.
+us, for reasons a format table with a third-party engine in it cannot see.
 
 | Engine and input | Size | Convert | **Compare** | Peak RSS |
 |---|---:|---:|---:|---:|
@@ -887,8 +962,12 @@ don't have to.
 | Peak RSS, our CSV path | 4.41 GB | 4.37 GB |
 | Time saved | ≤15% | **80%** |
 
-Measured on one machine in one sitting, `python scripts/bench_parquet.py
---polars`. Every row that finished returns identical counts — matched 9,990,000,
+The table below is a different measurement from the [one at the
+top](#four-formats-one-engine): it exists to place us against DuckDB and polars
+on the same files, where that one exists to place the formats against each other
+with nothing but this project involved. Measured on one machine in one sitting,
+`python scripts/bench_parquet.py --polars`. Every row that finished returns
+identical counts — matched 9,990,000,
 changed 599,320, added 10,000, removed 10,000 — so these are eight ways of doing
 exactly the same work.
 
@@ -1315,6 +1394,10 @@ a float, so byte-identity does not depend on any language's floating-point round
 ## Test payloads
 
 `scripts/gen_data.py` builds a deterministic pair with 20 columns keyed on `(account_id, txn_id)`.
+`cpp/build/gen-data` builds the same bytes far faster, and writes **CSV, newline-delimited JSON and
+Parquet** from one field-by-field recipe rather than converting one into another — so the four inputs
+of a format comparison hold the same rows by construction.
+
 File B drifts from A by a fixed recipe, so every run has a known answer:
 
 | Drift | Share of rows |
@@ -1353,7 +1436,13 @@ cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression none
 # the smallest memory limit a comparison finishes in
 scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
 
-# the same comparison from CSV, Parquet and JSON, engine held constant
+# the four native formats against each other, nothing else involved
+#   -- this is what .github/workflows/benchmark-formats.yml runs
+(cd cpp && make && make gen-data)
+python scripts/bench_formats_native.py --rows 10m --data /tmp/bench --out formats.json
+
+# the historical version: the same comparison from CSV, Parquet and JSON with a
+# third-party engine held constant
 python scripts/bench_formats.py
 
 # ours against DuckDB and polars, on CSV and on Parquet, in one sitting
@@ -1377,6 +1466,11 @@ python scripts/bench_external.py --rows 1m --mem-cap-gb 12
 # smallest heap each Java engine finishes in
 scripts/min_heap.sh
 ```
+
+`bench_formats_native.py` is the one to reach for when the question is about formats: it generates
+each of the four, measures it and deletes it before the next, because at ten million rows all four at
+once is about 15 GB. It exits non-zero if the four disagree about the counts, which is the point --
+four readers of the same rows that reach different answers is a bug, not a benchmark.
 
 `bench.py` records generation time, comparison wall time, throughput, peak RSS, report size and the
 counts, then fails if a scale exceeds its budget (10k: 20s / 1.5 GB, 1M: 120s / 6 GB, 10M: 900s /
