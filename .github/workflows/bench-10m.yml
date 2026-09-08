@@ -57,9 +57,9 @@ on:
         type: boolean
         default: true
       rust_simd:
-        description: "Also build the Rust vector binary (adds ~25 minutes: RUSTFLAGS invalidates the cargo cache)"
+        description: "Also build the Rust vector binary (its own target dir, about a minute)"
         type: boolean
-        default: false
+        default: true
 
 concurrency:
   group: bench-10m-${{ github.ref }}
@@ -71,7 +71,7 @@ env:
   FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
   REPEATS: ${{ github.event.inputs.repeats || '2' }}
   MATRIX: ${{ github.event.inputs.matrix || 'true' }}
-  RUST_SIMD: ${{ github.event.inputs.rust_simd || 'false' }}
+  RUST_SIMD: ${{ github.event.inputs.rust_simd || 'true' }}
 
 jobs:
   bench:
@@ -120,7 +120,13 @@ jobs:
 
       - name: Build every port and every scanner
         run: |
-          (cd rust && cargo build --release)
+          # --no-default-features leaves out DuckDB and polars. This job runs
+          # `--engine turbo` exclusively and never called either, and compiling
+          # them cost nineteen minutes of a twenty-four minute step: nine for a
+          # bundled DuckDB, seven for the polars and arrow chain, and four more
+          # linking our own crate against both under thin LTO. The turbo engine,
+          # its Parquet reader and the generator are all still here.
+          (cd rust && cargo build --release --no-default-features)
           (cd zig && zig build --release=fast)
           (cd cpp && CXX=clang++ make && CXX=clang++ make gen-data)
           if [ "$MATRIX" = "true" ]; then
@@ -131,12 +137,13 @@ jobs:
             (cd zig && zig build --release=fast -Dscan=32 -Dcpu=native --prefix zig-out-v32)
             # Rust's vector path is a target feature rather than a source
             # switch, and changing RUSTFLAGS invalidates everything cargo has
-            # cached -- a second full build of DuckDB and Polars for one scanner.
-            # Worth twenty-five minutes when the question is being asked, and off
-            # by default when it is not.
+            # cached, so it needs a target directory and a build of its own.
+            # That used to mean a second full build of DuckDB and polars for one
+            # scanner row, which is why it was off by default; without them it
+            # is about a minute, so it is on.
             if [ "$RUST_SIMD" = "true" ]; then
               (cd rust && RUSTFLAGS="-C target-feature=+avx2" \
-                  cargo build --release --target-dir target-avx2)
+                  cargo build --release --no-default-features --target-dir target-avx2)
             fi
             if grep -q avx512bw /proc/cpuinfo; then
               (cd zig && zig build --release=fast -Dscan=64 -Dcpu=native --prefix zig-out-v64)

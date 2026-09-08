@@ -22,11 +22,24 @@ path = "src/bin/gen_data.rs"
 name = "bench"
 path = "src/bin/bench.rs"
 
+# The two heavy engines are optional, and on by default: a plain `cargo build`
+# is unchanged, and a build that only needs `turbo` can leave them out.
+#
+# This is not a packaging nicety, it is nineteen minutes. A bundled DuckDB is one
+# enormous C++ translation unit and takes nine of them on a hosted runner; the
+# polars and arrow chain takes another seven; and linking our own crate against
+# both, at `lto = "thin"` and one codegen unit, takes four more. The benchmark
+# workflow runs `--engine turbo` exclusively and called none of it.
+[features]
+default = ["duckdb-engine", "polars-engine"]
+duckdb-engine = ["dep:duckdb"]
+polars-engine = ["dep:polars"]
+
 [dependencies]
 # Engine: DuckDB, out-of-core, the default. Bundled so no system library is needed.
-duckdb = { version = "1.10505.0", features = ["bundled"] }
+duckdb = { version = "1.10505.0", features = ["bundled"], optional = true }
 # Engine: Polars, the Rust original behind the Node binding benchmarked in ../ts.
-polars = { version = "0.55.2", features = ["lazy", "csv", "dtype-full", "is_in", "strings", "abs"] }
+polars = { version = "0.55.2", features = ["lazy", "csv", "dtype-full", "is_in", "strings", "abs"], optional = true }
 # Engine: native, over the csv crate.
 csv = "1.4.0"
 # Engine: turbo. Maps the file instead of reading it, so the bytes are paged in

@@ -33,6 +33,7 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+#[cfg(feature = "duckdb-engine")]
 impl From<duckdb::Error> for Error {
     fn from(e: duckdb::Error) -> Self {
         Error(e.to_string())
@@ -45,6 +46,7 @@ impl From<csv::Error> for Error {
     }
 }
 
+#[cfg(feature = "polars-engine")]
 impl From<polars::prelude::PolarsError> for Error {
     fn from(e: polars::prelude::PolarsError) -> Self {
         Error(e.to_string())

@@ -17,11 +17,21 @@ Rust **edition 2024**, stable toolchain. `cargo fmt --check`, `cargo clippy -D w
 
 ```bash
 cd rust
-cargo build --release        # target/release/csvdiff
+cargo build --release                          # every engine
+cargo build --release --no-default-features    # turbo, sortmerge and native only
 ```
 
 DuckDB is compiled from the bundled amalgamation, so the first build is slow and needs a C++
 compiler; nothing else is required.
+
+**`--no-default-features` drops DuckDB and polars**, and with them most of the build. On a hosted
+runner the full build is about 21 minutes — nine for the bundled DuckDB, which is one enormous C++
+translation unit, seven for the polars and arrow chain, and four more linking this crate against
+both under thin LTO — against about **one minute** without them. `turbo` and its Parquet reader,
+`sortmerge`, `native` and the generator are all still there, so it is the right build for a
+benchmark or for a container that only ever runs the byte-level engine; the benchmark workflows use
+it for exactly that reason. Asking for an engine the build does not carry says so by name rather
+than failing obscurely, and `--engine auto` skips past it.
 
 ## Use
 

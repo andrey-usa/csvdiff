@@ -1,7 +1,9 @@
 //! The engine registry and the [`compare`] entry point.
 
+#[cfg(feature = "duckdb-engine")]
 pub mod duckdb;
 pub mod native;
+#[cfg(feature = "polars-engine")]
 pub mod polars;
 pub mod pqdiff;
 pub mod sortmerge;
@@ -111,12 +113,25 @@ fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult
     }
 
     let result = match engine {
+        #[cfg(feature = "duckdb-engine")]
         Engine::DuckDb => duckdb::compare(a, b, opt),
+        #[cfg(feature = "polars-engine")]
         Engine::Polars => polars::compare(a, b, opt),
         Engine::Turbo => turbo::compare(a, b, opt),
         Engine::SortMerge => sortmerge::compare(a, b, opt),
         Engine::Native => native::compare(a, b, opt),
         Engine::Auto => unreachable!("auto is resolved before this point"),
+        // Only present in a build that left an engine out. Asking for one by
+        // name then has to say so: the name is spelled right, and `auto` would
+        // have picked a different engine rather than failing, so silence here
+        // would look like the engine ran.
+        #[cfg(not(all(feature = "duckdb-engine", feature = "polars-engine")))]
+        other => {
+            return Err(Error::new(format!(
+                "this build has no {other} engine -- it was compiled without the \
+                 `{other}-engine` feature. Use --engine turbo, or rebuild with it."
+            )));
+        }
     };
     result.map_err(|e| Error::new(format!("the {engine} engine failed: {e}")))
 }
@@ -138,12 +153,18 @@ pub fn resolve_engine(requested: Engine) -> Engine {
 /// Whether a backend can run in this build.
 pub fn available(engine: Engine) -> bool {
     match engine {
+        #[cfg(feature = "duckdb-engine")]
         Engine::DuckDb => duckdb::available(),
+        #[cfg(feature = "polars-engine")]
         Engine::Polars => polars::available(),
         Engine::Turbo => turbo::available(),
         Engine::SortMerge => sortmerge::available(),
         Engine::Native => native::available(),
         Engine::Auto => false,
+        // An engine this build does not carry is not available, which is what
+        // `auto` needs to hear to skip past it.
+        #[cfg(not(all(feature = "duckdb-engine", feature = "polars-engine")))]
+        _ => false,
     }
 }
 

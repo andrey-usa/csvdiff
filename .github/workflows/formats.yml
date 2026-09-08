@@ -61,15 +61,19 @@ jobs:
       # which is how eleven of them silently did not run here.
       - name: Build the three ports
         run: |
-          (cd rust && cargo build --release)
+          # --no-default-features leaves out DuckDB and polars. Nothing in this
+          # job asks for either -- every run here is `--engine turbo` or the
+          # columnar Parquet path -- and compiling them is most of the job.
+          (cd rust && cargo build --release --no-default-features)
           (cd zig && zig build --release=fast)
           (cd cpp && CXX=clang++ make && CXX=clang++ make gen-data)
 
-      # The dev profile, deliberately: the release profile links with LTO and
-      # a bundled DuckDB, which costs twenty minutes to compile seven test
-      # binaries and buys nothing a correctness test can use.
+      # The dev profile, deliberately: the release profile links with thin LTO
+      # in one codegen unit, which costs minutes per test binary and buys
+      # nothing a correctness test can use. Same feature set as the build above,
+      # so the two share a target directory instead of each filling their own.
       - name: Rust format tests
-        run: cd rust && cargo test --test formats
+        run: cd rust && cargo test --no-default-features --test formats --test parquet
 
       # A skip is not a pass. The suite reports one per line, so the run fails
       # if any check declined to run for want of a tool this job just built.
