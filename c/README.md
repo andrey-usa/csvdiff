@@ -121,56 +121,80 @@ the toolchain and calling it the language.
 
 ## What Parquet turned out to be worth
 
-One four-core container, 16 GB, interleaved runs so a slow patch of the machine
-hits both binaries equally. Both ports read the same files and are checked to
-produce the same counts and the same per-column statistics on every run.
+One four-core container, 16 GB. Every table below comes from a single sitting
+with the ports **interleaved** — each runs once per round, and the rounds are
+what repeat. That is not fussiness: this machine's speed drifts under the runs
+themselves, as the page cache fills and the kernel's supply of free 2 MB pages
+is picked over and replenished, so a number taken now and one taken twenty
+minutes ago compare machine states rather than builds. An earlier draft of this
+file quoted a 1.83x speedup that was really 1.50x for exactly that reason.
 
-**Two million rows, uncompressed Parquet** (415 MB of input), seven runs each:
+`scripts/bench_ports_parquet.py` produces these, and fails if the ports disagree
+about how many rows changed.
 
-| Build | Best | Median | Worst | CPU | Peak RSS |
+**Ten million rows, uncompressed Parquet** (2,074 MB of input), five rounds:
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **2.78s** | **3.02s** | **3.37s** | **7.4s** | 3,414 MB | 1,341 MB |
+| C++ | 3.99s | 4.03s | 4.34s | 11.9s | 3,477 MB | 1,404 MB |
+| Rust | 5.30s | 5.40s | 5.88s | 13.9s | 3,436 MB | 1,362 MB |
+| Zig | 9.49s | 10.28s | 10.64s | 13.0s | 3,419 MB | 1,346 MB |
+
+**Two million rows, uncompressed Parquet** (415 MB), five rounds:
+
+| Port | Best | Median | Worst | CPU | Peak RSS |
 |---|---:|---:|---:|---:|---:|
-| **C** | **0.53s** | **0.74s** | **0.85s** | **1.5s** | **740 MB** |
-| C++ | 1.02s | 1.06s | 1.13s | 2.8s | 769 MB |
+| **C** | **0.63s** | **0.67s** | **0.75s** | **1.4s** | 728 MB |
+| C++ | 0.83s | 0.87s | 0.91s | 2.3s | 767 MB |
+| Rust | 1.39s | 1.42s | 1.46s | 3.0s | 839 MB |
+| Zig | 1.94s | 1.99s | 2.03s | 2.7s | **695 MB** |
 
-**Ten million rows** (2,074 MB of input), five runs each:
+**The same two million rows as CSV** (702 MB), four rounds — the control:
 
-| Build | Best | Median | Worst | CPU | Peak RSS |
-|---|---:|---:|---:|---:|---:|
-| **C** | **3.86s** | **4.02s** | **5.22s** | **10.6s** | **3,280 MB** |
-| C++ | 5.18s | 5.23s | 5.34s | 15.2s | 3,394 MB |
+| Port | Best | Median | CPU | Peak RSS |
+|---|---:|---:|---:|---:|
+| C | 7.89s | 8.46s | 7.9s | 839 MB |
+| C++ | **3.77s** | **3.79s** | 9.9s | 942 MB |
+| Rust | 8.63s | 8.98s | 8.6s | 1,000 MB |
+| Zig | 4.42s | 4.80s | **7.7s** | **827 MB** |
 
-**The format is worth about 4.6x, and it is the same 4.6x in both languages.**
-The same two million rows as CSV, same machine:
+Three things fall out of putting those side by side.
 
-| Build | Format | Compare | CPU |
-|---|---|---:|---:|
-| C | CSV | 11.55s | 11.5s |
-| C | Parquet | **0.53s** | **1.5s** |
-| C++ | CSV | 5.05s | 13.2s |
-| C++ | Parquet | **1.03s** | **2.8s** |
+**The format is worth 2.9x to 5.6x, in every language.** Measured in CPU rather
+than wall clock, because the ports thread the two paths differently and wall
+clock would be reporting that instead:
 
-Wall clock says Parquet is worth 21x in C and 4.9x in C++, but that comparison
-is contaminated: the C **CSV** path is single-threaded and the C **Parquet**
-path is not. CPU time takes the threading back out and leaves the format on its
-own — 11.5s to 1.5s and 13.2s to 2.8s. **7.7x and 4.7x**, and the part of the
-gap that is not the format is the tuning below.
+| Port | CSV | Parquet | The format is worth |
+|---|---:|---:|---:|
+| C | 7.9s | 1.4s | **5.6x** |
+| C++ | 9.9s | 2.3s | **4.3x** |
+| Rust | 8.6s | 3.0s | **2.9x** |
+| Zig | 7.7s | 2.7s | **2.9x** |
+
+**The order changes completely between the two formats.** On CSV this port is
+slowest of the four and C++ is twice as quick; on Parquet it is the fastest and
+C++ is half a second behind. Nothing about either language changed — the C CSV
+path is single-threaded and its Parquet path is not, and Parquet moves the work
+from parsing bytes to walking arrays, which is a different problem with
+different winners. A ranking of languages taken from one format is a ranking of
+that format's implementations.
+
+**Peak memory is the same everywhere, to within 2%.** 3,414 to 3,477 MB across
+four languages at ten million rows. That is the design, not the language, and it
+is the same conclusion this port reached on CSV.
 
 ## Where the time went, and what moved it
 
-The first working version of this path took **4.84s** on ten million rows
-(uncontended, best of five, warm cache). It now takes **2.65s**. Every step was
-measured rather than reasoned about, and one of them was reverted:
+The first working version of this path and the current one, built from the same
+source tree and run interleaved in one sitting, ten million rows:
 
-| Change | Phase | Before | After |
-|---|---|---:|---:|
-| Pre-size the plain-value array from the footer's row count | compared columns | 1.31s | 1.17s |
-| Fold eight bytes at a time instead of one | build key indexes | 1.77s | 1.79s |
-| Prefetch the slot an insert or probe will land on | build + join | 1.79s / 1.21s | 1.39s / 0.88s |
-| Fuse the index-rebase pass into the push; hoist two invariant branches | compared columns | 1.11s | 1.06s |
-| **Put the slot table on huge pages** | build key indexes | 1.38s | **0.59s** |
-| Put the column arrays on huge pages too | compared columns | 1.00s | 1.96s — **reverted** |
+| Build | Best | Median | Worst | CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|
+| before tuning (`34775da`) | 3.83s | 4.23s | 4.41s | 10.6s | 3,468 MB |
+| **after tuning** | **2.56s** | **3.06s** | **3.28s** | **6.8s** | **3,403 MB** |
 
-Uncontended phase profile, before and after:
+**1.50x on wall clock and 1.56x on CPU.** Phase by phase, uncontended:
 
 | Phase | Before | After |
 |---|---:|---:|
@@ -179,42 +203,62 @@ Uncontended phase profile, before and after:
 | build key indexes | 1.77s | **0.59s** |
 | join | 1.16s | **0.76s** |
 | compared columns | 1.31s | **0.95s** |
-| **wall** | **4.84s** | **2.65s** |
 
-Four things are worth writing down.
+Six changes were kept and three were measured and thrown away:
 
-**The hash was never the problem.** Widening `fold_bytes` to eight bytes a step
-is the obvious optimisation for a phase that hashes twenty million keys, and it
-did nothing at all — 1.77s to 1.79s. Splitting the phase said why: the parallel
-hash sweep is 0.17s of it and the serial insertion is 1.23s. The wide fold is
-still in the code because it costs nothing and helps a longer key, but it is
-kept as a fact rather than as a saving.
+| Change | Phase | Verdict |
+|---|---|---|
+| Pre-size the plain-value array from the footer's row count | compared columns | 1.31s → 1.17s |
+| Prefetch the slot an insert or probe will land on | build + join | 1.79 → 1.39s, 1.21 → 0.88s |
+| Fuse the index-rebase pass into the push; hoist two invariant branches | compared columns | 1.11s → 1.06s |
+| **Put the slot table on huge pages** | build key indexes | **1.38s → 0.59s** |
+| Fold eight bytes at a time instead of one | build key indexes | 1.77s → 1.79s — kept, but it does nothing |
+| Put the *column* arrays on huge pages too | compared columns | 1.00s → 1.96s — **reverted** |
+| Put the *key column* arrays on huge pages | join | 2.03s → 2.79s overall — **reverted** |
+| Shard the index so insertion runs on every core | build key indexes | 1.95s → 2.84s overall — **reverted** |
+
+Four things worth writing down.
 
 **The insertion was a page-table problem, not a memory-latency one.** Prefetching
 the next slot helped, as it should when every insert is a cache miss, but an
-insert still cost 123 ns afterwards — far more than a DRAM access. At ten
-million keys the table is 128 MB, which is 32,768 pages of 4 KB against a TLB
-holding perhaps 1,500, so nearly every probe took a page walk *on top of* its
-cache miss. Asking for 2 MB pages makes the same table 64 entries, and the phase
-went from 1.38s to 0.59s. This was the single largest change here, and it is
-three lines.
+insert still cost 123 ns afterwards — far more than a DRAM access. At ten million
+keys the table is 128 MB, which is 32,768 pages of 4 KB against a TLB holding
+perhaps 1,500, so nearly every probe took a page walk *on top of* its cache miss.
+Asking for 2 MB pages makes the same table 64 entries: 1.38s to 0.59s, in three
+lines, and it is the largest single change here.
 
-**Huge pages are about how often, not how big.** The column buffers are the same
-eighty megabytes the slot table is, walked just as randomly, and putting them on
-huge pages made things *worse* — 1.00s to 1.96s. The two slot tables are
-allocated once each; a column buffer is allocated thirty-four times, on four
-threads at once, and with `transparent_hugepage` set to `madvise` every one of
-those asks makes the kernel compact memory to find a 2 MB run. The change was
-reverted and the reason left in `grow()` so nobody tries it again.
+**Huge pages are about how often, not how big — measured three times.** The
+column buffers are the same eighty megabytes the slot table is, walked just as
+randomly, and huge-paging them made things *worse*: 1.00s to 1.96s. So was the
+narrower version that took only the four key columns, which are read once and
+probed at random rows and looked like the ideal case: 2.03s to 2.79s. With
+`transparent_hugepage` set to `madvise` every request makes the kernel compact
+memory to find a 2 MB run, and that cost scales with the number of asks, not
+their size. Two allocations win; six lose; sixteen lose badly.
 
-**A hand-rolled bounds check is easy to get subtly wrong.** Replacing a
-per-value dictionary-index check with one max-reduction over the page is a real
-saving — a max has no loop-carried dependency, so it vectorises — but the first
-version reduced over `int32_t`. A bit width of 32 can decode a value with the
-top bit set, which is negative as `int32_t`, passes a signed max, and then
-indexes the dictionary at a vast offset. The per-value check it replaced caught
-that by accident, because the cast to `size_t` made it enormous. The reduction
-is unsigned now.
+**Sharding the index cost more than the serial insertion it removed.** Insertion
+is serial within a side, so only two of four cores work through it — the obvious
+fix is to split the table by hash, which is safe here because equal keys always
+hash into the same shard and so first-occurrence-wins survives. It was built,
+and it was 2.84s against 1.95s. The CPU column said why: 9.2s against 5.8s.
+Routing rows to shards means either scanning every row once per shard, which is
+eight times the sequential reads, or bucketing them first, which needs 120 MB a
+side. The prize was the 0.18s of serial insertion left after the huge-page fix;
+the cheapest routing that gets it costs more than that. Reverted.
+
+**The obvious optimisation did nothing.** Widening `fold_bytes` to eight bytes a
+step is what you would do first to a phase that hashes twenty million keys, and
+it measured 1.77s to 1.79s. Splitting the phase said why: the parallel hash sweep
+is 0.17s of it and the serial insertion is 1.23s. It stays because it costs
+nothing and helps a longer key, but as a fact rather than a saving.
+
+One bug found by writing it down. Replacing a per-value dictionary-index check
+with a single max-reduction is a real saving — a max has no loop-carried
+dependency, so it vectorises — but the first version reduced over `int32_t`. A
+bit width of 32 can decode a value with the top bit set, which is negative,
+passes a signed max, and then indexes the dictionary at a vast offset. The
+per-value check it replaced caught that by accident, because the cast to
+`size_t` made it enormous. The reduction is unsigned now.
 
 ## Layout
 

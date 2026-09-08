@@ -1,0 +1,155 @@
+name: CI (C)
+
+# The C port carries two things nothing else gates: the memory floor, and the
+# only Parquet reader here that refuses compression outright. Both are easy to
+# break silently, so both are checked on every push that touches c/.
+#
+# The benchmark is a separate job on a button, not on every push. It needs ten
+# million rows written twice and every port built, which is minutes rather than
+# seconds -- and a number is only worth having when it comes off a host anyone
+# reading this can rent.
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports_parquet.py"]
+  pull_request:
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports_parquet.py"]
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Rows for the benchmark job (10m, 2m, 20m ...)"
+        default: "10m"
+      repeats:
+        description: "Interleaved rounds per port"
+        default: "5"
+
+concurrency:
+  group: ci-c-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test c, ${{ matrix.cc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both compilers, because the gap between them on this source is a
+        # finding the port exists to show rather than an implementation detail.
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: What this runner is
+        run: |
+          ${{ matrix.cc }} --version | head -1
+          echo "transparent_hugepage: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+
+      # test.sh holds the C port to the Rust port's answers on the awkward
+      # fixture, and its Parquet fixtures come from the C++ generator, so both
+      # have to exist before it runs.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Build the ports test.sh compares against
+        run: |
+          cargo build --release --manifest-path rust/Cargo.toml
+          make -C cpp gen-data
+
+      - name: Build
+        run: CC=${{ matrix.cc }} make -C c
+
+      # A check that declines to run is not a check that passed: test.sh prints
+      # "skip" and keeps going when a fixture generator is missing, which would
+      # let the whole Parquet half of the suite disappear behind a green tick.
+      - name: test.sh
+        run: |
+          set -o pipefail
+          bash c/test.sh 2>&1 | tee /tmp/c-test.txt
+          if grep -q '^skip' /tmp/c-test.txt; then
+            echo "::error::a check skipped rather than ran"
+            exit 1
+          fi
+
+      - name: Sanitizers
+        run: |
+          ${{ matrix.cc }} -std=c11 -O1 -g -fsanitize=address,undefined \
+              -Wall -Wextra -pthread -o /tmp/csvdiff-asan c/*.c
+          tmp=$(mktemp -d)
+          for flags in "" "--dict-limit 1" "--dict-limit 175 --row-group-size 300"; do
+            cpp/build/gen-data --rows 5k --out-dir "$tmp" --prefix s \
+                --format parquet --compression none $flags >/dev/null
+            /tmp/csvdiff-asan compare "$tmp/s_a.unc.parquet" "$tmp/s_b.unc.parquet" \
+                -k account_id,txn_id -i updated_at --json /dev/null
+            code=$?
+            [ $code -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
+          done
+
+  bench:
+    name: every port, ${{ github.event.inputs.rows || '10m' }} rows
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Install Zig
+        run: |
+          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+            | tar -xJ -C /opt
+          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+
+      # Ten million rows of Parquet is 2 GB written twice, and the runner ships
+      # with tens of gigabytes of toolchains this job never opens.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h / | tail -1
+
+      - name: What this runner is
+        run: |
+          {
+            echo "## Host"
+            echo '```'
+            lscpu | grep -E 'Model name|^CPU\(s\)|L3 cache'
+            free -g | head -2
+            echo "transparent_hugepage: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build every port
+        run: |
+          make -C cpp
+          make -C cpp gen-data
+          make -C c
+          cargo build --release --manifest-path rust/Cargo.toml
+          (cd zig && zig build --release=fast)
+
+      - name: Generate and run
+        run: |
+          rows="${{ github.event.inputs.rows || '10m' }}"
+          reps="${{ github.event.inputs.repeats || '5' }}"
+          data=$(mktemp -d)
+          cpp/build/gen-data --rows "$rows" --out-dir "$data" --prefix p \
+              --format parquet --compression none
+          {
+            echo "## $rows rows, uncompressed Parquet"
+            echo
+            python3 scripts/bench_ports_parquet.py \
+                "$data/p_a.unc.parquet" "$data/p_b.unc.parquet" --repeats "$reps"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
