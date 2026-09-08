@@ -10,7 +10,7 @@ LDFLAGS ?= -pthread
 BIN     = csvdiff
 OBJ     = csvdiff.o parquet.o pqdiff.o parallel.o
 
-all: $(BIN)
+all: $(BIN) gen-data
 
 $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS)
@@ -20,7 +20,13 @@ parquet.o:  parquet.c parquet.h
 pqdiff.o:   pqdiff.c pqdiff.h parquet.h parallel.h
 parallel.o: parallel.c parallel.h
 
+# The generator writes this port's own fixtures and benchmark inputs, byte for
+# byte the same files the other generators write. Having it here is what lets a
+# check run without a second toolchain built first.
+gen-data: gen-data.c pqwrite.c pqwrite.h
+	$(CC) $(CFLAGS) -o $@ gen-data.c pqwrite.c
+
 clean:
-	rm -f $(BIN) $(OBJ)
+	rm -f $(BIN) gen-data $(OBJ)
 
 .PHONY: all clean

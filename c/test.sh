@@ -9,9 +9,22 @@ set -e
 cd "$(dirname "$0")"
 make >/dev/null
 RUST=../rust/target/release/csvdiff
-GEN=../cpp/build/gen-data
+GEN=./gen-data
 CPP=../cpp/build/csvdiff
-[ -x "$RUST" ] || { echo "build the Rust port first: (cd ../rust && cargo build --release)"; exit 2; }
+
+# Two sets of checks, because they cost very different amounts to run.
+#
+# By default only the ones this port can answer on its own: it generates its own
+# fixtures now, so nothing else has to be built first and the whole suite is a
+# few seconds. `--with-ports` adds the cross-port checks -- the Rust port as the
+# oracle on CSV, the C++ port on ndjson, and the two generators' bytes against
+# each other -- which need those toolchains and are worth a job of their own.
+with_ports=0
+[ "${1:-}" = "--with-ports" ] && with_ports=1
+if [ "$with_ports" = 1 ]; then
+  [ -x "$RUST" ] || { echo "--with-ports needs the Rust port: (cd ../rust && cargo build --release)"; exit 2; }
+  [ -x "$CPP" ] || { echo "--with-ports needs the C++ port: (cd ../cpp && make && make gen-data)"; exit 2; }
+fi
 
 fail=0
 summary() { head -1 | sed 's/ | turbo.*//'; }
@@ -29,6 +42,7 @@ check() { # label, then the flags both are given
   fi
 }
 
+if [ "$with_ports" = 1 ]; then
 echo "awkward fixture, c against rust:"
 check "defaults"
 # --trim and --ignore-case are not implemented here on purpose; see README.md.
@@ -46,6 +60,7 @@ PY
 then echo "  ok    counts and per-column changed/blanked/filled"
 else echo "  FAIL  counts or per-column stats differ"; fail=1
 fi
+fi   # with_ports
 
 agree() { python3 -c '
 import json, sys
@@ -110,12 +125,14 @@ else
       printf '  FAIL  %s threads disagrees with 1 thread\n' "$t"; fail=1
     fi
   done
-  "$RUST" compare "$thr_dir/t_a.csv" "$thr_dir/t_b.csv" -k k --engine turbo -o /dev/null \
-      --json "$thr_dir/rust.json" >/dev/null 2>&1 || true
-  if agree "$thr_dir/one.json" "$thr_dir/rust.json"; then
-    echo "  ok    and what the rust port finds"
-  else
-    echo "  FAIL  the threaded sweep disagrees with the rust port"; fail=1
+  if [ "$with_ports" = 1 ]; then
+    "$RUST" compare "$thr_dir/t_a.csv" "$thr_dir/t_b.csv" -k k --engine turbo -o /dev/null \
+        --json "$thr_dir/rust.json" >/dev/null 2>&1 || true
+    if agree "$thr_dir/one.json" "$thr_dir/rust.json"; then
+      echo "  ok    and what the rust port finds"
+    else
+      echo "  FAIL  the threaded sweep disagrees with the rust port"; fail=1
+    fi
   fi
 fi
 rm -rf "$thr_dir"
@@ -148,10 +165,10 @@ if [ -x "$GEN" ]; then
   else
     echo "  FAIL  ndjson disagrees with csv on the same rows"; fail=1
   fi
-  # Against C++ rather than Rust here: on main the C++ port is the only other one
-  # that reads ndjson at all, and a check against a port that refuses the file
-  # would be a check that always passes.
-  if [ -x "$CPP" ]; then
+  # Against C++ rather than Rust here: it is the only other port that reads
+  # ndjson at all, and a check against a port that refuses the file would be a
+  # check that always passes.
+  if [ "$with_ports" = 1 ]; then
     "$CPP" compare "$js_dir/j_a.ndjson" "$js_dir/j_b.ndjson" -k account_id,txn_id \
         -i updated_at --json "$js_dir/cpp.json" >/dev/null 2>&1 || true
     if agree "$js_dir/js.json" "$js_dir/cpp.json"; then
@@ -159,8 +176,6 @@ if [ -x "$GEN" ]; then
     else
       echo "  FAIL  ndjson disagrees with the c++ port"; fail=1
     fi
-  else
-    echo "  skip  the c++ port is not built, so ndjson was not cross-checked"; fail=1
   fi
   rm -rf "$js_dir"
 else
@@ -220,9 +235,10 @@ rm -rf "$esc_dir"
 # per-column changed/blanked/filled. So each case generates one pair in both
 # formats and requires the two reports to agree in full.
 #
-# The fixtures come from cpp/build/gen-data, which writes CSV and Parquet from
-# one field-by-field recipe. Where it is not built these skip by name rather
-# than silently passing: (cd ../cpp && make gen-data).
+# The fixtures come from this port's own generator, which writes CSV, ndjson and
+# Parquet from one field-by-field recipe -- byte for byte the same files the C++
+# generator writes, which is checked below. Where it is not built these skip by
+# name rather than silently passing.
 pq_dir=$(mktemp -d); trap 'rm -rf "$tmp" "$pq_dir"' EXIT
 
 same_report() { # label, key, then the generator flags for the parquet side
@@ -259,7 +275,6 @@ if [ -x "$GEN" ]; then
   rm -f "$pq_dir"/r_*
   "$GEN" --rows 1k --out-dir "$pq_dir" --prefix r >/dev/null 2>&1
   "$GEN" --rows 1k --out-dir "$pq_dir" --prefix r --format parquet --compression none >/dev/null 2>&1
-  "$GEN" --rows 1k --out-dir "$pq_dir" --prefix r --format parquet --compression snappy >/dev/null 2>&1
   # A column store and a byte stream have no common ground to be compared on.
   if ./csvdiff compare "$pq_dir/r_a.unc.parquet" "$pq_dir/r_b.csv" -k account_id 2>&1 \
        | grep -q "one file is parquet"; then
@@ -269,16 +284,53 @@ if [ -x "$GEN" ]; then
   fi
   # This port carries no decompressor on purpose; saying so is better than
   # producing a wrong answer out of bytes it did not understand.
-  if ./csvdiff compare "$pq_dir/r_a.parquet" "$pq_dir/r_b.parquet" -k account_id 2>&1 \
-       | grep -q "uncompressed parquet only"; then
+  # This port writes no snappy, so the file that proves it refuses one is
+  # checked in rather than generated.
+  if ./csvdiff compare ../tests/fixtures/snappy.parquet ../tests/fixtures/snappy.parquet \
+       -k account_id 2>&1 | grep -q "uncompressed parquet only"; then
     echo "  ok    snappy is refused by name"
   else
     echo "  FAIL  snappy should be refused by name"; fail=1
   fi
 else
   echo "skip: $GEN is not built, so the parquet checks did not run"
-  echo "      build it with: (cd ../cpp && make gen-data)"
+  echo "      it is built by 'make' in this directory"
   fail=1
+fi
+
+# --- the generator against the C++ one --------------------------------------
+#
+# The fast half of this suite makes its own fixtures, which is only safe because
+# the bytes are the same bytes. A generator that drifted would not fail any
+# check above -- both sides of every comparison would drift together -- so the
+# drift has to be caught here, against the generator this one replaced.
+if [ "$with_ports" = 1 ]; then
+  echo "generator bytes, c against c++:"
+  gen_dir=$(mktemp -d)
+  gen_case() { # label, then the flags both generators are given
+    local label=$1; shift
+    rm -rf "$gen_dir/c" "$gen_dir/x"; mkdir -p "$gen_dir/c" "$gen_dir/x"
+    "$GEN" --out-dir "$gen_dir/c" --prefix g "$@" >/dev/null 2>&1
+    ../cpp/build/gen-data --out-dir "$gen_dir/x" --prefix g "$@" >/dev/null 2>&1
+    local same=1 any=0
+    for f in $(cd "$gen_dir/x" && ls); do
+      any=1
+      cmp -s "$gen_dir/c/$f" "$gen_dir/x/$f" || same=0
+    done
+    if [ "$any" = 1 ] && [ "$same" = 1 ]; then
+      printf '  ok    %s\n' "$label"
+    else
+      printf '  FAIL  %s\n' "$label"; fail=1
+    fi
+  }
+  gen_case "csv"                    --rows 5k
+  gen_case "ndjson"                 --rows 5k --format json
+  gen_case "parquet"                --rows 5k --format parquet --compression none
+  gen_case "parquet, small groups"  --rows 5k --format parquet --compression none --row-group-size 512
+  gen_case "parquet, dict gives up" --rows 5k --format parquet --compression none --dict-limit 175 --row-group-size 300
+  gen_case "parquet, all plain"     --rows 5k --format parquet --compression none --dict-limit 1
+  gen_case "a different seed"       --rows 2k --seed 42
+  rm -rf "$gen_dir"
 fi
 
 exit $fail
