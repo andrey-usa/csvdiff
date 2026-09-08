@@ -20,7 +20,6 @@ on:
       - "cpp/**"
       - "rust/src/**"
       - "zig/src/**"
-      - "go/**"
       - ".github/workflows/parity.yml"
   pull_request:
   workflow_dispatch:
@@ -43,10 +42,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.24"
-          cache-dependency-path: go/go.sum
       - name: Install Zig
         run: |
           curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
@@ -59,7 +54,6 @@ jobs:
           make -C cpp
           cargo build --release --manifest-path rust/Cargo.toml
           (cd zig && zig build --release=fast)
-          (cd go && go build -o csvdiff ./cmd/csvdiff)
 
       - name: One dataset, from the C generator
         run: |
@@ -85,7 +79,6 @@ jobs:
             run cpp  "$fmt" cpp/build/csvdiff compare "$a" "$b"
             run rust "$fmt" rust/target/release/csvdiff compare "$a" "$b" --engine turbo -o /dev/null
             run zig  "$fmt" zig/zig-out/bin/csvdiff compare "$a" "$b"
-            run go   "$fmt" go/csvdiff compare "$a" "$b" --engine native -o /dev/null
           done
           python3 - <<'PY'
           import glob, json, sys, collections

@@ -4,12 +4,12 @@ Compare two tables on a composite key and get a self-contained HTML report. Key
 columns, compared columns and normalisation rules are parameters, so the same
 tool serves every recurring comparison.
 
-The tool is five byte-level ports to one result contract — **C**, **C++**,
-**Rust**, **Zig** and **Go** — which is what makes the benchmark sections below a
+The tool is four byte-level ports to one result contract — **C**, **C++**,
+**Rust** and **Zig** — which is what makes the benchmark sections below a
 like-for-like comparison rather than a collection of anecdotes.
 
 The project began as a DuckDB-backed Python implementation with Java,
-TypeScript and dataframe engines beside it for comparison. That comparison is
+TypeScript, Go and dataframe engines beside it for comparison. That comparison is
 settled: the byte-level ports are between one and two orders of magnitude
 faster, so those implementations no longer run in CI or in the benchmarks.
 Their results are kept in [the archive](#archive-implementations-no-longer-in-the-project)
@@ -208,8 +208,8 @@ minutes because neither needs a toolchain other than its own.
 | `ci-c.yml` | push, PR | builds the C port under gcc and clang, runs its fifteen self-contained checks, and puts CSV, ndjson and Parquet through ASan and UBSan. A second job adds the cross-port checks and the generator byte-parity check, which need Rust and C++ |
 | `parity.yml` | push, PR | one dataset from `c/gen-data`, every native port that reads each format, identical counts and column stats required |
 | `benchmark-native.yml` | push, manual | the two leading ports across all three formats on every push; Rust and Zig as well on demand, at any row count |
-| `ci-rust.yml`, `ci-go.yml` | push, PR | each port's own suite |
-| `benchmark-rust.yml`, `benchmark-go.yml` | manual | each port on its own |
+| `ci-rust.yml` | push, PR | the Rust port's own suite |
+| `benchmark-rust.yml` | manual | the Rust port on its own |
 
 ```bash
 gh workflow run "Benchmark (native)" -f rows=10m -f formats=csv,json,parquet -f all_ports=true
@@ -252,27 +252,22 @@ First, the format, because it is worth more than the engine choice below it:
 | CSV, compared again and again | convert once, then compare Parquet | the conversion pays back from about the fifth comparison |
 | newline-delimited JSON | compare it as JSON, or as one side against a CSV | the two formats meet at the join; it is 1.4x slower than CSV and 2.4x the bytes |
 
-Then the engine:
+Then the port. All four give the same answer; they differ in what they carry
+and how fast they get there.
 
 | Your input | Use | Why |
 |---|---|---|
-| Up to ~100k rows | anything | every engine finishes well under a second; startup cost dominates, so pick on convenience |
-| 100k – 2M rows | `polars` where you have it, else `turbo` | columnar wins this band outright; the byte-level engines are close behind on a quarter of the memory |
-| 2M – 20M rows, memory to spare | `turbo` | byte-level scanning; the only class that stays fast *and* still finishes at 10M+ |
-| 2M+ and you can build C++ | the [`cpp/`](cpp/) port, `--threads 4` | same design across every core: 2.5x the JVM on the same box and 1.5 GB lighter, and the only port that reads Parquet and JSON as well as CSV — but counts and JSON only, no HTML report |
-| 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design, reads Parquet as well as CSV, lowest memory of anything here — counts and JSON only |
-| Any size, memory constrained | `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB in the Rust port |
-| Larger than tested, or unknown | `sortmerge` | the only engine whose memory does not grow with the input |
-| You need a hard guarantee | Zig port, `--max-memory MB` | a `FixedBufferAllocator`, so the bound is enforced rather than hoped for |
+| Up to ~100k rows | anything | every port finishes well under a second; startup cost dominates, so pick on convenience |
+| Any size, and you want the fastest | the [`c/`](c/) port | fastest measured on CSV, ndjson and Parquet alike, and the least memory above its input. Counts and JSON only, no HTML report |
+| You need the HTML report | the [`rust/`](rust/) port | the full result contract, rendered |
+| You need a hard memory guarantee | the [`zig/`](zig/) port, `--max-memory MB` | a `FixedBufferAllocator`, so the bound is enforced rather than hoped for |
+| Memory constrained, larger than tested | the Rust port's `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB, and the only engine whose memory does not grow with the input |
 
-**The winner genuinely flips with scale**, which is why there is no single recommendation. Go's
-row-at-a-time engine wins at 10k on startup cost alone, Polars wins at 1M on columnar throughput, and
-at 10M the byte-level engines win because they are the only ones still standing. Any single "fastest
-implementation" claim would be wrong at two sizes out of three.
-
-**Above roughly 2M rows the question stops being speed and becomes memory.** TypeScript `polars` is
-the fastest thing measured at 1M and cannot run 10M at all. The engines that survive are the ones
-that never build a string per cell.
+**Above roughly 2M rows the question stops being speed and becomes memory.** The
+engines that survive at ten million rows are the ones that never build a string
+per cell — which is what every port here has in common, and what the dataframe
+engines in [the archive](#archive-implementations-no-longer-in-the-project) did
+not.
 
 ---
 
@@ -453,7 +448,7 @@ Set A runners, is **19% slower at 20M**. The full four-engine matrix is under
 C++, from the same source with the same flags, **1.8x apart**. clang beats gcc by 1.6x on C++ and
 1.5x on C. Any comparison of C against Rust against Zig that does not name the compiler behind each
 binary is reporting the toolchain and calling it the language — which includes Set A, where the Rust
-and Go numbers come from whichever toolchain the runner had.
+numbers come from whichever toolchain the runner had.
 
 **A newer compiler is worth real time for free.** clang 20 over clang 18, g++ 14 over g++ 13, and
 Zig 0.17-dev over 0.16 — **17% at 1M and 11% at 20M**, the largest single-version gain measured
@@ -582,7 +577,8 @@ what sets the real ceiling: at a billion rows it would want roughly 100 GB, whic
 and the Python generator writes a million rows in 30.5s — around 25 minutes for 50M alone. All the
 generators emit byte-identical files (`parity.yml` enforces it), so the harness is free to pick on
 speed. Go was the first answer; a threaded C++ one ([`cpp/tools/gen_data.cpp`](cpp/tools/gen_data.cpp))
-is the last one worth having:
+was the next, and [`c/gen-data`](c/gen-data.c) — which writes the same bytes and needs only a C
+compiler — is the one the harnesses reach for now:
 
 | Generating 10M rows (3.7 GB) | Time | vs the disk |
 |---|---:|---:|
@@ -693,8 +689,8 @@ cell changed. That instinct is why the `sortmerge` engine exists.
 # Archive: implementations no longer in the project
 
 The project started as a DuckDB-backed Python implementation, with Java,
-TypeScript, polars and datacompy beside it to answer "is a bespoke engine even
-worth writing?". It is answered. On ten million rows the byte-level ports are
+TypeScript, Go, polars and datacompy beside it to answer "is a bespoke engine
+even worth writing?". It is answered. On ten million rows the byte-level ports are
 between one and two orders of magnitude faster than the dataframe engines, and
 the C port holds its whole working set within about 130 MB of its input where
 the dataframe engines needed gigabytes.
@@ -712,7 +708,8 @@ having measured it.
 | polars, datacompy | Set C | no |
 | Java (five execution modes) | Sets A and B | no |
 | TypeScript | Set A | no |
-| C, C++, Rust, Zig, Go | Set B, and the per-port READMEs | **yes** |
+| Go | Sets A and B | no |
+| C, C++, Rust, Zig | Set B, and the per-port READMEs | **yes** |
 
 The removed code is in `git log`, not in the working tree.
 
@@ -1412,26 +1409,19 @@ you an inflated diff and say nothing about why.
 
 # Ports
 
-Five full ports, all to one result contract: the same JSON, the same HTML template, the same exit
-codes, so a report from any of them is interchangeable and a benchmark number from one is directly
-comparable with a number from another.
-
-| | Directory | Engines | Notes |
-|---|---|---|---|
-| Python | `.` (this) | duckdb | the reference; also has `serve` and `mail` |
-| TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
-| Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, sortmerge, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM, plus an out-of-core sort-merge join |
-| Go | [`go/`](go/) | duckdb, sortmerge, native | Go 1.24 |
-| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024; reads **Parquet** on a columnar path that never reconstructs a row |
-
-Three more carry the byte-level engine and the JSON counts only — benchmark and parity ports, so the
-same design can be measured in four languages without three more HTML renderers to keep in step:
+Four byte-level ports, all to one result contract: the same JSON counts, the
+same exit codes, so a benchmark number from one is directly comparable with a
+number from another.
 
 | | Directory | Built with | Scope |
 |---|---|---|---|
-| C | [`c/`](c/) | `cc` or `clang`, C11 | one file, single-threaded on purpose — it exists to find the memory floor; no `--trim`, `--ignore-case` or `--tolerance` |
-| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | reads CSV, **newline-delimited JSON** and **Parquet** — CSV and JSON compare against each other, Parquet against Parquet; `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
+| **C** | [`c/`](c/) | `cc` or `clang`, C11 | the fastest on every format measured. Reads **CSV**, **newline-delimited JSON** and **uncompressed Parquet**, and writes all three itself (`c/gen-data`). Threaded on every path. Counts and JSON only, no HTML; no `--trim`, `--ignore-case` or `--tolerance` |
+| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | reads CSV, ndjson and Parquet including **Snappy** — CSV and JSON compare against each other, Parquet against Parquet; `--threads N`; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
+| Rust | [`rust/`](rust/) | edition 2024 | the full contract, **HTML report included**; engines `turbo`, `sortmerge` and `native`; reads Parquet on a columnar path that never reconstructs a row |
 | Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | threaded; reads **CSV and Parquet**; `--max-memory MB` is enforced, not advisory, on both paths |
+
+The Java, TypeScript, Go and Python ports were part of this comparison and are
+in [the archive](#archive-implementations-no-longer-in-the-project).
 
 The C++ and Zig ports build both indexes at once and run the two directions of the join at once,
 which is what Java's `turbo` has always done. C++ goes further, splitting each file into row-aligned
@@ -1542,14 +1532,14 @@ those implementations; `git log` has them, and their results are in
 c/                        the leading port: CSV, ndjson and Parquet, plus its own
                           generator (gen-data) and test.sh
 cpp/                      the C++ port, and the generator that also writes Snappy
-rust/ zig/ go/            the other byte-level ports, same result contract
+rust/ zig/                the other byte-level ports, same result contract
 scripts/bench_ports.py    every port on one pair, interleaved, with a counts gate
 scripts/bench_native.py   one design across toolchains
 scripts/bench_scale.py    one engine across every size
 scripts/gen_data.py       the original Python generator, kept as the reference recipe
 tests/fixtures/awkward_*  every shape that has broken an engine here
 tests/fixtures/snappy.*   the file that proves the C port refuses a codec
-.github/workflows/        ci-c, ci-rust, ci-go, parity, benchmark-native
+.github/workflows/        ci-c, ci-rust, parity, benchmark-native
 CLAUDE.md, .claude/       project context, slash commands, report-editing skill
 ```
 

@@ -1,11 +1,11 @@
 # csvdiff
 
 Composite-key table comparison — CSV, newline-delimited JSON and Parquet — as byte-level ports in
-C, C++, Rust, Zig and Go, held to one result contract. Key columns, compared columns and
+C, C++, Rust and Zig, held to one result contract. Key columns, compared columns and
 normalisation are runtime parameters; nothing about a specific dataset belongs in the code.
 
-The DuckDB-backed Python implementation, and the Java, TypeScript and dataframe engines beside it,
-are no longer in the project. Their results are in README.md's archive section.
+The DuckDB-backed Python implementation, and the Java, TypeScript, Go and dataframe engines beside
+it, are no longer in the project. Their results are in README.md's archive section.
 
 ## Commands
 
@@ -30,7 +30,7 @@ gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 |---|---|
 | `c/` | the leading port on every format measured. `csvdiff.c` (CSV and ndjson), `parquet.c` + `pqdiff.c` (the columnar path), `parallel.c`, `gen-data.c` + `pqwrite.c` (its own generator) |
 | `cpp/` | the C++ port, and the generator that also writes Snappy |
-| `rust/`, `zig/`, `go/` | the other byte-level ports, same result contract |
+| `rust/`, `zig/` | the other byte-level ports, same result contract |
 | `scripts/bench_ports.py` | every port on one pair, interleaved, with a counts gate |
 | `scripts/gen_data.py` | the original Python generator, kept as the reference recipe |
 

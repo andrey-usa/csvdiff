@@ -40,19 +40,17 @@ def rows_in(label: str) -> int:
 def generator() -> list[str]:
     """The fastest generator on hand.
 
-    All five ports emit byte-identical files -- parity.yml enforces it on every
-    change -- so this is free to pick on speed alone. Go builds in seconds and
-    writes a million rows in 4.6s against the Python generator's 30.5s, which at
-    fifty million rows is four minutes instead of twenty-five. The Python one
-    stays as the fallback, since it needs no toolchain.
+    Every generator emits byte-identical files -- c/test.sh --with-ports holds
+    the C one against the C++ one on every format and option -- so this is free
+    to pick on speed alone. The C generator builds in about a second and needs
+    nothing but a compiler. The Python one stays as the fallback, since it needs
+    no toolchain at all, at 30.5s a million rows against the C generator's.
     """
-    built = Path("/tmp/csvdiff-gendata")
-    go_src = ROOT / "go/cmd/gen-data"
-    if not built.exists() and go_src.exists() and shutil.which("go"):
-        done = subprocess.run(["go", "build", "-o", str(built), "./cmd/gen-data"],
-                              cwd=ROOT / "go", capture_output=True)
+    built = ROOT / "c/gen-data"
+    if not built.exists() and shutil.which("make"):
+        done = subprocess.run(["make", "gen-data"], cwd=ROOT / "c", capture_output=True)
         if done.returncode != 0:
-            print(f"  (go generator would not build, using python)", file=sys.stderr)
+            print("  (the C generator would not build, using python)", file=sys.stderr)
     if built.exists():
         return [str(built)]
     return [sys.executable, str(ROOT / "scripts/gen_data.py")]
