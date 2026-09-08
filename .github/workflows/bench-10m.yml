@@ -13,6 +13,20 @@ name: Benchmark 10M
 # in the middle would be answering a different one.
 
 on:
+  # A push that touches an engine or the harness re-runs the whole matrix. That
+  # is deliberate: a performance change is not a change until it has been
+  # measured, and measuring it anywhere but one known host is how the numbers in
+  # this repository stop being comparable.
+  push:
+    branches: ["claude/**", "bench/**"]
+    paths:
+      - "cpp/src/**"
+      - "cpp/Makefile"
+      - "rust/src/**"
+      - "zig/src/**"
+      - "zig/build.zig"
+      - "scripts/bench_formats_ports.py"
+      - ".github/workflows/bench-10m.yml"
   workflow_dispatch:
     inputs:
       rows:
@@ -33,9 +47,16 @@ concurrency:
   group: bench-10m-${{ github.ref }}
   cancel-in-progress: false
 
+# A push carries no inputs, so the defaults live here and both events read them.
+env:
+  ROWS: ${{ github.event.inputs.rows || '10m' }}
+  FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
+  REPEATS: ${{ github.event.inputs.repeats || '2' }}
+  MATRIX: ${{ github.event.inputs.matrix || 'true' }}
+
 jobs:
   bench:
-    name: ${{ github.event.inputs.rows }} rows, ${{ github.event.inputs.formats }}
+    name: ten million rows, every port, every scanner
     runs-on: ubuntu-latest
     timeout-minutes: 240
     steps:
@@ -83,7 +104,7 @@ jobs:
           (cd rust && cargo build --release)
           (cd zig && zig build --release=fast)
           (cd cpp && CXX=clang++ make && CXX=clang++ make gen-data)
-          if [ "${{ github.event.inputs.matrix }}" = "true" ]; then
+          if [ "$MATRIX" = "true" ]; then
             (cd cpp && CXX=clang++ make scanners)
             (cd zig && zig build --release=fast -Dscan=32 --prefix zig-out-v32)
             if grep -q avx512bw /proc/cpuinfo; then
@@ -96,18 +117,17 @@ jobs:
 
       - name: Run the matrix
         run: |
+          matrix=""
+          [ "$MATRIX" = "true" ] && matrix="--matrix"
           python3 scripts/bench_formats_ports.py \
-            --rows "${{ github.event.inputs.rows }}" \
-            --formats "${{ github.event.inputs.formats }}" \
-            --repeats "${{ github.event.inputs.repeats }}" \
-            ${{ github.event.inputs.matrix == 'true' && '--matrix' || '' }} \
+            --rows "$ROWS" --formats "$FORMATS" --repeats "$REPEATS" $matrix \
             | tee /tmp/bench.txt
 
       - name: Publish the table
         if: always()
         run: |
           {
-            echo "## ${{ github.event.inputs.rows }} rows — ${{ github.event.inputs.formats }}"
+            echo "## $ROWS rows — $FORMATS"
             echo
             echo '```'
             cat /tmp/bench.txt
@@ -117,6 +137,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: bench-${{ github.event.inputs.rows }}
+          name: bench-${{ github.run_id }}
           path: /tmp/bench.txt
           retention-days: 30

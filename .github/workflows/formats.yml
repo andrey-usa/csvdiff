@@ -8,7 +8,7 @@ name: Formats (Rust, Zig, C++)
 
 on:
   push:
-    branches: [main]
+    branches: [main, "claude/**"]
     paths:
       - "rust/**"
       - "zig/**"
@@ -72,7 +72,7 @@ jobs:
 
       - name: Every port, every format, one answer
         run: |
-          ROWS=${{ github.event.inputs.rows || '1m' }}
+          ROWS="${{ github.event.inputs.rows || '1m' }}"
           mkdir -p data
           for f in csv ndjson parquet; do
             ./rust/target/release/gen-data --rows "$ROWS" --out-dir data --prefix fmt --format $f
