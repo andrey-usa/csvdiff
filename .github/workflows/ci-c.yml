@@ -79,6 +79,11 @@ jobs:
             exit 1
           fi
 
+      # A compare exits 1 when it finds differences, which is the expected
+      # outcome of every case here -- so the exit code has to be caught rather
+      # than allowed to reach `bash -e`, which would end the step at the first
+      # comparison and call a working run a failure. Only 0 and 1 are results;
+      # anything else is a crash or a sanitizer report.
       - name: Sanitizers
         run: |
           ${{ matrix.cc }} -std=c11 -O1 -g -fsanitize=address,undefined \
@@ -87,10 +92,10 @@ jobs:
           for flags in "" "--dict-limit 1" "--dict-limit 175 --row-group-size 300"; do
             cpp/build/gen-data --rows 5k --out-dir "$tmp" --prefix s \
                 --format parquet --compression none $flags >/dev/null
+            code=0
             /tmp/csvdiff-asan compare "$tmp/s_a.unc.parquet" "$tmp/s_b.unc.parquet" \
-                -k account_id,txn_id -i updated_at --json /dev/null
-            code=$?
-            [ $code -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
+                -k account_id,txn_id -i updated_at --json /dev/null || code=$?
+            [ "$code" -le 1 ] || { echo "::error::sanitizer run exited $code"; exit 1; }
           done
 
   bench:
