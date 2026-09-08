@@ -168,6 +168,23 @@ pub const RowParser = union(enum) {
         /// key column, so the run is a range rather than a single entry.
         slots: []const u16,
         starts: []const u32,
+
+        /// Marks the slots of columns `from` onward absent.
+        ///
+        /// This replaces clearing every slot at the top of the row. `out` is
+        /// reused across rows, so a column this row does not reach has to be
+        /// blanked or it would show the previous row's value -- but that is
+        /// only the columns after the row ran out, and a well-formed row runs
+        /// out of nothing. The full clear was 315 million instructions of the
+        /// 4.6 billion this port spent on a 200,000-row pair, seven per cent of
+        /// the whole comparison, because it ran twenty slots per row per file
+        /// whether or not a single one of them needed it.
+        inline fn blankFrom(self: Csv, out: []Field, from: usize) void {
+            if (from > self.last_needed) return;
+            for (self.slots[self.starts[from]..self.starts[self.last_needed + 1]]) |slot| {
+                out[slot] = f.ABSENT;
+            }
+        }
     };
 
     pub const Json = struct {
@@ -258,7 +275,6 @@ pub const RowParser = union(enum) {
     }
 
     fn parseCsv(self: Csv, d: []const u8, start: usize, end: usize, out: []Field) usize {
-        @memset(out, f.ABSENT);
         var pos = start;
         var column: usize = 0;
 
@@ -281,14 +297,23 @@ pub const RowParser = union(enum) {
             }
             column += 1;
 
-            if (next >= end) return end;
-            if (d[next] == '\n') return next + 1;
+            if (next >= end) {
+                self.blankFrom(out, column);
+                return end;
+            }
+            if (d[next] == '\n') {
+                self.blankFrom(out, column);
+                return next + 1;
+            }
             pos = next + 1;
+            // Every needed column is filled, so there is nothing to blank: the
+            // rest of the row is skipped without being parsed.
             if (column > self.last_needed) {
                 const eol = endOfRow(d, pos, end);
                 return if (eol >= end) end else eol + 1;
             }
         }
+        self.blankFrom(out, column);
         return end;
     }
 

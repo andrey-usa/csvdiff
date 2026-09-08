@@ -473,6 +473,34 @@ fn buildIndex(
     return ix;
 }
 
+/// One key column of one file, decoded on its own thread.
+///
+/// Reading a column is the expensive half of the key phase -- pages decoded,
+/// dictionaries built, levels expanded -- and the two sides' columns have
+/// nothing in common, so there is no reason to do them in turn. What follows
+/// them, interning the two dictionaries into one id space, does have to be
+/// serial per column: it is one shared id space by construction, and it is a
+/// few thousand string comparisons rather than ten million.
+const KeyRead = struct {
+    /// A ceiling so the jobs and their thread handles live on the stack. A key
+    /// of more than sixteen columns reads in place instead.
+    const max_jobs = 32;
+
+    gpa: std.mem.Allocator,
+    map: []const u8,
+    at: usize,
+    out: *Col,
+    err: ?anyerror = null,
+
+    fn run(self: *KeyRead) void {
+        const c = parquet.readColumn(self.gpa, self.map, self.at) catch |e| {
+            self.err = e;
+            return;
+        };
+        self.out.* = .{ .c = c, .map = self.map };
+    }
+};
+
 /// One side's index, built on its own thread. The two sides share nothing --
 /// not the mapping, not the key columns, not the table -- so the only reason
 /// this is a struct rather than a call is that a thread cannot return an error.
@@ -844,15 +872,33 @@ pub fn compare(
     defer a_keys.deinit(gpa);
     defer b_keys.deinit(gpa);
 
-    for (opt.key, 0..) |k, j| {
-        a_keys.col[j] = .{
-            .c = try parquet.readColumn(gpa, a_map, indexOf(a_meta.names, k)),
-            .map = a_map,
-        };
-        b_keys.col[j] = .{
-            .c = try parquet.readColumn(gpa, b_map, indexOf(b_meta.names, k)),
-            .map = b_map,
-        };
+    // Every key column, both sides, at once. These reads are the phase that
+    // decodes pages for ten million rows and they share nothing -- different
+    // files, different columns, separate outputs -- but they used to run one
+    // after another, which is where this path's cores-busy ratio went. There
+    // are `2 * key_size` of them and usually four.
+    {
+        var jobs: [KeyRead.max_jobs]KeyRead = undefined;
+        var n: usize = 0;
+        for (opt.key, 0..) |k, j| {
+            if (n + 2 > KeyRead.max_jobs) break;
+            jobs[n] = .{ .gpa = gpa, .map = a_map, .at = indexOf(a_meta.names, k), .out = &a_keys.col[j] };
+            jobs[n + 1] = .{ .gpa = gpa, .map = b_map, .at = indexOf(b_meta.names, k), .out = &b_keys.col[j] };
+            n += 2;
+        }
+        // A key wider than the job table falls back to reading in place, which
+        // is the old behaviour and still right.
+        for (opt.key[n / 2 ..], n / 2..) |k, j| {
+            a_keys.col[j] = .{ .c = try parquet.readColumn(gpa, a_map, indexOf(a_meta.names, k)), .map = a_map };
+            b_keys.col[j] = .{ .c = try parquet.readColumn(gpa, b_map, indexOf(b_meta.names, k)), .map = b_map };
+        }
+
+        var threads: [KeyRead.max_jobs]?std.Thread = @splat(null);
+        // The last job runs on this thread rather than waiting for one.
+        for (1..n) |i| threads[i] = std.Thread.spawn(.{}, KeyRead.run, .{&jobs[i]}) catch null;
+        if (n > 0) jobs[0].run();
+        for (1..n) |i| if (threads[i]) |t| t.join() else jobs[i].run();
+        for (jobs[0..n]) |job| if (job.err) |e| return e;
     }
     a_keys.rows = if (key_size > 0) a_keys.col[0].rows() else 0;
     b_keys.rows = if (key_size > 0) b_keys.col[0].rows() else 0;

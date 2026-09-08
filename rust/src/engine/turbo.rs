@@ -460,6 +460,47 @@ where
     })
 }
 
+/// Maps `items` into an owned `Vec` across `threads` threads, in order.
+///
+/// The report's rows are the one place this engine turns cells into `String`s,
+/// and it does it up to two hundred thousand times — fifty thousand changed
+/// rows on both sides, plus the added and removed lists — over twenty columns
+/// each. Every row is independent of every other, so the only reason it was
+/// serial is that nobody had split it, and it is the whole of the gap between
+/// the Rust port's cores-busy ratio and the C++ port's.
+///
+/// Chunked rather than one thread per list: the four lists are very uneven —
+/// fifty thousand against ten — so dealing them out whole would leave two
+/// threads idle while the other two did all of it.
+fn map_rows<T, U, F>(items: &[T], threads: usize, each: F) -> Vec<U>
+where
+    T: Sync,
+    U: Send,
+    F: Fn(&T) -> U + Sync,
+{
+    let parts = threads.clamp(1, items.len().div_ceil(1 << 12).max(1));
+    if parts <= 1 {
+        return items.iter().map(&each).collect();
+    }
+    let chunk = items.len().div_ceil(parts);
+    let mut out: Vec<U> = Vec::with_capacity(items.len());
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(chunk)
+            .skip(1)
+            .map(|part| {
+                let each = &each;
+                scope.spawn(move || part.iter().map(each).collect::<Vec<U>>())
+            })
+            .collect();
+        out.extend(items.chunks(chunk).next().into_iter().flatten().map(&each));
+        for handle in handles {
+            out.extend(handle.join().expect("a report row worker"));
+        }
+    });
+    out
+}
+
 /// Parses and hashes every row of a mapped text file, in `threads` chunks.
 fn sweep_text(
     side: &Side,
@@ -827,55 +868,41 @@ fn join(
         })
         .collect();
 
-    // Only now does anything become a String, and only for the rows kept.
-    let mut removed_rows: Vec<Vec<Val>> = removed
-        .held
-        .iter()
-        .map(|p| row_values(a, ai, p.row, opt))
-        .collect();
-    let mut added_rows: Vec<Vec<Val>> = added
-        .held
-        .iter()
-        .map(|p| row_values(b, bi, p.row, opt))
-        .collect();
-    let mut changed_a: Vec<Vec<Val>> = changed
-        .held
-        .iter()
-        .map(|p| row_values(a, ai, p.row, opt))
-        .collect();
-    let mut changed_b: Vec<Vec<Val>> = changed
-        .held
-        .iter()
-        .map(|p| row_values(b, bi, p.mate, opt))
-        .collect();
+    // Only now does anything become a String, and only for the rows kept -- but
+    // "only" is up to two hundred thousand rows over twenty columns, which was
+    // the last serial second of every run that renders a report.
+    let mut removed_rows = map_rows(&removed.held, threads, |p| row_values(a, ai, p.row, opt));
+    let mut added_rows = map_rows(&added.held, threads, |p| row_values(b, bi, p.row, opt));
+    let mut changed_a = map_rows(&changed.held, threads, |p| row_values(a, ai, p.row, opt));
+    let mut changed_b = map_rows(&changed.held, threads, |p| row_values(b, bi, p.mate, opt));
 
     sort_rows(&mut removed_rows, key_size);
     sort_rows(&mut added_rows, key_size);
     sort_changed_together(&mut changed_a, &mut changed_b, key_size);
 
-    let changed_cells: Vec<Vec<Cell>> = changed_a
-        .iter()
-        .zip(&changed_b)
-        .map(|(ar, br)| {
-            let mut cells: Vec<CellDiff> = Vec::new();
-            for i in 0..nc {
-                let (x, y) = (&ar[key_size + i], &br[key_size + i]);
-                if differs(x, y, opt) {
-                    cells.push(CellDiff {
-                        column: i,
-                        a: x.clone(),
-                        b: y.clone(),
-                    });
-                }
+    // Zipped by index rather than by iterator so the two sides can be chunked
+    // together; they are the same length and in the same order by construction.
+    let rows: Vec<usize> = (0..changed_a.len()).collect();
+    let changed_cells: Vec<Vec<Cell>> = map_rows(&rows, threads, |&r| {
+        let (ar, br) = (&changed_a[r], &changed_b[r]);
+        let mut cells: Vec<CellDiff> = Vec::new();
+        for i in 0..nc {
+            let (x, y) = (&ar[key_size + i], &br[key_size + i]);
+            if differs(x, y, opt) {
+                cells.push(CellDiff {
+                    column: i,
+                    a: x.clone(),
+                    b: y.clone(),
+                });
             }
-            let mut row: Vec<Cell> = ar[..key_size]
-                .iter()
-                .map(|v| Cell::Value(v.clone()))
-                .collect();
-            row.push(Cell::Diffs(cells));
-            row
-        })
-        .collect();
+        }
+        let mut row: Vec<Cell> = ar[..key_size]
+            .iter()
+            .map(|v| Cell::Value(v.clone()))
+            .collect();
+        row.push(Cell::Diffs(cells));
+        row
+    });
 
     let counts = Counts {
         a_rows: ai.rows,
@@ -897,8 +924,8 @@ fn join(
         counts,
         columns,
         changed: changed_cells,
-        added: added_rows.iter().map(|r| to_cells(r)).collect(),
-        removed: removed_rows.iter().map(|r| to_cells(r)).collect(),
+        added: map_rows(&added_rows, threads, |r| to_cells(r)),
+        removed: map_rows(&removed_rows, threads, |r| to_cells(r)),
         changed_a,
         changed_b,
     }

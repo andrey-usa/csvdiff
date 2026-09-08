@@ -222,9 +222,21 @@ pub const Logical = struct {
 
 /// Whether two fields hold the same logical bytes, without decoding either.
 pub fn sameBytes(a: Slab, x: Field, b: Slab, y: Field) bool {
+    // The overwhelmingly common case: neither field carries an escape, so the
+    // bytes in the file *are* the value and one length check plus a memcmp
+    // settles it. The parser knows this per field -- `plainField` never sets the
+    // flag and `quotedField` sets it only when a quote appears in the body -- so
+    // it costs nothing to ask.
+    //
+    // This used to be gated on `Logical.isPlain()`, which is `dialect == .raw`:
+    // true for Parquet and false for every CSV file ever compared. So the CSV
+    // path always fell through to the loop below and compared ten million rows
+    // one byte at a time through a switch. It was 0.76 billion instructions of
+    // a 4.3 billion run against the C++ port's 0.43 billion for the same work --
+    // the single largest difference between the two ports.
+    if (!f.isEscaped(x) and !f.isEscaped(y)) return std.mem.eql(u8, a.raw(x), b.raw(y));
     var lx = a.logical(x);
     var ly = b.logical(y);
-    if (lx.isPlain() and ly.isPlain()) return std.mem.eql(u8, a.raw(x), b.raw(y));
     while (true) {
         const cx = lx.next();
         const cy = ly.next();
