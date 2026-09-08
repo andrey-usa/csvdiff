@@ -27,6 +27,12 @@ counted as slow or as agreeing with everyone: on `main` the Rust and Zig ports
 refuse newline-delimited JSON, and a table that quietly omitted them would read
 as though they had not been asked.
 
+Ports built from another checkout can be added with `CSVDIFF_PORTS_EXTRA`, a
+JSON array of `[label, path, extra_flags]`. That is how a branch's port is
+measured against the same rows on the same host in the same sitting, which is
+the only way two builds can be compared at all -- and the counts gate below
+applies to them exactly as it does to the built-in four.
+
     python scripts/bench_ports.py A.parquet B.parquet --repeats 5
 """
 from __future__ import annotations
@@ -60,7 +66,40 @@ def ports() -> list[tuple[str, list[str], list[str]]]:
             out.append((label, [str(path)], flags))
         else:
             print(f"  {label:5s} -- not built ({path})", file=sys.stderr)
+    out += extras()
     return out
+
+
+def extras() -> list[tuple[str, list[str], list[str]]]:
+    """Ports from `CSVDIFF_PORTS_EXTRA`: JSON `[[label, path, [flags...]], ...]`.
+
+    A malformed value is an error rather than a silent empty list -- the whole
+    reason to pass this is that a column is expected in the table, and a
+    benchmark that quietly measured one fewer port than asked for is worse than
+    one that refuses to start."""
+    raw = os.environ.get("CSVDIFF_PORTS_EXTRA", "").strip()
+    if not raw:
+        return []
+    try:
+        spec = json.loads(raw)
+        items = [(str(l), [str(p)], [str(f) for f in fl]) for l, p, fl in spec]
+    except (ValueError, TypeError) as exc:
+        raise SystemExit(f"CSVDIFF_PORTS_EXTRA is not [[label, path, [flags]]]: {exc}")
+    out = []
+    for label, prefix, flags in items:
+        # Resolved against the repository root like the built-in four, so the
+        # variable says the same thing wherever it is set from.
+        prefix = [str(ROOT / prefix[0])]
+        if Path(prefix[0]).exists():
+            out.append((label, prefix, flags))
+        else:
+            print(f"  {label:5s} -- not built ({prefix[0]})", file=sys.stderr)
+    return out
+
+
+def slug(label: str) -> str:
+    """A label is a table heading, not a filename; this makes it one."""
+    return "".join(c if c.isalnum() else "_" for c in label)
 
 
 def warm(*paths: str) -> None:
@@ -115,7 +154,7 @@ def main() -> int:
     # One run each first, to find out who can read this pair at all.
     reads: list[tuple[str, list[str], list[str]]] = []
     for label, prefix, flags in builds:
-        out = f"{args.tmp}/ports_{label.replace('+', 'p')}.json"
+        out = f"{args.tmp}/ports_{slug(label)}.json"
         _, _, _, code = run(prefix + ["compare", args.a, args.b, "-k", args.key,
                                       "-i", args.ignore, "--json", out] + flags,
                             f"{args.tmp}/ports_err.txt")
@@ -133,7 +172,7 @@ def main() -> int:
     answers: dict[str, dict | None] = {}
     for _ in range(args.repeats):
         for label, prefix, flags in builds:
-            out = f"{args.tmp}/ports_{label.replace('+', 'p')}.json"
+            out = f"{args.tmp}/ports_{slug(label)}.json"
             secs, rss, cpu, code = run(
                 prefix + ["compare", args.a, args.b, "-k", args.key, "-i", args.ignore,
                           "--json", out] + flags, f"{args.tmp}/ports_err.txt")

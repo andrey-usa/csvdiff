@@ -36,6 +36,11 @@ on:
         description: "Add Rust and Zig"
         type: boolean
         default: true
+      alt_ref:
+        description: >-
+          Also build Rust and Zig from this ref and measure them as separate
+          columns. Empty for none.
+        default: "claude/data-comparison-rust-zig-jam00m"
 
 concurrency:
   group: bench-native-${{ github.ref }}
@@ -56,12 +61,24 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.all_ports == 'true'
         run: echo "ALL_PORTS=1" >> "$GITHUB_ENV"
 
+      # A second checkout, not a merge. Both branches have written a Zig Parquet
+      # reader independently, so reconciling them is somebody's afternoon; that
+      # is no reason to wait to find out which one is faster. Two trees, one
+      # host, one sitting, one set of rows.
+      - uses: actions/checkout@v4
+        if: env.ALL_PORTS == '1' && github.event.inputs.alt_ref != ''
+        with:
+          ref: ${{ github.event.inputs.alt_ref }}
+          path: alt
+
       - uses: dtolnay/rust-toolchain@stable
         if: env.ALL_PORTS == '1'
       - uses: Swatinem/rust-cache@v2
         if: env.ALL_PORTS == '1'
         with:
-          workspaces: rust
+          workspaces: |
+            rust
+            alt/rust
       - name: Install Zig
         if: env.ALL_PORTS == '1'
         run: |
@@ -96,6 +113,40 @@ jobs:
             cargo build --release --manifest-path rust/Cargo.toml
             (cd zig && zig build --release=fast)
           fi
+
+      # The alt tree's builds are allowed to fail without ending the run: it is
+      # another branch's work in progress, and the four ports this workflow is
+      # about do not stop being worth measuring because somebody's Zig is
+      # mid-refactor. A port that did not build is named in the table's place
+      # rather than silently missing -- bench_ports.py prints it as "not built".
+      - name: Build the alt ref's Rust and Zig
+        if: env.ALL_PORTS == '1' && github.event.inputs.alt_ref != ''
+        continue-on-error: true
+        run: |
+          set -x
+          make -C alt/cpp || true
+          cargo build --release --manifest-path alt/rust/Cargo.toml || true
+          (cd alt/zig && zig build --release=fast) || true
+          ls -l alt/cpp/build/csvdiff alt/rust/target/release/csvdiff \
+                alt/zig/zig-out/bin/csvdiff || true
+
+      - name: Register the alt ports
+        if: env.ALL_PORTS == '1' && github.event.inputs.alt_ref != ''
+        run: |
+          ref="${{ github.event.inputs.alt_ref }}"
+          tag="${ref##*/}"
+          python3 - "$tag" <<'PY' >> "$GITHUB_ENV"
+          import json, sys
+          tag = sys.argv[1]
+          spec = [
+              [f"C++ ({tag})", "alt/cpp/build/csvdiff", []],
+              [f"Rust ({tag})", "alt/rust/target/release/csvdiff",
+               ["--engine", "turbo", "-o", "/dev/null"]],
+              [f"Zig ({tag})", "alt/zig/zig-out/bin/csvdiff", []],
+          ]
+          print("CSVDIFF_PORTS_EXTRA=" + json.dumps(spec))
+          PY
+          echo "measuring the alt ref as well: $ref" >> "$GITHUB_STEP_SUMMARY"
 
       # Each format is generated, measured and deleted in turn: at ten million
       # rows all three at once would be more than a runner has.
