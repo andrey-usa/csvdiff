@@ -13,11 +13,16 @@ the three formats hold the same values spelled the same way; a conversion step
 would otherwise be measuring the converter. Each format is generated, measured
 and deleted in turn, because all three at ten million rows is about 15 GB.
 
-Peak RSS comes from `wait4`'s rusage for that exact child -- the kernel's own
-high-water mark rather than a poll that can miss a spike. These engines map
-their inputs, so resident pages include the file; the `above` column subtracts
-it, and for Parquet that number is the whole point, since the pages are decoded
-into an arena and the mapping is given back.
+Peak RSS and CPU time both come from `wait4`'s rusage for that exact child --
+the kernel's own high-water mark rather than a poll that can miss a spike. These
+engines map their inputs, so resident pages include the file; the `above` column
+subtracts it, and for Parquet that number is the whole point, since the pages are
+decoded into an arena and the mapping is given back.
+
+CPU seconds over wall seconds is the `cores` column: how many of this machine's
+cores were actually busy. It is the column that separates "slow" from "idle" --
+two ports at the same wall time and 1.2x against 3.6x cores are not the same
+result, and the first one has headroom the second has already spent.
 
 Both inputs are read once before anything is timed: a cold page cache costs more
 than every difference this table is trying to show.
@@ -89,8 +94,16 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     return rows
 
 
-def run(argv: list[str], timeout: float) -> tuple[float, float, int]:
-    """Times one child: seconds, peak RSS in MB, exit code (-1 if it was killed)."""
+def run(argv: list[str], timeout: float) -> tuple[float, float, float, int]:
+    """Times one child: wall seconds, peak RSS in MB, CPU seconds, exit code.
+
+    CPU is user plus system for that exact child, from the same `wait4` rusage
+    the RSS comes from. Wall time says how long you waited; CPU divided by wall
+    says how many cores were busy while you waited, which is the difference
+    between an engine that is slow and an engine that is idle. A port that
+    finishes in the same wall time on half the CPU has the headroom the other
+    one has already spent.
+    """
     started = time.monotonic()
     pid = os.fork()
     if pid == 0:
@@ -107,11 +120,12 @@ def run(argv: list[str], timeout: float) -> tuple[float, float, int]:
         done, status, usage = os.wait4(pid, os.WNOHANG)
         if done:
             return (time.monotonic() - started, usage.ru_maxrss / 1024,
-                    os.waitstatus_to_exitcode(status))
+                    usage.ru_utime + usage.ru_stime, os.waitstatus_to_exitcode(status))
         if time.monotonic() > deadline:
             os.kill(pid, 9)
-            os.wait4(pid, 0)
-            return time.monotonic() - started, 0.0, -1
+            _, _, usage = os.wait4(pid, 0)
+            return (time.monotonic() - started, 0.0,
+                    usage.ru_utime + usage.ru_stime, -1)
         time.sleep(0.05)
 
 
@@ -183,25 +197,31 @@ def main(argv: list[str]) -> int:
             for _ in range(args.repeats):
                 argv_run = prefix + ["compare", str(a), str(b)] + KEY + flags + \
                     ["--json", str(summary)]
-                seconds, rss, code = run(argv_run, args.timeout)
+                seconds, rss, cpu, code = run(argv_run, args.timeout)
                 if code not in (0, 1):
                     print(f"  {label:5s} FAILED (exit {code})", flush=True)
                     best = None
                     break
                 got = counts(summary)
                 answers.setdefault(f"{label}/{fmt}", got)
+                # The best run is the fastest one, and its CPU travels with it:
+                # pairing the fastest wall time with another run's CPU would
+                # make the utilisation a ratio of two different runs.
                 if best is None or seconds < best[0]:
-                    best = (seconds, rss)
+                    best = (seconds, rss, cpu)
             if best is None:
                 results.append({"format": fmt, "port": label, "seconds": None})
                 continue
-            seconds, rss = best
+            seconds, rss, cpu = best
             results.append({
                 "format": fmt, "port": label, "seconds": seconds, "rss": rss,
+                "cpu": cpu, "cores": cpu / seconds if seconds > 0 else 0.0,
                 "input": size, "above": rss - size, "rows": got["a_rows"],
             })
-            print(f"  {label:5s} {seconds:8.2f}s  {rss:9,.0f} MB peak  "
-                  f"{rss - size:8,.0f} MB above the input", flush=True)
+            print(f"  {label:5s} {seconds:8.2f}s  {cpu:8.1f}s cpu  "
+                  f"{cpu / seconds if seconds else 0:5.2f}x cores  "
+                  f"{rss:9,.0f} MB peak  {rss - size:8,.0f} MB above the input",
+                  flush=True)
 
         if not args.keep:
             for path in (a, b):
@@ -217,14 +237,18 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"  {json.dumps(json.loads(distinct.pop()))}")
 
-    print("\n| Build | Format | Compare | Rows/s | Peak RSS | Above the input |")
-    print("|---|---|---:|---:|---:|---:|")
+    cores = os.cpu_count() or 1
+    print(f"\n{cores} cores; \"cores\" is CPU seconds over wall seconds -- how many "
+          f"were busy, out of {cores}.")
+    print("\n| Build | Format | Compare | Rows/s | CPU | Cores | Peak RSS | Above the input |")
+    print("|---|---|---:|---:|---:|---:|---:|---:|")
     for row in results:
         if row.get("seconds") is None:
-            print(f"| {row['port']} | {row['format']} | — | — | — | — |")
+            print(f"| {row['port']} | {row['format']} | — | — | — | — | — | — |")
             continue
         rate = row["rows"] / row["seconds"]
         print(f"| {row['port']} | {row['format']} | {row['seconds']:.2f}s | {rate:,.0f} | "
+              f"{row['cpu']:.1f}s | {row['cores']:.2f}x | "
               f"{row['rss']:,.0f} MB | {row['above']:,.0f} MB |")
     return 0
 

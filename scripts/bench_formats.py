@@ -93,8 +93,10 @@ def run(cmd):
         os.execv(cmd[0], cmd)
         os._exit(127)
     _, status, usage = os.wait4(pid, 0)
+    # CPU as well as RSS, from the one rusage: wall time says how long you
+    # waited, CPU over wall says how many cores were busy while you did.
     return (time.monotonic() - started, usage.ru_maxrss / 1024,
-            os.waitstatus_to_exitcode(status))
+            usage.ru_utime + usage.ru_stime, os.waitstatus_to_exitcode(status))
 
 
 def convert(fmt):
@@ -120,7 +122,7 @@ def convert(fmt):
 def measure(label, a_path, b_path, convert_secs=None):
     warm(a_path, b_path)
     size = (os.path.getsize(a_path) + os.path.getsize(b_path)) / 2**20
-    secs, rss, code = run([DUCK, "-csv", "-c", sql(a_path, b_path)])
+    secs, rss, cpu, code = run([DUCK, "-csv", "-c", sql(a_path, b_path)])
     conv = f"{convert_secs:7.1f}s" if convert_secs is not None else "      —"
     if code != 0:
         why = open("/tmp/duck_err.txt").read().strip().splitlines()
@@ -135,14 +137,16 @@ def measure(label, a_path, b_path, convert_secs=None):
                   f"added {b_keys - matched:,} removed {a_keys - matched:,}")
     else:
         counts = "(no counts parsed)"
-    print(f"{label:26} {size:8,.0f}M {conv} {secs:9.2f}s {rss:9,.0f}M   {counts}", flush=True)
+    print(f"{label:26} {size:8,.0f}M {conv} {secs:9.2f}s {cpu:7.1f}s "
+          f"{cpu / secs if secs else 0:5.2f}x {rss:9,.0f}M   {counts}", flush=True)
 
 
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
     print("10M rows, both files. Same comparison: first-occurrence-wins on the key,\n"
           "inner join, per-cell diff over 17 compared columns.\n")
-    print(f"{'engine and input':26} {'size':>9} {'convert':>8} {'compare':>10} {'peak RSS':>10}   counts")
+    print(f"{'engine and input':26} {'size':>9} {'convert':>8} {'compare':>10} "
+          f"{'cpu':>7} {'cores':>6} {'peak RSS':>10}   counts")
 
     if only in (None, "csv"):
         measure("DuckDB, CSV", A_CSV, B_CSV)
@@ -167,11 +171,12 @@ def main():
         out = "/tmp/fmt_cpp.json"
         if os.path.exists(out):
             os.remove(out)
-        secs, rss, _ = run([CPP, "compare", A_CSV, B_CSV, "-k", ",".join(KEY),
-                            "-i", IGNORE, "--threads", "4", "--json", out])
+        secs, rss, cpu, _ = run([CPP, "compare", A_CSV, B_CSV, "-k", ",".join(KEY),
+                                 "-i", IGNORE, "--threads", "4", "--json", out])
         c = json.load(open(out))["counts"]
         size = (os.path.getsize(A_CSV) + os.path.getsize(B_CSV)) / 2**20
-        print(f"{'ours (C++), CSV':26} {size:8,.0f}M       — {secs:9.2f}s {rss:9,.0f}M   "
+        print(f"{'ours (C++), CSV':26} {size:8,.0f}M       — {secs:9.2f}s {cpu:7.1f}s "
+              f"{cpu / secs if secs else 0:5.2f}x {rss:9,.0f}M   "
               f"matched {c['matched']:,} changed {c['changed']:,} "
               f"added {c['added']:,} removed {c['removed']:,}")
 

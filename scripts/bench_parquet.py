@@ -158,7 +158,8 @@ def polars_row(a, b, label, cap_gb, convert_secs=None):
                 else (why[-1][:90] if why else f"exit {code}"))
         size = (os.path.getsize(a) + os.path.getsize(b)) / 2**20
         conv = f"{convert_secs:7.1f}s" if convert_secs is not None else "      —"
-        print(f"{label:34} {size:8,.0f}M {conv} {'failed':>10} {cpu:8.1f}s {rss:9,.0f}M   {note}",
+        print(f"{label:34} {size:8,.0f}M {conv} {'failed':>10} {cpu:8.1f}s "
+              f"{cpu / secs if secs else 0:6.2f}x {rss:9,.0f}M   {note}",
               flush=True)
         return
     c = json.loads(open("/tmp/bench_pq_out.txt").read().strip().splitlines()[-1])
@@ -197,7 +198,8 @@ def convert(duck, a_csv, b_csv, codec, dest_a, dest_b):
 def row(label, a, b, secs, rss, cpu, counts, convert_secs=None):
     size = (os.path.getsize(a) + os.path.getsize(b)) / 2**20
     conv = f"{convert_secs:7.1f}s" if convert_secs is not None else "      —"
-    print(f"{label:34} {size:8,.0f}M {conv} {secs:9.2f}s {cpu:8.1f}s {rss:9,.0f}M   {counts}",
+    print(f"{label:34} {size:8,.0f}M {conv} {secs:9.2f}s {cpu:8.1f}s "
+          f"{cpu / secs if secs else 0:6.2f}x {rss:9,.0f}M   {counts}",
           flush=True)
 
 
@@ -276,7 +278,7 @@ def main():
           "polars is run one column at a time, because the way anyone would write it does\n"
           "not finish -- see the note at the top of this file.\n")
     print(f"{'engine and input':34} {'size':>9} {'convert':>8} {'compare':>10} "
-          f"{'cpu':>9} {'peak RSS':>10}   counts")
+          f"{'cpu':>9} {'cores':>7} {'peak RSS':>10}   counts")
 
     have_polars = False
     if args.polars:

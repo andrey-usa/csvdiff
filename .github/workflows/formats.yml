@@ -133,6 +133,8 @@ jobs:
                     f"| {c['added']} | {c['removed']} |")
           PY
 
+      # Wall time, CPU time and peak RSS on every row: what it cost, how many
+      # cores it took to cost that, and what it held while doing it.
       - name: Benchmark the three ports across the three formats
         run: |
           python3 scripts/bench_formats_ports.py \

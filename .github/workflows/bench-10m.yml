@@ -1,6 +1,13 @@
 name: Benchmark 10M
 
-# Ten million rows, every native port, every scanner, with peak RSS on every row.
+# Ten million rows, every native port, every scanner, with peak RSS and CPU time
+# on every row.
+#
+# CPU divided by wall is the `cores` column, and it is the one that says *why* a
+# row is where it is: two ports at the same wall time, one at 1.4x cores and one
+# at 3.6x, are not the same result. The first has headroom the second has
+# already spent, and on a four-core runner it is the difference between an
+# engine that is slow and an engine that is idle.
 #
 # It runs here rather than on a laptop for the reason every table in the README
 # gives: a comparison between builds only means something when they ran on one

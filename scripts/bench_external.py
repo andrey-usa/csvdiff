@@ -20,6 +20,7 @@ import argparse
 import csv
 import json
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,7 @@ class Result:
     kind: str                      # library or approach it stands for
     seconds: float | None = None
     peak_mb: float | None = None
+    cpu_seconds: float | None = None
     counts: dict[str, int] | None = None
     failed: str | None = None
     note: str = ""
@@ -145,8 +147,15 @@ def _apply_cap() -> None:
 
 
 def run(cmd: list[str], timeout: float = 3600, env: dict | None = None,
-        cap: bool = True) -> tuple[int, str, str, float, float]:
-    """Runs a command, returning status, stdout, stderr, wall seconds and peak RSS.
+        cap: bool = True) -> tuple[int, str, str, float, float, float]:
+    """Runs a command: status, stdout, stderr, wall seconds, peak RSS and CPU.
+
+    CPU comes from RUSAGE_CHILDREN read either side of the wait -- it is
+    cumulative over every child this process has reaped, so the difference is
+    this child's, which holds because the tools here are run one at a time.
+    Wall time says how long you waited; CPU over wall says how many cores were
+    busy while you did, which is the difference between a tool that is slow and
+    one that is single-threaded.
 
     `cap=False` exempts a tool from the address-space limit. The limit is
     RLIMIT_AS, which bounds *reserved* address space rather than resident pages,
@@ -154,6 +163,7 @@ def run(cmd: list[str], timeout: float = 3600, env: dict | None = None,
     `clickhouse_sql`. Use it only where the cap is measuring the wrong thing.
     """
     started = time.perf_counter()
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env={**os.environ, **(env or {})},
@@ -167,9 +177,16 @@ def run(cmd: list[str], timeout: float = 3600, env: dict | None = None,
         proc.kill()
         out, err = proc.communicate()
         stop.set()
-        return -1, out, err, time.perf_counter() - started, seen[0]
+        return -1, out, err, time.perf_counter() - started, seen[0], cpu_since(before)
     stop.set()
-    return proc.returncode, out, err, round(time.perf_counter() - started, 2), round(seen[0], 1)
+    return (proc.returncode, out, err, round(time.perf_counter() - started, 2),
+            round(seen[0], 1), cpu_since(before))
+
+
+def cpu_since(before: resource.struct_rusage) -> float:
+    """User plus system seconds charged to reaped children since `before`."""
+    now = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return round((now.ru_utime - before.ru_utime) + (now.ru_stime - before.ru_stime), 2)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +242,7 @@ def ours(a: Path, b: Path, out: Path, engine: str, jar: Path) -> Result:
     cmd = [str(java_exe()), "--add-modules", "jdk.incubator.vector"]
     if MEM_CAP_BYTES is not None:
         cmd.append(f"-Xmx{jvm_heap_mb(MEM_CAP_BYTES, (a, b))}m")
-    status, _, err, secs, mb = run([
+    status, _, err, secs, mb, cpu = run([
         *cmd, "-cp", str(jar), "dev.csvdiff.Cli",
         "compare", str(a), str(b), "-k", ",".join(KEY), "-i", IGNORE,
         "--engine", engine, "-o", str(out / f"ours-{engine}.html"), "--json", str(summary),
@@ -234,7 +251,7 @@ def ours(a: Path, b: Path, out: Path, engine: str, jar: Path) -> Result:
         return Result(f"csvdiff (this project, {engine})", "bespoke", **failure(status, err))
     counts = json.loads(summary.read_text())["counts"]
     return Result(
-        f"csvdiff (this project, {engine})", "bespoke", secs, mb,
+        f"csvdiff (this project, {engine})", "bespoke", secs, mb, cpu,
         {"changed": counts["changed"], "added": counts["added"], "removed": counts["removed"]},
         note="cell-level diff, duplicate-key report, self-contained HTML",
         extra={"full": counts},
@@ -249,7 +266,7 @@ def go_csvdiff(a: Path, b: Path, out: Path, exe: str) -> Result:
     which cell did.
     """
     marks = fresh(out / "go-csvdiff.csv")
-    status, stdout, err, secs, mb = run([
+    status, stdout, err, secs, mb, cpu = run([
         exe, str(a), str(b), "--primary-key", "0,1", "--ignore-columns", "19", "--format", "rowmark",
     ])
     if status != 0:
@@ -266,7 +283,7 @@ def go_csvdiff(a: Path, b: Path, out: Path, exe: str) -> Result:
             tally[bucket] += 1
             keys[bucket].add(tuple(cells[0].split(",")[:2]))
     return Result(
-        "csvdiff (Go, aswinkarthik)", "hash-only", secs, mb,
+        "csvdiff (Go, aswinkarthik)", "hash-only", secs, mb, cpu,
         {k: len(v) for k, v in keys.items()},
         note="row hash only: says a row changed, not which cell",
         extra={"rows_emitted": tally},
@@ -296,14 +313,14 @@ def duckdb_sql(a: Path, b: Path, out: Path, exe: str) -> Result:
         f"  count(*) FILTER (WHERE b.{KEY[0]} IS NULL) AS removed",
         f"FROM a FULL OUTER JOIN b ON {on};",
     ])
-    status, stdout, err, secs, mb = run([exe, "-csv", "-c", sql])
+    status, stdout, err, secs, mb, cpu = run([exe, "-csv", "-c", sql])
     if status != 0:
         return Result("DuckDB CLI (hand-written SQL)", "SQL", **failure(status, err))
     rows = [r for r in stdout.strip().splitlines() if r and not r.startswith("changed")]
     values = [int(v) for v in rows[-1].split(",")] if rows else [0, 0, 0]
     (out / "duckdb-sql.txt").write_text(stdout)
     return Result(
-        "DuckDB CLI (hand-written SQL)", "SQL", secs, mb,
+        "DuckDB CLI (hand-written SQL)", "SQL", secs, mb, cpu,
         dict(zip(("changed", "added", "removed"), values)),
         note="counts only: no cell diff, no duplicate-key report, no report file",
     )
@@ -367,7 +384,7 @@ def clickhouse_sql(a: Path, b: Path, out: Path, exe: str, spill: bool = False) -
     # rather than on real use, and what the table would then record is the
     # instrument rather than the tool. Its own `max_memory_usage` in the SQL
     # above keeps the run bounded instead; measured RSS stays well under the cap.
-    status, stdout, err, secs, mb = run(
+    status, stdout, err, secs, mb, cpu = run(
         [exe, "local", "--format", "CSV", "--queries-file", str(script)],
         cap=not spill)
     if status != 0:
@@ -378,7 +395,7 @@ def clickhouse_sql(a: Path, b: Path, out: Path, exe: str, spill: bool = False) -
     note = "counts only: no cell diff, no duplicate-key report, no report file"
     if spill:
         note += "; spills to disk, so it finishes where the in-memory join cannot"
-    return Result(label, "SQL", secs, mb,
+    return Result(label, "SQL", secs, mb, cpu,
                   dict(zip(("changed", "added", "removed"), values)), note=note)
 
 
@@ -390,7 +407,7 @@ def daff_diff(a: Path, b: Path, out: Path, exe: str) -> Result:
     table, not a summary, so the counts here come from tallying the `@@` marks.
     """
     diff = fresh(out / "daff.csv")
-    status, _, err, secs, mb = run([
+    status, _, err, secs, mb, cpu = run([
         exe, "diff", "--unordered", "--output", str(diff), "--ignore", IGNORE,
         *[arg for k in KEY for arg in ("--id", k)], str(a), str(b),
     ])
@@ -407,7 +424,7 @@ def daff_diff(a: Path, b: Path, out: Path, exe: str) -> Result:
             elif mark == "---":
                 tally["removed"] += 1
     return Result(
-        "daff (JS)", "alignment diff", secs, mb, tally,
+        "daff (JS)", "alignment diff", secs, mb, cpu, tally,
         note="cell-level diff; no duplicate-key concept — a repeated key reads as an insert",
     )
 
@@ -419,14 +436,14 @@ def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
     everyone else's; the child is this same file under ``--child``.
     """
     summary = fresh(out / "datacompy-polars.json")
-    status, _, err, secs, mb = run([
+    status, _, err, secs, mb, cpu = run([
         sys.executable, str(Path(__file__).resolve()), "--child", "datacompy-polars",
         str(a), str(b), str(summary),
     ])
     if status != 0 or not summary.exists():
         return Result("datacompy (Polars)", "dataframe", **failure(status, err))
     return Result(
-        "datacompy (Polars)", "dataframe", secs, mb, json.loads(summary.read_text()),
+        "datacompy (Polars)", "dataframe", secs, mb, cpu, json.loads(summary.read_text()),
         note="cell-level diff and a per-column summary; whole frame in memory",
     )
 
@@ -441,14 +458,14 @@ def csv_diff_tool(a: Path, b: Path, out: Path) -> Result:
     for this tool has to do it too.
     """
     summary = fresh(out / "csv-diff.json")
-    status, _, err, secs, mb = run([
+    status, _, err, secs, mb, cpu = run([
         sys.executable, str(Path(__file__).resolve()), "--child", "csv-diff",
         str(a), str(b), str(summary),
     ])
     if status != 0 or not summary.exists():
         return Result("csv-diff (Python)", "row dicts", **failure(status, err))
     return Result(
-        "csv-diff (Python)", "row dicts", secs, mb, json.loads(summary.read_text()),
+        "csv-diff (Python)", "row dicts", secs, mb, cpu, json.loads(summary.read_text()),
         note="single key column and no column-ignore, so the input has to be reshaped first",
         expresses_task=False,
     )
@@ -464,7 +481,7 @@ def unix_pipeline(a: Path, b: Path, out: Path) -> Result:
     script = Path(__file__).resolve().parent / "unix_pipeline.sh"
     work = out / "unix-work"
     shutil.rmtree(work, ignore_errors=True)
-    status, stdout, err, secs, mb = run(["bash", str(script), str(a), str(b), str(work)])
+    status, stdout, err, secs, mb, cpu = run(["bash", str(script), str(a), str(b), str(work)])
     shutil.rmtree(work, ignore_errors=True)
     if status != 0:
         return Result("sort(1) + join(1)", "shell pipeline", **failure(status, err))
@@ -473,7 +490,7 @@ def unix_pipeline(a: Path, b: Path, out: Path) -> Result:
         (line.split("=", 1) for line in stdout.strip().splitlines() if "=" in line)
     )
     return Result(
-        "sort(1) + join(1)", "shell pipeline", secs, mb, counts,
+        "sort(1) + join(1)", "shell pipeline", secs, mb, cpu, counts,
         note="counts only; no CSV quoting, no duplicate-key concept, no diff",
         expresses_task=False,
     )
@@ -601,6 +618,11 @@ def repeat(make: "Callable[[], Result]", times: int) -> Result:
     A single run on a shared four-core machine varies by a quarter, which is wider than most
     of the gaps in the table it feeds. The median of three is not a rigorous statistic but it
     is enough to stop one unlucky run from deciding a ranking.
+
+    Peak memory is the largest across the runs, because the question memory
+    answers is "could this have fitted". CPU stays paired with the wall time of
+    the one run it was measured beside -- the cores-busy ratio is meaningless if
+    its numerator and denominator come from different runs.
     """
     runs = [make() for _ in range(max(1, times))]
     ok = [r for r in runs if not r.failed and r.seconds is not None]
@@ -650,12 +672,14 @@ def table(results: list[Result], truth: Result | None) -> str:
         return "—" if value is None else str(value)
 
     lines = [
-        "| Tool | Approach | Time | Peak RSS | changed / added / removed | Agrees | Notes |",
-        "| --- | --- | ---: | ---: | --- | --- | --- |",
+        "| Tool | Approach | Time | CPU | Cores | Peak RSS | changed / added / removed "
+        "| Agrees | Notes |",
+        "| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |",
     ]
     for r in results:
         if r.failed:
-            lines.append(f"| {r.tool} | {r.kind} | — | — | — | — | **{r.failed}** |")
+            lines.append(f"| {r.tool} | {r.kind} | — | — | — | — | — | — | "
+                         f"**{r.failed}** |")
             continue
         counts = r.counts or {}
         shown = " / ".join(f"{counts.get(k, 0):,}" for k in ("changed", "added", "removed"))
@@ -666,8 +690,10 @@ def table(results: list[Result], truth: Result | None) -> str:
         else:
             agrees = verdict(counts, truth)
         lines.append(
-            f"| {r.tool} | {r.kind} | {r.seconds:.2f}s | {r.peak_mb:,.0f} MB | "
-            f"{shown} | {agrees} | {r.note} |"
+            f"| {r.tool} | {r.kind} | {r.seconds:.2f}s | "
+            f"{'—' if r.cpu_seconds is None else f'{r.cpu_seconds:.1f}s'} | "
+            f"{'—' if not r.cpu_seconds or not r.seconds else f'{r.cpu_seconds / r.seconds:.2f}x'} | "
+            f"{r.peak_mb:,.0f} MB | {shown} | {agrees} | {r.note} |"
         )
     return "\n".join(lines)
 
@@ -740,8 +766,10 @@ def main() -> int:
         print(f"running {name} on {args.rows} ...", file=sys.stderr, flush=True)
         results.append(repeat(make, args.repeats))
         r = results[-1]
-        print(f"  {r.failed or f'{r.seconds:.2f}s  {r.peak_mb:,.0f} MB  {r.counts}'}",
-              file=sys.stderr, flush=True)
+        cores = f"{r.cpu_seconds / r.seconds:.2f}x" if r.cpu_seconds and r.seconds else "—"
+        line = r.failed or (f"{r.seconds:.2f}s  {r.cpu_seconds or 0:.1f}s cpu  "
+                            f"{cores} cores  {r.peak_mb:,.0f} MB  {r.counts}")
+        print(f"  {line}", file=sys.stderr, flush=True)
 
     truth = next((r for r in results if r.tool.startswith("csvdiff (this project")), None)
     rendered = table(results, truth)

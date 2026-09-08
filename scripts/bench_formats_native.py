@@ -99,6 +99,9 @@ def measure(args, label, flags, ext):
         "generate_seconds": round(generate, 2),
         "compare_seconds": round(secs, 2),
         "cpu_seconds": round(cpu, 1),
+        # CPU over wall: how many cores were busy. The column that separates an
+        # engine that is slow from one that is idle.
+        "cores_busy": round(cpu / secs, 2) if secs else 0.0,
         "peak_rss_mb": round(rss),
         "rows_per_second": int(rows / secs) if secs > 0 else 0,
         "counts": counts,
@@ -134,12 +137,12 @@ def main():
 
     print(f"\n{args.rows} rows x 20 columns, both files, keyed on "
           f"({', '.join(KEY)}), ignoring {IGNORE}\n")
-    print(f"| Input | Size | Generate | **Compare** | Rows/s | CPU | Peak RSS |")
-    print(f"|---|---:|---:|---:|---:|---:|---:|")
+    print(f"| Input | Size | Generate | **Compare** | Rows/s | CPU | Cores | Peak RSS |")
+    print(f"|---|---:|---:|---:|---:|---:|---:|---:|")
     for r in results:
         print(f"| {r['format']} | {r['size_mb']:,.0f} MB | {r['generate_seconds']}s "
               f"| **{r['compare_seconds']}s** | {r['rows_per_second']:,}/s "
-              f"| {r['cpu_seconds']}s | {r['peak_rss_mb']:,} MB |")
+              f"| {r['cpu_seconds']}s | {r['cores_busy']}x | {r['peak_rss_mb']:,} MB |")
     if baseline:
         print(f"\nAll {len(results)} formats agree: matched {baseline['matched']:,}, "
               f"changed {baseline['changed']:,}, added {baseline['added']:,}, "

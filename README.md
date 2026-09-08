@@ -597,6 +597,15 @@ because this is a question about readers and a codec in the middle answers a
 different one. Ten million rows, best of two, four threads, counts identical in
 every row of the table.
 
+**Every row carries CPU time as well as wall time, and the ratio of the two.**
+CPU divided by wall is how many of the runner's four cores were actually busy,
+and it is the column that says *why* a row is where it is. Two builds at the
+same wall time, one at 1.4x cores and one at 3.6x, are not the same result: the
+first has headroom the second has already spent, and the fix for each is a
+different fix. A row that is slow at 1.4x is not using the machine; a row that
+is slow at 3.9x is using all of it and needs less work, not more threads. Both
+numbers come from the same `wait4` rusage as the peak RSS beside them.
+
 | Build | Input | Compare | Rows/s | Peak RSS | Above the input |
 |---|---|---:|---:|---:|---:|
 | C++ | CSV, 3,509 MB | **8.98s** | 1,113,348 | 4,385 MB | 876 MB |
