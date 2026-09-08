@@ -45,6 +45,78 @@ then echo "  ok    counts and per-column changed/blanked/filled"
 else echo "  FAIL  counts or per-column stats differ"; fail=1
 fi
 
+agree() { python3 -c '
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+shape = lambda r: (r["counts"], sorted(tuple(sorted(c.items())) for c in r["columns"]))
+sys.exit(0 if shape(a) == shape(b) else 1)
+' "$1" "$2"; }
+
+echo "the threaded csv sweep, over quoted newlines and chunk boundaries:"
+# --- the threaded CSV sweep -------------------------------------------------
+#
+# Rows are found on every core, which means a thread starts in the middle of the
+# file and has to work out whether it landed inside a quoted field. Nothing in
+# the fixtures above reaches the size where that splitting turns on, so this
+# builds a file that does, out of the shapes that make the boundary hard:
+# newlines inside quotes, doubled quotes, delimiters inside quotes, CRLF, blank
+# lines between rows, duplicate keys, and rows present on one side only.
+#
+# The check is that the thread count cannot change the answer -- against itself
+# at one thread, and against the Rust port.
+thr_dir=$(mktemp -d)
+python3 - "$thr_dir" <<'PY'
+import random, sys
+out_dir = sys.argv[1]
+random.seed(3)
+FIELDS = ["plain", '"has,comma"', '"has\nnewline\nand more"',
+          '"doubled ""quote"" inside"', '"comma, and\nnewline together"', '""']
+def rows(side):
+    out = ["k,a,b,c\n"]
+    for i in range(130000):
+        if side == "b" and i % 5000 == 0:
+            continue                                  # removed from B
+        a = FIELDS[(i * 7 + (3 if side == "b" and i % 41 == 0 else 0)) % len(FIELDS)]
+        b = str(i * 3 + (1 if side == "b" and i % 23 == 0 else 0))
+        c = '"tail\nwith newline"' if i % 11 == 0 else "tail"
+        sep = "\r\n" if i % 13 == 0 else "\n"
+        out.append(f"K{i:07d},{a},{b},{c}{sep}")
+        if i % 997 == 0:
+            out.append(f"K{i:07d},{a},{b},{c}{sep}")   # a duplicate key
+        if i % 1499 == 0:
+            out.append("\n")                           # a blank line is not a row
+    if side == "b":
+        for i in range(40):
+            out.append(f"NEW{i:05d},plain,0,tail\n")   # added in B
+    return "".join(out)
+for side in ("a", "b"):
+    open(f"{out_dir}/t_{side}.csv", "w").write(rows(side))
+PY
+bytes=$(wc -c < "$thr_dir/t_a.csv")
+if [ "$bytes" -lt 4194304 ]; then
+  echo "  FAIL  the threading fixture is $bytes bytes, under the 4 MB split threshold"
+  fail=1
+else
+  ./csvdiff compare "$thr_dir/t_a.csv" "$thr_dir/t_b.csv" -k k --threads 1 \
+      --json "$thr_dir/one.json" >/dev/null 2>&1 || true
+  for t in 2 3 4 7; do
+    ./csvdiff compare "$thr_dir/t_a.csv" "$thr_dir/t_b.csv" -k k --threads $t \
+        --json "$thr_dir/many.json" >/dev/null 2>&1 || true
+    if agree "$thr_dir/one.json" "$thr_dir/many.json"; then
+      printf '  ok    %s threads finds what 1 thread finds\n' "$t"
+    else
+      printf '  FAIL  %s threads disagrees with 1 thread\n' "$t"; fail=1
+    fi
+  done
+  "$RUST" compare "$thr_dir/t_a.csv" "$thr_dir/t_b.csv" -k k --engine turbo -o /dev/null \
+      --json "$thr_dir/rust.json" >/dev/null 2>&1 || true
+  if agree "$thr_dir/one.json" "$thr_dir/rust.json"; then
+    echo "  ok    and what the rust port finds"
+  else
+    echo "  FAIL  the threaded sweep disagrees with the rust port"; fail=1
+  fi
+fi
+rm -rf "$thr_dir"
 echo "quoting, ragged rows and keys near the end of the file:"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 printf 'a,k,c\nx,K1,c1\ny,K2,cc\n'        > "$tmp/a.csv"
@@ -52,6 +124,7 @@ printf 'a,k,c\nx,K1,c1\ny,K2,cccccccc\n'  > "$tmp/b.csv"
 r=$("$RUST" compare "$tmp/a.csv" "$tmp/b.csv" -k k --engine turbo -o /dev/null 2>&1 | summary) || true
 c=$(./csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | summary) || true
 [ "$r" = "$c" ] && echo "  ok    key in the last bytes of the file" || { echo "  FAIL  key near end: rust=$r c=$c"; fail=1; }
+
 
 
 # --- the Parquet path -------------------------------------------------------
@@ -67,13 +140,6 @@ c=$(./csvdiff compare "$tmp/a.csv" "$tmp/b.csv" -k k 2>&1 | summary) || true
 # than silently passing: (cd ../cpp && make gen-data).
 GEN=../cpp/build/gen-data
 pq_dir=$(mktemp -d); trap 'rm -rf "$tmp" "$pq_dir"' EXIT
-
-agree() { python3 -c '
-import json, sys
-a, b = (json.load(open(p)) for p in sys.argv[1:3])
-shape = lambda r: (r["counts"], sorted(tuple(sorted(c.items())) for c in r["columns"]))
-sys.exit(0 if shape(a) == shape(b) else 1)
-' "$1" "$2"; }
 
 same_report() { # label, key, then the generator flags for the parquet side
   local label=$1 key=$2; shift 2

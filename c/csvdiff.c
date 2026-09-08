@@ -31,6 +31,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "parallel.h"
 #include "parquet.h"
 #include "pqdiff.h"
 
@@ -309,22 +310,12 @@ typedef struct {
     uint32_t *occurrences;
     size_t keys, keys_cap;
     Field *probe;      /* re-used by every lookup, so a probe is not an allocation */
+    Field *probe2;     /* the other side of a lazy equality check, same reason */
     int64_t dup_keys, dup_rows;
     bool failed;       /* a field too long for the packed length */
 } RowIndex;
 
 #define TABLE_EMPTY (-1)
-
-static bool grow(void **p, size_t *cap, size_t need, size_t elem) {
-    if (need <= *cap) return true;
-    size_t next = *cap ? *cap * 2 : 4096;
-    while (next < need) next *= 2;
-    void *fresh = realloc(*p, next * elem);
-    if (!fresh) return false;
-    *p = fresh;
-    *cap = next;
-    return true;
-}
 
 static size_t slot_of(const RowIndex *ix, uint64_t hash) {
     /* The high bits of an FNV hash are the well-mixed ones; fold them down. */
@@ -335,122 +326,377 @@ static void index_fields(const RowIndex *ix, int32_t row, Field *out) {
     parse_row(ix->parser, ix->slab->data, (size_t)ix->row_start[row], ix->slab->size, out);
 }
 
-static bool index_rehash(RowIndex *ix) {
-    size_t size = (ix->mask + 1) * 2;
-    int32_t *table = malloc(size * sizeof *table);
-    if (!table) return false;
-    for (size_t i = 0; i < size; i++) table[i] = TABLE_EMPTY;
-    free(ix->table);
-    ix->table = table;
-    ix->mask = size - 1;
-    for (size_t key = 0; key < ix->keys; key++) {
-        size_t slot = slot_of(ix, ix->row_hash[ix->first_row[key]]);
-        while (ix->table[slot] != TABLE_EMPTY) slot = (slot + 1) & ix->mask;
-        ix->table[slot] = (int32_t)key;
+/* ------------------------------------------------------------------------- */
+/* Finding the rows, on every core                                             */
+/* ------------------------------------------------------------------------- */
+
+/* How many rows ahead to start the load for. See pqdiff.c, where the same
+ * constant was measured against the same kind of table. */
+#define PREFETCH_AHEAD 24
+
+/* Below this there is nothing worth dividing: the boundary work would cost more
+ * than the parsing it splits. */
+#define SPLIT_FROM (4u << 20)
+
+/* One chunk's rows, in the order they appear in it. */
+typedef struct {
+    uint64_t *start;
+    uint64_t *hash;
+    size_t    n, cap;
+    bool      failed;   /* a field too long for the packed length */
+    bool      oom;
+} Chunk;
+
+/*
+ * Where each chunk begins, as offsets of real row starts.
+ *
+ * Walking forward from a nominal split is the whole difficulty: a newline inside
+ * a quoted field is not a row boundary, and a thread starting mid-file cannot
+ * tell whether it is inside such a field. Parity settles it. Every `"` toggles
+ * in-quote state -- including both halves of a doubled quote, which toggles
+ * twice and so leaves the state alone, which is exactly right -- so the number
+ * of quotes before a position says whether that position is inside a field.
+ * Counting them is a scan for one byte, far cheaper than parsing.
+ */
+static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_t *bounds) {
+    const char *d = s->data;
+    const size_t end = s->size;
+    if (threads <= 1 || end - from < SPLIT_FROM) {
+        bounds[0] = from;
+        bounds[1] = end;
+        return 1;
     }
+    unsigned n = 0;
+    bounds[n++] = from;
+    for (unsigned i = 1; i < threads; i++) {
+        const size_t nominal = from + (end - from) * i / threads;
+        size_t quotes = 0;
+        for (size_t at = from; at < nominal;) {
+            const size_t q = next_of1(d, at, nominal, '"');
+            if (q >= nominal) break;
+            quotes++;
+            at = q + 1;
+        }
+        bool in_quotes = (quotes & 1) != 0;
+        size_t at = nominal;
+        for (; at < end; at++) {
+            if (d[at] == '"') in_quotes = !in_quotes;
+            else if (d[at] == '\n' && !in_quotes) { at++; break; }
+        }
+        if (at > bounds[n - 1] && at < end) bounds[n++] = at;
+    }
+    bounds[n] = end;
+    return n;
+}
+
+static bool chunk_push(Chunk *c, size_t start, uint64_t hash) {
+    if (c->n == c->cap) {
+        size_t next = c->cap ? c->cap * 2 : 8192;
+        uint64_t *st = realloc(c->start, next * sizeof *st);
+        if (!st) return false;
+        c->start = st;
+        uint64_t *hs = realloc(c->hash, next * sizeof *hs);
+        if (!hs) return false;
+        c->hash = hs;
+        c->cap = next;
+    }
+    c->start[c->n] = start;
+    c->hash[c->n] = hash;
+    c->n++;
     return true;
 }
 
-static bool index_add(RowIndex *ix, size_t start, const Field *fields) {
-    if (!grow((void **)&ix->row_start, &ix->rows_cap, ix->rows + 1, sizeof *ix->row_start))
-        return false;
-    size_t hash_cap = ix->rows_cap;
-    uint64_t *hashes = realloc(ix->row_hash, hash_cap * sizeof *ix->row_hash);
-    if (!hashes) return false;
-    ix->row_hash = hashes;
+typedef struct {
+    const Slab      *slab;
+    const RowParser *parser;
+    size_t           key_size;
+    const size_t    *bounds;
+    Chunk           *chunk;
+} SweepCtx;
 
-    int32_t row = (int32_t)ix->rows;
-    uint64_t hash = UINT64_C(0xcbf29ce484222325);
-    for (size_t i = 0; i < ix->key_size; i++) hash = hash_field(ix->slab, fields[i], hash);
-    ix->row_start[ix->rows] = start;
-    ix->row_hash[ix->rows] = hash;
-    ix->rows++;
+/*
+ * Parses and hashes every row that *starts* in this chunk, running past its end
+ * to finish the last one. This is the work worth splitting: it reads the file
+ * and writes only its own chunk, so any number of threads may be inside it.
+ */
+static void sweep_part(void *vctx, unsigned p) {
+    SweepCtx *c = vctx;
+    Chunk *out = &c->chunk[p];
+    const char *d = c->slab->data;
+    const size_t end = c->slab->size, stop = c->bounds[p + 1];
+    Field *fields = malloc(c->parser->width * sizeof *fields);
+    if (!fields) { out->oom = true; return; }
 
-    size_t slot = slot_of(ix, hash);
-    for (;;) {
-        int32_t at = ix->table[slot];
-        if (at == TABLE_EMPTY) {
-            if (!grow((void **)&ix->first_row, &ix->keys_cap, ix->keys + 1, sizeof *ix->first_row))
-                return false;
-            uint32_t *occ = realloc(ix->occurrences, ix->keys_cap * sizeof *ix->occurrences);
-            if (!occ) return false;
-            ix->occurrences = occ;
-            ix->table[slot] = (int32_t)ix->keys;
-            ix->first_row[ix->keys] = row;
-            ix->occurrences[ix->keys] = 1;
-            ix->keys++;
-            if (ix->keys * 2 > ix->mask + 1 && !index_rehash(ix)) return false;
-            return true;
-        }
-        int32_t candidate = ix->first_row[at];
-        if (ix->row_hash[candidate] == hash) {
-            index_fields(ix, candidate, ix->probe);
-            bool ok = true;
-            for (size_t i = 0; i < ix->key_size && ok; i++) {
-                bool xa = is_absent(ix->slab, ix->probe[i]), ya = is_absent(ix->slab, fields[i]);
-                ok = (xa || ya) ? (xa && ya) : same_bytes(ix->slab, ix->probe[i], ix->slab, fields[i]);
-            }
-            if (ok) {
-                if (++ix->occurrences[at] == 2) {
-                    ix->dup_keys++;
-                    ix->dup_rows++; /* the first occurrence counts once the key repeats */
-                }
-                ix->dup_rows++;
-                return true;
-            }
-        }
-        slot = (slot + 1) & ix->mask;
-    }
-}
-
-static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser, size_t from,
-                        size_t key_size) {
-    memset(ix, 0, sizeof *ix);
-    ix->slab = slab;
-    ix->parser = parser;
-    ix->key_size = key_size;
-    ix->mask = (1u << 12) - 1;
-    ix->table = malloc((ix->mask + 1) * sizeof *ix->table);
-    ix->probe = malloc(parser->width * sizeof *ix->probe);
-    Field *fields = malloc(parser->width * sizeof *fields);
-    if (!ix->table || !ix->probe || !fields) { free(fields); return false; }
-    for (size_t i = 0; i <= ix->mask; i++) ix->table[i] = TABLE_EMPTY;
-
-    const char *d = slab->data;
-    size_t end = slab->size, pos = from;
-    bool ok = true;
-    while (pos < end) {
+    size_t pos = c->bounds[p];
+    while (pos < stop) {
         if (d[pos] == '\n') { pos++; continue; }            /* an empty line is not a row */
         if (d[pos] == '\r' && pos + 1 < end && d[pos + 1] == '\n') { pos += 2; continue; }
-        size_t next = parse_row(parser, d, pos, end, fields);
-        for (size_t i = 0; i < parser->width; i++)
-            if (fields[i] == TOO_LONG) ix->failed = true;
-        if (ix->failed) { ok = false; break; }
-        if (!index_add(ix, pos, fields)) { ok = false; break; }
+        const size_t next = parse_row(c->parser, d, pos, end, fields);
+        for (size_t i = 0; i < c->parser->width; i++)
+            if (fields[i] == TOO_LONG) out->failed = true;
+        if (out->failed) break;
+        uint64_t hash = UINT64_C(0xcbf29ce484222325);
+        for (size_t i = 0; i < c->key_size; i++) hash = hash_field(c->slab, fields[i], hash);
+        if (!chunk_push(out, pos, hash)) { out->oom = true; break; }
         if (next <= pos) break; /* no progress: a malformed tail, not an endless loop */
         pos = next;
     }
     free(fields);
-    return ok;
 }
 
+/*
+ * Rows are found and hashed on every core; they are inserted on one.
+ *
+ * The split is not arbitrary. A row's hash depends on nothing but that row, so
+ * finding and hashing divides perfectly. Insertion does not: first-occurrence
+ * wins, and which occurrence is first depends on the order rows arrive, so
+ * threading it would make the answer depend on the scheduler.
+ *
+ * Two things the serial half does that the old single walk did not. The table
+ * is sized once from the row count the sweep just established, where before it
+ * started at 4,096 and doubled -- thirteen rehashes at ten million rows, each
+ * one a full pass of random probes. And equality is checked lazily: a row's
+ * fields are only re-parsed when a probe lands on an occupied slot whose hash
+ * matches, which on ten million rows with a thousand duplicate keys is about a
+ * thousand parses rather than ten million.
+ */
+static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser, size_t from,
+                        size_t key_size, unsigned threads) {
+    memset(ix, 0, sizeof *ix);
+    ix->slab = slab;
+    ix->parser = parser;
+    ix->key_size = key_size;
+    ix->probe = malloc(parser->width * sizeof *ix->probe);
+    ix->probe2 = malloc(parser->width * sizeof *ix->probe2);
+    if (!ix->probe || !ix->probe2) return false;
+
+    if (threads < 1) threads = 1;
+    size_t *bounds = malloc((threads + 1) * sizeof *bounds);
+    Chunk *chunks = calloc(threads, sizeof *chunks);
+    if (!bounds || !chunks) { free(bounds); free(chunks); return false; }
+    const unsigned ways = chunk_bounds(slab, from, threads, bounds);
+
+    SweepCtx sc = { slab, parser, key_size, bounds, chunks };
+    run_parts(sweep_part, &sc, ways);
+    free(bounds);
+
+    bool ok = true;
+    for (unsigned p = 0; p < ways; p++) {
+        if (chunks[p].failed) ix->failed = true;
+        if (chunks[p].oom) ok = false;
+        ix->rows += chunks[p].n;
+    }
+    if (ix->failed) ok = false;
+
+    if (ok) {
+        ix->row_start = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->row_start);
+        ix->row_hash = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->row_hash);
+        ok = ix->row_start && ix->row_hash;
+    }
+    if (ok) {
+        /* Copied chunk by chunk, and each chunk released as it is taken, so the
+         * high-water mark is the flat arrays plus one chunk rather than plus
+         * all of them. */
+        size_t at = 0;
+        for (unsigned p = 0; p < ways; p++) {
+            memcpy(ix->row_start + at, chunks[p].start, chunks[p].n * sizeof *ix->row_start);
+            memcpy(ix->row_hash + at, chunks[p].hash, chunks[p].n * sizeof *ix->row_hash);
+            at += chunks[p].n;
+            free(chunks[p].start);
+            free(chunks[p].hash);
+            chunks[p].start = NULL;
+            chunks[p].hash = NULL;
+        }
+        ix->rows_cap = ix->rows;
+    }
+    for (unsigned p = 0; p < ways; p++) { free(chunks[p].start); free(chunks[p].hash); }
+    free(chunks);
+    if (!ok) return false;
+
+    /* Sized once, to under a half load, so nothing ever rehashes. */
+    size_t cap = 1u << 12;
+    while (cap < ix->rows * 2 + 16) cap <<= 1;
+    ix->table = alloc_huge(cap * sizeof *ix->table);
+    ix->first_row = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->first_row);
+    ix->occurrences = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->occurrences);
+    if (!ix->table || !ix->first_row || !ix->occurrences) return false;
+    ix->keys_cap = ix->rows;
+    ix->mask = cap - 1;
+    memset(ix->table, 0xFF, cap * sizeof *ix->table);   /* TABLE_EMPTY is -1 */
+
+    for (size_t r = 0; r < ix->rows; r++) {
+        /* Every insert is a cache miss on a table too big to hold, and the hash
+         * that decides which line is already in hand. */
+        if (r + PREFETCH_AHEAD < ix->rows)
+            __builtin_prefetch(&ix->table[slot_of(ix, ix->row_hash[r + PREFETCH_AHEAD])], 1, 0);
+        const uint64_t hash = ix->row_hash[r];
+        size_t slot = slot_of(ix, hash);
+        for (;;) {
+            const int32_t at = ix->table[slot];
+            if (at == TABLE_EMPTY) {
+                ix->table[slot] = (int32_t)ix->keys;
+                ix->first_row[ix->keys] = (int32_t)r;
+                ix->occurrences[ix->keys] = 1;
+                ix->keys++;
+                break;
+            }
+            const int32_t candidate = ix->first_row[at];
+            if (ix->row_hash[candidate] == hash) {
+                index_fields(ix, candidate, ix->probe);
+                index_fields(ix, (int32_t)r, ix->probe2);
+                bool same = true;
+                for (size_t i = 0; i < key_size && same; i++) {
+                    const bool xa = is_absent(slab, ix->probe[i]);
+                    const bool ya = is_absent(slab, ix->probe2[i]);
+                    same = (xa || ya) ? (xa && ya)
+                                      : same_bytes(slab, ix->probe[i], slab, ix->probe2[i]);
+                }
+                if (same) {
+                    if (++ix->occurrences[at] == 2) {
+                        ix->dup_keys++;
+                        ix->dup_rows++;  /* the first occurrence counts once the key repeats */
+                    }
+                    ix->dup_rows++;
+                    break;
+                }
+            }
+            slot = (slot + 1) & ix->mask;
+        }
+    }
+    return true;
+}
+
+/* Both files' indexes, built at once. */
+typedef struct {
+    RowIndex        *ix[2];
+    const Slab      *slab[2];
+    const RowParser *parser[2];
+    size_t           from[2];
+    size_t           key_size;
+    unsigned         threads;
+    bool             ok[2];
+} BuildCtx;
+
+static void build_part(void *vctx, unsigned p) {
+    BuildCtx *c = vctx;
+    c->ok[p] = index_build(c->ix[p], c->slab[p], c->parser[p], c->from[p], c->key_size,
+                           c->threads);
+}
+
+/*
+ * `probe` is the caller's scratch, not the index's, because several threads are
+ * inside this at once. It used to hang off the RowIndex, which was safe only
+ * while the comparison ran on one thread.
+ */
 static int32_t index_lookup(const RowIndex *ix, const Slab *other, const Field *fields,
-                            uint64_t hash) {
+                            uint64_t hash, Field *probe) {
     size_t slot = slot_of(ix, hash);
     for (;;) {
         int32_t at = ix->table[slot];
         if (at == TABLE_EMPTY) return -1;
         int32_t candidate = ix->first_row[at];
         if (ix->row_hash[candidate] == hash) {
-            index_fields(ix, candidate, ix->probe);
+            index_fields(ix, candidate, probe);
             bool ok = true;
             for (size_t i = 0; i < ix->key_size && ok; i++) {
-                bool xa = is_absent(ix->slab, ix->probe[i]), ya = is_absent(other, fields[i]);
-                ok = (xa || ya) ? (xa && ya) : same_bytes(ix->slab, ix->probe[i], other, fields[i]);
+                bool xa = is_absent(ix->slab, probe[i]), ya = is_absent(other, fields[i]);
+                ok = (xa || ya) ? (xa && ya) : same_bytes(ix->slab, probe[i], other, fields[i]);
             }
             if (ok) return candidate;
         }
         slot = (slot + 1) & ix->mask;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Comparing, on every core                                                    */
+/*                                                                             */
+/* Every distinct key is independent of every other: it is looked up in the     */
+/* other file's table and its columns compared, and nothing it does affects     */
+/* what any other key finds. So the work splits over contiguous ranges of one   */
+/* side's keys, each range counting into its own totals, and the totals are     */
+/* summed at the end. Counts are sums, so the order they are added in cannot    */
+/* change the answer.                                                          */
+/* ------------------------------------------------------------------------- */
+
+typedef struct {
+    int64_t  matched, changed, removed, added;
+    int64_t *col_changed, *col_blanked, *col_filled;
+    Field   *fa, *fb, *probe;
+    bool     oom;
+} CmpPart;
+
+typedef struct {
+    const RowIndex *ai, *bi;
+    const Slab     *a, *b;
+    size_t          key_size, nc, width;
+    unsigned        ways, b_ways;
+    CmpPart        *parts;
+} CmpCtx;
+
+static void compare_part(void *vctx, unsigned p) {
+    CmpCtx *c = vctx;
+    CmpPart *out = &c->parts[p];
+    const size_t key_size = c->key_size, nc = c->nc;
+
+    out->fa = malloc(c->width * sizeof *out->fa);
+    out->fb = malloc(c->width * sizeof *out->fb);
+    out->probe = malloc(c->width * sizeof *out->probe);
+    out->col_changed = calloc(nc ? nc : 1, sizeof *out->col_changed);
+    out->col_blanked = calloc(nc ? nc : 1, sizeof *out->col_blanked);
+    out->col_filled = calloc(nc ? nc : 1, sizeof *out->col_filled);
+    if (!out->fa || !out->fb || !out->probe || !out->col_changed || !out->col_blanked ||
+        !out->col_filled) {
+        out->oom = true;
+        return;
+    }
+
+    if (p < c->ways) {
+        const size_t lo = c->ai->keys * p / c->ways, hi = c->ai->keys * (p + 1) / c->ways;
+        for (size_t k = lo; k < hi; k++) {
+            const int32_t row = c->ai->first_row[k];
+            /* The sweep already hashed this row; re-deriving it here meant
+             * hashing every key twice per run. */
+            const uint64_t hash = c->ai->row_hash[row];
+            if (k + PREFETCH_AHEAD < hi)
+                __builtin_prefetch(
+                    &c->bi->table[slot_of(c->bi,
+                                          c->ai->row_hash[c->ai->first_row[k + PREFETCH_AHEAD]])],
+                    0, 0);
+            index_fields(c->ai, row, out->fa);
+            const int32_t mate = index_lookup(c->bi, c->a, out->fa, hash, out->probe);
+            if (mate < 0) { out->removed++; continue; }
+            out->matched++;
+            index_fields(c->bi, mate, out->fb);
+            bool any = false;
+            for (size_t i = 0; i < nc; i++) {
+                const Field x = out->fa[key_size + i], y = out->fb[key_size + i];
+                const bool xa = is_absent(c->a, x), ya = is_absent(c->b, y);
+                const bool differs = (xa || ya) ? (xa != ya) : !same_bytes(c->a, x, c->b, y);
+                if (differs) {
+                    any = true;
+                    out->col_changed[i]++;
+                    if (ya) out->col_blanked[i]++;
+                    if (xa) out->col_filled[i]++;
+                }
+            }
+            if (any) out->changed++;
+        }
+        return;
+    }
+
+    const unsigned q = p - c->ways;
+    const size_t lo = c->bi->keys * q / c->b_ways, hi = c->bi->keys * (q + 1) / c->b_ways;
+    for (size_t k = lo; k < hi; k++) {
+        const int32_t row = c->bi->first_row[k];
+        const uint64_t hash = c->bi->row_hash[row];
+        if (k + PREFETCH_AHEAD < hi)
+            __builtin_prefetch(
+                &c->ai->table[slot_of(c->ai,
+                                      c->bi->row_hash[c->bi->first_row[k + PREFETCH_AHEAD]])],
+                0, 0);
+        index_fields(c->bi, row, out->fb);
+        if (index_lookup(c->ai, c->b, out->fb, hash, out->probe) < 0) out->added++;
     }
 }
 
@@ -461,6 +707,7 @@ static void index_free(RowIndex *ix) {
     free(ix->first_row);
     free(ix->occurrences);
     free(ix->probe);
+    free(ix->probe2);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -743,41 +990,54 @@ int main(int argc, char **argv) {
         if (b_src[i] > bp.last_needed) bp.last_needed = b_src[i];
     }
 
-    if (!index_build(&ai, &a, &ap, a_start, key_size) || !index_build(&bi, &b, &bp, b_start, key_size)) {
-        fail(ai.failed || bi.failed ? "a field is larger than this engine packs" : "out of memory");
-        goto done;
+    {
+        /*
+         * Both files at once, each on half the budget. The sweep inside a build
+         * is parallel but the insertion after it is not, so run one after the
+         * other the machine sits half idle through both serial tails; overlapped,
+         * one file's insertion runs against the other's sweep.
+         */
+        unsigned budget = threads ? threads : cpu_count();
+        BuildCtx bc = { { &ai, &bi }, { &a, &b }, { &ap, &bp }, { a_start, b_start },
+                        key_size, budget > 1 ? budget / 2 : 1, { false, false } };
+        run_parts(build_part, &bc, 2);
+        if (!bc.ok[0] || !bc.ok[1]) {
+            fail(ai.failed || bi.failed ? "a field is larger than this engine packs"
+                                        : "out of memory");
+            goto done;
+        }
     }
 
     int64_t matched = 0, changed = 0, added = 0, removed = 0;
-    for (size_t k = 0; k < ai.keys; k++) {
-        int32_t row = ai.first_row[k];
-        index_fields(&ai, row, fa);
-        uint64_t hash = UINT64_C(0xcbf29ce484222325);
-        for (size_t i = 0; i < key_size; i++) hash = hash_field(&a, fa[i], hash);
-        int32_t mate = index_lookup(&bi, &a, fa, hash);
-        if (mate < 0) { removed++; continue; }
-        matched++;
-        index_fields(&bi, mate, fb);
-        bool any = false;
-        for (size_t i = 0; i < nc; i++) {
-            Field x = fa[key_size + i], y = fb[key_size + i];
-            bool xa = is_absent(&a, x), ya = is_absent(&b, y);
-            bool differs = (xa || ya) ? (xa != ya) : !same_bytes(&a, x, &b, y);
-            if (differs) {
-                any = true;
-                col_changed[i]++;
-                if (ya) { col_blanked[i]++; }
-                if (xa) { col_filled[i]++; }
+    {
+        unsigned budget = threads ? threads : cpu_count();
+        unsigned ways = ai.keys < (1u << 14) ? 1u : budget;
+        unsigned b_ways = bi.keys < (1u << 14) ? 1u : budget;
+        CmpPart *parts = calloc(ways + b_ways, sizeof *parts);
+        if (!parts) { fail("out of memory"); goto done; }
+        CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts };
+        run_parts(compare_part, &cc, ways + b_ways);
+
+        bool oom = false;
+        for (unsigned p = 0; p < ways + b_ways; p++) {
+            const CmpPart *q = &parts[p];
+            oom = oom || q->oom;
+            matched += q->matched;
+            changed += q->changed;
+            removed += q->removed;
+            added += q->added;
+            for (size_t i = 0; i < nc && q->col_changed; i++) {
+                col_changed[i] += q->col_changed[i];
+                col_blanked[i] += q->col_blanked[i];
+                col_filled[i] += q->col_filled[i];
             }
         }
-        if (any) changed++;
-    }
-    for (size_t k = 0; k < bi.keys; k++) {
-        int32_t row = bi.first_row[k];
-        index_fields(&bi, row, fb);
-        uint64_t hash = UINT64_C(0xcbf29ce484222325);
-        for (size_t i = 0; i < key_size; i++) hash = hash_field(&b, fb[i], hash);
-        if (index_lookup(&ai, &b, fb, hash) < 0) added++;
+        for (unsigned p = 0; p < ways + b_ways; p++) {
+            free(parts[p].fa); free(parts[p].fb); free(parts[p].probe);
+            free(parts[p].col_changed); free(parts[p].col_blanked); free(parts[p].col_filled);
+        }
+        free(parts);
+        if (oom) { fail("out of memory"); goto done; }
     }
 
     {

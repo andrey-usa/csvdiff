@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "pqdiff.h"
+#include "parallel.h"
 #include "parquet.h"
 
 #include <fcntl.h>
@@ -278,30 +279,13 @@ static inline int      tag_is(uint64_t slot, uint64_t h) { return ((slot ^ h) & 
 static inline size_t   pos_of(uint64_t slot) { return (size_t)(slot & POS_MASK) - 1; }
 
 /*
- * The slot table, zeroed, on huge pages where the kernel will give them.
- *
- * At ten million keys this array is 128 MB and every probe lands in a different
- * part of it. On 4 KB pages that is 32,768 pages against a TLB that holds
- * something like 1,500 entries, so essentially every probe takes a page walk on
- * top of its cache miss -- which is why an insert cost 123 ns here even with the
- * next slot already prefetched. On 2 MB pages the same table is 64 entries and
- * the walk disappears.
- *
- * This machine's transparent_hugepage is set to `madvise`, so they have to be
- * asked for, and the allocation has to be aligned for the ask to be honoured.
- * Where the kernel declines, this is an ordinary aligned allocation and
- * everything still works, only slower.
+ * The slot table, zeroed. `alloc_huge` puts it on 2 MB pages where the kernel
+ * will, which is the difference between an insert costing 123 ns and 37 ns --
+ * see parallel.h for why, and c/README.md for the measurement.
  */
 static uint64_t *alloc_slots(size_t n) {
-    const size_t huge = (size_t)2 << 20;
-    const size_t bytes = n * sizeof(uint64_t);
-    const size_t rounded = (bytes + huge - 1) & ~(huge - 1);
-    void *p = NULL;
-    if (posix_memalign(&p, huge, rounded) != 0) return NULL;
-#ifdef MADV_HUGEPAGE
-    madvise(p, rounded, MADV_HUGEPAGE);
-#endif
-    memset(p, 0, bytes);
+    uint64_t *p = alloc_huge(n * sizeof *p);
+    if (p) memset(p, 0, n * sizeof *p);
     return p;
 }
 
@@ -318,49 +302,6 @@ typedef struct {
 static void index_free(Index *ix) {
     free(ix->slots); free(ix->firsts); free(ix->counts); free(ix->hashes);
     memset(ix, 0, sizeof *ix);
-}
-
-/* ------------------------------------------------------------------------- */
-/* Running a phase on several threads                                          */
-/*                                                                             */
-/* One shape for every parallel phase here: part 0 runs on the calling thread   */
-/* and the rest get one each. A thread that will not spawn is not a failure --  */
-/* its part runs inline, slower and still right.                               */
-/* ------------------------------------------------------------------------- */
-
-typedef struct {
-    void   (*fn)(void *ctx, unsigned part);
-    void    *ctx;
-    unsigned part;
-} Job;
-
-static void *job_entry(void *p) {
-    Job *j = p;
-    j->fn(j->ctx, j->part);
-    return NULL;
-}
-
-static void run_parts(void (*fn)(void *, unsigned), void *ctx, unsigned ways) {
-    if (ways <= 1) { fn(ctx, 0); return; }
-    pthread_t *tid = calloc(ways, sizeof *tid);
-    Job       *job = calloc(ways, sizeof *job);
-    if (!tid || !job) {                       /* no memory for threads: do it inline */
-        for (unsigned p = 0; p < ways; p++) fn(ctx, p);
-        free(tid); free(job);
-        return;
-    }
-    unsigned started = 0;
-    for (unsigned p = 1; p < ways; p++) {
-        job[p].fn = fn; job[p].ctx = ctx; job[p].part = p;
-        if (pthread_create(&tid[p], NULL, job_entry, &job[p]) == 0) started++;
-        else { fn(ctx, p); tid[p] = 0; }
-    }
-    fn(ctx, 0);
-    for (unsigned p = 1; p < ways; p++)
-        if (tid[p]) pthread_join(tid[p], NULL);
-    (void)started;
-    free(tid);
-    free(job);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -838,11 +779,7 @@ int pq_compare(const char *a_path, const char *b_path,
     Failure *col_fail = NULL;
     uint64_t *any = NULL;
 
-    unsigned budget = threads;
-    if (budget == 0) {
-        const long n = sysconf(_SC_NPROCESSORS_ONLN);
-        budget = n > 0 ? (unsigned)n : 1u;
-    }
+    unsigned budget = threads ? threads : cpu_count();
 
     if (map_open(&am, a_path) != 0 || map_open(&bm, b_path) != 0) goto done;
     if (pq_read_meta(am.data, am.size, &ameta) != 0) goto done;

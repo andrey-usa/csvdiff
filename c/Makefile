@@ -8,16 +8,17 @@ CC     ?= cc
 CFLAGS ?= -std=c11 -O2 -march=native -Wall -Wextra -Werror -pthread
 LDFLAGS ?= -pthread
 BIN     = csvdiff
-OBJ     = csvdiff.o parquet.o pqdiff.o
+OBJ     = csvdiff.o parquet.o pqdiff.o parallel.o
 
 all: $(BIN)
 
 $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS)
 
-csvdiff.o: csvdiff.c pqdiff.h parquet.h
-parquet.o: parquet.c parquet.h
-pqdiff.o:  pqdiff.c pqdiff.h parquet.h
+csvdiff.o:  csvdiff.c pqdiff.h parquet.h parallel.h
+parquet.o:  parquet.c parquet.h
+pqdiff.o:   pqdiff.c pqdiff.h parquet.h parallel.h
+parallel.o: parallel.c parallel.h
 
 clean:
 	rm -f $(BIN) $(OBJ)
