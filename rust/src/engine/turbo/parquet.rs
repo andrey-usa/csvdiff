@@ -224,9 +224,9 @@ impl Reader {
                 decoded.push(self.decode_column(wave[0].1));
                 for handle in handles {
                     decoded.push(
-                        handle
-                            .join()
-                            .unwrap_or_else(|_| Err(Error::new("a Parquet column decoder panicked"))),
+                        handle.join().unwrap_or_else(|_| {
+                            Err(Error::new("a Parquet column decoder panicked"))
+                        }),
                     );
                 }
             });
