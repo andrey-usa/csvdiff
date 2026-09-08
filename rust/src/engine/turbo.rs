@@ -42,6 +42,8 @@ mod text;
 mod thrift;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of};
@@ -60,6 +62,15 @@ const CHUNKING_THRESHOLD: usize = 4 << 20;
 
 /// How many keys make the join worth splitting.
 const JOIN_THRESHOLD: usize = 1 << 14;
+
+/// Keys per join chunk.
+///
+/// Sized in rows rather than in threads so that the chunk boundaries -- and so
+/// which rows a capped section keeps -- are the same at any `--threads`. Small
+/// enough that no single chunk can be the last thing four cores are waiting on:
+/// at ten million keys this is a couple of hundred chunks of a few hundredths
+/// of a second each.
+const JOIN_CHUNK: usize = 1 << 16;
 
 /// How many threads this comparison may use in total. Both files are read at
 /// once and each is split further, so this is the width of the whole run rather
@@ -252,6 +263,40 @@ fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u6
 // The index
 // ---------------------------------------------------------------------------
 
+/// Phase timings, on stderr, when `CSVDIFF_PHASES` is set — the same switch and
+/// the same output shape the C++ columnar path uses.
+///
+/// A comparison has costs that move independently: sweeping and hashing every
+/// row, inserting them into the index, joining, and rendering. Knowing which one
+/// grew is the difference between tuning and guessing, and the cores-busy column
+/// says only *that* something is serial, never which thing.
+struct Phases {
+    on: bool,
+    tag: &'static str,
+    last: Instant,
+}
+
+impl Phases {
+    /// `tag` prefixes every line, because the two files are read on two threads
+    /// and their phases would otherwise interleave unattributed.
+    fn new(tag: &'static str) -> Self {
+        Phases {
+            on: std::env::var_os("CSVDIFF_PHASES").is_some(),
+            tag,
+            last: Instant::now(),
+        }
+    }
+
+    fn mark(&mut self, what: &str) {
+        let now = Instant::now();
+        if self.on {
+            let name = format!("{}{}", self.tag, what);
+            eprintln!("  {:<26} {:7.3}s", name, (now - self.last).as_secs_f64());
+        }
+        self.last = now;
+    }
+}
+
 /// A slot holds the top bits of its key's hash and the position in `first_row`
 /// plus one, so zero means empty.
 ///
@@ -309,8 +354,16 @@ impl RowIndex {
     /// order rows arrive — first occurrence of a key wins, and the duplicate
     /// counts follow from that. Doing the second half in parallel would make the
     /// answer depend on thread scheduling.
-    fn build(side: &Side, key_size: usize, opt: &Options, threads: usize) -> Result<Self> {
+    fn build(
+        side: &Side,
+        key_size: usize,
+        opt: &Options,
+        threads: usize,
+        tag: &'static str,
+    ) -> Result<Self> {
+        let mut phases = Phases::new(tag);
         let mut chunks = sweep(side, key_size, opt, threads)?;
+        phases.mark("sweep (parallel)");
 
         let total: usize = chunks.iter().map(|c| c.at.len()).sum();
         // Sized once for the rows about to be inserted, at about a two-thirds
@@ -357,6 +410,7 @@ impl RowIndex {
             chunk.at = Vec::new();
             chunk.hash = Vec::new();
         }
+        phases.mark("index insert (serial)");
         Ok(idx)
     }
 
@@ -748,11 +802,18 @@ impl Capped {
     }
 }
 
-/// One range of A's keys, joined on its own thread.
+/// What one chunk of the queue produced: A's chunks carry counts and picks,
+/// B's carry only the rows A never had.
+enum Piece {
+    A(Part),
+    B(Capped),
+}
+
+/// One chunk of A's keys.
 ///
-/// Each range keeps its own counts, column stats and capped lists; because the
-/// ranges are contiguous and merged in order, the result is identical to one
-/// thread's, including which rows survive the cap.
+/// Each chunk keeps its own counts, column stats and capped lists; because the
+/// chunks are contiguous and merged in chunk order, the result is identical to
+/// one thread's, including which rows survive the cap.
 struct Part {
     matched: i64,
     changed_per: Vec<i64>,
@@ -771,6 +832,16 @@ fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> 
     let mut fields = vec![ABSENT; side.width];
     idx.fields_of(side, row, &mut fields);
     fields.iter().map(|f| value(&side.slab, *f, opt)).collect()
+}
+
+/// How many chunks `keys` divides into. One below the threshold, where finding
+/// the boundaries would cost more than the join it splits.
+fn ways_for(keys: usize) -> usize {
+    if keys < JOIN_THRESHOLD {
+        1
+    } else {
+        keys.div_ceil(JOIN_CHUNK).max(1)
+    }
 }
 
 fn to_cells(values: &[Val]) -> Vec<Cell> {
@@ -796,15 +867,19 @@ fn join(
     // and neither the absence checks nor the value decoding are reachable.
     let plain = !needs_normalising(opt);
 
-    // A's side is the long pole: every distinct key is looked up in B, both rows
-    // are read, and every compared column is examined. B's side only asks whether
-    // each of its keys exists in A. So A splits over ranges and B gets a thread
-    // of its own; the two write different outputs and read both indexes without
-    // writing either.
-    let mut ways = threads.saturating_sub(1).max(1);
-    if ai.first_row.len() < JOIN_THRESHOLD {
-        ways = 1;
-    }
+    // Both sides are chunked into one queue and every thread pulls from it.
+    //
+    // Giving B a thread of its own looked right -- A reads both rows and every
+    // compared column where B only asks whether each of its keys exists in A --
+    // but measuring it says otherwise: B's four million probes on one thread took
+    // 3.1s while A's three ranges took 1.6s each, so the join was waiting on B
+    // with three cores idle. A key costs B about two thirds of what it costs A,
+    // and B has just as many of them; nothing about that ratio makes a thread the
+    // right unit. Chunks do not care which side they came from.
+    let a_keys = ai.first_row.len();
+    let b_keys = bi.first_row.len();
+    let a_ways = ways_for(a_keys);
+    let b_ways = ways_for(b_keys);
 
     let a_range = |p: usize| -> Part {
         let mut out = Part {
@@ -822,8 +897,8 @@ fn join(
             vec![ABSENT; width],
             vec![ABSENT; width],
         );
-        let lo = ai.first_row.len() * p / ways;
-        let hi = ai.first_row.len() * (p + 1) / ways;
+        let lo = a_keys * p / a_ways;
+        let hi = a_keys * (p + 1) / a_ways;
         for &row in &ai.first_row[lo..hi] {
             ai.fields_of(a, row, &mut fa);
             // The hash is the one the sweep computed for this row: the same
@@ -885,10 +960,12 @@ fn join(
         out
     };
 
-    let b_side = || -> Capped {
+    let b_range = |p: usize| -> Capped {
         let mut added = Capped::new(cap, exporting);
         let (mut fb, mut probe) = (vec![ABSENT; width], vec![ABSENT; width]);
-        for &row in &bi.first_row {
+        let lo = b_keys * p / b_ways;
+        let hi = b_keys * (p + 1) / b_ways;
+        for &row in &bi.first_row[lo..hi] {
             bi.fields_of(b, row, &mut fb);
             let hash = bi.row_hash[row as usize];
             if ai
@@ -901,27 +978,56 @@ fn join(
         added
     };
 
-    let (parts, added) = std::thread::scope(|scope| {
-        let b_worker = scope.spawn(b_side);
-        let mut parts: Vec<Part> = Vec::with_capacity(ways);
-        if ways == 1 {
-            parts.push(a_range(0));
-        } else {
-            let handles: Vec<_> = (1..ways)
-                .map(|p| {
-                    let a_range = &a_range;
-                    scope.spawn(move || a_range(p))
-                })
-                .collect();
-            parts.push(a_range(0));
-            for handle in handles {
-                parts.push(handle.join().expect("a join range"));
+    // Chunk `t` is A's chunk `t` while `t` is below `a_ways` and B's after that.
+    // Threads take them in that order, so the merge below only has to sort the
+    // pieces back into it.
+    let next = AtomicUsize::new(0);
+    let take_chunks = || -> Vec<(usize, Piece)> {
+        let mut mine = Vec::new();
+        loop {
+            let t = next.fetch_add(1, Ordering::Relaxed);
+            if t >= a_ways + b_ways {
+                return mine;
+            }
+            mine.push(match t.checked_sub(a_ways) {
+                None => (t, Piece::A(a_range(t))),
+                Some(p) => (t, Piece::B(b_range(p))),
+            });
+        }
+    };
+
+    let mut phases = Phases::new("");
+    let mut pieces = std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..threads.max(1))
+            .map(|_| {
+                let take_chunks = &take_chunks;
+                scope.spawn(take_chunks)
+            })
+            .collect();
+        let mut all = take_chunks();
+        for handle in handles {
+            all.extend(handle.join().expect("a join worker"));
+        }
+        all
+    });
+    pieces.sort_by_key(|(t, _)| *t);
+
+    let mut parts: Vec<Part> = Vec::with_capacity(a_ways);
+    let mut added = Capped::new(cap, exporting);
+    for (_, piece) in pieces {
+        match piece {
+            Piece::A(part) => parts.push(part),
+            Piece::B(chunk) => {
+                for pick in &chunk.held {
+                    added.push(*pick);
+                }
+                added.total += chunk.total - chunk.held.len() as i64;
             }
         }
-        (parts, b_worker.join().expect("the added side"))
-    });
+    }
 
-    // Merged in range order, so the rows kept under the cap are the same rows
+    phases.mark("  join chunks (par)");
+    // Merged in chunk order, so the rows kept under the cap are the same rows
     // one thread would have kept.
     let mut changed = Capped::new(cap, exporting);
     let mut removed = Capped::new(cap, exporting);
@@ -958,17 +1064,20 @@ fn join(
     // Only now does anything become a String, and only for the rows kept -- but
     // "only" is up to two hundred thousand rows over twenty columns, which was
     // the last serial second of every run that renders a report.
+    phases.mark("  merge parts (serial)");
     let mut removed_rows = map_rows(&removed.held, threads, |p| row_values(a, ai, p.row, opt));
     let mut added_rows = map_rows(&added.held, threads, |p| row_values(b, bi, p.row, opt));
     let mut changed_a = map_rows(&changed.held, threads, |p| row_values(a, ai, p.row, opt));
     let mut changed_b = map_rows(&changed.held, threads, |p| row_values(b, bi, p.mate, opt));
 
+    phases.mark("  row values (par)");
     sort_rows(&mut removed_rows, key_size);
     sort_rows(&mut added_rows, key_size);
     sort_changed_together(&mut changed_a, &mut changed_b, key_size);
 
     // Zipped by index rather than by iterator so the two sides can be chunked
     // together; they are the same length and in the same order by construction.
+    phases.mark("  sorts (serial)");
     let rows: Vec<usize> = (0..changed_a.len()).collect();
     let changed_cells: Vec<Vec<Cell>> = map_rows(&rows, threads, |&r| {
         let (ar, br) = (&changed_a[r], &changed_b[r]);
@@ -991,6 +1100,7 @@ fn join(
         row
     });
 
+    phases.mark("  changed cells (par)");
     let counts = Counts {
         a_rows: ai.rows,
         b_rows: bi.rows,
@@ -1023,11 +1133,23 @@ fn sort_rows(rows: &mut [Vec<Val>], key_size: usize) {
 }
 
 /// Sorts the changed rows by key while keeping the parallel A and B lists in step.
+///
+/// The permutation moves rows rather than copying them. Cloning instead meant
+/// deep-copying every `String` in both lists -- fifty thousand rows over twenty
+/// columns, twice -- which was almost the whole of this engine's serial sort
+/// time, and none of it was the comparisons.
 fn sort_changed_together(a: &mut Vec<Vec<Val>>, b: &mut Vec<Vec<Val>>, key_size: usize) {
     let mut order: Vec<usize> = (0..a.len()).collect();
     order.sort_by(|&p, &q| compare_keys(&a[p], &a[q], key_size));
-    *a = order.iter().map(|&i| a[i].clone()).collect();
-    *b = order.iter().map(|&i| b[i].clone()).collect();
+    permute(a, &order);
+    permute(b, &order);
+}
+
+/// Reorders `v` so that `v[i]` becomes what `v[order[i]]` was, moving each
+/// element exactly once. `order` must be a permutation of `0..v.len()`.
+fn permute<T: Default>(v: &mut Vec<T>, order: &[usize]) {
+    let mut src = std::mem::take(v);
+    *v = order.iter().map(|&i| std::mem::take(&mut src[i])).collect();
 }
 
 /// The duplicate-key section: most duplicated first, then by key.
@@ -1215,14 +1337,14 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // time, and each is split further: two files across four cores is two chunks
     // each, so the whole machine is busy rather than half of it.
     let per_file = (total / 2).max(1);
-    let prepare = |input: Input| -> Result<(Side, RowIndex)> {
+    let prepare = |input: Input, tag: &'static str| -> Result<(Side, RowIndex)> {
         let side = input.project(&wanted, per_file)?;
-        let index = RowIndex::build(&side, key_size, opt, per_file)?;
+        let index = RowIndex::build(&side, key_size, opt, per_file, tag)?;
         Ok((side, index))
     };
     let (from_a, from_b) = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| prepare(b_input));
-        let mine = prepare(a_input);
+        let worker = scope.spawn(|| prepare(b_input, "B "));
+        let mine = prepare(a_input, "A ");
         let theirs = worker
             .join()
             .unwrap_or_else(|_| Err(Error::new("a file reader panicked")));
@@ -1230,9 +1352,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     });
     let (a, ai) = from_a?;
     let (b, bi) = from_b?;
+    let mut phases = Phases::new("");
 
     let dup_a = duplicate_section(&a, &ai, opt);
     let dup_b = duplicate_section(&b, &bi, opt);
+    phases.mark("duplicate sections");
     let joined = join(
         &a,
         &ai,
@@ -1244,8 +1368,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         total,
     );
 
+    phases.mark("join");
     let meta = resolved.meta(&opt.key, a_cols, b_cols);
-    assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared)
+    let out = assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared);
+    phases.mark("assemble");
+    out
 }
 
 /// The turbo engine has no optional dependency.
