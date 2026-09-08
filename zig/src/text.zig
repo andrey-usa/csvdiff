@@ -168,6 +168,13 @@ pub const RowParser = union(enum) {
         /// key column, so the run is a range rather than a single entry.
         slots: []const u16,
         starts: []const u32,
+        /// The one slot each column feeds, or a sentinel. Almost every column
+        /// feeds exactly one, and the hot path stores through this rather than
+        /// slicing `slots` -- which costs two dependent loads from `starts` and
+        /// a loop setup, per column, per parse, and a row is parsed about two
+        /// and a half times: once by the sweep, then again for each side of the
+        /// join and once more when a probe compares keys.
+        single: []const i32,
 
         /// Marks the slots of columns `from` onward absent.
         ///
@@ -179,6 +186,24 @@ pub const RowParser = union(enum) {
         /// 4.6 billion this port spent on a 200,000-row pair, seven per cent of
         /// the whole comparison, because it ran twenty slots per row per file
         /// whether or not a single one of them needed it.
+        /// `single[column]` when the column feeds no slot, and when it feeds
+        /// more than one -- `--compare` naming a key column is the only way to
+        /// get there, so it is worth a branch rather than a second array.
+        pub const NONE: i32 = -1;
+        pub const MANY: i32 = -2;
+
+        /// Stores one field into every slot its column feeds.
+        inline fn store(self: Csv, out: []Field, column: usize, field: Field) void {
+            const one = self.single[column];
+            if (one >= 0) {
+                out[@intCast(one)] = field;
+            } else if (one == MANY) {
+                for (self.slots[self.starts[column]..self.starts[column + 1]]) |slot| {
+                    out[slot] = field;
+                }
+            }
+        }
+
         inline fn blankFrom(self: Csv, out: []Field, from: usize) void {
             if (from > self.last_needed) return;
             for (self.slots[self.starts[from]..self.starts[self.last_needed + 1]]) |slot| {
@@ -230,12 +255,22 @@ pub const RowParser = union(enum) {
                 filled[c] += 1;
             }
         }
+        // The one-slot shortcut, derived from the same counting sort.
+        const single = try gpa.alloc(i32, last + 1);
+        for (single, 0..) |*one, c| {
+            one.* = switch (starts[c + 1] - starts[c]) {
+                0 => Csv.NONE,
+                1 => @intCast(slots[starts[c]]),
+                else => Csv.MANY,
+            };
+        }
         return .{ .csv = .{
             .delimiter = delimiter,
             .source = source,
             .last_needed = last,
             .slots = slots,
             .starts = starts,
+            .single = single,
         } };
     }
 
@@ -260,6 +295,7 @@ pub const RowParser = union(enum) {
             .csv => |c| {
                 gpa.free(c.slots);
                 gpa.free(c.starts);
+                gpa.free(c.single);
             },
         }
     }
@@ -290,11 +326,7 @@ pub const RowParser = union(enum) {
                 next = scan.nextOf2(d, pos, end, self.delimiter, '\n');
                 field = plainField(d, pos, next);
             }
-            if (column <= self.last_needed) {
-                for (self.slots[self.starts[column]..self.starts[column + 1]]) |slot| {
-                    out[slot] = field;
-                }
-            }
+            if (column <= self.last_needed) self.store(out, column, field);
             column += 1;
 
             if (next >= end) {

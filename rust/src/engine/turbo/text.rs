@@ -258,6 +258,13 @@ pub(super) enum RowParser {
         /// Which slots each column of the file feeds. Inverted from the wanted
         /// list once, so storing a field is a lookup rather than a walk.
         slots_for: Vec<Vec<u16>>,
+        /// The one slot each column feeds, or a sentinel. Almost every column
+        /// feeds exactly one, and the hot path stores through this rather than
+        /// chasing a pointer into `slots_for` and looping -- per column, per
+        /// parse, and a row is parsed about two and a half times: once by the
+        /// sweep, then again for each side of the join and once more when a
+        /// probe compares keys.
+        single: Vec<i32>,
     },
     Json {
         /// The key whose value belongs in each slot; `None` for a column this
@@ -268,6 +275,11 @@ pub(super) enum RowParser {
         slot_mask: usize,
     },
 }
+
+/// `single[column]` when the column feeds no slot, and when it feeds more
+/// than one.
+const NONE: i32 = -1;
+const MANY: i32 = -2;
 
 fn name_hash(s: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -291,10 +303,22 @@ impl RowParser {
                 slots_for[*column].push(slot as u16);
             }
         }
+        // The one-slot shortcut, from the same inversion. NONE is a column no
+        // slot wants; MANY is `--compare` naming a key column, the only way a
+        // column feeds two, and worth a branch rather than a second array.
+        let single = slots_for
+            .iter()
+            .map(|s| match s.len() {
+                0 => NONE,
+                1 => i32::from(s[0]),
+                _ => MANY,
+            })
+            .collect();
         RowParser::Csv {
             delimiter,
             last_needed,
             slots_for,
+            single,
         }
     }
 
@@ -330,24 +354,48 @@ impl RowParser {
                 delimiter,
                 last_needed,
                 slots_for,
-                ..
-            } => self.parse_csv(*delimiter, slots_for, *last_needed, data, start, end, out),
+                single,
+            } => self.parse_csv(
+                *delimiter,
+                slots_for,
+                single,
+                *last_needed,
+                data,
+                start,
+                end,
+                out,
+            ),
             RowParser::Json { .. } => self.parse_json(data, start, end, out),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn parse_csv(
         &self,
         delimiter: u8,
         slots_for: &[Vec<u16>],
+        single: &[i32],
         last_needed: usize,
         data: &[u8],
         start: usize,
         end: usize,
         out: &mut [Field],
     ) -> usize {
-        out.fill(ABSENT);
+        // `out` is reused across rows, so a column this row does not reach has
+        // to be blanked or it would show the previous row's value -- but that is
+        // only the columns after the row ran out, and a well-formed row runs out
+        // of nothing. Clearing all of them up front ran twenty stores per row
+        // per file to no purpose.
+        let blank_from = |out: &mut [Field], from: usize| {
+            if from <= last_needed {
+                for slots in &slots_for[from..=last_needed] {
+                    for slot in slots {
+                        out[*slot as usize] = ABSENT;
+                    }
+                }
+            }
+        };
         let mut pos = start;
         let mut column = 0usize;
 
@@ -364,24 +412,34 @@ impl RowParser {
                 (plain_field(data, pos, next), next)
             };
             if column <= last_needed {
-                for slot in &slots_for[column] {
-                    out[*slot as usize] = field;
+                let one = single[column];
+                if one >= 0 {
+                    out[one as usize] = field;
+                } else if one == MANY {
+                    for slot in &slots_for[column] {
+                        out[*slot as usize] = field;
+                    }
                 }
             }
             column += 1;
 
             if next >= end {
+                blank_from(out, column);
                 return end;
             }
             if data[next] == b'\n' {
+                blank_from(out, column);
                 return next + 1;
             }
             pos = next + 1;
+            // Every needed column is filled, so there is nothing to blank: the
+            // rest of the row is skipped without being parsed.
             if column > last_needed {
                 let eol = end_of_row(data, pos, end);
                 return if eol >= end { end } else { eol + 1 };
             }
         }
+        blank_from(out, column);
         end
     }
 
