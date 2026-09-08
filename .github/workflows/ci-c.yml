@@ -43,6 +43,22 @@ jobs:
         with:
           python-version: "3.14"
 
+      # Two compiled binaries have been committed to this port inside three
+      # commits -- c/gen-data, then c/csvdiff-asan -- both built with
+      # `-march=native`, both invisible until a runner tried to execute one.
+      # Neither failed the suite that was running at the time. This is the check
+      # that would have caught either one the moment it was staged.
+      - name: No compiled binaries in the index
+        run: |
+          set -o pipefail
+          bad=$(git ls-files -z | xargs -0 -r file --mime-type -- \
+              | grep -E ':[[:space:]]*application/x-(executable|pie-executable|sharedlib|object|archive)$') || true
+          if [ -n "$bad" ]; then
+            echo "::error::a build artifact is tracked in git"
+            echo "$bad"
+            exit 1
+          fi
+
       - name: What this runner is
         run: |
           ${{ matrix.cc }} --version | head -1
