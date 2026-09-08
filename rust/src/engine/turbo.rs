@@ -169,15 +169,15 @@ fn cell_differs(a: &Slab, x: Field, b: &Slab, y: Field, opt: &Options) -> bool {
 fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
     const PRIME: u64 = 0x100_0000_01b3;
     let mut h = seed;
-    let mut chunks = bytes.chunks_exact(8);
+    let mut chunks = bytes.as_chunks::<8>().0.iter();
     for chunk in &mut chunks {
-        let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
+        let word = u64::from_le_bytes(*chunk);
         h = (h ^ word).wrapping_mul(PRIME);
         // The xor-shift is what spreads a whole word into the low bits, which
         // is where the table's slot comes from.
         h ^= h >> 29;
     }
-    let tail = chunks.remainder();
+    let tail = &bytes[bytes.len() - bytes.len() % 8..];
     if !tail.is_empty() {
         let mut word = [0u8; 8];
         word[..tail.len()].copy_from_slice(tail);

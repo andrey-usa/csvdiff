@@ -70,12 +70,6 @@ const VECTOR_WIDTH: usize = 64;
     not(target_feature = "avx512bw")
 ))]
 const VECTOR_WIDTH: usize = 32;
-#[cfg(not(all(
-    target_arch = "x86_64",
-    any(target_feature = "avx2", target_feature = "avx512bw")
-)))]
-const VECTOR_WIDTH: usize = 0;
-
 /// The bytes of the sixteen-to-sixty-four at `at` that equal `a` or `b`, one bit
 /// each, or `None` where this build has no vector unit to ask.
 #[cfg(all(
@@ -136,18 +130,16 @@ fn word_at(data: &[u8], at: usize) -> u64 {
 pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> usize {
     let data = &data[..end.min(data.len())];
     let mut at = from;
-    if VECTOR_WIDTH > 0 {
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_feature = "avx2", target_feature = "avx512bw")
-        ))]
-        while at + VECTOR_WIDTH <= data.len() {
-            let hits = vector_hits(data, at, a, b);
-            if hits != 0 {
-                return at + hits.trailing_zeros() as usize;
-            }
-            at += VECTOR_WIDTH;
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_feature = "avx2", target_feature = "avx512bw")
+    ))]
+    while at + VECTOR_WIDTH <= data.len() {
+        let hits = vector_hits(data, at, a, b);
+        if hits != 0 {
+            return at + hits.trailing_zeros() as usize;
         }
+        at += VECTOR_WIDTH;
     }
     let (ba, bb) = (broadcast(a), broadcast(b));
     while at + 8 <= data.len() {
@@ -171,18 +163,16 @@ pub(super) fn next_of2(data: &[u8], from: usize, end: usize, a: u8, b: u8) -> us
 pub(super) fn next_of1(data: &[u8], from: usize, end: usize, target: u8) -> usize {
     let data = &data[..end.min(data.len())];
     let mut at = from;
-    if VECTOR_WIDTH > 0 {
-        #[cfg(all(
-            target_arch = "x86_64",
-            any(target_feature = "avx2", target_feature = "avx512bw")
-        ))]
-        while at + VECTOR_WIDTH <= data.len() {
-            let hits = vector_hits(data, at, target, target);
-            if hits != 0 {
-                return at + hits.trailing_zeros() as usize;
-            }
-            at += VECTOR_WIDTH;
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_feature = "avx2", target_feature = "avx512bw")
+    ))]
+    while at + VECTOR_WIDTH <= data.len() {
+        let hits = vector_hits(data, at, target, target);
+        if hits != 0 {
+            return at + hits.trailing_zeros() as usize;
         }
+        at += VECTOR_WIDTH;
     }
     let bt = broadcast(target);
     while at + 8 <= data.len() {
