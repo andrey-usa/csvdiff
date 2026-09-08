@@ -412,37 +412,22 @@ def daff_diff(a: Path, b: Path, out: Path, exe: str) -> Result:
     )
 
 
-def datacompy_compare(a: Path, b: Path, out: Path) -> Result:
-    """datacompy (Capital One) — the reconciliation library, on pandas.
+def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
+    """datacompy (Capital One) — the reconciliation library, over Polars.
 
     Runs in a child process so its peak memory is measured the same way as
     everyone else's; the child is this same file under ``--child``.
     """
-    summary = fresh(out / "datacompy.json")
-    status, _, err, secs, mb = run([
-        sys.executable, str(Path(__file__).resolve()), "--child", "datacompy",
-        str(a), str(b), str(summary),
-    ])
-    if status != 0 or not summary.exists():
-        return Result("datacompy (pandas)", "dataframe", **failure(status, err))
-    return Result(
-        "datacompy (pandas)", "dataframe", secs, mb, json.loads(summary.read_text()),
-        note="cell-level diff and a per-column summary; whole frame in memory",
-    )
-
-
-def datacompy_polars(a: Path, b: Path, out: Path) -> Result:
-    """datacompy again, this time over Polars rather than pandas."""
     summary = fresh(out / "datacompy-polars.json")
     status, _, err, secs, mb = run([
         sys.executable, str(Path(__file__).resolve()), "--child", "datacompy-polars",
         str(a), str(b), str(summary),
     ])
     if status != 0 or not summary.exists():
-        return Result("datacompy (polars)", "dataframe", **failure(status, err))
+        return Result("datacompy (Polars)", "dataframe", **failure(status, err))
     return Result(
-        "datacompy (polars)", "dataframe", secs, mb, json.loads(summary.read_text()),
-        note="same library, columnar backend",
+        "datacompy (Polars)", "dataframe", secs, mb, json.loads(summary.read_text()),
+        note="cell-level diff and a per-column summary; whole frame in memory",
     )
 
 
@@ -491,21 +476,6 @@ def unix_pipeline(a: Path, b: Path, out: Path) -> Result:
         "sort(1) + join(1)", "shell pipeline", secs, mb, counts,
         note="counts only; no CSV quoting, no duplicate-key concept, no diff",
         expresses_task=False,
-    )
-
-
-def pandas_merge(a: Path, b: Path, out: Path) -> Result:
-    """The hand-written pandas outer merge — what most people write before finding a library."""
-    summary = fresh(out / "pandas.json")
-    status, _, err, secs, mb = run([
-        sys.executable, str(Path(__file__).resolve()), "--child", "pandas",
-        str(a), str(b), str(summary),
-    ])
-    if status != 0 or not summary.exists():
-        return Result("pandas (hand-written merge)", "dataframe", **failure(status, err))
-    return Result(
-        "pandas (hand-written merge)", "dataframe", secs, mb, json.loads(summary.read_text()),
-        note="counts only unless you write more; duplicate keys multiply through the merge",
     )
 
 
@@ -562,19 +532,7 @@ def classify(status: int, err: str) -> str:
 # Child mode: one dataframe tool per run, so peak memory is its own
 # ---------------------------------------------------------------------------
 
-def child_datacompy(a: Path, b: Path, summary: Path) -> None:
-    import datacompy
-    import pandas as pd
-
-    dtype = {c: "string" for c in HEADER}
-    left, right = (pd.read_csv(p, dtype=dtype, keep_default_na=False).drop(columns=[IGNORE])
-                   for p in (a, b))
-    cmp = datacompy.PandasCompare(left, right, join_columns=KEY, df1_name="a", df2_name="b")
-    _write_counts(summary, cmp)
-
-
 def child_datacompy_polars(a: Path, b: Path, summary: Path) -> None:
-    """The same library over Polars — the backend, not the design, is what changes."""
     import datacompy
     import polars as pl
 
@@ -586,7 +544,7 @@ def child_datacompy_polars(a: Path, b: Path, summary: Path) -> None:
 
 
 def _write_counts(summary: Path, cmp: object) -> None:
-    """Both comparators expose the same three numbers under the same names."""
+    """The three numbers the comparator exposes, under the names it uses."""
     summary.write_text(json.dumps({
         "changed": int(len(cmp.all_mismatch())),
         "added": int(cmp.df2_unq_rows.shape[0]),
@@ -618,25 +576,6 @@ def child_csv_diff(a: Path, b: Path, summary: Path) -> None:
 def _keyed(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
     """The key-to-row mapping csv-diff's own loader builds, with our fused key."""
     return {row["__key"]: row for row in rows}
-
-
-def child_pandas(a: Path, b: Path, summary: Path) -> None:
-    import pandas as pd
-
-    dtype = {c: "string" for c in HEADER}
-    left, right = (pd.read_csv(p, dtype=dtype, keep_default_na=False).drop(columns=[IGNORE])
-                   for p in (a, b))
-    merged = left.merge(right, on=KEY, how="outer", indicator=True, suffixes=("_a", "_b"))
-    compared = [c for c in HEADER if c != IGNORE and c not in KEY]
-    both = merged["_merge"] == "both"
-    differs = False
-    for c in compared:
-        differs = differs | (merged[f"{c}_a"].fillna("") != merged[f"{c}_b"].fillna(""))
-    summary.write_text(json.dumps({
-        "changed": int((both & differs).sum()),
-        "added": int((merged["_merge"] == "right_only").sum()),
-        "removed": int((merged["_merge"] == "left_only").sum()),
-    }))
 
 
 # ---------------------------------------------------------------------------
@@ -759,9 +698,8 @@ def main() -> int:
 
     if args.child:
         tool, a, b, summary = args.child
-        {"datacompy": child_datacompy, "datacompy-polars": child_datacompy_polars,
-          "csv-diff": child_csv_diff, "pandas": child_pandas}[tool](
-            Path(a), Path(b), Path(summary))
+        {"datacompy-polars": child_datacompy_polars,
+         "csv-diff": child_csv_diff}[tool](Path(a), Path(b), Path(summary))
         return 0
 
     out = args.out_dir / args.rows
@@ -787,9 +725,7 @@ def main() -> int:
         ("clickhouse-spill",
          (lambda: clickhouse_sql(a, b, out, ch_exe, spill=True)) if ch_exe else None),
         ("daff", (lambda: daff_diff(a, b, out, daff_exe)) if daff_exe else None),
-        ("datacompy", lambda: datacompy_compare(a, b, out)),
         ("datacompy-polars", lambda: datacompy_polars(a, b, out)),
-        ("pandas", lambda: pandas_merge(a, b, out)),
         ("csv-diff", lambda: csv_diff_tool(a, b, out)),
         ("unix", lambda: unix_pipeline(a, b, out)),
     ]

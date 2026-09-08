@@ -37,7 +37,7 @@ engines and assert it in `tests/test_engine.py` — never compute it in JavaScri
 
 ```bash
 pytest
-python scripts/bench.py --rows 10k --engine duckdb   # or pandas locally
+python scripts/bench.py --rows 10k
 ```
 
 Then check the generated `bench/10k-*.html`:

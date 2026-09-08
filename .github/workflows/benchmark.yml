@@ -7,11 +7,6 @@ on:
         description: 'Comma-separated row counts to run, e.g. "10k,1m,10m" or "20m". "all" means 10k,1m,10m.'
         type: string
         default: all
-      engine:
-        description: Engine
-        type: choice
-        default: duckdb
-        options: [duckdb, pandas]
       enforce_budget:
         description: Fail the job when a scale exceeds its time or memory budget
         type: boolean
@@ -28,6 +23,12 @@ jobs:
     outputs:
       scales: ${{ steps.pick.outputs.scales }}
     steps:
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - id: pick
         run: |
           raw='${{ inputs.scales || 'all' }}'
@@ -48,14 +49,13 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
 
       - name: Install
         run: |
           pip install --upgrade pip
-          if [ "${{ inputs.engine || 'duckdb' }}" = "pandas" ]; then pip install "pandas>=2.0"; else pip install "duckdb>=1.0"; fi
-          pip install -e . --no-deps
+          pip install -e .
 
       - name: Runner capacity
         run: |
@@ -64,19 +64,17 @@ jobs:
       - name: Generate and compare ${{ matrix.scale }} rows
         env:
           ENFORCE: ${{ inputs.enforce_budget }}
-          ENGINE: ${{ inputs.engine || 'duckdb' }}
         run: |
           extra=""
           [ "$ENFORCE" = "false" ] && extra="--no-budget"
           python scripts/bench.py \
             --rows ${{ matrix.scale }} \
-            --engine "$ENGINE" \
             --data-dir data --out-dir bench \
             --threads "$(nproc)" --memory-limit 8GB $extra
 
       - uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.scale }}-${{ inputs.engine || 'duckdb' }}
+          name: bench-${{ matrix.scale }}
           path: |
             bench/*.html
             bench/*.json
@@ -87,6 +85,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - uses: actions/download-artifact@v4
         with:
           path: all
@@ -120,6 +124,12 @@ jobs:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - uses: actions/download-artifact@v4
         with:
           path: site

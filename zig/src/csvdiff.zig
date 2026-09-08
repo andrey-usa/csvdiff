@@ -25,14 +25,15 @@ const scan = @import("scan.zig");
 const fld = @import("field.zig");
 const slab_mod = @import("slab.zig");
 const text = @import("text.zig");
-const parquet = @import("parquet.zig");
+const parquet = @import("pqread.zig");
 const codec = @import("codec.zig");
 const encoding = @import("encoding.zig");
 
 const Field = fld.Field;
 const ABSENT = fld.ABSENT;
 const TOO_LONG = fld.TOO_LONG;
-const Slab = slab_mod.Slab;
+// Re-exported: `pqdiff.zig` maps its two files the same way this engine does.
+pub const Slab = slab_mod.Slab;
 const Dialect = slab_mod.Dialect;
 
 pub const Error = error{

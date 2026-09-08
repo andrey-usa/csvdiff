@@ -8,8 +8,12 @@ bytes at a time with SWAR, and nothing becomes a string unless it reaches the
 report.
 
 It reads **CSV, newline-delimited JSON and Parquet**, decoding Parquet's pages
-itself, and splits the comparison across every core. The two sides need not be
-in the same format.
+itself, and splits the comparison across every core. A Parquet pair takes a
+different path entirely — [columnar, and never reconstructing a
+row](../README.md#reading-parquet-natively) — and the budget bounds that path
+exactly as it bounds this one. Where only one side is Parquet there is no column
+to compare a byte stream against, so it is materialised into rows and read by
+the text engine: slower, and still an answer rather than a refusal.
 
 ```bash
 zig build --release=fast
@@ -17,7 +21,13 @@ zig-out/bin/csvdiff compare a.csv b.csv -k id --json summary.json
 zig-out/bin/csvdiff compare a.csv b.parquet -k id        # either side, any format
 zig-out/bin/csvdiff compare a.csv b.csv -k id --threads 4
 zig-out/bin/csvdiff compare a.csv b.csv -k id --max-memory 256
+zig-out/bin/csvdiff compare a.parquet b.parquet -k account_id,txn_id
+./test.sh                # against the Rust port, and Parquet against its own CSV
 ```
+
+**Build it with `--release=fast`.** A plain `zig build` is a Debug build and is
+about four times slower on the Parquet path; Zig 0.16 spells the flag
+`--release`, not `-Doptimize`.
 
 ## Why this port exists
 
@@ -51,19 +61,25 @@ On a million rows, best of three, one 4-core container:
 slow one, and a `preferred_optimize_mode` in `build.zig` does not change that —
 it sets the default for `-Drelease`, which Zig 0.16 spells `--release`.
 
-Against the other ports of the same design:
+Against the other ports of the same design, after the hash and threading changes
+described in the root README (a million rows, best of three, one container):
 
 | | Compare | Peak RSS |
 |---|---:|---:|
-| C++ (clang 18) | **3.39s** | 509 MB |
-| **Zig 0.16** | 5.13s | **413 MB** |
-| Rust | 5.18s | 583 MB |
-| Java | 5.20s | 632 MB |
+| **Zig 0.16** | **0.89s** | **426 MB** |
+| C++ (clang 18) | 0.94s | 514 MB |
+| Rust, engine only | 0.77s | 439 MB |
+| Rust, with its HTML report | 1.58s | 584 MB |
 
-Zig, Rust and Java land within 1.4% of each other — one measurement's worth of
-noise. Zig holds the least memory of the four. C++ built with clang is half as
-fast again as any of them, and built with gcc it is the slowest; see
-`../cpp/README.md`.
+The three are within a few per cent of each other, which is the point: this is
+one design in three languages, and where they differ it is by what they were
+asked to produce. The Rust row is the only one that is not comparing like with
+like — its default run renders the report the other two do not produce at all,
+and that is the 0.8s between its two rows. Zig still holds the least memory.
+
+`-Dscan=32` builds the same engine with a 32-byte vector scanner instead of
+SWAR, which is worth about 7% at ten million rows on a runner with AVX2; the
+numbers and the reasoning are in the root README.
 
 ## Input formats
 
@@ -125,11 +141,13 @@ refused by name instead.
 
 | File | What it holds |
 |---|---|
-| `src/scan.zig` | SWAR scanning |
+| `src/scan.zig` | delimiter scanning: SWAR, or a vector register with `-Dscan=32`/`64` |
 | `src/field.zig` | the packed field word |
 | `src/slab.zig` | the bytes a field points into, and how they are unescaped |
 | `src/text.zig` | the CSV and newline-delimited JSON readers |
-| `src/parquet.zig` | the Parquet reader: metadata, pages, values as text |
+| `src/parquet.zig` | a Parquet reader shaped for comparing: Thrift footer, page decoder, RLE/bit-packed hybrid, snappy |
+| `src/pqdiff.zig` | the columnar comparison — key join first, then one column at a time, on shared dictionary ids |
+| `src/pqread.zig` | the same file read as rows, for the mixed parquet/text pair |
 | `src/thrift.zig` | the compact protocol the Parquet footer is written in |
 | `src/codec.zig` | snappy and LZ4 by hand; gzip and zstd from the standard library |
 | `src/encoding.zig` | the RLE/bit-packed hybrid and the delta encodings |

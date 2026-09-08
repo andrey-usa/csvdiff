@@ -1,9 +1,10 @@
 """Composite-key CSV comparison.
 
-Engine: DuckDB (default). It streams both files from disk, infers delimiters,
-hash-joins on the composite key and spills to disk when data exceeds RAM, so
-multi-GB files are fine. If DuckDB is not installed, a pandas fallback with the
-same result contract is used (in-memory only).
+Engine: DuckDB. It streams both files from disk, infers delimiters, hash-joins
+on the composite key and spills to disk when data exceeds RAM, so multi-GB files
+are fine. It is a required dependency rather than one of several: the byte-level
+ports in cpp/, rust/, zig/, java/ and go/ are where the alternatives live, and
+they are held to this same contract.
 
 Result contract (JSON-serialisable dict) — consumed by report.py and by any
 other sink (JSON sidecar, email, CI gate):
@@ -41,7 +42,7 @@ class Options:
     max_rows: int = 50_000                # rows embedded per section in the report
     delimiter: str | None = None          # None -> auto-detect
     encoding: str = "utf-8"
-    engine: str = "auto"                  # auto | duckdb | pandas
+    engine: str = "auto"                  # auto | duckdb
     threads: int | None = None
     memory_limit: str | None = None       # e.g. "4GB" (DuckDB only)
     export_dir: str | None = None         # write full, uncapped changed/added/removed CSVs here
@@ -59,20 +60,18 @@ def compare(a_path: str, b_path: str, opt: Options) -> dict[str, Any]:
             raise CompareError(f"File not found: {p}")
 
     t0 = time.perf_counter()
-    engine = opt.engine
-    if engine == "auto":
-        try:
-            import duckdb  # noqa: F401
-            engine = "duckdb"
-        except ImportError:
-            engine = "pandas"
-
-    if engine == "duckdb":
-        result = _compare_duckdb(a_path, b_path, opt)
-    elif engine == "pandas":
-        result = _compare_pandas(a_path, b_path, opt)
-    else:
+    engine = "duckdb" if opt.engine == "auto" else opt.engine
+    if engine != "duckdb":
         raise CompareError(f"Unknown engine: {engine}")
+    try:
+        import duckdb  # noqa: F401
+    except ImportError as exc:
+        raise CompareError(
+            "DuckDB is required: pip install duckdb. It is the only engine this "
+            "implementation carries; the byte-level ports are in cpp/, rust/, zig/, "
+            "java/ and go/."
+        ) from exc
+    result = _compare_duckdb(a_path, b_path, opt)
 
     result["meta"].update({
         "a": {"name": os.path.basename(a_path), "path": os.path.abspath(a_path),
@@ -281,132 +280,3 @@ def _compare_duckdb(a_path: str, b_path: str, opt: Options) -> dict[str, Any]:
         "added": added, "removed": removed,
         "dup_a": dups["a"], "dup_b": dups["b"],
     }
-
-
-# ----------------------------------------------------------------------------
-# pandas fallback (same contract, in-memory)
-# ----------------------------------------------------------------------------
-
-def _compare_pandas(a_path: str, b_path: str, opt: Options) -> dict[str, Any]:
-    import pandas as pd
-
-    def load(path):
-        # names + skiprows + usecols is how pandas is told to tolerate a ragged row: it pads a
-        # short one and drops the fields a long one has past the header, which is what every other
-        # engine here does with them. Left to itself pandas refuses the file outright ("Expected 3
-        # fields in line 3, saw 4"), and a row with a stray comma is a difference to report rather
-        # than a reason to compare nothing at all.
-        header = pd.read_csv(path, dtype=str, nrows=0, sep=opt.delimiter or None,
-                             engine="python" if opt.delimiter is None else "c",
-                             encoding=opt.encoding).columns.tolist()
-        df = pd.read_csv(path, dtype=str, keep_default_na=False, sep=opt.delimiter or None,
-                         engine="python" if opt.delimiter is None else "c", encoding=opt.encoding,
-                         names=header, skiprows=1, index_col=False,
-                         usecols=range(len(header)))
-        df = df.replace({"": None})
-        return df
-
-    A, B = load(a_path), load(b_path)
-    a_ncols, b_ncols = len(A.columns), len(B.columns)
-    compared, only_a, only_b = _resolve_columns(list(A.columns), list(B.columns), opt)
-    key = opt.key
-
-    def norm(df):
-        df = df[key + compared].copy()
-        for c in key + compared:
-            s = df[c]
-            if opt.trim:
-                s = s.str.strip()
-            if opt.ignore_case:
-                s = s.str.lower()
-            if opt.empty_is_null:
-                s = s.replace({"": None})
-            df[c] = s
-        return df
-
-    A, B = norm(A), norm(B)
-    counts = {"a_rows": len(A), "b_rows": len(B)}
-    dups = {}
-    for name, df in (("a", A), ("b", B)):
-        g = df.groupby(key, dropna=False).size()
-        d = g[g > 1].sort_values(ascending=False)
-        counts[f"{name}_dup_keys"], counts[f"{name}_dup_rows"] = int(len(d)), int(d.sum())
-        counts[f"{name}_keys"] = int(len(g))
-        rows = [list(k if isinstance(k, tuple) else (k,)) + [int(n)] for k, n in d.head(opt.max_rows).items()]
-        dups[name] = {"cols": key + ["count"], "rows": _nan_to_none(rows), "truncated": len(d) > opt.max_rows}
-
-    A1 = A.drop_duplicates(subset=key, keep="first")
-    B1 = B.drop_duplicates(subset=key, keep="first")
-    J = A1.merge(B1, on=key, how="outer", suffixes=("__a", "__b"), indicator=True)
-
-    def differs(x, y):
-        if x is None and y is None:
-            return False
-        if opt.tolerance > 0:
-            try:
-                return abs(float(x) - float(y)) > opt.tolerance
-            except (TypeError, ValueError):
-                pass
-        return x != y
-
-    def val(v):
-        return None if v is None or (isinstance(v, float) and v != v) else v
-
-    matched = J[J["_merge"] == "both"]
-    columns = [{"name": c, "changed": 0, "blanked": 0, "filled": 0} for c in compared]
-    changed_rows = []
-    n_changed = 0
-    nk = len(key)
-    mcols = key + [f"{c}__a" for c in compared] + [f"{c}__b" for c in compared]
-    nc = len(compared)
-    for rec in matched[mcols].itertuples(index=False, name=None):
-        cells = []
-        for i in range(nc):
-            x, y = val(rec[nk + i]), val(rec[nk + nc + i])
-            if differs(x, y):
-                cells.append([i, x, y])
-                columns[i]["changed"] += 1
-                if y is None:
-                    columns[i]["blanked"] += 1
-                if x is None:
-                    columns[i]["filled"] += 1
-        if cells:
-            n_changed += 1
-            if len(changed_rows) < opt.max_rows:
-                changed_rows.append([val(v) for v in rec[:nk]] + [cells])
-    counts.update({"matched": int(len(matched)), "changed": n_changed, "unchanged": int(len(matched)) - n_changed,
-                   "added": int((J["_merge"] == "right_only").sum()),
-                   "removed": int((J["_merge"] == "left_only").sum())})
-
-    def side(flag, suffix):
-        sub = J[J["_merge"] == flag].sort_values(key)
-        cols = key + [f"{c}{suffix}" for c in compared]
-        rows = [[val(v) for v in r] for r in sub[cols].head(opt.max_rows).itertuples(index=False, name=None)]
-        return {"cols": key + compared, "rows": rows, "truncated": len(sub) > opt.max_rows}
-
-    changed_rows.sort(key=lambda r: [("" if v is None else str(v)) for v in r[:len(key)]])
-
-    if opt.export_dir:
-        os.makedirs(opt.export_dir, exist_ok=True)
-        J[J["_merge"] == "right_only"].sort_values(key)[key + [f"{c}__b" for c in compared]] \
-            .set_axis(key + compared, axis=1).to_csv(os.path.join(opt.export_dir, "added.csv"), index=False)
-        J[J["_merge"] == "left_only"].sort_values(key)[key + [f"{c}__a" for c in compared]] \
-            .set_axis(key + compared, axis=1).to_csv(os.path.join(opt.export_dir, "removed.csv"), index=False)
-        chg = [r for r in matched[mcols].itertuples(index=False, name=None)
-               if any(differs(val(r[nk + i]), val(r[nk + nc + i])) for i in range(nc))]
-        both = key + [x for c in compared for x in (f"{c} (A)", f"{c} (B)")]
-        pd.DataFrame([list(r[:nk]) + [x for i in range(nc) for x in (r[nk + i], r[nk + nc + i])] for r in chg],
-                     columns=both).sort_values(key).to_csv(os.path.join(opt.export_dir, "changed.csv"), index=False)
-    return {
-        "meta": {"key": key, "compared": compared, "only_in_a": only_a, "only_in_b": only_b,
-                 "a_cols": a_ncols, "b_cols": b_ncols},
-        "counts": counts,
-        "columns": columns,
-        "changed": {"cols": key, "rows": changed_rows, "truncated": n_changed > opt.max_rows},
-        "added": side("right_only", "__b"), "removed": side("left_only", "__a"),
-        "dup_a": dups["a"], "dup_b": dups["b"],
-    }
-
-
-def _nan_to_none(rows):
-    return [[None if (isinstance(v, float) and v != v) else v for v in r] for r in rows]

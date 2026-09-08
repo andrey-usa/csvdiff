@@ -26,6 +26,12 @@ jobs:
         go: ["1.24"]
     steps:
       - uses: actions/checkout@v4
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
 
       - uses: actions/setup-go@v5
         with:
@@ -81,6 +87,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned so every workflow here runs the same interpreter; the runner's
+      # own python3 drifts with the image. Keep this in step with the others:
+      #   grep -rn python-version .github/workflows
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"

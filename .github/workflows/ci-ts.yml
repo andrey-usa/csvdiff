@@ -124,12 +124,12 @@ jobs:
           cache-dependency-path: ts/package-lock.json
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
       - run: npm ci && npm run build
       - name: Install the Python implementation
         working-directory: .
-        run: pip install "duckdb>=1.0" && pip install -e . --no-deps
+        run: pip install -e .
       - name: Same data, both implementations, identical counts and column stats
         working-directory: .
         run: |

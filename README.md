@@ -1,16 +1,73 @@
 # csvdiff
 
-Compare two CSV files on a composite key and get a self-contained HTML report.
-Key columns, compared columns and normalisation rules are parameters, so the same
+Compare two tables on a composite key and get a self-contained HTML report. Key
+columns, compared columns and normalisation rules are parameters, so the same
 tool serves every recurring comparison.
 
-The same tool exists in five languages to one result contract, plus three byte-level
-parity ports. That is what makes the benchmark section below a like-for-like
-comparison rather than a collection of anecdotes.
+The same tool exists in five languages to one result contract, plus three
+byte-level parity ports. That is what makes the benchmark sections below a
+like-for-like comparison rather than a collection of anecdotes.
 
-**Jump to:** [Using it](#using-it) · [Which engine at which size](#which-engine-at-which-size) ·
-[Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) · [Formats](#input-formats-is-csv-the-problem) · [Techniques](#techniques) · [Ports](#ports) ·
+**Jump to:** [Using it](#using-it) · [Four formats, one engine](#four-formats-one-engine) ·
+[Which engine at which size](#which-engine-at-which-size) ·
+[Benchmarks](#benchmarks) · [Scaling to 50M](#how-the-fastest-build-scales) ·
+[Formats](#input-formats-is-csv-the-problem) · [Techniques](#techniques) · [Ports](#ports) ·
 [Reproducing](#reproducing-the-numbers) · [Open questions](#open-questions)
+
+---
+
+# Four formats, one engine
+
+The C++ port reads **CSV, newline-delimited JSON and Parquet natively** — no
+library between it and the bytes — and the generator *writes* all three from one
+field-by-field recipe. So a format comparison here involves nothing but this
+project: no third-party reader, no conversion step, no intermediate CSV.
+
+Measured on a stock 4-cpu GitHub Actions runner by
+[`.github/workflows/benchmark-formats.yml`](.github/workflows/benchmark-formats.yml),
+which runs on every push that touches `cpp/`. Every row is the same comparison:
+first-occurrence-wins on `(account_id, txn_id)`, inner join, per-cell diff over
+seventeen columns.
+
+### 10,000,000 rows × 20 columns
+
+| Input | Size | Generate | **Compare** | Rows/s | CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| CSV | 3,509 MB | 9.07s | **10.51s** | 951,238/s | 31.4s | 4,389 MB |
+| JSON (ndjson) | 8,488 MB | 31.83s | **14.44s** | 692,409/s | 42.1s | 9,363 MB |
+| Parquet + snappy | 992 MB | 6.37s | **2.81s** | 3,555,956/s | 9.1s | 4,006 MB |
+| **Parquet uncompressed** | 2,074 MB | **4.87s** | **2.35s** | **4,250,766/s** | 7.2s | **3,468 MB** |
+
+### 100,000 rows × 20 columns
+
+| Input | Size | Generate | **Compare** | Rows/s | CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| CSV | 35 MB | 0.05s | **0.24s** | 424,367/s | 0.6s | 58 MB |
+| JSON (ndjson) | 85 MB | 0.10s | **0.29s** | 341,462/s | 0.8s | 108 MB |
+| Parquet + snappy | 10 MB | 0.16s | **0.08s** | 1,298,720/s | 0.2s | 47 MB |
+| **Parquet uncompressed** | 21 MB | 0.17s | **0.04s** | **2,260,539/s** | 0.1s | 47 MB |
+
+**All four formats return identical counts** — at 10M: matched 9,990,000,
+changed 599,320, added 10,000, removed 10,000, duplicate rows 2,000 in A and
+1,000 in B. That is the workflow's correctness gate, not a footnote: four
+readers that disagree about how many rows changed is a bug, so the run fails and
+names the format that disagreed.
+
+Three things worth taking from these tables.
+
+**Parquet is 4.5x CSV and 6.1x JSON at ten million rows**, on a fifth of the
+bytes and 21% less memory. Not because the parser got faster — because the
+comparison stops being a comparison of strings. See
+[Reading Parquet natively](#reading-parquet-natively).
+
+**Writing Parquet is quicker than writing CSV.** 4.87s against 9.07s, because
+there are 1.4 GB fewer bytes to put on disk and the encoding is cheaper than
+formatting text. The route this project used to take — write the CSV, then have
+DuckDB convert it — cost 20.9s + 67.9s on a comparable machine.
+
+**JSON costs what its bytes cost.** 2.4x the size of the CSV and 1.4x the
+comparison time, with every field carrying its name. It is worth having because
+it is the input people actually receive, not because it is fast.
 
 ---
 
@@ -23,8 +80,9 @@ pip install duckdb            # engine
 pip install -e .              # gives you the `csvdiff` command
 ```
 
-Python 3.11+. Everything except the engine is standard library. If DuckDB is not
-installed the tool falls back to pandas (same results, in-memory only).
+Python 3.14. Everything except the engine is standard library, and DuckDB is the
+only engine this implementation carries — the alternatives are the byte-level
+[ports](#ports), held to the same result contract.
 
 ## Launch modes
 
@@ -81,7 +139,7 @@ per recurring comparison so nobody retypes them.
 | `--delimiter`, `--encoding` | override auto-detection |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--engine` | pick an engine explicitly — see [Which engine at which size](#which-engine-at-which-size) |
+| `--engine` | `duckdb`, which is the only one this implementation carries; the alternatives are the [ports](#ports) |
 | `--threads`, `--memory-limit` | DuckDB resource limits |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
@@ -99,8 +157,8 @@ no option to allow it; it refuses such a file and says which engines will take i
 Both files are read as text (no type-inference surprises such as `1.0` vs `1`), hash-joined on the
 key in parallel, and spilled to disk when they don't fit in RAM. Multi-GB files compare in seconds to
 low minutes on a laptop, with one wheel as the only dependency. Polars is comparably fast in memory
-but not out-of-core; pandas is 5-20x slower and memory-bound. The [benchmarks](#benchmarks) below put
-numbers on all three, and on the bespoke engines that beat them.
+but not out-of-core. The [benchmarks](#benchmarks) below put numbers on both, and on the bespoke
+engines that beat them.
 
 ## The report
 
@@ -126,7 +184,7 @@ always exact regardless of the cap.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | push, PR | pytest on Python 3.11/3.12/3.13, a 10k smoke comparison on both engines, a check that the report has no external references, and a job asserting DuckDB and pandas return identical counts on 200k rows |
+| `ci.yml` | push, PR | pytest, a 10k smoke comparison, and a check that the report has no external references |
 | `parity.yml` | push, PR | every implementation must return identical counts and column stats, and all five data generators must emit byte-identical files |
 | `benchmark.yml` | manual, weekly cron | generates 10k / 1M / 10M rows × 20 columns, compares, enforces time and memory budgets, uploads reports, writes a results table to the job summary |
 | `compare.yml` | manual, or `workflow_call` | compares two files given as repo paths or URLs and publishes the report as an artifact |
@@ -168,9 +226,8 @@ file with a sparse payload, and SQL identifiers go through `_q()` / `_lit()` rat
 
 | Slash command | What it does |
 |---|---|
-| `/bench [10k\|1m\|10m] [duckdb\|pandas]` | runs a scale and reports time, throughput, peak RSS against budget |
+| `/bench [10k\|1m\|10m]` | runs a scale and reports time, throughput, peak RSS against budget |
 | `/compare <a> <b> <key> [flags]` | runs a comparison and summarises the discrepancies, flagging setup mistakes such as a non-unique key |
-| `/engines-agree` | checks DuckDB and pandas still produce identical counts on 200k rows |
 | `/ci-fix` | pulls the latest failing run's logs, reproduces locally, fixes the cause |
 
 `.claude/settings.json` pre-approves the test, benchmark and `gh run` commands, asks before
@@ -181,6 +238,17 @@ settings. `.claude/skills/csvdiff-report/` covers changes to the HTML report spe
 
 # Which engine at which size
 
+First, the format, because it is worth more than the engine choice below it:
+
+| Your input arrives as | Do this | Why |
+|---|---|---|
+| Parquet | compare it as Parquet, with the [`cpp/`](cpp/) port | 4.5x CSV at ten million rows, on a fifth of the bytes — [why](#reading-parquet-natively) |
+| CSV, compared once | compare the CSV | converting costs more than the one comparison saves |
+| CSV, compared again and again | convert once, then compare Parquet | the conversion pays back from about the fifth comparison |
+| newline-delimited JSON | compare it as JSON, or as one side against a CSV | the two formats meet at the join; it is 1.4x slower than CSV and 2.4x the bytes |
+
+Then the engine:
+
 | Your input | Use | Why |
 |---|---|---|
 | Up to ~100k rows | anything | every engine finishes well under a second; startup cost dominates, so pick on convenience |
@@ -188,7 +256,8 @@ settings. `.claude/skills/csvdiff-report/` covers changes to the HTML report spe
 | 2M – 20M rows, memory to spare | `turbo` | byte-level scanning; the only class that stays fast *and* still finishes at 10M+ |
 | 2M+ and you can build C++ | the [`cpp/`](cpp/) port, `--threads 4` | same design across every core: 2.5x the JVM on the same box and 1.5 GB lighter — but counts and JSON only, no HTML report |
 | 2M+ and you want the report too | Rust `turbo` | the same threading as the C++ port, and the only build here that produces the HTML report at that speed |
-| Your input is JSON or Parquet | Rust `turbo` or the [`zig/`](zig/) port | the only engines here that read either natively; either side of the comparison may be in any of the three formats |
+| Your input is JSON or Parquet | any of the three native ports | all three read CSV, newline-delimited JSON and Parquet natively; either side of the comparison may be in any of the three formats |
+| A Parquet pair | any of the three native ports | a Parquet-to-Parquet comparison never reconstructs a row: it joins on the key columns and then compares whole columns as integers |
 | 2M+ and you prefer Zig | the [`zig/`](zig/) port | same design and threading, lowest memory of anything here — counts and JSON only |
 | Any size, memory constrained | `sortmerge` | spills to disk — 3.68 GB of CSV compared in 208 MB in the Rust port |
 | Larger than tested, or unknown | `sortmerge` | the only engine whose memory does not grow with the input |
@@ -258,7 +327,6 @@ Input sizes: 10k = 3.7 MB · 1M = 368 MB · 10M = 3.68 GB · 20M = 7.36 GB.
 | **Other libraries** | | | |
 | Java `tablesaw` | 1.31s · 183 MB | 8.53s · 2,054 MB | ✗ heap OOM at 64.3s |
 | TypeScript `arquero` | 0.34s · 152 MB | 17.22s · 3,487 MB | ✗ V8 512 MB string cap at 0.5s |
-| Python `pandas` | 0.82s · 100 MB | 52.89s · 2,748 MB | ✗ runner killed (OOM) |
 
 **Nine of nineteen engines do not finish at 10M.** That is where the design decisions show, and it is
 why the recommendation table turns on memory rather than speed.
@@ -515,6 +583,67 @@ They are, in waves: N threads fill their own buffers, the buffers are written in
 is bounded by the wave rather than the file. At 17.7s against `dd`'s 16.6s there is nothing left to
 win — generation is now pure I/O.
 
+## Set D — ten million rows on a hosted runner
+
+Sets A to C were run before three changes that moved every number in them: the
+key hash, the field store, and the join's second hash. This set is the state of
+the three native ports afterwards, and it runs on `ubuntu-latest` through
+[`bench-10m.yml`](.github/workflows/bench-10m.yml) rather than on a container
+here — a hosted runner is the one host anyone reading this can rent for nothing.
+
+Every payload is written by this project's own generator, so the CSV and the
+Parquet hold the same values spelled the same way; Parquet is uncompressed,
+because this is a question about readers and a codec in the middle answers a
+different one. Ten million rows, best of two, four threads, counts identical in
+every row of the table.
+
+| Build | Input | Compare | Rows/s | Peak RSS | Above the input |
+|---|---|---:|---:|---:|---:|
+| C++ | CSV, 3,509 MB | **8.98s** | 1,113,348 | 4,385 MB | 876 MB |
+| Zig | CSV | 10.38s | 963,198 | 4,391 MB | 882 MB |
+| Rust | CSV | 10.39s | 963,012 | 4,443 MB | 935 MB |
+| Rust, engine only | CSV | 9.17s | 1,090,193 | 4,428 MB | 920 MB |
+| C++ AVX2 | CSV | **8.33s** | 1,201,185 | 4,390 MB | 881 MB |
+| Zig AVX2 | CSV | 9.64s | 1,037,543 | 4,432 MB | 923 MB |
+| Rust | Parquet, 1,535 MB | 8.33s | 1,200,126 | 8,415 MB | 6,880 MB |
+| Zig | Parquet | 9.13s | 1,095,262 | 8,278 MB | 6,743 MB |
+| Rust, engine only | Parquet | 7.12s | 1,404,186 | 8,440 MB | 6,906 MB |
+| Zig AVX2 | Parquet | 9.08s | 1,101,023 | 8,275 MB | 6,740 MB |
+
+Every row returns `matched 9,990,000 · changed 599,320 · added 10,000 ·
+removed 10,000`, and the harness refuses to print the table if any row disagrees.
+[The run.](https://github.com/andrey-usa/csvdiff/actions/runs/34188270810)
+
+**Rust and Zig now match the C++ port**, which is what this branch set out to
+find out. The three are within 16% of each other on CSV, having started three
+times apart.
+
+**Two rows are not comparing like with like, and say so.** The Rust port renders
+the HTML report; the C++ and Zig ports produce counts and JSON only. `Rust,
+engine only` is the same comparison with `--max-rows 1`, which is the row to read
+against the other two ports. The difference between its rows — about a second at
+this size — is the report: fifty thousand changed rows decoded into strings,
+sorted, gzipped and embedded.
+
+**The Parquet rows are superseded and kept for the comparison they lose.** They
+measure a reader that decodes the pages into *rows* and hands them to the same
+byte-level engine the CSV rows use — the honest way to read Parquet if you want
+one reader for `a.parquet` against `b.csv`, and the wrong way if both sides are
+Parquet. While this branch was measuring it, `main` landed a columnar path that
+never reconstructs a row: it joins on the key columns and then compares whole
+columns as `int32` ids. That is 2.35s and 3.5 GB on the same rows against 8.33s
+and 8.4 GB here — [the design is described
+below](#the-design-never-reconstruct-a-row) — so it is now the Parquet path in
+all three ports, and the row-materialising reader survives only as the fallback
+for the mixed case it was the only answer to. **The next run of this table
+re-measures those rows**; they are left in place rather than deleted because
+"the fastest input and the largest memory" was a real finding about a real
+design, and the reason it stopped being true is the interesting part.
+
+**The vector scanner beats SWAR by about 7%**, in both ports, which reverses what
+this repository said before the key hash was fixed. That story is under
+[SWAR, and how it compares to real SIMD](#swar-and-how-it-compares-to-real-simd).
+
 ## Set C — against the field
 
 Sets A and B compare this project with itself. That says which language and which technique is
@@ -529,8 +658,7 @@ run through the tools people actually reach for.
 | **DuckDB CLI** | a full outer join written by hand in SQL | yes |
 | **clickhouse-local** | the same join, on the fastest CSV reader in the survey | yes |
 | **daff** | the tabular-diff library behind `git daff`; alignment-based, `--id` pins a key | yes |
-| **datacompy** (Capital One) | the reconciliation library, on pandas or Polars | yes |
-| **pandas** | the outer merge people write before finding a library | yes |
+| **datacompy** (Capital One) | the reconciliation library, on Polars | yes |
 | **csv-diff** (Simon Willison) | small, popular, row dicts | **no** — one key column, no column-ignore |
 | **sort(1) + join(1)** | the shell pipeline | **no** — no idea what CSV quoting is |
 
@@ -547,9 +675,7 @@ transferring. **qsv** has no keyed diff subcommand of this shape.
 | clickhouse-local (SQL) | 0.19s · 191 MB | **2.23s** · 1,417 MB | 152.57s · 8,345 MB | +7 changed, +1 removed |
 | clickhouse-local (spilling join) | 0.22s · 197 MB | 6.71s · 1,954 MB | 507.21s · 6,711 MB | +7 changed, +1 removed |
 | daff (JS) | 0.48s · 121 MB | 46.87s · 4,134 MB | ✗ V8 512 MB string cap | dup keys only |
-| datacompy (pandas) | 1.06s · 188 MB | 38.70s · 2,274 MB | ✗ out of memory | +49 added, +99 removed |
-| datacompy (polars) | 0.79s · 178 MB | 5.64s · 2,685 MB | ✗ out of memory | +49 added, +99 removed |
-| pandas (hand-written merge) | 0.89s · 143 MB | 28.21s · 1,825 MB | ✗ out of memory | +7 changed, +1 removed |
+| datacompy (Polars) | 0.79s · 178 MB | 5.64s · 2,685 MB | ✗ out of memory | +49 added, +99 removed |
 | csv-diff (Python) | 0.34s · 67 MB | 25.26s · 3,420 MB | ✗ out of memory | agrees |
 | sort(1) + join(1) | 0.11s · **4 MB** | 10.58s · 251 MB | 118.47s · 2,483 MB | +7 changed, +1 removed |
 
@@ -562,22 +688,16 @@ Times alone hide what each tool gives you for them:
 | DuckDB / ClickHouse SQL | no — counts only | no | no |
 | daff | yes | no — a repeat reads as an insert | diff table |
 | datacompy | yes, plus per-column summary | no — pairs duplicates positionally | text summary |
-| pandas merge | counts unless you write more | no — duplicates multiply | no |
 | csv-diff | yes | no | no |
 | sort + join | no — counts only | no | no |
 
-**At ten million rows most of the field cannot run at all.** Six of the ten external entries fail on
-3.68 GB in a 12 GB budget. The interesting thing is not that they are slow — it is that "fastest"
+**At ten million rows most of the field cannot run at all.** Four of the eight external entries fail
+on 3.68 GB in a 12 GB budget. The interesting thing is not that they are slow — it is that "fastest"
 stops being the question.
 
 **daff's ceiling is not memory.** It reads the file with `readFileSync`, and V8 refuses to build a
 string longer than 512 MB. No amount of RAM moves that limit, so daff cannot open a file this size on
 any machine. Every other failure above is genuine memory exhaustion; this one is a wall.
-
-**The backend decides a dataframe's speed, not the library.** At 1M datacompy takes 38.70s on pandas
-and 5.64s on Polars — same library, same call, 6.9x apart. That gap is wider than any language
-difference in this whole project. If a dataframe reconciliation is slow, the first question is which
-backend it is on.
 
 **The dedicated tool is faster and hungrier.** csvdiff (Go) finishes 1M in 3.32s against our 6.26s
 and uses 1,519 MB against our 664 MB — while storing strictly less: two hashes per row, which is why
@@ -708,7 +828,67 @@ the compare to one column, which leaves a ~120-byte tail to skip per row, still 
 This is the same conclusion the JVM reached by a completely different route, and the agreement is
 worth more than either result alone: real SIMD through the Vector API lost to SWAR by 19% at 20M, and
 real SIMD through AVX2/AVX-512 intrinsics loses to SWAR by 4-25% in C++. **For CSV of this shape the
-scan is not the place to spend a vector register.** The code kept is the SWAR scanner.
+scan is not the place to spend a vector register.**
+
+### That conclusion did not survive fixing the hash
+
+It was true of the engine that measured it, and the engine changed. The key hash
+was FNV-1a a byte at a time over a twenty-six-byte key, computed four times a row
+— both files, indexed then probed — which is about a billion dependent
+multiply-xor steps at ten million rows. A hash is internal, so the only property
+it owes anyone is that the index build and the join probe agree about it; taking
+eight bytes at a time keeps that. Two of those four hashes then went away
+entirely, because the sweep had already stored the answer the join was
+recomputing. At a million rows on one container, best of three: C++ 1.76s → 0.94s,
+Zig 1.91s → 0.89s, Rust 3.22s → 1.58s.
+
+**With the hash no longer the bottleneck, the scan is a larger share of what is
+left, and the vector register wins.** At ten million rows on a hosted runner —
+one binary per scanner, so nothing is measuring a branch:
+
+| Build | Scanner | 10M CSV | Rows/s |
+|---|---|---:|---:|
+| C++ | AVX2, 32 bytes | **8.33s** | 1,201,185 |
+| C++ | SWAR, 8 bytes | 8.98s | 1,113,659 |
+| Zig | AVX2, 32 bytes | **9.64s** | 1,037,543 |
+| Zig | SWAR, 8 bytes | 10.38s | 963,198 |
+
+**7% either way, in two implementations that share no code.** That the two agree
+on the size of it is worth more than either number: the same change, made
+independently in C++ intrinsics and in Zig's `@Vector`, moved the same workload
+by the same amount.
+
+What this does *not* say is that the textbook was right all along. The earlier
+table is not wrong — SIMD really did lose on that engine, and it lost because
+fields average 9.2 bytes and a 32-byte load answers a 9-byte question. What
+changed is everything else: with a billion multiply-xor steps removed, the same
+wasted loads now sit on the critical path where they used to be hidden behind
+the hash. **A scanner benchmark measures the engine around it**, which is the
+part of this that generalises.
+
+AVX-512 is unmeasured here rather than lost: the runners this ran on do not have
+it, so the 64-byte builds were skipped by name. `make scanners` and
+`zig build -Dscan=64 -Dcpu=native` build them for a machine that does.
+
+**There are now two scanners, and the same question has to be asked of both.**
+The columnar Parquet path has no delimiters to find, but it produces a mismatch
+mask — one byte per compared cell — and reads it with the identical idiom. The
+two workloads look nothing alike from the scanner's point of view:
+
+| | CSV: find a delimiter | Parquet: find a changed cell |
+|---|---|---|
+| Hit rate | a field every 9.2 bytes | about 0.7% of cells |
+| An 8-byte step is empty | never | 94.6% of the time |
+| A 32-byte step is empty | never | 80% of the time |
+| What a wider register saves | loads *and* branches | branches only — the mask is already in L1 |
+| What it wastes | reading past the delimiter | nothing; the whole block is read either way |
+
+On CSV a wider register reads memory it does not need, which is what the first
+table above measured. On the mismatch mask there is no such waste — every byte
+is examined either way — so the wider register is pure branch reduction, and the
+prediction is that it should win by more there than it does on CSV. The scanner
+builds are run against both formats for that reason; `bench_formats_ports.py
+--matrix` prints the rows side by side.
 
 **SWAR's other advantages are structural.** It needs no incubator module, so `turbo` is the fastest
 engine that runs on a stock `java -jar` with no flags, and it uses slightly less memory because no
@@ -807,6 +987,18 @@ DuckDB is the constant because it reads all of them natively and spills rather
 than dying. Polars was tried first and was killed by the OOM killer at ten
 million rows on CSV alone, twice.
 
+**This section is the historical one**, kept because the reasoning in it is
+instructive and because one of its conclusions turned out to be wrong. The
+current answer, measured on our own reader and our own generator with no third
+party involved, is at the top: [Four formats, one
+engine](#four-formats-one-engine).
+
+What follows is what the question looked like when the only way to read Parquet
+here was to ask DuckDB. The C++ port now reads all three natively —
+[JSON](#reading-json-natively) and [Parquet](#reading-parquet-natively) — and the
+Parquet answer turned out to be the opposite of what the table below predicts for
+us, for reasons a format table with a third-party engine in it cannot see.
+
 | Engine and input | Size | Convert | **Compare** | Peak RSS |
 |---|---:|---:|---:|---:|
 | DuckDB, CSV | 3,509 MB | — | 54.78s | 12,372 MB |
@@ -847,9 +1039,9 @@ file in the table.
 
 ### Reading JSON natively
 
-The C++ port reads newline-delimited JSON as well as CSV, and the two meet at the
-join — a CSV export compares against the JSON the same pipeline emits, with the
-key order on each side free to differ.
+All three native ports read newline-delimited JSON as well as CSV, and the two
+meet at the join — a CSV export compares against the JSON the same pipeline
+emits, with the key order on each side free to differ.
 
 | Input | Size | Compare | Rows/s | Peak RSS |
 |---|---:|---:|---:|---:|
@@ -862,6 +1054,10 @@ DuckDB on the same ndjson — 17.08s, 11,260 MB — this is level on time and 17
 under on memory, where on CSV it is 5.8x faster. It is worth having for the input
 people actually receive, not for speed.
 
+(That table is the C++ port before the hash changes; the shape of the answer is
+what matters and it has not moved — JSON is 2.4x the bytes and every field
+carries its name.)
+
 It fits because a JSON value is a contiguous run of bytes, so a field stays an
 offset and a length into the mapping exactly as it does for CSV. The one new rule
 is the escape: CSV doubles a quote, JSON puts a backslash in front of one. Both go
@@ -870,49 +1066,287 @@ so hashing and equality cannot come to different conclusions about the same valu
 `\uXXXX` and surrogate pairs are decoded rather than compared as written, because
 a writer may emit a character either way and both spellings have to compare equal.
 
-### Why there is no native Parquet
+### Reading Parquet natively
 
-Everything this engine needs from a file is *given a row start, fill the fields,
-return the next row start*. Parquet is columnar and has no row start: values for
-one row live in twenty separate column chunks. Reconstructing row N for the join
-means keeping an offset per row per column, and at ten million rows that is the
-whole argument:
+**This section used to argue that a Parquet reader was the wrong thing to build.
+It was wrong, and the way it was wrong is worth keeping.**
 
-| | At 10M rows |
-|---|---:|
-| A field offset per row per compared column | **1.42 GB** |
-| Dictionary indices instead, where a column is dictionary-encoded | 0.71 GB |
-| *The entire index today* | *0.98 GB* |
-| Mapped Parquet input, both files, uncompressed | 2.04 GB |
-| Mapped CSV input, both files | 3.43 GB |
+The argument had two premises. The first: reconstructing row N for the join means
+holding a field offset per row per column, 1.42 GB at ten million rows, so
+Parquet could end up costing *more* memory than CSV. The second: parsing is only
+15% of a run in this engine, so a format that made parsing free would save 15%.
 
-Best case — every column dictionary-encoded — that is 2.04 + 0.71 = **2.75 GB
-against today's 4.41 GB**, so about a third less memory, for a Thrift metadata
-parser, a page decoder, snappy, and a join that no longer re-reads rows from the
-mapping. Worst case it is *more* memory than CSV.
+The second premise was true and irrelevant. The first was true only of a design
+that reconstructs rows — and the whole point of a columnar format is that you
+don't have to.
 
-Set against a 15% ceiling on the time it could save, it is the wrong next thing to
-build. Sharding the index insert is worth more and is a day's work rather than a
-fortnight's. That is why this table exists instead of a Parquet reader.
+| | Predicted | Measured |
+|---|---:|---:|
+| Peak RSS, Parquet uncompressed | 2.75 GB | **3.41 GB** |
+| Peak RSS, our CSV path | 4.41 GB | 4.37 GB |
+| Time saved | ≤15% | **80%** |
 
-**And for our engine none of the formats would help much.** Timing the phases of a
-ten-million-row comparison in the C++ port:
+**What the reader refuses, it refuses by name.** Nested or repeated schemas,
+`BYTE_STREAM_SPLIT`, LZO and Brotli produce an error naming the feature rather
+than a wrong answer. The encodings and codecs it does read are pinned by fixtures
+pyarrow wrote — plain and dictionary, five codecs, version-2 delta pages, several
+row groups — because a reader tested only against files its own writer produced
+tests nothing.
 
-| Phase | Wall |
-|---|---:|
-| Parse and hash both files | 1.86s |
-| Insert into the index (single-threaded) | 3.09s |
-| The join | ~7s |
-| **Total** | **12.02s** |
+**One Parquet file against a text one is the case the columnar path cannot
+take**, because there is no column to compare a byte stream against. The Rust and
+Zig ports answer it anyway, by decoding the pages into rows and handing them to
+the byte-level engine — `rust/src/engine/turbo/parquet.rs` and `zig/src/pqread.zig`.
+That costs exactly what the columnar path exists to avoid, which is why it is the
+fallback and not the path: a Parquet pair never goes near it.
 
-Parsing is **15%** of the run, so a format that made it free would save 15% — where
-the same change is worth 3.6x to DuckDB. That difference is the whole point: a
-byte-level CSV parser is already close to the cost of not parsing at all, so the
-sequential insert, which costs more than all the parsing, is the thing worth
-attacking. Adding a Parquet reader would buy less than sharding that would.
 
-The one real argument for Parquet here is memory rather than speed: at 2,088 MB
-against 3,509 MB of CSV, the mapped input shrinks by 40%.
+The table below is a different measurement from the [one at the
+top](#four-formats-one-engine): it exists to place us against DuckDB and polars
+on the same files, where that one exists to place the formats against each other
+with nothing but this project involved. Measured on one machine in one sitting,
+`python scripts/bench_parquet.py --polars`. Every row that finished returns
+identical counts — matched 9,990,000,
+changed 599,320, added 10,000, removed 10,000 — so these are eight ways of doing
+exactly the same work.
+
+| Engine and input | Size | Convert | **Compare** | CPU | Peak RSS |
+|---|---:|---:|---:|---:|---:|
+| ours (C++), CSV | 3,509 MB | — | 23.78s | 63.7s | 4,370 MB |
+| DuckDB, CSV | 3,509 MB | — | 86.25s | 171.6s | 11,708 MB |
+| polars, CSV | 3,509 MB | — | *out of memory* | 91.8s | 5,670 MB |
+| ours (C++), Parquet + snappy | 1,043 MB | 67.9s | 6.85s | 19.0s | 3,840 MB |
+| DuckDB, Parquet + snappy | 1,043 MB | 67.9s | 25.73s | 96.3s | 11,707 MB |
+| polars, Parquet + snappy | 1,043 MB | 67.9s | 129.83s | 479.7s | 4,238 MB |
+| **ours (C++), Parquet uncompressed** | 2,088 MB | 83.0s | **4.83s** | **14.1s** | **3,412 MB** |
+| DuckDB, Parquet uncompressed | 2,088 MB | 83.0s | 22.71s | 84.8s | 11,985 MB |
+| polars, Parquet uncompressed | 2,088 MB | 83.0s | 121.31s | 452.5s | 4,328 MB |
+
+> This table is a fresh sitting on a slower machine than the tables above it —
+> our CSV path reads 23.78s here and 12.34s there. Compare rows *within* the
+> table, not across tables. polars is capped at 14 GB of address space on a 15 GB
+> machine, so an out-of-memory is a reported failure rather than an OOM kill.
+
+**4.9x our own CSV path, 4.7x DuckDB on the same file, 25x polars, and a third of
+DuckDB's memory.** The format is worth 4.9x to us and 3.8x to DuckDB, which
+inverts the earlier finding — when the parser was the only thing the format could
+improve, CSV was 15% of the run; when the format changes the *shape* of the
+comparison, it is most of it.
+
+**Converting still costs more than it saves, once.** 68-83s to write the Parquet
+against 17-19s saved per comparison. It pays from the fifth comparison of the
+same file onward — which is the recurring-reconciliation case, but not the
+one-off one.
+
+But that is the cost of *converting*, and for benchmark data there is nothing to
+convert from. The generator writes Parquet column by column from the same recipe
+it writes CSV from, which makes the CSV in the middle unnecessary:
+
+| Making a 10M pair | Time | Needs |
+|---|---:|---|
+| CSV, natively | 20.9s | — |
+| …then DuckDB converts it to snappy Parquet | +67.9s | the 3.5 GB of CSV |
+| …then DuckDB converts it to uncompressed Parquet | +83.0s | the 3.5 GB of CSV |
+| **Parquet + snappy, natively** | **12.9s** | — |
+| **Parquet uncompressed, natively** | **15.2s** | — |
+
+`cpp/build/gen-data --rows 10m --format parquet --compression snappy`. **6.9x
+quicker than the route through DuckDB, and it never writes the CSV at all.** The
+files it makes are slightly smaller than DuckDB's (520 MB against 547 MB at
+snappy), DuckDB reads them to the same digest as the CSV, and comparing our file
+against DuckDB's file of the same ten million rows reports zero differences.
+
+It also gives the tests something they did not have: the Parquet checks in
+`cpp/test.sh` used to be skipped wherever DuckDB was not installed, because
+DuckDB was the only way to produce a Parquet file. Six of them now run anywhere
+the port builds, including the case where a column's dictionary gives up partway
+— `--dict-limit 175 --row-group-size 300` makes three of the twenty columns come
+out mixed. The two DuckDB checks that remain are the ones only a foreign writer
+can give: that DuckDB reads what we wrote, and that our file and DuckDB's file of
+the same rows compare as identical.
+
+#### What polars had to be rewritten into
+
+The polars rows come with an asterisk, and it is the most interesting result in
+the table. Written the way anyone would write it — join the two frames, compare
+every compared cell, sum — **polars cannot finish this at ten million rows on
+either Parquet form**, and no amount of pushing helps: streaming engine, threads
+turned down to two, a cap just under the whole machine. It dies at 7-11 GB. On
+CSV it was killed by the OOM killer twice before any of this, which is why DuckDB
+is the constant in the format table above.
+
+Taking it apart says exactly where:
+
+| polars, 10M, Parquet + snappy | Wall | Peak RSS | |
+|---|---:|---:|---|
+| First-occurrence-wins on the key | 1.79s | 1,584 MB | fine |
+| Inner join, count the rows | 2.74s | 2,560 MB | fine |
+| …and compare 17 columns per cell | — | 7,091 MB | **out of memory** |
+
+The join is not the problem and the dedup is not the problem. The per-cell diff
+is — which is the one thing this tool exists to do.
+
+What polars *can* finish is the columnar shape: dedup, join and diff **one column
+at a time**, projecting only the keys and that column, then union the keys of the
+rows that differed. Peak drops to 4.2 GB and the answer is exactly right. That is
+the same strategy this port's Parquet path uses — so the table is measuring
+polars doing our design by hand, and it is still 19-25x slower, at 24-32x the CPU,
+because each pass re-reads the file.
+
+On CSV even that is not enough: forty passes over a 1.8 GB text file, each
+re-parsing and re-deduplicating it, runs out of memory too. The polars CSV row in
+the table is the columnar version failing, not the naive one.
+
+Which is also why polars is the one engine here that is *slower* on uncompressed
+Parquet than on snappy: forty passes over twice the bytes costs more than
+decompressing them once. We read each column exactly once, so for us the ranking
+goes the other way.
+
+#### The design: never reconstruct a row
+
+Four steps, and no step ever holds more than a few columns:
+
+1. **Read only the key columns.** Two columns, both files, held for the whole run.
+2. **Join on them once**, producing a list of matched `(a_row, b_row)` pairs —
+   40 MB per side at ten million rows.
+3. **Walk the compared columns one at a time**, each read, diffed, and released
+   before the next is asked for. Four workers, so four columns are in flight;
+   that is a memory choice, not a parallelism one.
+4. **Never build a row.** A changed row is assembled at the end, for the fifty
+   thousand rows that reach the report, out of what each column pass kept.
+
+The last one is what the earlier argument missed. A row list of 1.42 GB is only
+needed if the join has to see whole rows. It doesn't: it needs the key columns,
+and everything after it is per-column.
+
+#### The trick: two dictionaries, one id space
+
+Parquet stores a low-cardinality column as small integers indexing a table of its
+distinct values. Two files' dictionaries are unrelated — A's `currency` #3 is not
+B's #3 — so the obvious thing is to expand both back to strings and compare
+those, which throws the encoding away.
+
+Instead both dictionaries are interned into **one shared id space**, once per
+column. That is a few thousand string comparisons for a column of ten million
+rows. After it, two cells are equal exactly when their ids are, and the diff is:
+
+```c
+for (i = 0; i < m; ++i) xa[i] = a_id[a_index[pair_a[base + i]]];
+for (i = 0; i < m; ++i) xb[i] = b_id[b_index[pair_b[base + i]]];
+for (i = 0; i < m; ++i) neq[i] = xa[i] != xb[i];   // one packed compare per 8
+```
+
+Two gathers through a table small enough to sit in L2, then an `int32` compare
+the compiler turns into `vpcmpeqd`. A null is id `-1` on both sides, so
+"both absent" and "one absent" fall out of the same comparison with no branch.
+
+The mismatch mask is then read **eight bytes at a time**, the same SWAR idiom
+[the CSV scanner uses to find a delimiter](#swar-and-how-it-compares-to-real-simd)
+— here applied to finding a changed cell. About 0.7% of cells differ per column,
+so seven bytes in eight of that mask are zero and skipping them wholesale is most
+of the loop:
+
+```c
+std::memcpy(&w, neq + i, 8);
+while (w) {
+    unsigned byte = __builtin_ctzll(w) >> 3;
+    hit(base + i + byte);
+    w &= ~(0xFFULL << (byte * 8));
+}
+```
+
+A column either side stores plainly falls back to comparing bytes, and so does
+any column under `--tolerance`, where equality is not transitive and cannot be
+given an id.
+
+#### What the measurements moved, in order
+
+Every step below was measured, not assumed. The first version was **12.6s** and
+barely beat CSV; four changes took it to 4.9s, and none of them were in the
+comparison itself:
+
+| Change | 10M, snappy | Why |
+|---|---:|---|
+| First working version | 12.60s | |
+| Parallelise both join directions | 10.85s | B's side was single-threaded and became the tail |
+| Snappy: copy words, append in place | 8.30s | a back-reference was being copied a byte at a time |
+| Pack a slice into one 64-bit word | 7.20s | 8 bytes a value, not 16 — half the memory *and* half the bandwidth |
+| Bulk RLE decode, preallocated arrays | 4.69s | one 64-bit load per dictionary index instead of a refill loop |
+| Hash tag inside the index slot | **4.08s** | a probe that misses is settled by the word it already loaded |
+
+Two of these are the same lesson twice. **Packing a slice** into 40 bits of
+offset, 23 of length and one null bit is exactly what the CSV engine already does
+to a field, for exactly the same reason — and it was worth 15% of the run and
+1.1 GB of memory. **Putting the hash tag in the index slot** rather than in a
+parallel array removes the second cache miss from every failed probe; at ten
+million keys those second misses *were* the join.
+
+The snappy fix is the plainest of all: the decoder was writing back-references
+with `out.push_back(out[from + i])`, one byte at a time. Copying eight bytes at a
+time where the distance allows it, and decompressing straight into the buffer the
+offsets refer to rather than into a scratch string that then gets appended, took
+the whole read phase from 2.24s to 0.68s.
+
+#### The same path in three languages
+
+The columnar design is now in C++, Rust and Zig, and all three return the same
+counts on the same files. One machine, one sitting, ten million rows:
+
+| Port | CSV | Parquet + snappy | Parquet uncompressed | Peak RSS (uncompressed) |
+|---|---:|---:|---:|---:|
+| **C++** | 25.17s | 7.91s | **5.15s** | 3,421 MB |
+| **Rust** | 58.66s | 8.58s | 6.22s | 3,409 MB |
+| **Zig** | 33.82s | 16.47s | 14.20s | 3,417 MB |
+
+**The format is worth more than the language.** Rust's own CSV engine takes
+58.66s on these rows and its Parquet path 6.22s — 9.4x from changing what the
+comparison reads, in one language, with the same rules and the same answer. C++
+gains 4.9x and Zig 2.4x, the difference being how well each port already
+threaded its CSV path.
+
+The three are much closer to each other on Parquet than on CSV, and their peak
+memory is within 12 MB of each other — the design, not the language, is what
+sets both.
+
+Where they still differ is threading, not code. Per core the three are close:
+15.4s, 16.1s and 18.5s of CPU on the uncompressed file. C++ and Rust spread the
+column pass and both directions of the join; Zig spreads only the column pass,
+so its key phases now dominate its run. That is the next thing to do to the Zig
+port, and it is worth about 2x.
+
+#### What it refuses
+
+There is a writer as well as a reader — `cpp/tools/pq_write.{hpp,cpp}`, used by
+the generator — but it is benchmark and test scaffolding, not part of the engine,
+and it writes only the envelope the reader accepts. Everything below is about the
+reader.
+
+The reader implements what this job meets and names the rest rather than guessing:
+`BYTE_ARRAY` columns, PLAIN and dictionary encodings, uncompressed and snappy,
+data page v1. Nested columns, other types, other codecs and page v2 are errors
+that say which. Both files must be Parquet — comparing a column store against a
+byte stream would mean building rows out of one of them, which is the cost this
+path exists to avoid.
+
+One case it does *not* refuse, because DuckDB writes it on any high-cardinality
+string at scale: a column the writer starts as a dictionary and gives up on
+partway. Those columns fold into the plain form as they are read, which copies
+eight-byte handles rather than values.
+
+#### How it is checked
+
+The claim is that this is the *same* comparison, so the test is equality of the
+whole report. `cpp/test.sh` converts the awkward fixture to Parquet — snappy and
+uncompressed, large and tiny row groups — runs both paths, and requires the two
+JSON documents to be identical: counts, per-column statistics, every changed
+cell, every added and removed row, the duplicate sections, with only the file
+names and the timing removed. Nine option combinations, plus nulls against empty
+strings, plus a purpose-built mixed-encoding column, plus the refusal of a
+mixed Parquet/text pair.
+
+At ten million rows the check is the counts themselves: our CSV path, our Parquet
+path and DuckDB on both formats independently agree on matched 9,990,000 and
+changed 599,320.
 
 ## Using less memory than the report says
 
@@ -1043,7 +1477,7 @@ in B. Exactly one key here is duplicated on *both* sides (`ACC-00023757,TXN-0000
 that key the two leftovers cancel. Defensible — but it answers a question the tool never asks the
 user, and it makes the count depend on the order the duplicates appear in.
 
-**Tools that join** — the DuckDB SQL, the ClickHouse SQL, the pandas merge, the shell pipeline —
+**Tools that join** — the DuckDB SQL, the ClickHouse SQL, the shell pipeline —
 multiply them instead. A key twice in A and once in B joins to two rows; the one key twice on both
 sides joins to four. That is 151 extra rows at 1M, and each that happens to be a *changed* row is
 counted again, which is why `changed` lands 7 too high there and 91 too high at 10M. The number is
@@ -1080,11 +1514,11 @@ comparable with a number from another.
 
 | | Directory | Engines | Notes |
 |---|---|---|---|
-| Python | `.` (this) | duckdb, pandas | the reference; also has `serve` and `mail` |
+| Python | `.` (this) | duckdb | the reference; also has `serve` and `mail` |
 | TypeScript | [`ts/`](ts/) | duckdb, polars, arquero, native | Node 26, TypeScript 7 |
 | Java | [`java/`](java/) | duckdb, turbo, swar, shard, mmap, simd, tablesaw, sortmerge, native | Java 26, Maven; five byte-level engines on SWAR, the Vector API and FFM, plus an out-of-core sort-merge join |
 | Go | [`go/`](go/) | duckdb, sortmerge, native | Go 1.24 |
-| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024; `turbo` reads CSV, JSON **and Parquet**, and threads the whole comparison |
+| Rust | [`rust/`](rust/) | duckdb, polars, sortmerge, turbo, native | edition 2024; `turbo` reads CSV, JSON **and Parquet** and threads the whole comparison; a Parquet pair goes down a columnar path that never reconstructs a row |
 
 Three more carry the byte-level engine and the JSON counts only — benchmark and parity ports, so the
 same design can be measured in four languages without three more HTML renderers to keep in step:
@@ -1092,8 +1526,8 @@ same design can be measured in four languages without three more HTML renderers 
 | | Directory | Built with | Scope |
 |---|---|---|---|
 | C | [`c/`](c/) | `cc` or `clang`, C11 | one file, single-threaded on purpose — it exists to find the memory floor; no `--trim`, `--ignore-case` or `--tolerance` |
-| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | reads CSV **and newline-delimited JSON**, including one of each; `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
-| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | reads CSV, JSON **and Parquet**; `--threads N`; `--max-memory MB` is enforced, not advisory — including the arena Parquet decodes into |
+| C++ | [`cpp/`](cpp/) | `g++` or `clang++`, C++20 | reads CSV, **newline-delimited JSON** and **Parquet**, including one of each; a Parquet pair takes the columnar path; `--threads N` splits the work across every core; `--ignore-case` is ASCII-only and refuses non-ASCII by name |
+| Zig | [`zig/`](zig/) | Zig 0.16 or 0.17-dev, `--release=fast` | reads CSV, JSON **and Parquet**, columnar when both sides are Parquet; `--threads N`; `--max-memory MB` is enforced, not advisory — on both paths, including the arena Parquet decodes into |
 
 The C++ and Zig ports build both indexes at once and run the two directions of the join at once,
 which is what Java's `turbo` has always done. C++ goes further, splitting each file into row-aligned
@@ -1126,10 +1560,14 @@ a float, so byte-identity does not depend on any language's floating-point round
 ## Test payloads
 
 `scripts/gen_data.py` builds a deterministic pair with 20 columns keyed on `(account_id, txn_id)`.
-`rust/target/release/gen-data` writes the same rows and takes `--format csv|ndjson|parquet`, so a
-format comparison uses payloads this project wrote rather than a converter's idea of them — its
+`cpp/build/gen-data` builds the same bytes far faster, and writes **CSV, newline-delimited JSON and
+Parquet** from one field-by-field recipe rather than converting one into another — so the four inputs
+of a format comparison hold the same rows by construction.
+`rust/target/release/gen-data` takes the same `--format csv|ndjson|parquet` and writes the same rows,
+so a format comparison uses payloads this project wrote rather than a converter's idea of them — its
 Parquet writer is in [`rust/src/gendata/parquet.rs`](rust/src/gendata/parquet.rs), and pyarrow and
 DuckDB both read what it produces.
+
 File B drifts from A by a fixed recipe, so every run has a known answer:
 
 | Drift | Share of rows |
@@ -1159,21 +1597,38 @@ cpp/build/csvdiff compare a.csv b.csv -k id --threads 4  # C++ thread scaling
 # one engine across every size, generating and deleting each pair in turn
 python scripts/bench_scale.py --sizes 10k,1m,10m,20m,50m --threads 4
 
-# the generator that keeps up with the disk
+# the generator that keeps up with the disk -- as CSV, or straight to Parquet
 (cd cpp && make gen-data) && cpp/build/gen-data --rows 10m --out-dir data --prefix 10m
+cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression snappy
+cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression none \
+  --dict-limit 175 --row-group-size 300   # forces mixed-encoding columns
 
 # the smallest memory limit a comparison finishes in
 scripts/memory_floor.sh cpp/build/csvdiff compare a.csv b.csv -k id --threads 4
 
-# the same comparison from CSV, Parquet and JSON, engine held constant
+# the four native formats against each other, nothing else involved
+#   -- this is what .github/workflows/benchmark-formats.yml runs
+(cd cpp && make && make gen-data)
+python scripts/bench_formats_native.py --rows 10m --data /tmp/bench --out formats.json
+
+# the historical version: the same comparison from CSV, Parquet and JSON with a
+# third-party engine held constant
 python scripts/bench_formats.py
 
-# our own readers on all three formats, in all three native ports, one host
-rust/target/release/gen-data --rows 10m --out-dir data --format parquet
-python3 scripts/bench_formats_ports.py --rows 10m --repeats 2
+# ours against DuckDB and polars, on CSV and on Parquet, in one sitting
+python scripts/bench_parquet.py --data bench/external/data --prefix 10m --polars
 
-# our own reader on any one format
+# the same, generating everything natively first -- no DuckDB, no CSV in the middle
+python scripts/bench_parquet.py --native 10m --data /tmp/bench --prefix 10m
+
+# our own readers on all three formats, in all three native ports, one host,
+# with peak RSS on every row -- and, with --matrix, one binary per scanner
+python3 scripts/bench_formats_ports.py --rows 10m --formats csv,parquet --matrix
+
+# our own reader on any of the three formats
 cpp/build/csvdiff compare a.ndjson b.ndjson -k id --threads 4
+cpp/build/csvdiff compare a.parquet b.parquet -k id --threads 4
+CSVDIFF_PHASES=1 cpp/build/csvdiff compare a.parquet b.parquet -k id   # phase timings
 rust/target/release/csvdiff compare a.parquet b.csv -k id --engine turbo -o /dev/null
 zig/zig-out/bin/csvdiff compare a.parquet b.parquet -k id --threads 4
 
@@ -1187,6 +1642,11 @@ python scripts/bench_external.py --rows 1m --mem-cap-gb 12
 # smallest heap each Java engine finishes in
 scripts/min_heap.sh
 ```
+
+`bench_formats_native.py` is the one to reach for when the question is about formats: it generates
+each of the four, measures it and deletes it before the next, because at ten million rows all four at
+once is about 15 GB. It exits non-zero if the four disagree about the counts, which is the point --
+four readers of the same rows that reach different answers is a bug, not a benchmark.
 
 `bench.py` records generation time, comparison wall time, throughput, peak RSS, report size and the
 counts, then fails if a scale exceeds its budget (10k: 20s / 1.5 GB, 1M: 120s / 6 GB, 10M: 900s /
@@ -1205,7 +1665,7 @@ exactly one exemption, [explained above](#set-c--against-the-field).
 ## Project layout
 
 ```
-csvdiff/engine.py         comparison (DuckDB + pandas fallback), result contract at top
+csvdiff/engine.py         comparison (DuckDB), result contract at top
 csvdiff/report.py         HTML renderer
 csvdiff/cli.py            compare / serve / mail
 csvdiff/server.py         drag-and-drop page
@@ -1247,11 +1707,11 @@ Sizes and shapes not yet answered, roughly in the order they would pay off:
    cpu/wall and 20M from 54.60s to 33.32s. The guess in this slot that the scan was already
    bandwidth-bound was wrong, and the test that disproved it took one script. Zig still has the
    two-thread version only.
-6. **Shard the index insertion.** Phase timing puts it at 3.09s of a 12.02s run at ten million rows,
-   single-threaded, which now costs more than all the parsing. Sharding the hash table by key so each
-   thread owns a slice would parallelise it while keeping first-occurrence-wins, and it is worth more
-   than any input format would be — see
-   [Why there is no native Parquet](#why-there-is-no-native-parquet).
+6. **Shard the index insertion on the CSV path.** Phase timing puts it at 3.09s of a 12.02s run at
+   ten million rows, single-threaded. Sharding the hash table by key so each thread owns a slice
+   would parallelise it while keeping first-occurrence-wins. This slot used to add "and it is worth
+   more than any input format would be"; the [Parquet path](#reading-parquet-natively) took the same
+   comparison from 23.25s to 4.89s, so that half of the claim is settled and wrong.
 7. **Where does the C++ port stop scaling?** 2.53x cpu/wall on four cores is short of four, and the
    remaining sequential parts — table insertion, B's side of the join — are the obvious suspects. A
    box with more cores would say whether the design or the machine is the limit.

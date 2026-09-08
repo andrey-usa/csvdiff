@@ -52,8 +52,9 @@ ALL = {"csv", "ndjson", "parquet"}
 def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[str], set[str]]]:
     """(label, argv prefix, extra flags, the formats it can read).
 
-    The C++ port reads CSV and JSON; Parquet is the one the Rust and Zig ports
-    added and it did not, so it is absent from that row rather than slow in it.
+    All three ports read all three formats. A Parquet pair is the one input none
+    of them scans: it goes to the columnar path instead, which is why the Parquet
+    rows below are not measuring the scanner the CSV rows are.
 
     `matrix` adds the scanner builds -- SWAR against a vector register, one
     binary each so nothing is measuring a branch -- and the Rust engine without
@@ -63,7 +64,7 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     thread_flag = ["--threads", str(threads)] if threads else []
     report = ["--engine", "turbo", "-o", "/dev/null"]
     rows: list[tuple[str, list[str], list[str], set[str]]] = [
-        ("C++", [str(CPP)], thread_flag, TEXT),
+        ("C++", [str(CPP)], thread_flag, ALL),
         ("Rust", [str(RUST)], report + thread_flag, ALL),
         ("Zig", [str(ZIG)], thread_flag, ALL),
     ]
@@ -71,6 +72,8 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
         return rows
     rows.append(("Rust engine", [str(RUST)], report + ["--max-rows", "1"] + thread_flag, ALL))
     for label, path, flags, formats in [
+        # The scanner builds differ only in how they find a delimiter, so they
+        # are asked only about the formats that have delimiters to find.
         ("C++ swar", CPP.with_name("csvdiff-swar"), thread_flag, TEXT),
         ("C++ avx2", CPP.with_name("csvdiff-avx2"), thread_flag, TEXT),
         ("C++ avx512", CPP.with_name("csvdiff-avx512"), thread_flag, TEXT),

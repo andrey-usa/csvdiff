@@ -3,6 +3,7 @@
 pub mod duckdb;
 pub mod native;
 pub mod polars;
+pub mod pqdiff;
 pub mod sortmerge;
 pub mod turbo;
 
@@ -51,11 +52,21 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &mut Options) -> Result<Compar
     let result = run(engine, a_path, b_path, opt)?;
     let seconds = (start.elapsed().as_millis() as f64) / 1000.0;
 
+    // A Parquet pair goes to the columnar path whichever engine was asked for,
+    // so the report has to say `parquet` rather than repeat the request back.
+    // A mixed pair does not: that ran on `turbo`, and saying `parquet` would
+    // claim a path it did not take.
+    let label = if pqdiff::is_parquet(a_path) && pqdiff::is_parquet(b_path) {
+        "parquet".to_string()
+    } else {
+        engine.label().to_string()
+    };
+
     let meta = Meta {
         engine_meta: result.meta,
         a: file_meta(a_path),
         b: file_meta(b_path),
-        engine: engine.label().to_string(),
+        engine: label,
         seconds,
         generated: Local::now().to_rfc3339_opts(SecondsFormat::Secs, false),
         options: opt.clone(),
@@ -73,6 +84,32 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &mut Options) -> Result<Compar
 }
 
 fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult> {
+    // Parquet is not a text format and is not read as one. Two Parquet files go
+    // to the columnar path, which never materialises a row: it joins on the key
+    // columns and then compares whole columns as integers, whichever engine was
+    // asked for -- none of the others can read Parquet at all.
+    //
+    // One Parquet file against a text one has no column to compare a byte
+    // stream against, so that path is not available. `turbo` reads it anyway,
+    // by decoding the pages into rows (`turbo/parquet.rs`); it costs what the
+    // columnar path exists to avoid, and it answers the question rather than
+    // refusing it.
+    let (a_pq, b_pq) = (pqdiff::is_parquet(a), pqdiff::is_parquet(b));
+    if a_pq && b_pq {
+        return pqdiff::compare(a, b, opt)
+            .map_err(|e| Error::new(format!("the parquet engine failed: {e}")));
+    }
+    if (a_pq || b_pq) && !matches!(engine, Engine::Turbo | Engine::Auto) {
+        return Err(Error::new(format!(
+            "the {engine} engine cannot read parquet; use --engine turbo, \
+             or convert the other side to parquet too"
+        )));
+    }
+    if a_pq || b_pq {
+        return turbo::compare(a, b, opt)
+            .map_err(|e| Error::new(format!("the turbo engine failed: {e}")));
+    }
+
     let result = match engine {
         Engine::DuckDb => duckdb::compare(a, b, opt),
         Engine::Polars => polars::compare(a, b, opt),

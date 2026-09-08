@@ -7,7 +7,7 @@ a specific dataset belongs in the code.
 ## Commands
 
 ```bash
-pip install duckdb pandas -r requirements-dev.txt && pip install -e . --no-deps
+pip install -r requirements-dev.txt && pip install -e .
 pytest                                        # full suite, ~30s
 python scripts/gen_data.py --rows 10k --out-dir data
 python scripts/bench.py --rows 10k --engine duckdb
@@ -20,7 +20,7 @@ gh workflow run Benchmark -f scales=10k       # CI
 
 | Path | Role |
 |---|---|
-| `csvdiff/engine.py` | comparison; DuckDB primary, pandas fallback. Result contract is documented at the top of the file |
+| `csvdiff/engine.py` | comparison, on DuckDB. Result contract is documented at the top of the file |
 | `csvdiff/report.py` | HTML renderer — one template string, no build step |
 | `csvdiff/cli.py` | `compare` / `serve` / `mail` |
 | `csvdiff/server.py`, `mailbot.py` | drop page and mailbox launchers |
@@ -49,16 +49,14 @@ gh workflow run Benchmark -f scales=10k       # CI
 
 ## Style
 
-- Standard library only outside the engine; DuckDB is the sole runtime dependency and pandas is
-  an optional fallback. Do not add a web framework, a JS bundler, or a templating library.
+- Standard library only outside the engine; DuckDB is the sole runtime dependency. Do not add a
+  web framework, a JS bundler, or a templating library.
 - The report JS is plain ES2020 in `report.py`. It must keep working when opened from `file://`.
 - Prefer editing the existing virtualised grid over adding a table library; the grid renders only
   the visible rows and that is the reason large reports open instantly.
 
 ## Gotchas
 
-- `pandas` path holds everything in memory: ~2.8 GB for 1M rows x 20 columns. Use DuckDB for
-  anything above ~1M rows, and never benchmark 10M on the pandas engine.
 - `resource.ru_maxrss` is KB on Linux, bytes on macOS — `scripts/bench.py` handles both.
 - Duplicate keys: the first occurrence of each key joins, the rest are reported separately.
   Changing that changes the matched/added/removed counts, so it is a behaviour change, not a fix.

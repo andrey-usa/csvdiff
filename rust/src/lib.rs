@@ -27,6 +27,7 @@ pub mod engine;
 pub mod error;
 pub mod gendata;
 pub mod options;
+pub mod parquet;
 pub mod profiles;
 pub mod report;
 pub mod rowstore;

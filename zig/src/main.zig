@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const csvdiff = @import("csvdiff.zig");
+const pqdiff = @import("pqdiff.zig");
 
 const usage =
     \\csvdiff - composite-key comparison of CSV, JSON and Parquet, with a memory budget
@@ -148,7 +149,19 @@ pub fn main(init: std.process.Init) !u8 {
         gpa = fixed.threadSafeAllocator();
     }
 
-    var result = csvdiff.compare(io, gpa, files.items[0], files.items[1], opt) catch |err| {
+    // Parquet on both sides goes to the columnar path, which never reconstructs
+    // a row: it joins on the key columns and then compares whole columns as
+    // integers. Where only one side is Parquet that is not available -- there is
+    // no column to compare a byte stream against -- so the text engine reads it
+    // into rows instead, which is slower and still answers the question rather
+    // than refusing it.
+    const both_parquet = pqdiff.isParquetFile(io, files.items[0]) and
+        pqdiff.isParquetFile(io, files.items[1]);
+
+    var result = (if (both_parquet)
+        pqdiff.compare(io, gpa, files.items[0], files.items[1], opt)
+    else
+        csvdiff.compare(io, gpa, files.items[0], files.items[1], opt)) catch |err| {
         // A budget that was not enough is the one failure worth naming in full:
         // it is the answer to the question --max-memory was asked.
         if (err == error.OutOfMemory) {
@@ -192,9 +205,15 @@ pub fn main(init: std.process.Init) !u8 {
         try w.interface.flush();
     }
 
+    // Which path ran, not which one was asked for: a Parquet pair never goes
+    // through the byte scanner.
     try stdout.interface.print(
-        "A {d} rows | B {d} rows | matched {d} (changed {d}) | added {d} | removed {d} | dup keys A {d} B {d} | turbo\n",
-        .{ c.a_rows, c.b_rows, c.matched, c.changed, c.added, c.removed, c.a_dup_keys, c.b_dup_keys },
+        "A {d} rows | B {d} rows | matched {d} (changed {d}) | added {d} | removed {d} | dup keys A {d} B {d} | {s}\n",
+        .{
+            c.a_rows,       c.b_rows,   c.matched,       c.changed,
+            c.added,        c.removed,  c.a_dup_keys,    c.b_dup_keys,
+            if (both_parquet) @as([]const u8, "parquet") else "turbo",
+        },
     );
     try stdout.interface.flush();
     return if (result.identical()) 0 else 1;

@@ -13,5 +13,5 @@ test {
     _ = @import("thrift.zig");
     _ = @import("codec.zig");
     _ = @import("encoding.zig");
-    _ = @import("parquet.zig");
+    _ = @import("pqread.zig");
 }

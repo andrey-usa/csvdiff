@@ -2,13 +2,13 @@
 # ordinary C++ programmer would write and check against.
 CXX      ?= g++
 CXXFLAGS ?= -std=c++20 -O2 -march=native -Wall -Wextra -Wpedantic -Werror -pthread
-SRC       = src/csvdiff.cpp src/json.cpp src/main.cpp
+SRC       = src/csvdiff.cpp src/pqdiff.cpp src/parquet.cpp src/json.cpp src/main.cpp
 BIN       = build/csvdiff
 GEN       = build/gen-data
 
 all: $(BIN)
 
-$(BIN): $(SRC) src/csvdiff.hpp
+$(BIN): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
 
@@ -18,15 +18,15 @@ $(BIN): $(SRC) src/csvdiff.hpp
 # instructions; the AVX-512 build will not start on one that does not.
 scanners: build/csvdiff-swar build/csvdiff-avx2 build/csvdiff-avx512
 
-build/csvdiff-swar: $(SRC) src/csvdiff.hpp
+build/csvdiff-swar: $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
 
-build/csvdiff-avx2: $(SRC) src/csvdiff.hpp
+build/csvdiff-avx2: $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -DCSVDIFF_SCAN_AVX2 -mavx2 -o $@ $(SRC)
 
-build/csvdiff-avx512: $(SRC) src/csvdiff.hpp
+build/csvdiff-avx512: $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -DCSVDIFF_SCAN_AVX512 -mavx512f -mavx512bw -o $@ $(SRC)
 
@@ -35,11 +35,20 @@ build/csvdiff-avx512: $(SRC) src/csvdiff.hpp
 # the disk. See tools/gen_data.cpp.
 gen-data: $(GEN)
 
-$(GEN): tools/gen_data.cpp
+$(GEN): tools/gen_data.cpp tools/pq_write.cpp tools/pq_write.hpp
 	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -o $@ tools/gen_data.cpp
+	$(CXX) $(CXXFLAGS) -o $@ tools/gen_data.cpp tools/pq_write.cpp
+
+# A verification tool for the Parquet reader: dumps a file's schema, or one
+# column's values as text, so what the reader decoded can be diffed against
+# what wrote the file.
+pq-dump: build/pq-dump
+
+build/pq-dump: tools/pq_dump.cpp src/parquet.cpp src/parquet.hpp
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -o $@ tools/pq_dump.cpp src/parquet.cpp
 
 clean:
 	rm -rf build
 
-.PHONY: all gen-data scanners clean
+.PHONY: all gen-data scanners pq-dump clean

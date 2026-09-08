@@ -61,6 +61,30 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
 
+## Speed
+
+At ten million rows on a GitHub-hosted runner, four threads, best of two, with
+peak RSS on every row (the full matrix and how it is produced are in the root
+README; `bench-10m.yml` reruns it on every push that touches an engine):
+
+| Input | Compare | Rows/s | Peak RSS |
+|---|---:|---:|---:|
+| CSV, 3,509 MB | 10.39s | 963,000 | 4,443 MB |
+| CSV, engine only (`--max-rows 1`) | 9.17s | 1,090,000 | 4,428 MB |
+| Parquet, 1,535 MB | 8.33s | 1,200,000 | 8,415 MB |
+| Parquet, engine only | 7.12s | 1,404,000 | 8,440 MB |
+
+The two "engine only" rows are the same comparison without the HTML report,
+which is the thing this port produces and the C++ and Zig ports do not: about a
+second of it at this size, spent decoding fifty thousand changed rows into
+strings, sorting them and gzipping the payload. Judge the engine by those rows
+and the port by the others.
+
+Parquet is faster than CSV and its file is 2.3x smaller — there is no delimiter
+scanning left to do — and it costs the memory the CSV path does not spend,
+because decoded values live in an arena rather than in a mapping the kernel can
+evict.
+
 ## Engines
 
 Five backends, one result contract. Every engine must return identical `counts` and `columns` for

@@ -11,6 +11,13 @@ name: Benchmark 10M
 #
 # Parquet is written uncompressed: this is a question about readers, and a codec
 # in the middle would be answering a different one.
+#
+# The scanner builds are asked about both formats, because there are two
+# scanners. On CSV the idiom finds a delimiter in the mapped file; on a Parquet
+# pair, where there are no delimiters at all, the same idiom reads the mismatch
+# mask the columnar comparison produces. The two have different hit rates and
+# different amounts of memory traffic, so they can and do disagree about which
+# width wins -- which is the whole reason both are in the table.
 
 on:
   # A push that touches an engine or the harness re-runs the whole matrix. That
@@ -42,6 +49,10 @@ on:
         description: "Include the scanner builds (SWAR against AVX2 and AVX-512)"
         type: boolean
         default: true
+      rust_simd:
+        description: "Also build the Rust vector binary (adds ~25 minutes: RUSTFLAGS invalidates the cargo cache)"
+        type: boolean
+        default: false
 
 concurrency:
   group: bench-10m-${{ github.ref }}
@@ -53,6 +64,7 @@ env:
   FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
   REPEATS: ${{ github.event.inputs.repeats || '2' }}
   MATRIX: ${{ github.event.inputs.matrix || 'true' }}
+  RUST_SIMD: ${{ github.event.inputs.rust_simd || 'false' }}
 
 jobs:
   bench:
@@ -106,14 +118,21 @@ jobs:
           (cd cpp && CXX=clang++ make && CXX=clang++ make gen-data)
           if [ "$MATRIX" = "true" ]; then
             (cd cpp && CXX=clang++ make scanners)
-            (cd zig && zig build --release=fast -Dscan=32 --prefix zig-out-v32)
+            # -Dcpu=native is not optional here: without it the target is
+            # baseline x86-64, @Vector(32, u8) is lowered to scalar code, and
+            # the row would be measuring a slower SWAR rather than AVX2.
+            (cd zig && zig build --release=fast -Dscan=32 -Dcpu=native --prefix zig-out-v32)
             # Rust's vector path is a target feature rather than a source
             # switch, and changing RUSTFLAGS invalidates everything cargo has
-            # cached -- hence its own target directory and its own build.
-            (cd rust && RUSTFLAGS="-C target-feature=+avx2" \
-                cargo build --release --target-dir target-avx2)
+            # cached -- a second full build of DuckDB and Polars for one scanner.
+            # Worth twenty-five minutes when the question is being asked, and off
+            # by default when it is not.
+            if [ "$RUST_SIMD" = "true" ]; then
+              (cd rust && RUSTFLAGS="-C target-feature=+avx2" \
+                  cargo build --release --target-dir target-avx2)
+            fi
             if grep -q avx512bw /proc/cpuinfo; then
-              (cd zig && zig build --release=fast -Dscan=64 --prefix zig-out-v64)
+              (cd zig && zig build --release=fast -Dscan=64 -Dcpu=native --prefix zig-out-v64)
             else
               echo "no AVX-512 on this runner: the 64-byte builds are skipped"
               rm -f cpp/build/csvdiff-avx512
