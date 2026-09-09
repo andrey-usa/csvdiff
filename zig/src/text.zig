@@ -151,6 +151,46 @@ fn nameHash(s: []const u8) u64 {
 /// the whole object — but only once, and one hash per key rather than a search
 /// per wanted column, which at twenty columns would be four hundred comparisons
 /// a row.
+/// Where the wanted part of a row ends, when two files agree closely enough for
+/// one to be measured against the other in bytes.
+///
+/// The join's expensive question is whether a matched pair differs, and it
+/// answers it by parsing both rows into fields. It does not have to. If the two
+/// rows are byte-identical up to the end of the last column either file wants,
+/// then every column in between is byte-identical too, and no parse can say
+/// otherwise -- so the pair is unchanged and the mate never needs reading.
+///
+/// That holds only when both sides really are the same shape: the same delimiter
+/// and the same projection, because two files whose headers are ordered
+/// differently can carry identical bytes and mean different things. `source` is
+/// that projection before it is inverted, so comparing it settles the question
+/// outright. JSON has no such prefix -- its keys may come in any order -- so it
+/// never qualifies.
+pub const Tail = struct { slot: usize, delimiter: u8 };
+
+pub fn sharedTail(a: RowParser, b: RowParser) ?Tail {
+    const ca = switch (a) {
+        .csv => |c| c,
+        .json => return null,
+    };
+    const cb = switch (b) {
+        .csv => |c| c,
+        .json => return null,
+    };
+    if (ca.delimiter != cb.delimiter) return null;
+    if (ca.source.len != cb.source.len) return null;
+    for (ca.source, cb.source) |x, y| {
+        if (x) |xc| {
+            if (y) |yc| {
+                if (xc != yc) return null;
+            } else return null;
+        } else if (y != null) return null;
+    }
+    const run = ca.slots[ca.starts[ca.last_needed]..ca.starts[ca.last_needed + 1]];
+    if (run.len == 0) return null;
+    return .{ .slot = run[0], .delimiter = ca.delimiter };
+}
+
 pub const RowParser = union(enum) {
     csv: Csv,
     json: Json,

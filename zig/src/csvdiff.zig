@@ -439,6 +439,13 @@ const Rows = union(enum) {
 /// will not look at is the largest thing that side was doing.
 const Want = enum { whole, keys };
 
+/// A run of one row's bytes, and the delimiter that has to end it in the other
+/// file for that run to be a whole number of columns.
+const Span = struct { bytes: []const u8, delimiter: u8 };
+
+/// What a probe found: the row, and whether the bytes settled it outright.
+const Hit = struct { row: i32, same_bytes: bool };
+
 const Side = struct {
     gpa: std.mem.Allocator,
     slab: Slab,
@@ -458,6 +465,14 @@ const Side = struct {
                 @memcpy(out, c.fields[from..][0..self.width]);
             },
         }
+    }
+
+    /// The row parser, when rows are text and there is one.
+    fn parser(self: Side) ?text.RowParser {
+        return switch (self.rows) {
+            .text => |t| t.parser,
+            .columnar => null,
+        };
     }
 
     /// The key columns of that row, and nothing else.
@@ -873,9 +888,10 @@ const RowIndex = struct {
         fields: []const Field,
         hash: u64,
         want: Want,
+        span: ?Span,
         s: *Scratch,
         probe: []Field,
-    ) !?i32 {
+    ) !?Hit {
         var slot = self.slotOf(hash);
         while (true) {
             const word = self.table[slot];
@@ -884,6 +900,17 @@ const RowIndex = struct {
             if (tagIs(word, hash)) {
                 const candidate = self.first_row.items[posOf(word)];
                 if (self.row_hash.items[@intCast(candidate)] == hash) {
+                    // The bytes first, where the caller offered them. A candidate
+                    // whose row opens with the same bytes as far as either file
+                    // reads has the same keys and the same columns, and neither
+                    // row needs parsing to say so. A candidate the tag let
+                    // through with a different key fails this on its first few
+                    // bytes, so the cost of being wrong is a handful of them.
+                    if (span) |sp| {
+                        if (self.rowMatches(candidate, sp)) {
+                            return .{ .row = candidate, .same_bytes = true };
+                        }
+                    }
                     switch (want) {
                         .whole => self.fieldsOf(candidate, probe),
                         .keys => self.keysOf(candidate, probe),
@@ -895,11 +922,29 @@ const RowIndex = struct {
                             break;
                         }
                     }
-                    if (ok) return candidate;
+                    if (ok) return .{ .row = candidate, .same_bytes = false };
                 }
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+
+    /// Whether `candidate`'s row opens with exactly `sp.bytes` and ends that run
+    /// on a field boundary.
+    ///
+    /// The boundary is what makes the run a whole number of columns rather than
+    /// a truncation of one: without it `12,3` would match a row opening `12,34`.
+    fn rowMatches(self: *const RowIndex, candidate: i32, sp: Span) bool {
+        const data = self.side.slab.data;
+        const from: usize = @intCast(self.row_at.items[@intCast(candidate)]);
+        // Both tests, and in this order: `data.len - sp.bytes.len` underflows for
+        // a run longer than this whole file, which a release build would wrap
+        // rather than trap. A's rows and B's bytes come from different files and
+        // nothing bounds one by the other.
+        if (sp.bytes.len > data.len or from > data.len - sp.bytes.len) return false;
+        const to = from + sp.bytes.len;
+        if (to < data.len and data[to] != sp.delimiter and data[to] != '\n') return false;
+        return std.mem.eql(u8, data[from..to], sp.bytes);
     }
 
     fn uniqueKeys(self: RowIndex) i64 {
@@ -1176,6 +1221,10 @@ const Join = struct {
     parts: []Part,
     /// Chunk `i` is A's chunk `i` below this and B's above it.
     a_ways: usize,
+    /// Where a byte comparison may stand in for a parse, when the two files are
+    /// the same shape; see `text.sharedTail`. Null compares every pair column by
+    /// column, which is what a mixed pair, a columnar side or JSON gets.
+    span_tail: ?text.Tail,
     next: std.atomic.Value(usize),
 
     fn run(self: *Join) void {
@@ -1217,11 +1266,30 @@ const Join = struct {
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             const hash = self.ai.row_hash.items[@intCast(row)];
-            _ = (try self.bi.lookup(self.a.slab, fa, hash, .whole, &s, fb)) orelse {
+            // A's row up to the end of the last column either file wants. The
+            // end has to be a boundary in A as well: a quoted field ends on its
+            // closing quote, and what follows is not part of the run.
+            const span: ?Span = blk: {
+                const tail = self.span_tail orelse break :blk null;
+                const f = fa[tail.slot];
+                if (!fld.isReal(f)) break :blk null;
+                const data = self.a.slab.data;
+                const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
+                const to = fld.offsetOf(f) + fld.lenOf(f);
+                if (to < from or to > data.len) break :blk null;
+                if (to < data.len and data[to] != tail.delimiter and data[to] != '\n') {
+                    break :blk null;
+                }
+                break :blk .{ .bytes = data[from..to], .delimiter = tail.delimiter };
+            };
+            const hit = (try self.bi.lookup(self.a.slab, fa, hash, .whole, span, &s, fb)) orelse {
                 out.removed += 1;
                 continue;
             };
             out.matched += 1;
+            // The two rows carry the same bytes across every column either file
+            // wants, so no column differs and the mate was never read.
+            if (hit.same_bytes) continue;
             var any = false;
             // Two loops rather than one with a flag inside it: `plain` cannot
             // change between columns or between rows, and this is the innermost
@@ -1292,7 +1360,9 @@ const Join = struct {
             // it is about to probe against is discarded either way.
             self.bi.keysOf(row, fb);
             const hash = self.bi.row_hash.items[@intCast(row)];
-            if ((try self.ai.lookup(self.b.slab, fb, hash, .keys, &s, probe)) == null) out.added += 1;
+            if ((try self.ai.lookup(self.b.slab, fb, hash, .keys, null, &s, probe)) == null) {
+                out.added += 1;
+            }
         }
     }
 };
@@ -1466,6 +1536,7 @@ pub fn compare(
         .width = width,
         .parts = parts,
         .a_ways = a_ways,
+        .span_tail = if (a.parser()) |pa| (if (b.parser()) |pb| text.sharedTail(pa, pb) else null) else null,
         .next = std.atomic.Value(usize).init(0),
     };
     var phases = Phases.start("");
