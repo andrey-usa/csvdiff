@@ -373,6 +373,30 @@ impl Index {
 /// that row; insertion is serial because first-occurrence-wins depends on the
 /// order rows arrive, and threading it would make the answer depend on the
 /// scheduler. Same split as the CSV path.
+/// How many rows ahead a slot probe is started. The same distance the CSV engine
+/// uses, and as there it is not delicate.
+const PREFETCH_AHEAD: usize = 32;
+
+/// Starts the fetch of the slot `h` will land in, without waiting for it.
+///
+/// The build loop walks an array of hashes it already holds and the sweep walks
+/// another, and both then probe a slot table of tens of megabytes: a serial chain
+/// of misses, each waiting on an address known long before the load was issued.
+#[inline]
+fn prefetch_slot(slots: &[u64], mask: u64, h: u64) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: the index is masked into the table's length, so the pointer is in
+    // bounds, and a prefetch has no architectural effect in any case.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(slots.as_ptr().add((h & mask) as usize) as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (slots, mask, h);
+    }
+}
+
 fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -> Index {
     let n = s.rows;
     let mut hs = vec![0u64; n];
@@ -406,13 +430,21 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
     while cap * 2 < n * 3 + 16 {
         cap <<= 1;
     }
-    ix.slots = vec![0u64; cap];
+    // Written rather than calloc'd, for the reason the CSV engine's `empty_table`
+    // gives: a fresh mapping is one shared page of zeroes until something writes
+    // to it, and nothing reads this table before the inserts start, so every one
+    // of its pages would be first touched by a random probe.
+    ix.slots = Vec::with_capacity(cap);
+    ix.slots.resize(cap, 0u64);
     ix.mask = cap as u64 - 1;
     ix.firsts.reserve(n);
     ix.counts.reserve(n);
     ix.hashes.reserve(n);
 
     for (r, &h) in hs.iter().enumerate() {
+        if let Some(&soon) = hs.get(r + PREFETCH_AHEAD) {
+            prefetch_slot(&ix.slots, ix.mask, soon);
+        }
         let mut at = (h & ix.mask) as usize;
         loop {
             let slot = ix.slots[at];
@@ -727,6 +759,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         out.pa.reserve(hi - lo);
         out.pb.reserve(hi - lo);
         for at in lo..hi {
+            if let Some(&soon) = ai.hashes.get(at + PREFETCH_AHEAD) {
+                prefetch_slot(&bi.slots, bi.mask, soon);
+            }
             let row = ai.firsts[at];
             let mate = lookup(
                 &as_id,
@@ -754,6 +789,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let lo = bi.firsts.len() * p / b_ways;
         let hi = bi.firsts.len() * (p + 1) / b_ways;
         for at in lo..hi {
+            if let Some(&soon) = bi.hashes.get(at + PREFETCH_AHEAD) {
+                prefetch_slot(&ai.slots, ai.mask, soon);
+            }
             let row = bi.firsts[at];
             if lookup(
                 &as_id,
