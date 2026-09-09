@@ -374,14 +374,19 @@ fn hashField(slab: Slab, f: Field, o: Options, seed: u64, buf: []u8) Error!u64 {
             len += 1;
         }
     } else {
-        var it = slab.logical(f);
-        if (it.isPlain()) {
+        if (!fld.isEscaped(f)) {
             // Nothing to unescape, so the bytes are the value and eight of them
             // can be taken at a time. See `hashBytes`.
+            //
+            // The field word is asked directly rather than through `logical()`,
+            // which answers the same question by building an iterator over the
+            // slab -- the cost `sameBytes` used to pay, in the one function that
+            // runs for every key column of every row of both files.
             const raw = slab.raw(f);
             h = hashBytes(raw, h);
             len = raw.len;
         } else {
+            var it = slab.logical(f);
             while (it.next()) |b| {
                 h = (h ^ b) *% PRIME;
                 len += 1;

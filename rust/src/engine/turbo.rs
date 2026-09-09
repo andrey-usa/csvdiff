@@ -241,9 +241,14 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, seed: u64) -> u64 {
             h = (h ^ (*b as u64)).wrapping_mul(PRIME);
             len += 1;
         }
-    } else if slab.logical(f).is_plain() {
+    } else if !field::is_escaped(f) {
         // Nothing to unescape, so the bytes are the value and eight of them can
         // be taken at a time. See `hash_bytes`.
+        //
+        // The field word is asked directly rather than through `logical()`,
+        // which answers the same question by building an iterator over the slab
+        // -- the cost `same_bytes` used to pay, in the one function that runs
+        // for every key column of every row of both files.
         let raw = slab.raw(f);
         h = hash_bytes(raw, h);
         len = raw.len() as u64;
