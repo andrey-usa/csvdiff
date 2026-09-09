@@ -64,6 +64,68 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-09 (joint run, fourth) — one tree, four ports
+
+One GitHub Actions runner (4 vCPU / 16 GB), 10,000,000 rows × 20 columns, keyed
+on `(account_id, txn_id)`, `--ignore updated_at`, five interleaved rounds each.
+Every port from `82bf4c5`, compiled for the runner. Run `34365328117`.
+
+**The first table with no second checkout.** The three above it measured this
+tree against `claude/data-comparison-rust-zig-jam00m` out of a parallel
+checkout, with all the provenance trouble that carried — a branch that moved
+mid-run twice, and a pinned SHA to stop it. That branch is merged. Four ports,
+one tree, one build configuration.
+
+### CSV — input 3,509 MB
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **2.14s** | 2.15s | 2.19s | **7.7s** | 4,225 MB | **716 MB** |
+| C++ | 5.19s | 5.35s | 5.49s | 16.2s | 4,387 MB | 878 MB |
+| Rust | 2.46s | 2.47s | 2.51s | 8.2s | 4,408 MB | 899 MB |
+| Zig | 2.71s | 2.72s | 2.90s | 9.7s | 4,396 MB | 887 MB |
+
+### ndjson — input 8,487 MB
+
+Four ports, where every earlier table had two of them missing: Rust and Zig
+could not read ndjson before the merge.
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **7.40s** | 7.44s | 7.48s | **24.3s** | 9,204 MB | **716 MB** |
+| C++ | 20.53s | 20.78s | 21.08s | 67.8s | 9,367 MB | 880 MB |
+| Rust | 14.32s | 14.36s | 14.43s | 55.5s | 9,387 MB | 899 MB |
+| Zig | 13.88s | 13.97s | 14.00s | 54.3s | 9,377 MB | 890 MB |
+
+### Parquet — input 2,074 MB, uncompressed
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **1.48s** | 1.49s | 1.53s | **4.8s** | 3,371 MB | 1,297 MB |
+| C++ | 3.43s | 3.44s | 3.53s | 11.3s | 3,554 MB | 1,480 MB |
+| Rust | 2.80s | 2.82s | 2.84s | 9.1s | 3,548 MB | 1,474 MB |
+| Zig | 2.96s | 2.97s | 2.98s | 10.5s | 3,349 MB | **1,276 MB** |
+
+Counts agree across all four in every table: matched 9,990,000, changed
+599,320, added 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B.
+
+**What the day did to the C++ column.** It was the port dragging every table
+down — 17.51s on CSV in the morning's run, and 7.96s for the better of the two
+branches' versions. It is 5.19s here, after the merge took the quicker one and
+four changes brought it up to the current design. Those changes measured 2.24x
+of CPU on this host at two million rows; this is the same direction at ten
+million, in a table that gates on counts.
+
+**And the ranking that is now interesting.** On CSV, C leads Rust by 1.15x and
+spends 7.7 CPU-seconds against its 8.2. Two ports that started this project
+orders of magnitude apart are within noise of each other on the format most
+people have. ndjson is where the ports still differ by a factor — 1.9x — and
+the reason is one specific thing: the byte proof settles a CSV row from its raw
+bytes, and settling a JSON one first has to rule out a repeated name, which
+only the C port does.
+
+---
+
 ## 2026-09-09 (joint run, third) — the first one built fairly
 
 One GitHub Actions runner (4 vCPU / 16 GB), 10,000,000 rows × 20 columns, keyed
