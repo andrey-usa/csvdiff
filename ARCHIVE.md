@@ -74,6 +74,22 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Threading the generator** | 2.3x to 2.8x on wall for no more CPU -- flat on CSV, 12% *down* on ndjson. This was in the "not worth it" table above on the strength of a comparison that turned out to be unsound; it was a scope decision recorded as a measurement |
 | **Reading only the key columns where only keys are read** | C's CSV path: 2.66x at two million rows, **3.65x at ten million** — the gain grows with the size, because past cache the parses removed were memory traffic and not only instructions |
 | **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries |
+| **Writing the generator's two sides at once** | 2.0x on Parquet by itself, where splitting a row group's twenty columns — the split the design points at — is 1.28x |
+| **Deleting the dataframe engines from the Rust port** | a cold build went from twenty minutes to twenty seconds; nothing measured them any more |
+
+Measured on `claude/data-comparison-rust-zig-jam00m`, not here, and taken from
+that branch's own record; what this project measured of them is the joint run in
+[BENCHMARKS.md](BENCHMARKS.md), where its Zig does CSV in 4.55s and ndjson in
+15.58s.
+
+| Technique (other branch) | Verdict |
+|---|---|
+| **Not parsing every matched row twice** | the same finding the C port made independently, in both of those ports |
+| **Sizing the index once and tagging its slots** | a failed probe is settled by the word already loaded; the C port had this, those two did not |
+| **Joining both sides from one queue** | replaces two passes with one, and stops deep-copying the sorted rows |
+| **Writing the index's zeroes rather than asking the kernel** | faulting a fresh mapping in costs more than touching memory already owned |
+| **Prefetch distance 32** | their tuning; this port measured 24 on the same shape, so the optimum is a property of the machine as much as the code |
+| **AVX-512** | wins on a CPU that has it, which hosted runners mostly do not — their own note says the 64-byte builds skip themselves |
 
 ### Not worth it — measured, and recorded so it is not retried
 
@@ -82,6 +98,9 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Huge pages in a loop** | each request makes the kernel compact memory. Two allocations win; six lose; sixteen lose badly. Column arrays 1.00s → 1.96s, key columns 2.03s → 2.79s (measured twice) |
 | **Sharding the index insertion** | 2.84s against 1.95s, CPU 9.2s against 5.8s — the routing costs more than the serial insertion it parallelises |
 | **Widening the hash to 8 bytes at a time** | no measurable effect |
+| **A wave size other than 8,192 rows in the generator** | 2k, 32k and 131k all cost more on CSV (0.93s against 1.29s at 32k); ndjson is nearly flat, so the sensitive format chose it |
+| **Splitting a row group's columns as the main Parquet lever** | 1.28x, against 2.0x for writing the two sides at once. Most of a Parquet run is the serial feeding of cell values into the column arenas, not the encoding |
+| **Chasing a CPU regression that was noise** | an hour spent on a 1.9s→3.5s "regression" in the threaded generator that a nine-round measurement showed was 2.66s→2.61s. On this container a wall-clock difference under about 1.5x is not signal; use min-of-N CPU in one interleaved sitting |
 | **GPU offload** | not attempted. Per-row cost doubles between 1M and 3M as the index leaves L3, putting the plausible crossover at 370k-4M rows — but every GPU-side number would have been an estimate, since there is no GPU here |
 
 ### Things that were true and stopped being true
@@ -93,3 +112,8 @@ counts keys rather than rows, and reports duplicates as their own section.
   comparison from 23.25s to 4.89s — more than any engine change measured here.
 - **"`shard` (Vector API) beats `turbo` (SWAR)."** True at 10M by 0.08s, which
   was noise on single runs. At twice the size SWAR is 19% ahead.
+- **"The C port is fastest on every format."** True for about three hours. The
+  other branch's rewritten Zig now takes ndjson, 15.58s against 20.13s.
+- **"The C++ generator is faster than the C one and the gap stays."** Withdrawn:
+  its Parquet row compared snappy output against uncompressed, and the host
+  cannot measure that generator to better than a five-fold spread anyway.

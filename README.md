@@ -24,9 +24,9 @@ each port's fastest build.
 
 | Format | Input | C | C++ | Rust | Zig |
 |---|---:|---|---|---|---|
-| CSV | 3,509 MB | **4.06s** · 14.5s · 716 MB | 10.23s · 32.8s · 884 MB | 8.13s · 23.6s · 1,208 MB | 8.15s · 22.4s · 910 MB |
-| ndjson | 8,487 MB | **20.37s** · 74.8s · 716 MB | 26.12s · 80.7s · 884 MB | 22.85s · 70.7s · 1,208 MB | 22.14s · 67.5s · 929 MB |
-| Parquet | 2,074 MB | **1.55s** · 5.2s · 1,233 MB | 3.22s · 10.6s · 1,480 MB | 3.58s · 11.1s · 1,338 MB | 4.11s · 11.5s · 1,346 MB |
+| CSV | 3,509 MB | **4.16s** · 14.9s · 716 MB | 10.12s · 32.2s · 936 MB | 5.68s · 19.9s · 899 MB | 4.55s · 17.1s · 887 MB |
+| ndjson | 8,487 MB | 20.13s · 74.5s · 717 MB | 26.36s · 81.1s · 880 MB | 16.14s · 61.6s · 899 MB | **15.58s** · 61.2s · 879 MB |
+| Parquet | 2,074 MB | **1.63s** · 5.4s · 1,299 MB | 3.28s · 10.9s · 1,482 MB | 3.79s · 11.7s · 1,322 MB | 4.42s · 12.1s · 1,299 MB |
 
 All builds returned identical counts — matched 9,990,000, changed 599,320, added
 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B. That is the
@@ -35,31 +35,31 @@ mean a bug in one of them, so the run fails and names it.
 
 Three things this table says.
 
-**Parquet is a different problem.** 1.55s against 4.06s for the same rows in
+**Parquet is a different problem.** 1.63s against 4.16s for the same rows in
 CSV, on three-fifths of the bytes, because with both dictionaries interned into
 one id space a cell comparison becomes `int32 != int32` rather than a string
-comparison.
+comparison. No port is within 2x of the C one there.
 
-**JSON is the laggard now.** 2.4x the size of the CSV and **5x** the time. It
-used to be 1.5x; nothing about the JSON path got worse, CSV got out from under
-it. A JSON object must be walked to its closing brace whatever you want from
-it, which is the cost that stayed.
+**Nobody holds all three.** C takes Parquet by 2x and CSV by 9%; Zig takes
+ndjson by 23%. The C JSON path still walks every object to its closing brace,
+which is the cost the rest of its parse work could not remove — that is a known
+open item, not a mystery.
 
 **Read the CPU column, not the wall column.** Wall time mixes work with how many
-cores a design manages to use; CPU seconds do not. C leads all three formats on
-both here — on CSV it uses 14.5 CPU-seconds where the next build uses 22.4 — but
-it was last-but-two on that row until [three hours
-earlier](BENCHMARKS.md#2026-09-08--ten-million-rows-seven-builds-three-formats),
-at 57.3, and it was the CPU column that said the problem was work rather than
-threading.
+cores a design manages to use; CPU seconds do not. Every row here is within 4x
+of its own CPU on four cores, so the ranking is about work rather than
+scheduling — which is exactly how the C port found the change that took its CSV
+row from 14.82s to 4.16s in a day: not by threading harder, but because 57
+CPU-seconds against a rival's 24 said it was doing twice the work.
 
 > Every Rust and Zig cell above, and the C++ cells on CSV and ndjson, come from
-> `claude/data-comparison-rust-zig-jam00m`, which carries those ports' newer
-> engines; the C cells and C++ on Parquet come from this tree. The run built
-> both trees and gave each its own column rather than merging two branches in
-> order to measure them — two builds compared across two sittings are not
-> compared at all. Full tables, with both versions of every port side by side,
-> are in [BENCHMARKS.md](BENCHMARKS.md).
+> `claude/data-comparison-rust-zig-jam00m` at `0569a39`, which carries those
+> ports' rewritten engines; the C cells and C++ on Parquet come from this tree.
+> The run built both trees and gave each its own column rather than merging two
+> branches in order to measure them — two builds compared across two sittings
+> are not compared at all. This tree's own Rust and Zig are superseded by those
+> columns and are left out here; they are in
+> [BENCHMARKS.md](BENCHMARKS.md), which keeps every row a run produced.
 
 ---
 
@@ -94,11 +94,12 @@ another Parquet file; CSV and ndjson compare against each other.
 |---|---|---|---|
 | **[`c/`](c/)** | CSV, ndjson, uncompressed Parquet | fastest on Parquet; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
 | **[`cpp/`](cpp/)** | CSV, ndjson, Parquet **including Snappy** | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report |
-| **[`rust/`](rust/)** | CSV, Parquet | the full contract with the **HTML report**; engines `turbo`, `sortmerge` (spills to disk), `native`, plus DuckDB and polars | ndjson |
+| **[`rust/`](rust/)** | CSV, Parquet | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | ndjson |
 | **[`zig/`](zig/)** | CSV, Parquet | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report, no ndjson |
 
-The Rust port bundles DuckDB and polars, which is most of why it is the slowest
-to build. The C port is the quickest, at a couple of seconds.
+Every port now builds from its own toolchain alone, in seconds: the Rust one
+carried a bundled DuckDB and the polars and arrow chain until they were removed,
+and a cold build went from twenty minutes to twenty seconds.
 
 ### Duplicate keys
 

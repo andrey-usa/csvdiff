@@ -125,8 +125,8 @@ fn a_file_compared_with_itself_is_identical() {
 }
 
 /// An empty field is an absent value whether or not it was quoted. Every engine
-/// has to agree, or a count would change with the engine — Polars in particular
-/// keeps a quoted empty as a zero-length string unless it is normalised.
+/// has to agree, or a count would change with the engine: a reader that keeps a
+/// quoted empty as a zero-length string counts it as present.
 #[test]
 fn a_quoted_empty_field_is_absent() {
     let f = Fixture::new("k,v\n1,\n2,\"\"\n3,keep\n", "k,v\n1,\"\"\n2,\n3,keep\n");

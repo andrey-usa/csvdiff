@@ -5,7 +5,6 @@
 //! outer join and the sparse cell diffs — so an engine only has to supply
 //! normalised rows.
 //!
-//! The DuckDB engine does all of this in SQL instead and does not use this type.
 
 use std::collections::HashMap;
 

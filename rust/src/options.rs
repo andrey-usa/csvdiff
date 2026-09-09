@@ -15,10 +15,6 @@ use crate::error::{Error, Result};
 pub enum Engine {
     /// Picks the first available concrete engine.
     Auto,
-    /// DuckDB: out-of-core, handles files larger than RAM.
-    DuckDb,
-    /// Polars: in-memory, columnar, multi-threaded.
-    Polars,
     /// Byte-level: maps the file and indexes it in place, building no string
     /// for a cell unless that cell reaches the report.
     Turbo,
@@ -31,19 +27,12 @@ pub enum Engine {
 
 impl Engine {
     /// The real backends, in `Auto` preference order.
-    pub const CONCRETE: [Engine; 4] = [
-        Engine::DuckDb,
-        Engine::Polars,
-        Engine::SortMerge,
-        Engine::Native,
-    ];
+    pub const CONCRETE: [Engine; 3] = [Engine::Turbo, Engine::SortMerge, Engine::Native];
 
     /// The name used on the command line and in the report.
     pub fn label(self) -> &'static str {
         match self {
             Engine::Auto => "auto",
-            Engine::DuckDb => "duckdb",
-            Engine::Polars => "polars",
             Engine::Turbo => "turbo",
             Engine::SortMerge => "sortmerge",
             Engine::Native => "native",
@@ -57,13 +46,11 @@ impl FromStr for Engine {
     fn from_str(s: &str) -> Result<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Engine::Auto),
-            "duckdb" => Ok(Engine::DuckDb),
-            "polars" => Ok(Engine::Polars),
             "turbo" => Ok(Engine::Turbo),
             "sortmerge" => Ok(Engine::SortMerge),
             "native" => Ok(Engine::Native),
             other => Err(Error::new(format!(
-                "unknown engine: {other}. Choose one of auto, duckdb, polars, turbo, sortmerge, native"
+                "unknown engine: {other}. Choose one of auto, turbo, sortmerge, native"
             ))),
         }
     }
@@ -106,7 +93,6 @@ pub struct Options {
     pub encoding: String,
     pub engine: String,
     pub threads: Option<usize>,
-    pub memory_limit: Option<String>,
     pub export_dir: Option<String>,
 }
 
@@ -125,7 +111,6 @@ impl Default for Options {
             encoding: "utf-8".to_string(),
             engine: Engine::Auto.label().to_string(),
             threads: None,
-            memory_limit: None,
             export_dir: None,
         }
     }

@@ -81,7 +81,7 @@ fn write_cells(path: &Path, header: &[String], rows: &[Vec<Cell>]) -> Result<()>
     write_rows(path, header, &values)
 }
 
-/// Writes an uncapped export file. Shared with the Polars engine, which builds
+/// Writes an uncapped export file. Shared by the engines, which build
 /// its rows straight from the frame rather than from a [`Joined`].
 pub fn write_rows(path: &Path, header: &[String], rows: &[Vec<Val>]) -> Result<()> {
     let mut w = csv::Writer::from_path(path)

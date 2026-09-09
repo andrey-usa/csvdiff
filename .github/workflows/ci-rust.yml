@@ -36,8 +36,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # DuckDB is compiled from its bundled amalgamation, so a cold build is
-      # several minutes; the cache is what keeps this job reasonable.
+      # A cold build is about twenty seconds now that the dataframe engines are
+      # gone; the cache keeps it under that.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -98,11 +98,8 @@ jobs:
           workspaces: rust
       - run: cargo build --release
       - run: ./target/release/gen-data --rows 200k --out-dir data
-      # The duckdb and polars engines are no longer exercised here: this project
-      # compares byte-level engines now, and a CI job that spends minutes
-      # installing two dataframe libraries to re-confirm a superseded result is
-      # time taken from the checks that can still fail. Their recorded numbers
-      # are in the archive section of README.md.
+      # Every engine this port still carries, which is every engine it has:
+      # the dataframe ones are gone, and their numbers are in ARCHIVE.md.
       - name: Compare with every engine and diff the summaries
         run: |
           for e in turbo native; do

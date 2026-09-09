@@ -4,8 +4,10 @@ Composite-key table comparison — CSV, newline-delimited JSON and Parquet — a
 C, C++, Rust and Zig, held to one result contract. Key columns, compared columns and
 normalisation are runtime parameters; nothing about a specific dataset belongs in the code.
 
-The DuckDB-backed Python implementation, and the Java, TypeScript, Go and dataframe engines beside
-it, are no longer in the project. Their results are in README.md's archive section.
+The DuckDB-backed Python implementation, the Java, TypeScript and Go ports, and the dataframe
+engines beside them are no longer in the project -- including the Rust port's own `duckdb` and
+`polars` engines, removed once the comparison they existed for was settled. Their results are in
+ARCHIVE.md.
 
 ## Commands
 
@@ -59,8 +61,8 @@ gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 
 ## Style
 
-- Standard library only outside the engine; DuckDB is the sole runtime dependency. Do not add a
-  web framework, a JS bundler, or a templating library.
+- No runtime dependency carries a comparison engine any more: the four ports are the engine. Do
+  not add a dataframe library, a web framework, a JS bundler, or a templating library.
 - The report JS is plain ES2020 in `report.py`. It must keep working when opened from `file://`.
 - Prefer editing the existing virtualised grid over adding a table library; the grid renders only
   the visible rows and that is the reason large reports open instantly.

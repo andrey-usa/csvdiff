@@ -23,10 +23,6 @@ name = "bench"
 path = "src/bin/bench.rs"
 
 [dependencies]
-# Engine: DuckDB, out-of-core, the default. Bundled so no system library is needed.
-duckdb = { version = "1.10505.0", features = ["bundled"] }
-# Engine: Polars, the Rust original behind the Node binding benchmarked in ../ts.
-polars = { version = "0.55.2", features = ["lazy", "csv", "dtype-full", "is_in", "strings", "abs"] }
 # Engine: native, over the csv crate.
 csv = "1.4.0"
 # Engine: turbo. Maps the file instead of reading it, so the bytes are paged in
@@ -39,8 +35,6 @@ base64 = "0.23.1"
 # Local time with an offset for the report header; std has no calendar.
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
-# Debug info for polars plus a bundled DuckDB runs to tens of gigabytes and buys
-# nothing here: a failing test is reproduced from its own output, not a core dump.
 [profile.dev]
 debug = 0
 

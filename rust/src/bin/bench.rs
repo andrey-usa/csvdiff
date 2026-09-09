@@ -1,7 +1,7 @@
 //! Benchmarks one scale end to end and records the numbers.
 //!
 //! ```text
-//! cargo run --release --bin bench -- --rows 1m --engine duckdb --out-dir bench
+//! cargo run --release --bin bench -- --rows 1m --engine turbo --out-dir bench
 //! ```
 //!
 //! The comparison runs in a child process so peak RSS is measured honestly
@@ -53,7 +53,6 @@ struct Config {
     no_budget: bool,
     allow_failure: bool,
     threads: Option<String>,
-    memory_limit: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -97,7 +96,6 @@ fn parse_config() -> Config {
         no_budget: flag("--no-budget"),
         allow_failure: flag("--allow-failure"),
         threads: value("--threads"),
-        memory_limit: value("--memory-limit"),
     }
 }
 
@@ -149,9 +147,6 @@ fn run(cfg: &Config) -> Result<ExitCode> {
     ]);
     if let Some(threads) = &cfg.threads {
         args.extend(["--threads".to_string(), threads.clone()]);
-    }
-    if let Some(limit) = &cfg.memory_limit {
-        args.extend(["--memory-limit".to_string(), limit.clone()]);
     }
 
     let (status, stderr, wall) = run_child(&cfg.binary, &args)?;

@@ -34,6 +34,75 @@ a different question.
 
 ---
 
+## 2026-09-09 — seven builds against the other branch's rewritten ports
+
+GitHub Actions `ubuntu-latest`, 4 vCPU / 16 GB.
+[Run 34291857114](https://github.com/andrey-usa/csvdiff/actions/runs/34291857114)
+at `7aef55a`, alt ref `claude/data-comparison-rust-zig-jam00m` at `0569a39` —
+ten commits on from the run below, with both ports' index and join rewritten and
+AVX2 added. Five interleaved rounds each.
+
+`Rust` and `Zig` without a suffix are this tree's, which is `main`'s: they are
+kept in the table because leaving a superseded build out is how a project talks
+itself into a number, but they are not the current state of those ports and the
+`(alt)` rows are.
+
+### CSV — 3,509 MB
+
+| Build | Best | Median | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|
+| **C** | **4.16s** | 4.21s | **14.9s** | 4,225 MB | **716 MB** |
+| Zig (alt) | 4.55s | 4.56s | 17.1s | 4,396 MB | 887 MB |
+| Rust (alt) | 5.68s | 5.69s | 19.9s | 4,408 MB | 899 MB |
+| C++ (alt) | 10.12s | 10.18s | 32.2s | 4,445 MB | 936 MB |
+| C++ | 20.15s | 20.18s | 63.7s | 4,392 MB | 883 MB |
+| Zig *(superseded)* | 21.19s | 21.28s | 36.6s | 4,233 MB | 724 MB |
+| Rust *(superseded)* | 39.59s | 39.62s | 39.6s | 4,435 MB | 927 MB |
+
+### newline-delimited JSON — 8,487 MB
+
+| Build | Best | Median | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|
+| **Zig (alt)** | **15.58s** | 15.71s | **61.2s** | 9,367 MB | 879 MB |
+| Rust (alt) | 16.14s | 16.17s | 61.6s | 9,387 MB | 899 MB |
+| C | 20.13s | 20.38s | 74.5s | 9,204 MB | **717 MB** |
+| C++ (alt) | 26.36s | 26.52s | 81.1s | 9,368 MB | 880 MB |
+| C++ | 27.40s | 27.49s | 84.0s | 9,373 MB | 885 MB |
+
+`Rust` and `Zig` from this tree refuse ndjson and are absent by their own report.
+
+### uncompressed Parquet — 2,074 MB
+
+| Build | Best | Median | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|
+| **C** | **1.63s** | 1.66s | **5.4s** | 3,373 MB | 1,299 MB |
+| C++ | 3.28s | 3.29s | 10.9s | 3,555 MB | 1,482 MB |
+| C++ (alt) | 3.28s | 3.29s | 10.8s | 3,554 MB | 1,481 MB |
+| Rust (alt) | 3.79s | 3.82s | 11.7s | 3,396 MB | 1,322 MB |
+| Rust *(superseded)* | 4.23s | 4.24s | 12.1s | 3,409 MB | 1,336 MB |
+| Zig (alt) | 4.42s | 4.43s | 12.1s | 3,372 MB | 1,299 MB |
+| Zig *(superseded)* | 7.16s | 7.26s | 12.1s | 3,405 MB | 1,331 MB |
+
+All seven agree, same counts as every run above.
+
+### What this run said
+
+**C keeps CSV, by 9%.** 4.16s against their rewritten Zig's 4.55s, where three
+hours earlier the gap was 1.73x the other way. Their Zig went 8.15s to 4.55s in
+the same span.
+
+**C lost ndjson**, and to the thing it was warned about: their Zig does it in
+15.58s against C's 20.13s. The C JSON path still walks every object to its
+closing brace, which is the open item the parse work could not remove.
+
+**C keeps Parquet by 2x**, on the least CPU of any build in the table.
+
+**The alt build now takes 63 seconds, not 21 minutes,** because the workflow
+stopped compiling a bundled DuckDB and the polars chain for a job that runs
+`--engine turbo`. The whole run went from 72 minutes to 31.
+
+---
+
 ## 2026-09-08 (later still) — the C generator, on every core
 
 One 4-core / 16 GB container, 2,000,000 rows, nine interleaved rounds, both

@@ -15,8 +15,9 @@ cd rust
 cargo build --release        # target/release/csvdiff
 ```
 
-DuckDB is compiled from the bundled amalgamation, so the first build is slow and needs a C++
-compiler; nothing else is required.
+A cold build is about twenty seconds and needs nothing but a Rust toolchain. It used to be
+twenty minutes, because it compiled a bundled DuckDB and the polars and arrow chain for engines
+this project stopped comparing against.
 
 ## Use
 
@@ -49,36 +50,37 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 | `--delimiter`, `--encoding` | override auto-detection |
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
-| `--engine` | `auto` (default), `duckdb`, `polars`, `turbo`, `sortmerge`, or `native` |
-| `--threads`, `--memory-limit` | DuckDB resource limits |
+| `--engine` | `auto` (default, resolves to `turbo`), `turbo`, `sortmerge`, or `native` |
+| `--threads` | how many threads the engine may use |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
 
 ## Engines
 
-Five backends, one result contract. Every engine must return identical `counts` and `columns` for
+Three backends, one result contract. Every engine must return identical `counts` and `columns` for
 the same input; the test suite asserts it cell for cell on every engine, and CI asserts it on 200k
 rows. `--engine auto` takes the first one that can actually load, in the order below.
 
 | Engine | Implementation | Memory model | Use it for |
 |---|---|---|---|
-| `duckdb` | DuckDB through `duckdb-rs` (bundled C++) | out-of-core, spills to disk | the default; anything that does not fit in RAM |
-| `polars` | Polars, natively | in-memory, columnar, multi-threaded | the dataframe comparison point |
-| `turbo` | mapped file, byte-level index | off-heap bytes, index in memory | **the fastest here** |
+| `turbo` | mapped file, byte-level index | off-heap bytes, index in memory | **the default, and the fastest here** |
 | `sortmerge` | external sort, merge join | bounded memory, spills to disk | files past what memory can index |
 | `native` | this project, over the `csv` crate | in-memory, row-oriented | the dependency-light baseline |
 
 All three read CSV values as text — no type inference, so `1.0` and `1` stay different unless a
-tolerance is set — and all three treat an empty field as absent whether or not it is quoted. Polars
-needs help with that last rule: it reads an unquoted empty field as null but keeps a *quoted* empty
-as a zero-length string, so the engine normalises it back before any user-supplied normalisation
-runs. A test pins that behaviour.
+tolerance is set — and all three treat an empty field as absent whether or not it is quoted. A test
+pins that last rule, because it is the one a reader is most likely to get differently: a reader that
+keeps a quoted empty as a zero-length string counts it as present, and the count changes with the
+engine.
 
-This is the same Polars that the TypeScript port drives through `nodejs-polars`, so the pair
-measures what the Node binding costs over the Rust original.
+The DuckDB and polars engines were removed. They were the project's original comparison points and
+the question they answered — is a bespoke byte-level engine worth writing — is settled; their
+numbers are in [ARCHIVE.md](../ARCHIVE.md). What they cost while they stayed was a twenty-minute
+cold build on every job that touched this crate.
 
-Only `duckdb` is unbounded by RAM.
+Only `sortmerge` is unbounded by RAM: it spills to disk, so the ceiling is the disk rather than
+the memory.
 
 ## Development
 
@@ -86,7 +88,7 @@ Only `duckdb` is unbounded by RAM.
 cargo test
 cargo fmt --check && cargo clippy --all-targets -- -D warnings
 cargo run --release --bin gen-data -- --rows 10k --out-dir data
-cargo run --release --bin bench -- --rows 10k --engine duckdb
+cargo run --release --bin bench -- --rows 10k --engine turbo
 ```
 
 `gen-data` builds the same deterministic 20-column pair as the Python, TypeScript, Java and Go
@@ -110,8 +112,9 @@ time, wall time, throughput, report size and the resulting counts, and fails if 
 budget (10k: 20s / 1.5 GB, 1M: 120s / 6 GB, 10M: 900s / 12 GB on a 4-vCPU runner). An engine that
 cannot handle a scale is recorded as a failed row with the reason rather than aborting the run.
 
-The dev profile sets `debug = 0`: debug info for Polars plus a bundled DuckDB runs to tens of
-gigabytes, and a failing test here is reproduced from its own output rather than a core dump.
+The dev profile sets `debug = 0`. It was set when debug info for polars plus a bundled DuckDB ran
+to tens of gigabytes; it stays because a failing test here is reproduced from its own output rather
+than from a core dump.
 
 ## Workflows
 
@@ -128,8 +131,6 @@ src/lib.rs                the library's public surface
 src/contract.rs           the result contract
 src/options.rs            runtime parameters and engine names
 src/engine.rs             compare() entry point and the engine registry
-src/engine/duckdb.rs      DuckDB over duckdb-rs
-src/engine/polars.rs      Polars frames, joins and expressions
 src/engine/native.rs      csv-crate parse, RowStore join
 src/rowstore.rs           de-duplication, join and sparse cell diffs for the in-memory engine
 src/columns.rs            column resolution, normalisation, cell equality, key ordering

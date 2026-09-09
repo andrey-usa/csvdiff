@@ -35,9 +35,8 @@ compare options:
       --max-rows N        Rows embedded per section (default 50000)
       --delimiter D       Force delimiter (default: auto)
       --encoding ENC
-      --engine E          auto | duckdb | polars | turbo | sortmerge | native
+      --engine E          auto | turbo | sortmerge | native
       --threads N
-      --memory-limit S    DuckDB memory limit, e.g. 4GB
       --export-dir DIR    Write full changed/added/removed CSVs here
   -o, --out PATH          Report path (default: <a>__vs__<b>.html)
       --json PATH         Also write a JSON summary (counts + column stats) here
@@ -205,9 +204,6 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     }
     if let Some(v) = args.get("engine", None) {
         opt.engine = v.to_string();
-    }
-    if let Some(v) = args.get("memory-limit", None) {
-        opt.memory_limit = Some(v.to_string());
     }
     if let Some(v) = args.get("export-dir", None) {
         opt.export_dir = Some(v.to_string());

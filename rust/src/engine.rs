@@ -1,8 +1,6 @@
 //! The engine registry and the [`compare`] entry point.
 
-pub mod duckdb;
 pub mod native;
-pub mod polars;
 pub mod pqdiff;
 pub mod sortmerge;
 pub mod turbo;
@@ -90,8 +88,6 @@ fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult
     }
 
     let result = match engine {
-        Engine::DuckDb => duckdb::compare(a, b, opt),
-        Engine::Polars => polars::compare(a, b, opt),
         Engine::Turbo => turbo::compare(a, b, opt),
         Engine::SortMerge => sortmerge::compare(a, b, opt),
         Engine::Native => native::compare(a, b, opt),
@@ -102,8 +98,8 @@ fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult
 
 /// Turns [`Engine::Auto`] into a concrete backend.
 ///
-/// DuckDB is preferred because it streams from disk rather than holding both
-/// files in memory, but only if it can actually load here.
+/// `turbo` is preferred: it is the byte-level engine every benchmark here
+/// measures, and the only one that reads Parquet and newline-delimited JSON.
 pub fn resolve_engine(requested: Engine) -> Engine {
     if requested != Engine::Auto {
         return requested;
@@ -117,8 +113,6 @@ pub fn resolve_engine(requested: Engine) -> Engine {
 /// Whether a backend can run in this build.
 pub fn available(engine: Engine) -> bool {
     match engine {
-        Engine::DuckDb => duckdb::available(),
-        Engine::Polars => polars::available(),
         Engine::Turbo => turbo::available(),
         Engine::SortMerge => sortmerge::available(),
         Engine::Native => native::available(),

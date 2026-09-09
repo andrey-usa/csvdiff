@@ -33,20 +33,8 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<duckdb::Error> for Error {
-    fn from(e: duckdb::Error) -> Self {
-        Error(e.to_string())
-    }
-}
-
 impl From<csv::Error> for Error {
     fn from(e: csv::Error) -> Self {
-        Error(e.to_string())
-    }
-}
-
-impl From<polars::prelude::PolarsError> for Error {
-    fn from(e: polars::prelude::PolarsError) -> Self {
         Error(e.to_string())
     }
 }
