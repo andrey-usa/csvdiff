@@ -22,9 +22,15 @@ c/gen-data --rows 10k --out-dir data --prefix p --format json
 c/gen-data --rows 10k --out-dir data --prefix p --format parquet
 
 c/csvdiff compare data/p_a.csv data/p_b.csv -k account_id,txn_id -i updated_at
-python scripts/bench_ports.py data/p_a.csv data/p_b.csv --repeats 5
+python scripts/bench_ports.py data/p_a.csv data/p_b.csv --repeats 5    # every port, one table
+scripts/bench_ab.sh old/csvdiff new/csvdiff -- compare A.csv B.csv -k id   # two builds
+scripts/bench_ab.sh --self-test c/csvdiff -- compare A.csv B.csv -k id    # the harness itself
 gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 ```
+
+Linux is the only tested platform. C, C++ and Zig need POSIX or better — Zig
+calls `std.os.linux.clock_gettime`, so it is Linux and not merely POSIX — and
+only the Rust port builds on Windows without WSL. See the table in README.md.
 
 ## Layout
 
@@ -85,9 +91,50 @@ touch, not where you push.
   right answer can differ per port: `added` is derived arithmetically in C++ and Zig, from a
   bitmap in Rust, because only Rust has to name the rows.
 
+## Measuring
+
+Most of the wrong turns taken here have been measurement, not code. Read this
+before timing anything.
+
+- **Use `scripts/bench_ab.sh`, not a hand-rolled loop.** It runs both builds once
+  per round and reports the **median of the per-round ratios** with the middle
+  half beside it. When that half straddles 1.00x it says *no result* instead of
+  leaving a ratio to be argued about.
+- **Pair, do not average.** Comparing two builds' separately-taken bests reads
+  two copies of *the same binary* as 9.1% apart on this class of runner, and
+  fifteen rounds instead of five makes it 9.4% — because what a shared machine
+  does is drift, not jitter, and averaging does not touch drift. Paired, the
+  same A/A test reads 1.01x. `--self-test` runs it, so the claim can be
+  rechecked on whatever machine you are on.
+- **Do not reach for `hyperfine` here.** Its model is one build's runs then the
+  other's, which is the first case above; on two identical binaries it reported
+  "1.07 ± 0.20 times faster" twice and changed its mind about which the third
+  time. The ± is the honest part. Its point estimate is not readable under about
+  1.2x on this hardware.
+- **Bound the prize before building anything.** A deliberately unsound build that
+  removes the cost entirely says what the real thing could be worth at most.
+  Ten minutes of that has repeatedly replaced a day of implementation — and has
+  also justified one, when it showed 1.47x on the table.
+- **Check a probe against the counts it still produces, not just the clock.** A
+  probe that skipped the index insert measured 2.08x and meant nothing: an empty
+  index is an empty join, so it had priced both. `matched 0` in the output said
+  so, and nobody looked.
+- **Work removed beats work moved.** Taking a fifth of the join's CPU out of the
+  C++ port changed its wall clock by nothing, because the join is threaded and
+  was not the critical path. Parallelising the pass that *was* the critical path
+  also measured nothing — the machine was already busy. Deleting that pass was
+  worth 1.28x. Prefer removing a pass to speeding one up, and prove which you
+  have done.
+- **Never compare across tables.** Two numbers from two sittings compare machine
+  states. This runner's ndjson figures moved 20% between two runs one morning
+  with no code change in any port.
+
 ## Gotchas
 
 - `resource.ru_maxrss` is KB on Linux, bytes on macOS — the harnesses in `scripts/` handle both.
+- `--ignore` with a name no column matches is accepted in silence by all four ports, where `--key`
+  with one is an error. It has already cost a benchmark run that reported every row as changed.
+  Check the counts a run produces before believing its timings.
 - Duplicate keys: the first occurrence of each key joins, the rest are reported separately.
   Changing that changes the matched/added/removed counts, so it is a behaviour change, not a fix.
 - The report decodes its gzip payload with `DecompressionStream`, which needs a 2023+ browser.

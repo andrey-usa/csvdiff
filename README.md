@@ -62,30 +62,75 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > numbers moved 20% between two runs one morning with no code change at all.
 ---
 
-## Using it
+## Building and running
 
-Each port builds from its own directory, with its own toolchain and no system
-dependencies:
+### What runs where
+
+Only Linux is tested — all eleven CI jobs are `ubuntu-latest` — so the other two
+columns are what the source implies rather than what a run has proved.
+
+| Port | Linux | macOS | Windows | Why |
+|---|---|---|---|---|
+| **C** | tested | should work | **WSL** | `sys/mman.h`, `pthread.h`, `unistd.h`: POSIX, and MSVC has none of them |
+| **C++** | tested | should work | **WSL** | the same POSIX headers, minus pthread — it uses `std::thread` |
+| **Rust** | tested | should work | **native** | no `std::os::unix` anywhere; `memmap2` maps files on Windows too |
+| **Zig** | tested | **no** | **WSL** | one call to `std.os.linux.clock_gettime`, which is Linux and not merely POSIX |
+
+`test.sh` and `scripts/bench_ab.sh` are bash. On Windows they need WSL or Git
+Bash; `scripts/bench_ports.py` needs Python 3.
+
+### Building
+
+Each port builds from its own directory with its own toolchain, in seconds, and
+pulls in nothing that contains a comparison engine.
 
 ```bash
+# Linux, macOS, or WSL
 (cd c    && make)                    # cc or clang, C11. Also builds c/gen-data
 (cd cpp  && make)                    # g++ or clang++, C++20
 (cd rust && cargo build --release)   # edition 2024
 (cd zig  && zig build --release=fast)
 ```
 
+```powershell
+# Windows, PowerShell — the Rust port is the one that builds without WSL
+cd rust
+cargo build --release
+.\target\release\csvdiff.exe compare july.csv august.csv -k id
+```
+
+For the other three on Windows, install WSL (`wsl --install`) and use the bash
+commands above inside it. A Windows path is reachable from WSL as
+`/mnt/c/Users/you/data.csv`.
+
+### Running
+
 ```bash
+# the smallest useful invocation: two files and a key
 c/csvdiff compare july.csv august.csv -k order_id,line_no
+
+# -i skips columns that always move; --json writes the counts and samples;
+# --threads caps the cores it takes
 c/csvdiff compare july.csv august.csv -k id -i updated_at --json summary.json --threads 4
+
+# the Rust port is the one with the self-contained HTML report
 rust/target/release/csvdiff compare july.csv august.csv -k id -o report.html
 ```
 
-Exit codes: **0** identical, **1** differences found, **2** error (**3**
-duplicate keys, where `--fail-on-dups` is supported). That makes any of them a
-drop-in CI or pipeline gate.
+**Exit codes** make any of them a CI or pipeline gate directly:
 
-Format is detected from the bytes. A Parquet file may only be compared against
-another Parquet file; CSV and ndjson compare against each other.
+| Code | Meaning |
+|---:|---|
+| `0` | the two files are identical on the compared columns |
+| `1` | differences found — this is a normal result, not a failure |
+| `2` | an error: a missing key column, an unreadable file, out of memory |
+| `3` | duplicate keys, where `--fail-on-dups` is given — the Rust port only |
+
+`1` is the usual outcome, so a script that treats any non-zero status as failure
+will misread a successful comparison. Test for `2` and above.
+
+Format is detected from the bytes, not the extension. A Parquet file may only be
+compared against another Parquet file; CSV and ndjson compare against each other.
 
 ### What each port carries
 
@@ -208,10 +253,16 @@ tests/fixtures/          every shape that has broken an engine here
    key makes the answer impossible; a missing ignore quietly makes it wider. It
    cost a benchmark run here that reported every row as changed. Whether to
    warn or to refuse is a contract decision across four ports.
-3. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
+3. **Zig is Linux-only for one line.** `Phases.now()` calls
+   `std.os.linux.clock_gettime` for a diagnostic that is off by default, and
+   that call is compiled unconditionally — so the port will not build on macOS
+   or on Windows, where the other three will. `std.time.Instant` or a
+   `builtin.os.tag` switch would settle it; nothing else in that port looks
+   Linux-bound.
+4. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-4. **Compression.** Parquet here is generated uncompressed by choice, so no
+5. **Compression.** Parquet here is generated uncompressed by choice, so no
    table has ever measured a codec. Three ports could: Rust and Zig read snappy,
    gzip, zstd, lz4 and brotli, C++ reads snappy alone, and C carries no codec at
    all — the same choice its reader makes. What decompression costs against what
