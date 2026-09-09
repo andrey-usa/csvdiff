@@ -188,6 +188,14 @@ before timing anything.
 - **Neither Rust nor Zig reads brotli or LZO.** Both codec tables refuse them by name. The README
   claimed brotli for two ports for weeks, and it took a reader's zstd file to find out that nobody
   had run a codec through either port.
+- **A flag that is accepted and ignored is a wrong answer, not a convenience.** `gen-data`'s Rust
+  argument loop skipped anything it did not recognise, so `--rows=50m` -- the spelling every GNU
+  tool takes -- fell through to the `10k` default and the run printed `rust: 10000 rows` with no
+  mention of the flag it dropped; `--seed abc` was `unwrap_or(7)`; `--rows --out-dir data` read
+  the next flag as the row count. All three are errors now, and both spellings of every flag work.
+  This is the same family as `--ignore` matching nothing in silence (above) and it is the one to
+  watch for whenever a harness passes flags through: the run completes, the numbers are wrong,
+  and nothing says so.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
