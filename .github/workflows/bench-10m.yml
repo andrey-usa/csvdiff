@@ -27,12 +27,16 @@ name: Benchmark 10M
 # width wins -- which is the whole reason both are in the table.
 
 on:
-  # A push that touches an engine or the harness re-runs the whole matrix. That
-  # is deliberate: a performance change is not a change until it has been
-  # measured, and measuring it anywhere but one known host is how the numbers in
-  # this repository stop being comparable.
-  push:
-    branches: ["claude/**", "bench/**"]
+  # On a pull request, not on a push to a branch. The intent behind the push
+  # trigger was right -- a performance change is not a change until it has been
+  # measured on one known host -- but with two branches developing engines at
+  # once it cost more than it bought: a run takes twenty-five minutes, the
+  # concurrency group cancels in progress, and every push to a branch under
+  # measurement killed the table being produced from it. Three 10M runs went
+  # that way in one morning. A pull request does not move while it is being
+  # read, and `synchronize` re-runs it when it does.
+  pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - "cpp/src/**"
       - "cpp/Makefile"
