@@ -564,6 +564,7 @@ class RowParser {
     RowParser(char delimiter, std::vector<int> source)
         : delimiter_(delimiter), source_(std::move(source)) {
         for (int c : source_) last_needed_ = std::max(last_needed_, c);
+        key_last_ = last_needed_;  // until set_key_size says otherwise
         // Inverted once, so storing a field is a lookup rather than a walk of
         // every wanted column: twenty columns against twenty slots is four
         // hundred comparisons a row otherwise. A column can feed more than one
@@ -611,8 +612,13 @@ class RowParser {
     // shorter than the header leaves the missing fields absent, which is a
     // difference to report rather than a file to refuse.
     std::size_t parse(std::string_view d, std::size_t start, std::size_t end, Field* out) const {
-        if (dialect_ == Dialect::Json) return parse_json(d, start, end, out);
-        std::fill(out, out + source_.size(), kAbsent);
+        if (dialect_ == Dialect::Json) return parse_json(d, start, end, out, wanted_.size());
+        return parse_csv(d, start, end, out, last_needed_, source_.size());
+    }
+
+    std::size_t parse_csv(std::string_view d, std::size_t start, std::size_t end, Field* out,
+                          int last, std::size_t slots) const {
+        std::fill(out, out + slots, kAbsent);
         std::size_t pos = start;
         int column = 0;
 
@@ -631,13 +637,13 @@ class RowParser {
                 if (stop > pos && d[stop - 1] == '\r') --stop;  // CRLF behaves like LF
                 field = pack(pos, stop - pos, false);
             }
-            store(column, field, out);
+            store(column, field, out, last, slots);
             ++column;
 
             if (next >= end) return end;
             if (d[next] == '\n') return next + 1;
             pos = next + 1;
-            if (column > last_needed_) {
+            if (column > last) {
                 const std::size_t eol = end_of_row(d, pos, end);
                 return eol >= end ? end : eol + 1;
             }
@@ -647,6 +653,27 @@ class RowParser {
 
     std::size_t width() const {
         return dialect_ == Dialect::Json ? wanted_.size() : source_.size();
+    }
+
+    /// Key slots come first, so this is how far a key-only parse has to go.
+    void set_key_size(std::size_t n) {
+        key_size_ = n;
+        key_last_ = -1;
+        for (std::size_t slot = 0; slot < n && slot < source_.size(); ++slot)
+            key_last_ = std::max(key_last_, source_[slot]);
+        if (key_last_ < 0) key_last_ = last_needed_;
+    }
+
+    /// The keys, and nothing else.
+    ///
+    /// The sweep hashes keys and stores where the row starts; it never looks at
+    /// a compared column. Parsing all twenty to use two was most of what it
+    /// cost -- and the gain grows with the file, because past cache the parses
+    /// removed are memory traffic and not only instructions.
+    std::size_t parse_keys(std::string_view d, std::size_t start, std::size_t end,
+                           Field* out) const {
+        return dialect_ == Dialect::Json ? parse_json(d, start, end, out, key_size_)
+                                         : parse_csv(d, start, end, out, key_last_, key_size_);
     }
 
   private:
@@ -659,9 +686,10 @@ class RowParser {
     // Walks one JSON object, storing the values of the keys we want. One pass
     // over the object, one hash per key -- not a search per wanted column, which
     // at twenty columns would be four hundred comparisons a row.
-    std::size_t parse_json(std::string_view d, std::size_t start, std::size_t end,
-                           Field* out) const {
-        std::fill(out, out + wanted_.size(), kAbsent);
+    std::size_t parse_json(std::string_view d, std::size_t start, std::size_t end, Field* out,
+                           std::size_t slots) const {
+        std::fill(out, out + slots, kAbsent);
+        std::size_t found = 0;  // key slots filled, for the early exit below
         std::size_t pos = start;
         while (pos < end && json_space(d[pos])) ++pos;
         if (pos >= end) return end;
@@ -715,7 +743,23 @@ class RowParser {
             }
             if (!v.absent) {
                 const int slot = slot_for(key);
-                if (slot >= 0) out[slot] = pack(v.from, v.to - v.from, v.escaped);
+                if (slot >= 0 && static_cast<std::size_t>(slot) < slots) {
+                    // First occurrence wins for a key column, and only for a key
+                    // column -- the C port's rule, adopted here so the two agree
+                    // on a name a JSON object repeats. It is not a nicety: the
+                    // key-only parse below stops as soon as it has the keys, and
+                    // under last-wins it could stop on a different value than the
+                    // full parse ends with, which is a lookup that misses its own
+                    // row. Compared columns keep last-wins.
+                    if (static_cast<std::size_t>(slot) < key_size_) {
+                        if (out[slot] == kAbsent) {
+                            out[slot] = pack(v.from, v.to - v.from, v.escaped);
+                            if (++found == slots) break;
+                        }
+                    } else {
+                        out[slot] = pack(v.from, v.to - v.from, v.escaped);
+                    }
+                }
             }
         }
         return end_of_json_row(d, pos, end);
@@ -772,11 +816,13 @@ class RowParser {
         return end;
     }
 
-    void store(int column, Field f, Field* out) const {
-        if (column > last_needed_) return;
+    void store(int column, Field f, Field* out, int last, std::size_t slots) const {
+        if (column > last) return;
         const std::size_t at = static_cast<std::size_t>(column);
-        for (int i = csv_slot_starts_[at]; i < csv_slot_starts_[at + 1]; ++i)
-            out[csv_slots_[static_cast<std::size_t>(i)]] = f;
+        for (int i = csv_slot_starts_[at]; i < csv_slot_starts_[at + 1]; ++i) {
+            const std::size_t slot = static_cast<std::size_t>(csv_slots_[static_cast<std::size_t>(i)]);
+            if (slot < slots) out[slot] = f;
+        }
     }
 
     static std::size_t end_of_row(std::string_view d, std::size_t pos, std::size_t end) {
@@ -796,6 +842,8 @@ class RowParser {
     char delimiter_ = ',';
     std::vector<int> source_;
     int last_needed_ = 0;
+    int key_last_ = 0;
+    std::size_t key_size_ = 0;
     // The inverse of `source_`: which slots each column of the file feeds.
     std::vector<int> csv_slot_starts_, csv_slots_;
     Dialect dialect_ = Dialect::Csv;
@@ -824,6 +872,8 @@ class RowIndex {
     RowIndex(const Slab& slab, const RowParser& parser, std::size_t from, std::size_t key_size,
              const Options& opt, unsigned threads = 1)
         : slab_(slab), parser_(parser), key_size_(key_size), opt_(opt) {
+        // A placeholder until the sweep says how many rows there are; an empty
+        // file returns before that and needs a valid mask.
         table_.assign(1 << 12, kEmpty);
         mask_ = table_.size() - 1;
         scratch_.assign(parser.width() * 2, kAbsent);  // probe, then this row's key
@@ -862,6 +912,17 @@ class RowIndex {
         for (const auto& c : chunks) total += c.starts.size();
         row_start_.reserve(total);
         row_hash_.reserve(total);
+        // Sized once, from a row count the sweep has already produced. Growing
+        // into it instead costs a rehash per doubling -- thirteen of them at ten
+        // million rows, each one a full pass of random probes over a table far
+        // too big to cache, to arrive at the size that was known before the
+        // first insert. Under a half load, so nothing ever rehashes.
+        std::size_t cap = 1u << 12;
+        while (cap < total * 2 + 16) cap <<= 1;
+        table_.assign(cap, kEmpty);
+        mask_ = cap - 1;
+        first_row_.reserve(total);
+        occurrences_.reserve(total);
         // Each chunk is released as soon as it has been inserted. Holding all of
         // them until the end would keep two copies of every row's start and hash
         // alive at once -- the chunks and the arrays being filled from them --
@@ -1004,9 +1065,12 @@ class RowIndex {
                 pos += 2;
                 continue;
             }
-            const std::size_t next = parser.parse(d, pos, end, fields.data());
-            for (Field f : fields)
-                if (f == kTooLong)
+            // Keys only. This loop hashes the key and remembers where the row
+            // starts; it never looks at a compared column, and parsing all
+            // twenty to use two was most of what the sweep cost.
+            const std::size_t next = parser.parse_keys(d, pos, end, fields.data());
+            for (std::size_t i = 0; i < key_size_; ++i)
+                if (fields[i] == kTooLong)
                     throw Error("a field larger than " + std::to_string(kMaxFieldLen) +
                                 " bytes is more than this engine packs");
             out.starts.push_back(pos);
@@ -1322,10 +1386,14 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             out.push_back(std::find(header.begin(), header.end(), n) == header.end() ? "" : n);
         return out;
     };
-    const RowParser ap = a.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(a_header))
-                                                     : RowParser(a_delim, positions(a_header));
-    const RowParser bp = b.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(b_header))
-                                                     : RowParser(b_delim, positions(b_header));
+    RowParser ap = a.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(a_header))
+                                                : RowParser(a_delim, positions(a_header));
+    RowParser bp = b.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(b_header))
+                                                : RowParser(b_delim, positions(b_header));
+    // Key slots come first in both, so this is all a key-only parse needs to
+    // know: where to stop, and how many slots to fill.
+    ap.set_key_size(key_size);
+    bp.set_key_size(key_size);
 
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
