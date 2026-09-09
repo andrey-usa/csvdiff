@@ -364,6 +364,31 @@ if [ -x "$GEN" ]; then
   else
     echo "  FAIL  snappy should be refused by name"; fail=1
   fi
+
+  # A misspelled --ignore used to widen the comparison in silence: the column it
+  # meant to drop got compared and came back changed on every row. Both of this
+  # port's readers refuse it now, so the text path and the columnar one are
+  # checked separately -- they resolve columns in different files.
+  if ./csvdiff compare "$pq_dir/r_a.csv" "$pq_dir/r_b.csv" -k account_id -i no_such_column 2>&1 \
+       | grep -q "present in neither file"; then
+    echo "  ok    an unknown --ignore name is refused (text)"
+  else
+    echo "  FAIL  an unknown --ignore name should be refused (text)"; fail=1
+  fi
+  if ./csvdiff compare "$pq_dir/r_a.unc.parquet" "$pq_dir/r_b.unc.parquet" \
+       -k account_id -i no_such_column 2>&1 | grep -q "present in neither file"; then
+    echo "  ok    an unknown --ignore name is refused (parquet)"
+  else
+    echo "  FAIL  an unknown --ignore name should be refused (parquet)"; fail=1
+  fi
+  # The other half of the rule: a name that is really there still works, so the
+  # check refuses typos rather than refusing --ignore.
+  if ./csvdiff compare "$pq_dir/r_a.csv" "$pq_dir/r_b.csv" -k account_id -i updated_at \
+       >/dev/null 2>&1; [ $? -le 1 ]; then
+    echo "  ok    a real --ignore name is still accepted"
+  else
+    echo "  FAIL  a real --ignore name should be accepted"; fail=1
+  fi
 else
   echo "skip: $GEN is not built, so the parquet checks did not run"
   echo "      it is built by 'make' in this directory"
@@ -410,7 +435,12 @@ kcase() { # label, expected "changed added removed", then the flags
   fi
 }
 kcase "key in the third of four columns"      "1 1 1" -k id
-kcase "with everything after the key ignored" "0 1 1" -k id -i x,y,z
+# `z` was a typo for `z2` and nothing could see it: the columns are
+# x,y,id,z2, so this ignored two of the three non-key columns and compared
+# the third, while the label said all of them. The counts came out the same
+# either way, which is why it survived. `--ignore` refuses an unknown name
+# now, and that is how this was found.
+kcase "with everything after the key ignored" "0 1 1" -k id -i x,y,z2
 kcase "key in the last column"                "1 1 1" -k z2
 kcase "two key columns, first and last"       "1 1 1" -k x,z2
 rm -rf "$kdir"

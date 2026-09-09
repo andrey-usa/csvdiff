@@ -163,9 +163,12 @@ before timing anything.
 ## Gotchas
 
 - `resource.ru_maxrss` is KB on Linux, bytes on macOS — the harnesses in `scripts/` handle both.
-- `--ignore` with a name no column matches is accepted in silence by all four ports, where `--key`
-  with one is an error. It has already cost a benchmark run that reported every row as changed.
-  Check the counts a run produces before believing its timings.
+- `--ignore` with a name **no file has** is an error in all four ports, like `--key` and
+  `--compare` before it. It used to be accepted in silence, which cost a benchmark run that
+  reported every row as changed -- and hid a `-i x,y,z` against a `z2` column in this repository's
+  own C suite until the check went in. The rule is *neither* file, not both: `--ignore` is
+  subtractive, so a name only one side carries is real and does no harm. Keep the four ports
+  saying the same thing; `parity.yml` does not compare refusals.
 - Duplicate keys: the first occurrence of each key joins, the rest are reported separately.
   Changing that changes the matched/added/removed counts, so it is a behaviour change, not a fix.
 - The report decodes its gzip payload with `DecompressionStream`, which needs a 2023+ browser.
@@ -195,8 +198,8 @@ before timing anything.
   tool takes -- fell through to the `10k` default and the run printed `rust: 10000 rows` with no
   mention of the flag it dropped; `--seed abc` was `unwrap_or(7)`; `--rows --out-dir data` read
   the next flag as the row count. All three are errors now, and both spellings of every flag work.
-  This is the same family as `--ignore` matching nothing in silence (above) and it is the one to
-  watch for whenever a harness passes flags through: the run completes, the numbers are wrong,
+  This is the same family as `--ignore` matching nothing, which is fixed above, and it is the one
+  to watch for whenever a harness passes flags through: the run completes, the numbers are wrong,
   and nothing says so.
   The same trap sits in `csvdiff`'s own parser from the other side: **a value-less flag has to be
   in `FLAGS` in `main.rs`**, or it eats the token after it -- `head a.csv --csv` reported

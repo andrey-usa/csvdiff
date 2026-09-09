@@ -262,4 +262,24 @@ PYEOF
   rm -rf "$tmpp"
 fi
 
+# A misspelled --ignore used to widen the comparison in silence: the column it
+# meant to drop got compared and came back changed on every row. `--key` and
+# `--compare` have always refused an unknown name; this is the third.
+igdir=$(mktemp -d)
+printf 'id,a,b\nk1,p,q\n' > "$igdir/a.csv"
+printf 'id,a,b\nk1,p,X\n' > "$igdir/b.csv"
+out=$(build/csvdiff compare "$igdir/a.csv" "$igdir/b.csv" -k id -i no_such_column 2>&1) || true
+case "$out" in
+  *"present in neither file"*) echo "  ok    an unknown --ignore name is refused" ;;
+  *) echo "  FAIL  expected a refusal, got: $out"; fail=1 ;;
+esac
+# The other half: a real name still works, so the check refuses typos rather
+# than refusing --ignore.
+out=$(build/csvdiff compare "$igdir/a.csv" "$igdir/b.csv" -k id -i b 2>&1) || true
+case "$out" in
+  *"changed 0"*) echo "  ok    a real --ignore name is still accepted" ;;
+  *) echo "  FAIL  a real --ignore name should be accepted, got: $out"; fail=1 ;;
+esac
+rm -rf "$igdir"
+
 exit $fail

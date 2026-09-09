@@ -46,6 +46,29 @@ pub fn resolve(a_cols: &[String], b_cols: &[String], opt: &Options) -> Result<Re
         )));
     }
 
+    // A name that is in neither file is a typo, and a typo here is the one that
+    // does not announce itself: `--key` makes the answer impossible and
+    // `--compare` refuses, but a misspelled `--ignore` silently compares the
+    // column it was meant to drop and reports it as changed on every row. It
+    // cost a benchmark run, and a `-i x,y,z` against a `z2` column sat in this
+    // repository's own C suite until the check went in.
+    //
+    // In *neither* file, not in both: `--ignore` is subtractive, so naming a
+    // column that only one side has is a real name doing no harm -- it is not
+    // compared either way. Only a name nothing has can be a mistake.
+    let unknown: Vec<&str> = opt
+        .ignore
+        .iter()
+        .filter(|c| !a_cols.contains(c) && !b_cols.contains(c))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(Error::new(format!(
+            "ignore column(s) present in neither file: {}",
+            unknown.join(", ")
+        )));
+    }
+
     let common: Vec<String> = a_cols
         .iter()
         .filter(|c| b_cols.contains(c))
@@ -204,4 +227,77 @@ pub fn detect_delimiter(header_line: &str) -> u8 {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn opt(key: &[&str], ignore: &[&str]) -> Options {
+        Options {
+            key: names(key),
+            ignore: names(ignore),
+            ..Options::default()
+        }
+    }
+
+    /// The fault this check exists for. `--key` makes the answer impossible and
+    /// `--compare` refuses, but a misspelled `--ignore` used to compare the
+    /// column it meant to drop and call it changed on every row -- in silence.
+    #[test]
+    fn an_ignore_name_in_neither_file_is_refused() {
+        let a = names(&["x", "y", "id", "z2"]);
+        let b = a.clone();
+        let err = resolve(&a, &b, &opt(&["id"], &["x", "y", "z"])).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("present in neither file"), "{text}");
+        assert!(
+            text.contains('z'),
+            "the name has to be in the message: {text}"
+        );
+    }
+
+    /// `--ignore` is subtractive, so a name only one side carries is real and
+    /// does no harm: that column is not compared either way. Refusing it would
+    /// break the ordinary case of one flag set across files whose schemas
+    /// differ at the edges.
+    #[test]
+    fn an_ignore_name_in_one_file_is_allowed() {
+        let a = names(&["id", "shared", "only_a"]);
+        let b = names(&["id", "shared", "only_b"]);
+        for name in ["only_a", "only_b"] {
+            let r = resolve(&a, &b, &opt(&["id"], &[name]));
+            assert!(r.is_ok(), "{name} is a real column: {:?}", r.err());
+        }
+    }
+
+    #[test]
+    fn a_real_ignore_name_still_drops_its_column() {
+        let a = names(&["id", "keep", "drop"]);
+        let b = a.clone();
+        let r = resolve(&a, &b, &opt(&["id"], &["drop"])).expect("a real name");
+        assert_eq!(r.compared, names(&["keep"]));
+    }
+
+    /// The check must not fire on an empty `--ignore`, which is the default.
+    #[test]
+    fn no_ignore_at_all_is_fine() {
+        let a = names(&["id", "v"]);
+        let r = resolve(&a, &a.clone(), &opt(&["id"], &[])).expect("no ignore");
+        assert_eq!(r.compared, names(&["v"]));
+    }
+
+    /// It applies with `--compare` given too: the name is still a typo, even
+    /// where the comparison set was named explicitly and `--ignore` is unused.
+    #[test]
+    fn it_applies_even_when_compare_is_explicit() {
+        let a = names(&["id", "v", "w"]);
+        let mut o = opt(&["id"], &["nope"]);
+        o.compare = Some(names(&["v"]));
+        assert!(resolve(&a, &a.clone(), &o).is_err());
+    }
 }
