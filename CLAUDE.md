@@ -29,9 +29,20 @@ scripts/bench_ab.sh --self-test c/csvdiff -- compare A.csv B.csv -k id    # the 
 gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 ```
 
-Linux is the only tested platform. C, C++ and Zig need POSIX or better — Zig
-calls `std.os.linux.clock_gettime`, so it is Linux and not merely POSIX — and
-only the Rust port builds on Windows without WSL. See the table in README.md.
+Linux is the only platform anything is *run* on. C, C++ and Zig need POSIX or
+better; only the Rust port builds on Windows without WSL, and CI proves that on
+`windows-latest`. Zig cross-compiles for both macOS targets, checked in
+`parity.yml` on every run — cross-compiling is not running, and the table in
+README.md says so.
+
+**A namespace is not a target check.** `std.os.linux.clock_gettime` compiles on
+macOS and then issues Linux syscall numbers to a kernel that does not use them;
+the port carried that for a diagnostic that is off by default, and the README
+had it recorded as a *build* failure, which would have been the kinder one.
+Reach for `builtin.os.tag` and let a target with no implementation be a
+`@compileError`. Grepping a port for `std.os.unix` or `std.os.linux` proves
+nothing either way — it cannot see inside a dependency, which is how the Rust
+port shipped a Windows claim it could not honour.
 
 The two generators write byte-identical output. Use `c/gen-data` for anything
 large — it is threaded and 4.3x faster on wall time, and every table in

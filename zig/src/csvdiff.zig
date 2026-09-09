@@ -20,6 +20,7 @@
 //! the same field word, so the two sides of a comparison need not be in the same
 //! format. See `text.zig` and `parquet.zig`.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const scan = @import("scan.zig");
 const fld = @import("field.zig");
@@ -71,13 +72,45 @@ pub const Phases = struct {
 
     /// `tag` prefixes every line, because the two files are read on two threads
     /// and their phases would otherwise interleave unattributed.
-    /// The monotonic clock straight from the kernel: std's timing now wants an
+    ///
+    /// The monotonic clock straight from the platform: std's timing now wants an
     /// `Io`, and threading one through the engine for a diagnostic that is off by
-    /// default would be a worse trade than this one call.
+    /// default would be a worse trade than this switch.
+    ///
+    /// The switch is the point. This was one unconditional call to
+    /// `std.os.linux.clock_gettime`, which *compiles* on macOS -- `std.os.linux`
+    /// is a namespace, not a target check -- and then emits Linux syscall numbers
+    /// on a kernel that does not use them. A build error would have been the
+    /// kinder failure. `Phases.start` calls this whether or not `CSVDIFF_PHASES`
+    /// is set, so every macOS run went through it.
     fn now() i128 {
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+        return switch (builtin.os.tag) {
+            // Linux by way of the kernel, so this port keeps linking no libc.
+            .linux => blk: {
+                var ts: std.os.linux.timespec = undefined;
+                _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+                break :blk @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+            },
+            // Darwin always links libSystem, so the C entry point is the one.
+            .macos, .ios, .tvos, .watchos, .visionos => blk: {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &ts);
+                break :blk @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+            },
+            .windows => blk: {
+                var counter: std.os.windows.LARGE_INTEGER = undefined;
+                var frequency: std.os.windows.LARGE_INTEGER = undefined;
+                _ = std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter);
+                _ = std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency);
+                if (frequency == 0) break :blk 0;
+                break :blk @divTrunc(@as(i128, counter) * std.time.ns_per_s, @as(i128, frequency));
+            },
+            // Deliberately a build error rather than a plausible-looking number:
+            // a phase table is only worth reading if its clock is real.
+            else => @compileError(
+                "no monotonic clock for this target; add one to Phases.now()",
+            ),
+        };
     }
 
     pub fn start(tag: []const u8) Phases {

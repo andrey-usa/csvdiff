@@ -81,7 +81,7 @@ implies rather than what a run has proved.
 | **C** | tested | should work | **WSL** | `sys/mman.h`, `pthread.h`, `unistd.h`: POSIX, and MSVC has none of them |
 | **C++** | tested | should work | **WSL** | the same POSIX headers, minus pthread — it uses `std::thread` |
 | **Rust** | tested | should work | **tested, native** | builds and runs on `windows-latest` in CI |
-| **Zig** | tested | **no** | **WSL** | one call to `std.os.linux.clock_gettime`, which is Linux and not merely POSIX |
+| **Zig** | tested | cross-compiles in CI, not run | **WSL** | `std.posix.mmap` in `src/slab.zig`, and `environ.getPosix` in `src/main.zig` |
 
 The Rust row says "tested" because of a mistake. It first said "native" on the
 strength of a grep for `std::os::unix` finding nothing — which cannot see inside
@@ -336,12 +336,20 @@ tests/fixtures/          every shape that has broken an engine here
    key makes the answer impossible; a missing ignore quietly makes it wider. It
    cost a benchmark run here that reported every row as changed. Whether to
    warn or to refuse is a contract decision across four ports.
-3. **Zig is Linux-only for one line.** `Phases.now()` calls
-   `std.os.linux.clock_gettime` for a diagnostic that is off by default, and
-   that call is compiled unconditionally — so the port will not build on macOS
-   or on Windows, where the other three will. `std.time.Instant` or a
-   `builtin.os.tag` switch would settle it; nothing else in that port looks
-   Linux-bound.
+3. **Zig does not build for Windows** — two things, neither of them the one
+   this list used to name. `src/slab.zig` calls `std.posix.mmap`, whose `MAP`
+   type is `void` there, so the port needs a `CreateFileMapping` backend before
+   it compiles at all; and `src/main.zig` reads `CSVDIFF_PHASES` through
+   `environ.getPosix`, which on Windows reaches a Zig 0.16 stdlib error inside
+   `process/Environ.zig`. macOS was the other half of the claim and it was
+   simply wrong: the port cross-compiles for `aarch64-macos` and `x86_64-macos`,
+   and CI does that on every run now. What *was* Linux-bound was worse than a
+   build error — `Phases.now()` called `std.os.linux.clock_gettime`
+   unconditionally, which compiles on macOS, because `std.os.linux` is a
+   namespace and not a target check, and then issues Linux syscall numbers to a
+   kernel that does not use them. That one is fixed: a `builtin.os.tag` switch,
+   with a `@compileError` for any target that has no clock rather than a
+   plausible-looking number.
 4. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
