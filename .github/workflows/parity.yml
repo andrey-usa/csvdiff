@@ -48,6 +48,25 @@ jobs:
             | tar -xJ -C /opt
           echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
 
+      # Zig cross-compiles without a second toolchain, so keeping the macOS
+      # claim in README.md true costs one step rather than an inference from
+      # the source. It was an inference, and it was wrong in both directions:
+      # the port did build for macOS, and the line the README blamed for it not
+      # building -- `std.os.linux.clock_gettime` -- compiles there and then
+      # emits Linux syscall numbers on a kernel that does not use them, which is
+      # the worse of the two failures.
+      #
+      # This runs before the host build on purpose: a cross build overwrites
+      # zig-out/bin/csvdiff, and the steps below execute it.
+      - name: Zig cross-compiles for macOS
+        run: |
+          cd zig
+          for target in aarch64-macos x86_64-macos; do
+            echo "::group::$target"
+            zig build --release=fast -Dtarget="$target"
+            echo "::endgroup::"
+          done
+
       - name: Build the native ports
         run: |
           make -C c
