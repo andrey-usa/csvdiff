@@ -984,10 +984,32 @@ fn chunkBounds(
     }
 
     try bounds.append(gpa, from);
+    // Quotes before each split point, counted once per byte rather than once per
+    // byte per split point.
+    //
+    // Asking for the count from `from` to each split in turn reads the first
+    // slice of the file for every split, the second for all but one, and so on:
+    // `(threads - 1) / 2` passes over the file, and all of them on this thread,
+    // to prepare a sweep whose whole purpose is to use the others. Counting each
+    // slice on its own and running a prefix sum over the results gives the same
+    // numbers for one pass.
+    var before = try gpa.alloc(usize, threads);
+    defer gpa.free(before);
+    if (dialect == .csv) {
+        var running: usize = 0;
+        var prev = from;
+        for (1..threads) |i| {
+            const nominal = from + (end - from) * i / threads;
+            running += scan.countByte(data, prev, nominal, '"');
+            before[i] = running;
+            prev = nominal;
+        }
+    } else {
+        @memset(before, 0);
+    }
     for (1..threads) |i| {
         const nominal = from + (end - from) * i / threads;
-        var in_quotes = dialect == .csv and
-            scan.countByte(data, from, nominal, '"') % 2 == 1;
+        var in_quotes = dialect == .csv and before[i] % 2 == 1;
         var at = nominal;
         while (at < end) : (at += 1) {
             const c = data[at];
