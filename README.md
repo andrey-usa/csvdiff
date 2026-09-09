@@ -190,12 +190,43 @@ compared against another Parquet file; CSV and ndjson compare against each other
 |---|---|---|---|
 | **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed only) | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
 | **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report; no codec but snappy |
-| **[`rust/`](rust/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
-| **[`zig/`](zig/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for; the widest codec support here | no HTML report |
+| **[`rust/`](rust/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | brotli, and LZO |
+| **[`zig/`](zig/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report; brotli, and LZO |
+
+No port reads brotli or LZO; Zig's codec table names both as unsupported and
+Rust's rejects brotli by name. The codec lists above said otherwise until a
+reader's zstd file was refused — see **Parquet codecs** below.
 
 Every port builds from its own toolchain alone, in seconds, and carries no
 runtime dependency with a comparison engine in it. What was removed to get
 there, and what it measured before it went, is in [ARCHIVE.md](ARCHIVE.md).
+
+### Parquet codecs
+
+The Rust port carries **two** Parquet readers, and which one runs matters.
+
+| | Reads | Speed |
+|---|---|---|
+| the columnar path (`parquet` in the report) | uncompressed and snappy, `BYTE_ARRAY` columns, v1 pages | the fast one — it joins on key columns and compares whole columns without ever building a row |
+| `turbo` (`turbo` in the report) | the above plus gzip, zstd and lz4, other column types, v2 pages | decodes pages into rows; **3.7x** the columnar path's wall time on a pair both can read |
+
+By default a Parquet pair goes to the columnar path, and **falls through to
+`turbo` when that path does not read the file** — a codec it does not carry, a
+column type it does not decode. `--engine turbo` takes it there directly. The
+report's engine field says which one ran, so a run that fell through is visible
+rather than silent.
+
+That fall-through is new. Before it, a real file — NYC TLC trip data, zstd —
+was refused outright:
+
+```
+error: the parquet engine failed: only uncompressed and snappy parquet are read here: …
+```
+
+by a binary that reads zstd perfectly well, with `--engine turbo` ignored
+because the Parquet-pair branch ran before the engine was consulted. A refusal
+on capability grounds now routes; a corrupt file or a missing key column still
+fails, and says so as the columnar path's own error.
 
 ### Duplicate keys
 
@@ -314,11 +345,11 @@ tests/fixtures/          every shape that has broken an engine here
 4. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-5. **Compression.** Parquet here is generated uncompressed by choice, so no
-   table has ever measured a codec. Three ports could: Rust and Zig read snappy,
-   gzip, zstd, lz4 and brotli, C++ reads snappy alone, and C carries no codec at
-   all — the same choice its reader makes. What decompression costs against what
-   it saves in bytes read is unmeasured on one host.
+5. **Compression is unmeasured.** Parquet here is generated uncompressed by
+   choice, so no table has ever timed a codec. Three ports could: Rust and Zig
+   read snappy, gzip, zstd and lz4, C++ reads snappy alone, and C carries no
+   codec at all — the same choice its reader makes. What decompression costs
+   against what it saves in bytes read is unmeasured on one host.
 
 Three things that used to be on this list have been measured off it, and the
 numbers are in [BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):

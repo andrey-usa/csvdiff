@@ -27,6 +27,14 @@ fn fail<T>(what: &str, path: &str) -> Result<T> {
     Err(Error::new(format!("{what}: {path}")))
 }
 
+/// The same, for the corners of the format this reader deliberately does not
+/// cover. Marked so [`crate::engine`] can hand the pair to `turbo`, which reads
+/// more of Parquet than the columnar path does, instead of refusing a file this
+/// binary can in fact read.
+fn unsupported<T>(what: &str, path: &str) -> Result<T> {
+    Err(Error::unsupported(format!("{what}: {path}")))
+}
+
 // parquet.thrift, the handful of values this reader meets.
 const TYPE_BYTE_ARRAY: i64 = 6;
 const ENC_PLAIN: i64 = 0;
@@ -404,7 +412,7 @@ fn read_file_meta(data: &[u8], path: &str) -> Result<FileMeta> {
                         continue;
                     }
                     if children > 0 {
-                        return fail("nested parquet columns are not read here", path);
+                        return unsupported("nested parquet columns are not read here", path);
                     }
                     out.names.push(name);
                     out.optional.push(repetition == 1);
@@ -470,7 +478,7 @@ fn read_page_head(data: &[u8], at: usize, path: &str) -> Result<PageHead> {
                     }
                 }
             }
-            8 => return fail("parquet data page v2 is not read here", path),
+            8 => return unsupported("parquet data page v2 is not read here", path),
             _ => t.skip(ty)?,
         }
     }
@@ -810,10 +818,10 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
     for rg in &fm.groups {
         let c = &rg.columns[which];
         if c.ty != TYPE_BYTE_ARRAY {
-            return fail("only BYTE_ARRAY parquet columns are read here", path);
+            return unsupported("only BYTE_ARRAY parquet columns are read here", path);
         }
         if c.codec != CODEC_UNCOMPRESSED && c.codec != CODEC_SNAPPY {
-            return fail("only uncompressed and snappy parquet are read here", path);
+            return unsupported("only uncompressed and snappy parquet are read here", path);
         }
         // Every chunk has to agree about compression, because a slice is an
         // offset with no room to say what it is an offset *into*. Uncompressed
@@ -870,7 +878,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
 
             if h.ty == PAGE_DICTIONARY {
                 if h.encoding != ENC_PLAIN && h.encoding != ENC_PLAIN_DICTIONARY {
-                    return fail("only PLAIN parquet dictionaries are read here", path);
+                    return unsupported("only PLAIN parquet dictionaries are read here", path);
                 }
                 plain_slices(body, page_base, h.num_values, &mut dict, path)?;
             } else if h.ty == PAGE_DATA {
@@ -988,7 +996,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                 }
                 seen += h.num_values as i64;
             } else if h.ty == PAGE_DATA_V2 {
-                return fail("parquet data page v2 is not read here", path);
+                return unsupported("parquet data page v2 is not read here", path);
             } else if h.ty != PAGE_INDEX {
                 return fail("unknown parquet page type", path);
             }

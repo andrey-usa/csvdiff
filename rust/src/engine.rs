@@ -47,18 +47,12 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &mut Options) -> Result<Compar
         resolve_engine(requested)
     };
     let start = Instant::now();
-    let result = run(engine, a_path, b_path, opt)?;
+    // The label comes back from `run` rather than being reconstructed here: a
+    // Parquet pair no longer always takes the columnar path, so which reader
+    // actually ran is known only where the choice was made. Saying `parquet`
+    // for a run that fell through to `turbo` would claim a path it did not take.
+    let (result, label) = run(requested, engine, a_path, b_path, opt)?;
     let seconds = (start.elapsed().as_millis() as f64) / 1000.0;
-
-    // A Parquet pair goes to the columnar path whichever engine was asked for,
-    // so the report has to say `parquet` rather than repeat the request back.
-    // A mixed pair does not: that ran on `turbo`, and saying `parquet` would
-    // claim a path it did not take.
-    let label = if pqdiff::is_parquet(a_path) && pqdiff::is_parquet(b_path) {
-        "parquet".to_string()
-    } else {
-        engine.label().to_string()
-    };
 
     let meta = Meta {
         engine_meta: result.meta,
@@ -81,11 +75,20 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &mut Options) -> Result<Compar
     })
 }
 
-fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult> {
+/// Runs the comparison, and reports the engine label the run actually earned.
+fn run(
+    requested: Engine,
+    engine: Engine,
+    a: &Path,
+    b: &Path,
+    opt: &Options,
+) -> Result<(EngineResult, String)> {
     // Parquet is not a text format and is not read as one. Two Parquet files go
     // to the columnar path, which never materialises a row: it joins on the key
-    // columns and then compares whole columns as integers, whichever engine was
-    // asked for -- none of the others can read Parquet at all.
+    // columns and then compares whole columns as integers. None of sortmerge or
+    // native can read Parquet at all, so naming one of those does not change the
+    // route -- but `--engine turbo` now does, because there is a second reader
+    // behind it and asking for it should reach it.
     //
     // One Parquet file against a text one has no column to compare a byte
     // stream against, so that path is not available. `turbo` reads it anyway,
@@ -94,8 +97,39 @@ fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult
     // refusing it.
     let (a_pq, b_pq) = (pqdiff::is_parquet(a), pqdiff::is_parquet(b));
     if a_pq && b_pq {
-        return pqdiff::compare(a, b, opt)
-            .map_err(|e| Error::new(format!("the parquet engine failed: {e}")));
+        // `requested`, not `engine`: `auto` has already been resolved to
+        // `Turbo` for any Parquet input by this point, so testing the resolved
+        // value here would send every pair to `turbo` and quietly retire the
+        // columnar path. Only an explicit `--engine turbo` should do that.
+        if requested == Engine::Turbo {
+            return turbo::compare(a, b, opt)
+                .map(|r| (r, Engine::Turbo.label().to_string()))
+                .map_err(|e| Error::new(format!("the turbo engine failed: {e}")));
+        }
+        // The columnar path reads a narrow slice of Parquet on purpose -- plain
+        // or snappy, BYTE_ARRAY, v1 pages -- and everything outside it used to
+        // come back as a flat refusal, from a binary carrying a second reader
+        // that handles zstd, gzip, lz4, other column types and v2 pages. A real
+        // file (NYC TLC trip data, zstd) was turned away by it, and naming
+        // `--engine turbo` did not help because this branch ran first. So a
+        // refusal on capability grounds -- and only that, never a corrupt file
+        // or a missing column -- falls through to `turbo` instead.
+        match pqdiff::compare(a, b, opt) {
+            Ok(result) => return Ok((result, "parquet".to_string())),
+            Err(e) if e.is_unsupported() => {
+                return turbo::compare(a, b, opt)
+                    .map(|r| (r, Engine::Turbo.label().to_string()))
+                    .map_err(|turbo_err| {
+                        // Both refusals: the first says what the fast path could
+                        // not read, the second what actually stopped the run.
+                        Error::new(format!(
+                            "the parquet engine failed: {e}; and the turbo \
+engine, which reads more of the format, failed too: {turbo_err}"
+                        ))
+                    });
+            }
+            Err(e) => return Err(Error::new(format!("the parquet engine failed: {e}"))),
+        }
     }
     if (a_pq || b_pq) && !matches!(engine, Engine::Turbo | Engine::Auto) {
         return Err(Error::new(format!(
@@ -105,6 +139,7 @@ fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult
     }
     if a_pq || b_pq {
         return turbo::compare(a, b, opt)
+            .map(|r| (r, Engine::Turbo.label().to_string()))
             .map_err(|e| Error::new(format!("the turbo engine failed: {e}")));
     }
 
@@ -114,7 +149,9 @@ fn run(engine: Engine, a: &Path, b: &Path, opt: &Options) -> Result<EngineResult
         Engine::Native => native::compare(a, b, opt),
         Engine::Auto => unreachable!("auto is resolved before this point"),
     };
-    result.map_err(|e| Error::new(format!("the {engine} engine failed: {e}")))
+    result
+        .map(|r| (r, engine.label().to_string()))
+        .map_err(|e| Error::new(format!("the {engine} engine failed: {e}")))
 }
 
 /// Turns [`Engine::Auto`] into a concrete backend.
