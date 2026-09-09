@@ -700,8 +700,9 @@ join was waiting on](#what-the-join-was-waiting-on) is the round that did it.
   at one half, so it spent the run in a table twice the size it was designed for.
 * **Zig on Parquet is still the least parallel row here**, 2.66x against the C++
   port's 3.20x, and it is now the slowest Parquet row rather than the third. The
-  columnar path saw none of this round's work; the serial dictionary interning
-  described below is still what caps it.
+  columnar path saw none of this round's work. It has since had its own, and the
+  cause named here and below — serial dictionary interning — turned out not to be
+  one: [see the columnar round](#what-the-columnar-path-was-waiting-on).
 
 None of that is visible in a table of wall times, which is why every row here
 carries CPU.
@@ -804,6 +805,13 @@ buffer. The scratch already holds exactly those fields on a hit. Both ports had
 the line, and dropping it took the join from 4.24s to 3.80s in Rust and 2.99s to
 2.62s in Zig.
 
+Those two figures are each a port against itself, which is the only comparison
+they support: the Rust binary behind them was built `-C target-cpu=native` on a
+host with `avx512bw`, so it carries the 64-byte scanner, while the Zig one was
+built `-Dscan=32`. Rebuilt at matching widths the two ports' joins are within
+10% of each other, and the wide scanner is the finding that was hiding behind
+the mismatch — [below](#the-64-byte-scanner-loses-in-the-join-and-nowhere-else).
+
 Two things that looked promising were measured and thrown away. Deriving the
 probe mask from the slice length, so the compiler can prove every table access is
 in range, changed nothing at all. And Rust's `slice == slice` on a field is a call
@@ -812,6 +820,79 @@ Zig port's 343M for the same comparisons — replacing it with two overlapping
 eight-byte loads was **5.5% slower at 500k rows and a wash at four and ten
 million**. At this scale the join is bound by memory, not by instructions, and an
 instruction count that disagrees with a clock is not a result.
+
+#### The 64-byte scanner loses in the join, and nowhere else
+
+`-C target-cpu=native` on a host with `avx512bw` silently selects the 64-byte
+scanner, and comparing that against a 32-byte Zig build is what produced a
+"45% join gap" that does not exist. Rebuilding both ports at all three widths on
+one host, ten million rows, engine only:
+
+| Scan step | Rust | Zig |
+|---|---:|---:|
+| 8 bytes (SWAR) | 5.78s | 6.90s |
+| **32 bytes** | **5.27s** | **7.11s** |
+| 64 bytes | 6.83s | 8.28s |
+
+The 64-byte build is the worst in both ports here — and the phase breakdown says
+exactly where. Against the 32-byte build, its **sweep is identical** (0.563s
+against 0.563s) and its **join is 33% slower** in Rust and 42% in Zig.
+
+That asymmetry has a mechanism. A scan step reads its full width whether or not
+the delimiter it wants is in the first nine bytes, so a step that runs off the
+end of a row reads into the next one. In the sweep that costs nothing: rows are
+walked in file order, and the bytes read early are the bytes read next. In the
+join, a mate is a *random* row, and its 184 bytes span three cache lines — so
+over-reading 63 bytes past the end pulls in a fourth line that nothing else
+wants. Three lines becoming four is the 33%.
+
+This is the same story as [AVX-512 on two
+machines](#avx-512-measured-on-two-machines-that-disagree), one level further in:
+it is not the register width that decides, it is whether anything downstream
+uses the bytes the width forced you to read.
+
+### What the columnar path was waiting on
+
+The Parquet path had never had the treatment the CSV engine got, and the README
+had been naming the wrong culprit for it. Phase timings at ten million rows,
+uncompressed Parquet, in the Zig port:
+
+```
+  key columns (par)      0.18s
+  intern dicts (serial)  0.00s      <- the thing this file said was the cap
+  index build (2 ways)   1.29s
+  match sweep (2 ways)   3.01s
+  compared columns (par) 1.64s
+```
+
+**The serial interning is zero.** It is serial by construction, and it never
+runs: this payload's key columns are high-cardinality, so neither file
+dictionary-encodes them and the branch is skipped. A cost that is serial and a
+cost that is large are different claims, and only the first one was ever checked.
+
+What was actually there was the join shape the CSV engine had already fixed once
+— a thread per direction rather than chunks in a queue — and no prefetching at
+all in either the index build or the sweep, both of which probe a slot table of
+tens of megabytes from an array of hashes they hold in full.
+
+| | Zig columnar | Rust columnar |
+|---|---:|---:|
+| Before | 6.11s | 5.71s |
+| Chunked sweep | 4.79s | *(already chunked)* |
+| Prefetched probes | **3.62s** | **3.69s** |
+
+The C port measured the same prefetch at 1.79s → 1.39s on its build and 1.21s →
+0.88s on its join; this port's build went 1.39s → 1.01s and its sweep 1.74s →
+1.09s. Two implementations, two machines, the same pair of ratios.
+
+**Huge pages were measured and are not committed.** The C port took its build
+from 1.38s to 0.59s with `MADV_HUGEPAGE` on the slot table, on the argument that
+128 MB of table is 32,768 four-kilobyte pages against a TLB holding on the order
+of fifteen hundred entries. The same change here grants the pages —
+`AnonHugePages` goes from 0 to 258 MB — and cuts CPU by 3%, and the wall clock
+does not follow: +0.7% with asynchronous compaction and +3.2% with the
+synchronous setting this host defaults to. The page walk is not what this phase
+waits on here. Same code, same mechanism, opposite verdicts on two machines.
 
 ### What the CPU column found
 
@@ -849,9 +930,11 @@ fixed the same way.
 
 **Zig's columnar path read its key columns one side at a time.** They are the
 phase that decodes pages for ten million rows, and the two sides share nothing,
-so all of them now run at once. The interning after them stays serial because
-the shared id space is serial by construction — but that is a few thousand
-string comparisons against ten million rows.
+so all of them now run at once. The interning after them stays serial because the
+shared id space is serial by construction — and the guess made here, that it was
+therefore what capped the path, was wrong: measured, it is 0.000s, because this
+payload's key columns are high-cardinality and never dictionary-encoded at all.
+[What actually capped it.](#what-the-columnar-path-was-waiting-on)
 
 **Rust's gap was the report, and the first reading of it was wrong.** It looked
 like an engine that would not thread. The column says otherwise: `Rust, engine
