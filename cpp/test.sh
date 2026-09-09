@@ -12,12 +12,17 @@ RUST=../rust/target/release/csvdiff
 [ -x "$RUST" ] || { echo "build the Rust port first: (cd ../rust && cargo build --release)"; exit 2; }
 
 fail=0
+# The engine label and the time after it differ by port and by run, and the Rust
+# port groups its digits where this one does not -- which stays invisible until a
+# fixture passes a thousand rows, and then reads as a disagreement about counts.
+summary() { head -1 | sed 's/ | \(turbo\|parquet\).*//; s/,//g'; }
+
 check() { # label, then the flags both are given
   local label=$1; shift
   local a=../tests/fixtures/awkward_a.csv b=../tests/fixtures/awkward_b.csv
   local r c
-  r=$("$RUST" compare "$a" "$b" -k k "$@" --engine turbo -o /dev/null 2>&1 | head -1 | sed 's/ | turbo.*//') || true
-  c=$(build/csvdiff compare "$a" "$b" -k k "$@" 2>&1 | head -1 | sed 's/ | turbo.*//') || true
+  r=$("$RUST" compare "$a" "$b" -k k "$@" --engine turbo -o /dev/null 2>&1 | summary) || true
+  c=$(build/csvdiff compare "$a" "$b" -k k "$@" 2>&1 | summary) || true
   if [ "$r" = "$c" ]; then
     printf '  ok    %s\n' "$label"
   else
@@ -98,12 +103,9 @@ bytes=$(wc -c < "$thr/t_a.csv")
 if [ "$bytes" -lt 4194304 ]; then
   echo "  FAIL  the threading fixture is $bytes bytes, under the 4 MB split threshold"; fail=1
 else
-  # The Rust port groups its digits and this one does not, which no other check
-  # here notices because their fixtures hold fewer than a thousand rows.
-  plain() { head -1 | sed 's/ | turbo.*//' | tr -d ','; }
-  one=$(build/csvdiff compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --threads 1 2>&1 | plain) || true
+  one=$(build/csvdiff compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --threads 1 2>&1 | summary) || true
   for t in 2 3 4 7 16; do
-    many=$(build/csvdiff compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --threads $t 2>&1 | plain) || true
+    many=$(build/csvdiff compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --threads $t 2>&1 | summary) || true
     if [ "$one" = "$many" ]; then
       printf '  ok    %s threads finds what 1 thread finds\n' "$t"
     else
@@ -111,7 +113,7 @@ else
              "$t" "$one" "$t" "$many"; fail=1
     fi
   done
-  r=$("$RUST" compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --engine turbo -o /dev/null 2>&1 | plain) || true
+  r=$("$RUST" compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --engine turbo -o /dev/null 2>&1 | summary) || true
   [ "$one" = "$r" ] && echo "  ok    and what the rust port finds" \
     || { echo "  FAIL  the threaded sweep disagrees with the rust port"; echo "    rust: $r"; fail=1; }
 fi
