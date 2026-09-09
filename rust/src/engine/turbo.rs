@@ -1521,7 +1521,7 @@ impl Input {
                     .map(|n| header.iter().any(|c| c == *n).then_some(n.as_str()))
                     .collect();
                 let rows = reader.rows();
-                let (fields, arena) = reader.project(&names, threads)?;
+                let (fields, arena) = reader.project(&names, threads, usize::MAX)?;
                 // The mapping is finished with: everything the join reads now
                 // lives in the arena, so the file's pages can be given back.
                 drop(reader);
@@ -1619,4 +1619,121 @@ pub fn only_this_engine_reads(path: &Path) -> bool {
         }
     }
     sniff_dialect(&head[..read]) == Dialect::Json
+}
+
+// ---------------------------------------------------------------------------
+// Looking at one file
+// ---------------------------------------------------------------------------
+
+/// What a single file says about itself: its columns, and its rows where they
+/// are free to know.
+pub struct Shape {
+    pub format: &'static str,
+    pub columns: Vec<String>,
+    /// Parquet carries a row count in its footer. A text file does not, and
+    /// counting would mean reading all of it — which is not what a reader asking
+    /// "what is in here?" is paying for.
+    pub rows: Option<i64>,
+}
+
+/// The columns of one file, and its row count where the format states one.
+///
+/// This is the format detection the comparison itself uses -- the bytes decide,
+/// not the extension -- so a file this reports on is a file `compare` will read
+/// the same way.
+pub fn shape(path: &Path, opt: &Options) -> Result<Shape> {
+    let input = Input::open(path, opt)?;
+    Ok(match input {
+        Input::Parquet { reader, header } => Shape {
+            format: "parquet",
+            rows: Some(reader.rows() as i64),
+            columns: header,
+        },
+        Input::Text { slab, header, .. } => Shape {
+            format: if slab.dialect() == Dialect::Json {
+                "ndjson"
+            } else {
+                "csv"
+            },
+            rows: None,
+            columns: header,
+        },
+    })
+}
+
+/// The first `want` rows of a file, as text, with its column names.
+///
+/// A preview must not pay for the file. Parquet goes through `Reader::project`
+/// with a row limit, which stops decoding on a page boundary at or past it, so
+/// ten rows of a four-gigabyte file read one page per column rather than all of
+/// them. Text stops after `want` rows of the parser's own walk.
+///
+/// The values come back through the engine's parsers, not a second copy of
+/// them: a quoted CSV field is unquoted here exactly as the comparison would
+/// unquote it, and a `\u` escape in ndjson is decoded the same way. A preview
+/// that disagreed with the comparison would be worse than none.
+pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+    let input = Input::open(path, opt)?;
+    let header: Vec<String> = input.header().to_vec();
+    let width = header.len();
+    if want == 0 || width == 0 {
+        return Ok((header, Vec::new()));
+    }
+
+    match input {
+        Input::Parquet { reader, .. } => {
+            let rows = reader.rows().min(want);
+            if rows == 0 {
+                return Ok((header, Vec::new()));
+            }
+            let names: Vec<Option<&str>> = header.iter().map(|n| Some(n.as_str())).collect();
+            let (fields, arena) = reader.project(&names, budget(opt), want)?;
+            drop(reader);
+            let slab = Slab::owned(arena, Dialect::Raw);
+            let mut out = Vec::with_capacity(rows);
+            for r in 0..rows {
+                out.push(render_row(&slab, &fields[r * width..(r + 1) * width]));
+            }
+            Ok((header, out))
+        }
+        Input::Text {
+            slab,
+            delimiter,
+            from,
+            ..
+        } => {
+            let json = slab.dialect() == Dialect::Json;
+            let parser = if json {
+                RowParser::json(header.iter().cloned().map(Some).collect())
+            } else {
+                RowParser::csv(delimiter, (0..width).map(Some).collect())
+            };
+            let data = slab.data();
+            let end = data.len();
+            let mut at = from;
+            let mut fields = vec![ABSENT; width];
+            let mut out = Vec::with_capacity(want);
+            while at < end && out.len() < want {
+                at = parser.parse(data, at, end, &mut fields);
+                out.push(render_row(&slab, &fields));
+                fields.iter_mut().for_each(|f| *f = ABSENT);
+            }
+            Ok((header, out))
+        }
+    }
+}
+
+/// One row of field words as text. An absent or over-long field prints empty:
+/// a preview says what is there, and a short row is itself worth seeing.
+fn render_row(slab: &Slab, fields: &[Field]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|&f| {
+            if field::is_real(f) {
+                text_of(slab, f)
+            } else {
+                String::new()
+            }
+        })
+        .collect()
 }

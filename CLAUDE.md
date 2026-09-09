@@ -23,6 +23,8 @@ c/gen-data --rows 10k --out-dir data --prefix p --format parquet
 rust/target/release/gen-data --rows 10k --out-dir data --prefix p   # same bytes, no WSL
 
 c/csvdiff compare data/p_a.csv data/p_b.csv -k account_id,txn_id -i updated_at
+rust/target/release/csvdiff columns data/p_a.parquet   # names only, footer read
+rust/target/release/csvdiff head data/p_a.parquet -n 10   # stops at the first page
 python scripts/bench_ports.py data/p_a.csv data/p_b.csv --repeats 5    # every port, one table
 scripts/bench_ab.sh old/csvdiff new/csvdiff -- compare A.csv B.csv -k id   # two builds
 scripts/bench_ab.sh --self-test c/csvdiff -- compare A.csv B.csv -k id    # the harness itself
@@ -196,6 +198,15 @@ before timing anything.
   This is the same family as `--ignore` matching nothing in silence (above) and it is the one to
   watch for whenever a harness passes flags through: the run completes, the numbers are wrong,
   and nothing says so.
+  The same trap sits in `csvdiff`'s own parser from the other side: **a value-less flag has to be
+  in `FLAGS` in `main.rs`**, or it eats the token after it -- `head a.csv --csv` reported
+  "--csv needs a value".
+- **`columns` and `head` must not pay for the file.** `Reader::project` takes a row limit and
+  stops on a page boundary at or past it; `columns` on Parquet reads the footer alone. Ten rows of
+  a 384 MB Parquet file is 0.18s. If either grows a full read, the option has lost its reason to
+  exist. Their values go through the engine's own parsers, and a test asserts CSV, ndjson and
+  Parquet preview identically -- a preview that disagreed with the comparison would be worse than
+  none.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a

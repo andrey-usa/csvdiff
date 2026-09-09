@@ -21,6 +21,16 @@ usage: csvdiff <command> [options]
 
 commands:
   compare A B     Compare two CSV files on a composite key and write an HTML report
+  columns FILE    Print one file's column names, one per line
+  head FILE       Print the first rows of one file (default 10)
+
+columns and head read CSV, newline-delimited JSON and Parquet, and neither reads
+more of the file than it has to: `columns` on Parquet reads the footer, and
+`head` stops at the first page. Both take --delimiter and --encoding.
+
+head options:
+  -n, --rows N            Rows to show (default 10)
+      --csv               Print as CSV instead of an aligned table
 
 compare options:
   -k, --key COLS          Comma-separated key column(s) (or from --profile)
@@ -70,6 +80,20 @@ fn run(args: &[String]) -> u8 {
                 2
             }
         },
+        "columns" => match cmd_columns(&args[1..]) {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!("error: {e}");
+                2
+            }
+        },
+        "head" => match cmd_head(&args[1..]) {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!("error: {e}");
+                2
+            }
+        },
         other => {
             eprint!("error: unknown command: {other}\n\n{USAGE}");
             2
@@ -86,12 +110,16 @@ struct Args {
 
 /// The options that take no value. Anything else consumes the token after it,
 /// which is how a file path can appear before, between or after the options.
-const FLAGS: [&str; 7] = [
+const FLAGS: [&str; 8] = [
     "trim",
     "ignore-case",
     "empty-is-null",
     "no-compress",
     "fail-on-dups",
+    // `head --csv`. A value-taking flag left out of this list does not fail
+    // quietly -- it eats the token after it -- but it does fail confusingly:
+    // `head a.csv --csv` reported "--csv needs a value".
+    "csv",
     "help",
     "h",
 ];
@@ -300,4 +328,168 @@ fn report_peak_rss() {
             return;
         }
     }
+}
+
+/// `csvdiff columns FILE` — the column names, one per line.
+///
+/// One per line rather than a comma list because that is what a shell wants:
+/// the whole point of asking is usually to build a `--key` out of the answer,
+/// and `paste -sd,` turns this into one.
+fn cmd_columns(argv: &[String]) -> Result<u8> {
+    let args = Args::parse(argv)?;
+    if args.flag("help") || args.flag("h") {
+        print!("{USAGE}");
+        return Ok(0);
+    }
+    let Some(first) = args.positional.first() else {
+        return Err(Error::new("columns needs a file: csvdiff columns data.csv"));
+    };
+    let mut opt = Options::default();
+    apply_read_options(&args, &mut opt);
+
+    let shape = csvdiff::engine::turbo::shape(Path::new(first), &opt)?;
+    for name in &shape.columns {
+        println!("{name}");
+    }
+    // To stderr so the names on stdout stay pipeable on their own.
+    match shape.rows {
+        Some(rows) => eprintln!(
+            "{}: {} columns, {} rows",
+            shape.format,
+            shape.columns.len(),
+            thousands(rows)
+        ),
+        None => eprintln!(
+            "{}: {} columns (row count needs a full read)",
+            shape.format,
+            shape.columns.len()
+        ),
+    }
+    Ok(0)
+}
+
+/// `csvdiff head FILE [-n N]` — the first rows, aligned, or `--csv` for a
+/// machine.
+fn cmd_head(argv: &[String]) -> Result<u8> {
+    let args = Args::parse(argv)?;
+    if args.flag("help") || args.flag("h") {
+        print!("{USAGE}");
+        return Ok(0);
+    }
+    let Some(first) = args.positional.first() else {
+        return Err(Error::new("head needs a file: csvdiff head data.csv"));
+    };
+    let want = match args.get("rows", Some("n")) {
+        Some(text) => text
+            .parse::<usize>()
+            .map_err(|_| Error::new(format!("--rows must be a whole number, got: {text}")))?,
+        None => 10,
+    };
+    let mut opt = Options::default();
+    apply_read_options(&args, &mut opt);
+
+    let (columns, rows) = csvdiff::engine::turbo::head(Path::new(first), want, &opt)?;
+    if args.flag("csv") {
+        println!("{}", csv_line(&columns));
+        for row in &rows {
+            println!("{}", csv_line(row));
+        }
+        return Ok(0);
+    }
+    print_table(&columns, &rows);
+    Ok(0)
+}
+
+/// The two flags that change how a file is *read* rather than compared.
+fn apply_read_options(args: &Args, opt: &mut Options) {
+    if let Some(v) = args.get("delimiter", None) {
+        opt.delimiter = v.chars().next();
+    }
+    if let Some(v) = args.get("encoding", None) {
+        opt.encoding = v.to_string();
+    }
+}
+
+/// One CSV line, quoting only what has to be quoted.
+fn csv_line(cells: &[String]) -> String {
+    cells
+        .iter()
+        .map(|c| {
+            if c.contains([',', '"', '\n', '\r']) {
+                format!("\"{}\"", c.replace('"', "\"\""))
+            } else {
+                c.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// An aligned table, capped so one wide column cannot push the rest off screen.
+fn print_table(columns: &[String], rows: &[Vec<String>]) {
+    const CAP: usize = 32;
+    let clip = |s: &str| -> String {
+        let count = s.chars().count();
+        if count <= CAP {
+            s.to_string()
+        } else {
+            // A marker rather than a silent cut: a preview that quietly shortens
+            // a value teaches the wrong thing about the data.
+            format!("{}…", s.chars().take(CAP - 1).collect::<String>())
+        }
+    };
+    let head: Vec<String> = columns.iter().map(|c| clip(c)).collect();
+    let body: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| clip(c)).collect())
+        .collect();
+
+    let mut width: Vec<usize> = head.iter().map(|c| c.chars().count()).collect();
+    for row in &body {
+        for (i, cell) in row.iter().enumerate() {
+            if i < width.len() {
+                width[i] = width[i].max(cell.chars().count());
+            }
+        }
+    }
+
+    let line = |cells: &[String]| -> String {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let pad = width.get(i).copied().unwrap_or(0);
+                format!("{c:<pad$}")
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_string()
+    };
+
+    println!("{}", line(&head));
+    println!(
+        "{}",
+        width
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+    for row in &body {
+        println!("{}", line(row));
+    }
+}
+
+/// `1234567` as `1,234,567`, the way the compare summary already writes counts.
+fn thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
 }
