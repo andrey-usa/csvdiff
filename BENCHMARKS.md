@@ -64,6 +64,37 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-09 (generators) — the two generators a reader can reach
+
+One 4-core / 16 GB container, `scripts/bench_ab.sh`, seven interleaved rounds,
+2,000,000 rows of 20-column CSV — 736 MB across the pair each time.
+
+| Generator | Wall best | Wall median | CPU best | CPU median |
+|---|---:|---:|---:|---:|
+| `c/gen-data` | **1.05s** | **1.37s** | **2.41s** | **2.57s** |
+| `rust/target/release/gen-data` | 5.49s | 5.90s | 5.06s | 5.43s |
+
+Paired per-round ratio 0.23x wall (middle half 0.19-0.24) and 0.49x CPU
+(0.48-0.54): the Rust generator does about twice the work and takes four times
+the wall clock for it. The wall gap is wider than the CPU gap because the C one
+renders rows in waves across all four cores — 2.41s of CPU inside 1.05s of wall
+— while the Rust one is a single thread, 5.06s inside 5.49s.
+
+The two write **byte-identical output**: `cmp` on both files of the pair at
+2,000,000 rows, same `--seed` default. That matters more than the ratio. The
+generator is the only way a Windows reader without WSL gets a pair to compare
+at all, and it has to be the same pair the Linux tables were taken on, or the
+numbers here stop meaning anything. `c/test.sh --with-ports` checks the C
+generator against the C++ one on sixteen shapes including every thread count;
+the Rust one is checked here by hand and by the `windows-latest` CI job, which
+now runs the README's own generate-then-compare pair of commands.
+
+So: the C generator for anything large, and it is what every table in this file
+was taken on. The Rust one for Windows without WSL, or for a single toolchain —
+at 10k or 100k rows the difference is under a tenth of a second and irrelevant.
+
+---
+
 ## 2026-09-09 (after the `added` pass) — what a row parse costs, and a change that did not pay
 
 One 4-core / 16 GB container, 1,000,000 rows, thirteen interleaved rounds,
