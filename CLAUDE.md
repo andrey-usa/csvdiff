@@ -131,6 +131,18 @@ before timing anything.
   also measured nothing — the machine was already busy. Deleting that pass was
   worth 1.28x. Prefer removing a pass to speeding one up, and prove which you
   have done.
+- **Run `--self-test` on the machine you are on, before trusting a ratio.** What
+  it can resolve is a property of that container, not of the harness. One here
+  reported 1.11x for a build against itself at the default one warmup round, and
+  1.05x wall / 1.03x cpu at three — so on that machine anything under a few per
+  cent is unmeasurable, and the few per cent favours whichever build runs second.
+  A 350 MB pair needs more than one warmup round before the page cache stops
+  landing on build A.
+- **Rounds scale with how short the run is, not with how much you care.** The
+  same change read *no result* at nine rounds and 1.29x at twenty-five, because
+  the port measured finishes in 0.4s where the other takes 0.7s and the noise is
+  absolute rather than proportional. "No result" is a request for more rounds
+  before it is evidence of absence.
 - **Never compare across tables.** Two numbers from two sittings compare machine
   states. This runner's ndjson figures moved 20% between two runs one morning
   with no code change in any port.

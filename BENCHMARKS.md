@@ -97,6 +97,47 @@ allowed to lean on.
 
 ---
 
+## 2026-09-09 (verification) — the same two changes, through `bench_ab.sh`
+
+The `added` changes in both ports were measured with a hand-rolled interleaved
+loop that compared the two builds' medians. `scripts/bench_ab.sh` landed the same
+afternoon and compares them the right way -- paired within each round, on CPU,
+with a verdict. Re-running both through it, one 4-core / 16 GB container:
+
+| Change | Rounds | CPU ratio | Middle half | Verdict |
+|---|---:|---:|---:|---|
+| Rust, `added` from a bitmap | 9 | **1.14x** | 1.08–1.21 | 13% less work |
+| Zig, `added` derived | 9 | 1.11x | 0.91–1.12 | **no result** |
+| Zig, `added` derived | 25 | **1.29x** | 1.20–1.45 | 22% less work |
+
+Both hold. The Zig row is the interesting one: at nine rounds the harness refused
+to call it, and it was right to -- the run is 0.4s, so the same absolute noise is
+a much larger share of it than in Rust's 0.7s. Twenty-five rounds separate them
+cleanly. **How many rounds a comparison needs scales with how short the run is**,
+and the harness saying "no result" is a request for more rounds before it is
+evidence of anything.
+
+The self-test says what this particular container can resolve, and it is not what
+the harness's own notes assume:
+
+| Warmup | Rounds | A/A wall | A/A cpu | cpu middle half |
+|---:|---:|---:|---:|---:|
+| 1 | 7 | 1.11x | 1.09x | 0.93–1.26 |
+| 3 | 9 | 1.05x | 1.03x | 0.97–1.04 |
+
+One warmup round is not enough here on a 350 MB pair: the first round is still
+paying for the page cache, and it lands on whichever build runs first. Three
+warmups bring the A/A test back to a straddling middle half — but the point
+estimate stays near 1.03x, so **there is a systematic few per cent in favour of
+whichever build runs second**, and a change measured at 3% on this machine has
+not been measured at all.
+
+That last figure retires a number this file might otherwise have kept: a scan
+that replaced A's row parse measured -2.1% by the older method, which is inside
+the bias. Recorded as "did not pay" in the entry below, and it stays there --
+"no result" is the more accurate way to say it.
+
+---
 
 ## 2026-09-09 (generators) — the two generators a reader can reach
 
