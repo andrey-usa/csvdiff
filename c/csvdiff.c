@@ -1118,6 +1118,22 @@ typedef struct {
     CmpPart        *parts;
 } CmpCtx;
 
+/*
+ * `added` does not need a pass of its own.
+ *
+ * Every distinct key of A finds at most one distinct key of B, distinct keys of
+ * A cannot find the same key of B, and the comparison behind the lookup is
+ * symmetric -- so the number of B's keys that have an A counterpart is exactly
+ * the `matched` the A pass already counted, and `added` is `B's keys` minus it.
+ *
+ * That is an argument, and arguments about symmetry are exactly the kind that
+ * are wrong once. `CSVDIFF_VERIFY_ADDED=1` runs the old pass -- every key of B
+ * looked up in A -- and refuses the run if the two disagree, so the argument is
+ * checked rather than believed. test.sh runs it on the awkward fixture and on
+ * generated rows.
+ */
+static int verify_added(void) { return getenv("CSVDIFF_VERIFY_ADDED") != NULL; }
+
 static void compare_part(void *vctx, unsigned p) {
     CmpCtx *c = vctx;
     CmpPart *out = &c->parts[p];
@@ -1596,7 +1612,9 @@ int main(int argc, char **argv) {
     {
         unsigned budget = threads ? threads : cpu_count();
         unsigned ways = ai.keys < (1u << 14) ? 1u : budget;
-        unsigned b_ways = bi.keys < (1u << 14) ? 1u : budget;
+        /* The B pass only runs when it is being used to check the derivation. */
+        const int verify = verify_added();
+        unsigned b_ways = !verify ? 0u : (bi.keys < (1u << 14) ? 1u : budget);
         CmpPart *parts = calloc(ways + b_ways, sizeof *parts);
         if (!parts) { fail("out of memory"); goto done; }
         CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts };
@@ -1623,6 +1641,16 @@ int main(int argc, char **argv) {
         }
         free(parts);
         if (oom) { fail("out of memory"); goto done; }
+
+        const int64_t derived = (int64_t)bi.keys - matched;
+        if (verify && added != derived) {
+            fprintf(stderr, "error: added counted %lld, derived %lld -- the join is "
+                            "not symmetric on this input\n",
+                    (long long)added, (long long)derived);
+            status = 2;
+            goto done;
+        }
+        added = derived;
     }
 
     {

@@ -187,6 +187,38 @@ fi
 
 # Two rules the key-only JSON parse rests on, neither of which the generated
 # fixture can exercise because it never produces either shape.
+# `added` is derived from the A pass rather than counted by a pass of its own,
+# on the argument that the join is symmetric. CSVDIFF_VERIFY_ADDED=1 runs the
+# pass that was removed and refuses the run if the two disagree, so the argument
+# is checked here on every shape that has ever broken an engine, not assumed.
+echo "the derivation of added, checked against the pass it replaced:"
+vcheck() { # label, then the compare arguments
+  local label=$1; shift
+  local out code=0
+  # A compare exits 1 when it finds differences, which every case here does, so
+  # the status has to be caught rather than reach `set -e`. Declaring and
+  # assigning on one line would also hide it: the status would be `local`'s.
+  out=$(CSVDIFF_VERIFY_ADDED=1 ./csvdiff compare "$@" 2>&1 >/dev/null) || code=$?
+  if [ "$code" -le 1 ] && [ -z "$out" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    printf '  FAIL  %s\n    %s\n' "$label" "${out:-exit $code}"; fail=1
+  fi
+}
+vcheck "the awkward fixture" ../tests/fixtures/awkward_a.csv ../tests/fixtures/awkward_b.csv -k k
+if [ -x "$GEN" ]; then
+  vd=$(mktemp -d)
+  "$GEN" --rows 20k --out-dir "$vd" --prefix v >/dev/null 2>&1
+  "$GEN" --rows 20k --out-dir "$vd" --prefix v --format json >/dev/null 2>&1
+  "$GEN" --rows 20k --out-dir "$vd" --prefix v --format parquet >/dev/null 2>&1
+  vcheck "generated csv"     "$vd/v_a.csv"          "$vd/v_b.csv"          -k account_id,txn_id -i updated_at
+  vcheck "generated ndjson"  "$vd/v_a.ndjson"       "$vd/v_b.ndjson"       -k account_id,txn_id -i updated_at
+  vcheck "generated parquet" "$vd/v_a.unc.parquet"  "$vd/v_b.unc.parquet"  -k account_id,txn_id -i updated_at
+  rm -rf "$vd"
+else
+  echo "  skip  the derivation checks need $GEN"; fail=1
+fi
+
 echo "the ndjson rules the fast path depends on:"
 jd=$(mktemp -d)
 BS=$(printf '\\')

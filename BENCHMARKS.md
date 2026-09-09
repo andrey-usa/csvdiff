@@ -34,6 +34,26 @@ a different question.
 
 ---
 
+## 2026-09-09 (later still) — the second join pass, removed
+
+One 4-core / 16 GB container, 2,000,000 rows, five interleaved rounds.
+
+| Format | Before | After | | CPU before | CPU after |
+|---|---:|---:|---:|---:|---:|
+| CSV, 702 MB | 0.89s | **0.68s** | 1.31x | 3.0s | **2.3s** |
+| Parquet, 415 MB | 0.62s | **0.43s** | 1.44x | 1.7s | **1.2s** |
+
+Both engines looked every key of B up in A, over a second random-probed table,
+to count `added` — a number the A pass already implies, since `added` is B's
+distinct keys minus `matched`. Counts agree with four other ports on both
+formats, and `CSVDIFF_VERIFY_ADDED=1` runs the removed pass to check the
+derivation rather than trusting it.
+
+The CSV path across the day's three changes: **1.27s → 0.68s, 1.9x, with CPU
+3.9s → 2.3s** — none of it from threading harder.
+
+---
+
 ## 2026-09-09 (later) — a tag in the text index's slot
 
 One 4-core / 16 GB container, 2,000,000 rows, five interleaved rounds, both

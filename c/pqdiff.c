@@ -873,10 +873,21 @@ int pq_compare(const char *a_path, const char *b_path,
     phase_mark(&phase, "build key indexes");
 
     {
+        /*
+         * `added` is derived, not counted -- see the same argument and the same
+         * `CSVDIFF_VERIFY_ADDED` switch in csvdiff.c. Every distinct key of A
+         * finds at most one distinct key of B, two of A's cannot find the same
+         * one, and here the comparison behind the lookup is an integer compare
+         * over one interned id space, which is as symmetric as it gets. So B's
+         * pass exists only to check the derivation when asked.
+         */
+        const int verify = getenv("CSVDIFF_VERIFY_ADDED") != NULL;
         ways = ai.unique < (1u << 14) ? 1u : (budget ? budget : 1u);
-        b_ways = bi.unique < (1u << 14) ? 1u : (budget ? budget : 1u);
+        b_ways = !verify ? 0u : (bi.unique < (1u << 14) ? 1u : (budget ? budget : 1u));
         parts = calloc(ways, sizeof *parts);
-        b_parts = calloc(b_ways, sizeof *b_parts);
+        /* Never zero: `calloc(0, n)` may return NULL, which the check below
+         * would read as out of memory rather than as nothing to allocate. */
+        b_parts = calloc(b_ways ? b_ways : 1u, sizeof *b_parts);
         if (!parts || !b_parts) { pq_set_error("out of memory"); goto done; }
         JoinCtx jc = { &keys, &ai, &bi, parts, b_parts, ways, b_ways };
         run_parts(join_part, &jc, ways + b_ways);
@@ -895,8 +906,18 @@ int pq_compare(const char *a_path, const char *b_path,
             at += parts[p].n;
             out->removed += parts[p].missing;
         }
-        for (unsigned p = 0; p < b_ways; p++) out->added += b_parts[p].missing;
         out->matched = (int64_t)total;
+        {
+            int64_t counted = 0;
+            for (unsigned p = 0; p < b_ways; p++) counted += b_parts[p].missing;
+            const int64_t derived = (int64_t)bi.unique - out->matched;
+            if (verify && counted != derived) {
+                pq_set_error("added counted and derived disagree -- the join is "
+                             "not symmetric on this input");
+                goto done;
+            }
+            out->added = derived;
+        }
         out->ncols = 0;
 
         phase_mark(&phase, "join");

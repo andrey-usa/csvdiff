@@ -329,6 +329,43 @@ Ten minutes of experiment against a day of implementation is the trade this file
 keeps recommending, and this is the first time it has been taken before the day
 was spent rather than after.
 
+## The pass that did not need to exist
+
+The join ran twice. A's keys were looked up in B -- which is where `matched`,
+`changed`, `removed` and every per-column count come from -- and then B's keys
+were looked up in A, a second full pass over a second random-probed table, to
+count one number: `added`.
+
+It does not need a pass. Every distinct key of A finds at most one distinct key
+of B, two of A's keys cannot find the same key of B, and the comparison behind
+the lookup is symmetric, so the number of B's keys with an A counterpart is
+exactly the `matched` the first pass already counted:
+
+    added = B's distinct keys - matched
+
+That is an argument, and arguments about symmetry are the kind that are wrong
+once. `CSVDIFF_VERIFY_ADDED=1` runs the pass that was removed and refuses the
+run if the two disagree; `test.sh` runs it on the awkward fixture and on
+generated CSV, ndjson and Parquet, so the argument is checked on every shape
+that has ever broken an engine here rather than believed. The check was itself
+checked: with the derivation deliberately off by one it reports
+`added counted 2000, derived 2001` and stops.
+
+Both engines had the same second pass, and both lost it. Two million rows, five
+interleaved rounds:
+
+| Format | Before | After | | CPU before | CPU after |
+|---|---:|---:|---:|---:|---:|
+| CSV | 0.89s | **0.68s** | 1.31x | 3.0s | **2.3s** |
+| Parquet | 0.62s | **0.43s** | 1.44x | 1.7s | **1.2s** |
+
+Counts agree with four other ports on both.
+
+Where the day's three changes leave the CSV path: 1.27s before the tag, 1.07s
+after the ndjson work landed on the shared index, 0.89s with the tag, 0.68s
+without the second pass. **1.9x, and none of it threading** -- CPU fell from
+3.9s to 2.3s over the same three.
+
 ## The generator, on every core
 
 Every row is a pure function of its index, and whether a row is emitted at all
