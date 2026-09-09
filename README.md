@@ -202,16 +202,12 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **ndjson, again.** It is now 5x the CSV time on 2.4x the bytes, and the only
-   format where the C lead is under 2x. 2.34x at ten million rows came from framing rows on the
-   newline byte and letting the key-only parse stop once it has the keys. What
-   is left is the join, which still parses a matched row in full on both sides.
-   CSV no longer does — it proves most rows unchanged from their raw bytes —
-   but that proof cannot be used here as it stands: a JSON value is found by
-   name, and a name repeated in one object takes its *last* value, which a
-   prefix cannot see. Making non-key columns first-wins, as key columns already
-   are, would open it, and is a contract change the other ports have to agree
-   to.
+1. **ndjson, again.** It has the byte proof now — 1.29x of CPU, against a 1.47x
+   ceiling measured with a deliberately unsound build first — so what is left of
+   the join is the 6% of rows that really changed and the rows the proof
+   refuses. Past that, the floor is the byte scanning itself: this format costs
+   5x the Parquet time on four times the bytes, and no amount of join work
+   changes that.
 2. **Where the C CSV path stops scaling.** The join has given up most of what
    it was doing, so the sequential table insertion is now the larger share of
    the run rather than a tail on it. Sharding it by hash was measured and lost
