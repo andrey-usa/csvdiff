@@ -22,10 +22,12 @@
 #include "parallel.h"
 #include "pqwrite.h"
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define COLUMNS 20
 
@@ -368,23 +370,30 @@ static int write_text(const char *path, bool b, int64_t rows, int64_t seed, bool
 #endif
     const int64_t WAVE_ROWS = (int64_t)1 << WAVE_ROWS_SHIFT;
 
+    /* Failures come back as a negative errno rather than a bare -1: "write
+     * failed" on a full disk and on a missing directory read identically, and
+     * one of them cost a reader their first command. errno is captured at the
+     * point of failure, because the free/fclose on the way out would clobber
+     * it. */
     FILE *fh = fopen(path, "w");
-    if (!fh) return -1;
-    if (!json && fputs(CSV_HEADER, fh) < 0) { fclose(fh); return -1; }
+    if (!fh) return -errno;
+    if (!json && fputs(CSV_HEADER, fh) < 0) { const int e = errno; fclose(fh); return -e; }
 
     Blob *blob = calloc(ways, sizeof *blob);
-    if (!blob) { fclose(fh); return -1; }
+    if (!blob) { fclose(fh); return -ENOMEM; }
     Wave wave = { blob, 0, 0, rows, seed, b, json, ways, false };
     Wave *w = &wave;   /* a pointer, because EMIT_ROW is shared with the parts */
-    int bad = 0;
+    int bad = 0, err = 0;
 
     for (int64_t at = 0; at < rows && !bad; at += WAVE_ROWS) {
         w->lo = at;
         w->hi = at + WAVE_ROWS < rows ? at + WAVE_ROWS : rows;
         run_parts(wave_part, w, ways);
-        if (w->oom) { bad = 1; break; }
+        if (w->oom) { bad = 1; err = ENOMEM; break; }
         for (unsigned p = 0; p < ways; p++)
-            if (blob[p].n && fwrite(blob[p].p, 1, blob[p].n, fh) != blob[p].n) { bad = 1; break; }
+            if (blob[p].n && fwrite(blob[p].p, 1, blob[p].n, fh) != blob[p].n) {
+                bad = 1; err = errno; break;
+            }
     }
 
     if (!bad) {   /* the rows appended after the sequence, on this thread */
@@ -393,13 +402,14 @@ static int write_text(const char *path, bool b, int64_t rows, int64_t seed, bool
         bool oom = false;
         if (json) TAIL_ROWS(b, rows, EMIT_JSON_ROW);
         else      TAIL_ROWS(b, rows, EMIT_CSV_ROW);
-        if (oom || (out->n && fwrite(out->p, 1, out->n, fh) != out->n)) bad = 1;
+        if (oom) { bad = 1; err = ENOMEM; }
+        else if (out->n && fwrite(out->p, 1, out->n, fh) != out->n) { bad = 1; err = errno; }
     }
 
     for (unsigned p = 0; p < ways; p++) free(blob[p].p);
     free(blob);
-    if (fclose(fh) != 0) bad = 1;
-    return bad ? -1 : 0;
+    if (fclose(fh) != 0) { bad = 1; if (!err) err = errno; }
+    return bad ? -(err ? err : EIO) : 0;
 }
 
 static int write_parquet(const char *path, bool b, int64_t rows, int64_t seed,
@@ -504,6 +514,15 @@ int main(int argc, char **argv) {
     else if (!strcmp(format, "parquet")) ext = ".unc.parquet";
     else return usage();
 
+    /* Create the output directory rather than fail on it. `data/` is in
+     * .gitignore, so on a fresh clone the README's own first command wrote
+     * into a directory that was not there. One level only: a missing parent
+     * still fails, and now says so. */
+    if (mkdir(out_dir, 0777) != 0 && errno != EEXIST) {
+        fprintf(stderr, "error: cannot create %s: %s\n", out_dir, strerror(errno));
+        return 1;
+    }
+
     if (threads == 0) threads = cpu_count();
     if (threads == 0) threads = 1;
 
@@ -532,7 +551,7 @@ int main(int argc, char **argv) {
     for (int side = 0; side < 2; side++)
         if (sd.ok[side] != 0) {
             fprintf(stderr, "error: cannot write %s: %s\n", sd.path[side],
-                    sd.parquet ? pqw_error() : "write failed");
+                    sd.parquet ? pqw_error() : strerror(-sd.ok[side]));
             return 1;
         }
     return 0;

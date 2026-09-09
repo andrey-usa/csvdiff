@@ -20,6 +20,7 @@ ARCHIVE.md.
 c/gen-data --rows 10k --out-dir data --prefix p              # CSV
 c/gen-data --rows 10k --out-dir data --prefix p --format json
 c/gen-data --rows 10k --out-dir data --prefix p --format parquet
+rust/target/release/gen-data --rows 10k --out-dir data --prefix p   # same bytes, no WSL
 
 c/csvdiff compare data/p_a.csv data/p_b.csv -k account_id,txn_id -i updated_at
 python scripts/bench_ports.py data/p_a.csv data/p_b.csv --repeats 5    # every port, one table
@@ -31,6 +32,11 @@ gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 Linux is the only tested platform. C, C++ and Zig need POSIX or better — Zig
 calls `std.os.linux.clock_gettime`, so it is Linux and not merely POSIX — and
 only the Rust port builds on Windows without WSL. See the table in README.md.
+
+The two generators write byte-identical output. Use `c/gen-data` for anything
+large — it is threaded and 4.3x faster on wall time, and every table in
+BENCHMARKS.md was taken on it. The Rust one exists so a Windows reader without
+WSL can get a pair at all.
 
 ## Layout
 
@@ -139,6 +145,12 @@ before timing anything.
   Changing that changes the matched/added/removed counts, so it is a behaviour change, not a fix.
 - The report decodes its gzip payload with `DecompressionStream`, which needs a 2023+ browser.
   `--no-compress` is the escape hatch.
+- **Every command in README.md has to run as written, from a fresh clone.** Its examples named
+  `july.csv` and `august.csv` — placeholder names for files nothing in the tree produces — so the
+  first thing a new reader pasted failed, and a reader reported it. The examples generate the pair
+  first now. Change a flag, a column name or a binary name, and run the README's commands before
+  claiming the change is done; the `windows-latest` job in `ci-rust.yml` runs the PowerShell pair
+  for this reason.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
