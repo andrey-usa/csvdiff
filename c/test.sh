@@ -27,7 +27,10 @@ if [ "$with_ports" = 1 ]; then
 fi
 
 fail=0
-summary() { head -1 | sed 's/ | turbo.*//'; }
+# The engine label and the time after it differ by port and by run, and the Rust
+# port groups its digits where this one does not -- which stays invisible until a
+# fixture passes a thousand rows, and then reads as a disagreement about counts.
+summary() { head -1 | sed 's/ | \(turbo\|parquet\).*//; s/,//g'; }
 
 check() { # label, then the flags both are given
   local label=$1; shift
