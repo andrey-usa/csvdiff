@@ -412,7 +412,19 @@ const Rows = union(enum) {
     /// stores where a row starts rather than its fields, because an offset is
     /// eight bytes where the fields would be twenty times that, and re-parsing is
     /// cheap because the parser stops at the last needed column.
-    text: struct { parser: text.RowParser, from: usize },
+    text: struct {
+        parser: text.RowParser,
+        /// The same parser configured with the key columns alone, for the sweep.
+        ///
+        /// The sweep reads every row of the file and wants two things from each:
+        /// its hash, which comes from the key columns, and where the next row
+        /// starts. It has never wanted the other seventeen, and packing them was
+        /// most of what it cost -- a parser stops at the last column it was asked
+        /// for, so asking for less makes the rest of the row a plain scan for the
+        /// newline rather than a field-by-field walk.
+        keys: text.RowParser,
+        from: usize,
+    },
     /// Parquet: there is no row to re-read, so the fields are materialised once,
     /// row-major, and a row is an index into them.
     columnar: struct { fields: []Field, rows: usize },
@@ -441,7 +453,10 @@ const Side = struct {
 
     fn deinit(self: *Side) void {
         switch (self.rows) {
-            .text => |t| t.parser.deinit(self.gpa),
+            .text => |t| {
+                t.parser.deinit(self.gpa);
+                t.keys.deinit(self.gpa);
+            },
             .columnar => |c| self.gpa.free(c.fields),
         }
         if (self.wanted_names) |n| self.gpa.free(n);
@@ -508,6 +523,7 @@ const Input = union(enum) {
         self: Input,
         gpa: std.mem.Allocator,
         wanted: []const []const u8,
+        key_size: usize,
         threads: usize,
     ) !Side {
         const width = wanted.len;
@@ -522,6 +538,7 @@ const Input = union(enum) {
                     side.wanted_names = keys;
                     side.rows = .{ .text = .{
                         .parser = try text.RowParser.initJson(gpa, keys),
+                        .keys = try text.RowParser.initJson(gpa, keys[0..@min(key_size, width)]),
                         .from = t.from,
                     } };
                 } else {
@@ -531,6 +548,11 @@ const Input = union(enum) {
                     side.wanted_source = source;
                     side.rows = .{ .text = .{
                         .parser = try text.RowParser.initCsv(gpa, t.delimiter, source),
+                        .keys = try text.RowParser.initCsv(
+                            gpa,
+                            t.delimiter,
+                            source[0..@min(key_size, width)],
+                        ),
                         .from = t.from,
                     } };
                 }
@@ -923,6 +945,11 @@ const Sweep = struct {
         const gpa = self.gpa;
         const fields = try gpa.alloc(Field, self.side.width);
         defer gpa.free(fields);
+        // The sweep parses with the key-only parser, so it needs room for the
+        // key columns; the full-width buffer above is what a row over the field
+        // cap is re-read into, and what the columnar branch fills.
+        const keys = try gpa.alloc(Field, @max(1, self.key_size));
+        defer gpa.free(keys);
         var s = Scratch{};
         var chunk = &self.chunks[i];
 
@@ -956,12 +983,22 @@ const Sweep = struct {
                         pos += 2;
                         continue;
                     }
-                    const next = t.parser.parse(data, pos, data.len, fields);
-                    for (fields) |field| if (field == TOO_LONG) return Error.FieldTooLong;
+                    const next = t.keys.parse(data, pos, data.len, keys);
+                    // A field cannot be longer than the row that holds it, so
+                    // only a row over the cap can hide an over-long column the
+                    // key parser never looked at. That row, and only that row, is
+                    // re-read in full to find it. At a hundred and eighty bytes a
+                    // row this is one comparison and never taken; the check it
+                    // replaces walked twenty fields of every row of the file.
+                    for (keys) |field| if (field == TOO_LONG) return Error.FieldTooLong;
+                    if (next -| pos > fld.MAX_FIELD_LEN) {
+                        _ = t.parser.parse(data, pos, data.len, fields);
+                        for (fields) |field| if (field == TOO_LONG) return Error.FieldTooLong;
+                    }
                     try chunk.at.append(gpa, pos);
                     try chunk.hash.append(
                         gpa,
-                        try keyHash(self.side.slab, fields, self.key_size, self.opt, &s.a),
+                        try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a),
                     );
                     if (next <= pos) break; // no progress: a malformed tail, not a loop
                     pos = next;
@@ -1237,7 +1274,7 @@ const Prepare = struct {
     }
 
     fn go(self: *Prepare) !void {
-        self.side = try self.input.project(self.gpa, self.wanted, self.threads);
+        self.side = try self.input.project(self.gpa, self.wanted, self.key_size, self.threads);
         self.index = try RowIndex.build(
             self.gpa,
             &self.side.?,
