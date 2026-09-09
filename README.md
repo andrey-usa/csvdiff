@@ -91,10 +91,10 @@ another Parquet file; CSV and ndjson compare against each other.
 
 | | Reads | Notable | Not there |
 |---|---|---|---|
-| **[`c/`](c/)** | CSV, ndjson, uncompressed Parquet | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
-| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet **including Snappy** | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report |
-| **[`rust/`](rust/)** | CSV, ndjson, Parquet | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
-| **[`zig/`](zig/)** | CSV, ndjson, Parquet | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report |
+| **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed only) | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
+| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report; no codec but snappy |
+| **[`rust/`](rust/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
+| **[`zig/`](zig/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for; the widest codec support here | no HTML report |
 
 Every port builds from its own toolchain alone, in seconds, and carries no
 runtime dependency with a comparison engine in it. What was removed to get
@@ -195,11 +195,14 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **The byte proof is C's alone.** It settles most matched rows from their raw
-   bytes without parsing either side, and it is why C leads ndjson by 1.9x and
-   CSV by 1.15x. The other three ports parse both rows for every match. Porting
-   it is the single largest thing left in this repository, and the JSON version
-   needs the bounded tail scan that rules out a repeated name.
+1. **The byte proof reaches ndjson in one port out of four.** Settling a matched
+   row from its raw bytes is not C's alone — all four do it for CSV, each with
+   the same guard that two headers ordering the same columns differently would
+   break it, and Zig's `sharedTail` says so in as many words. What is C-only is
+   the JSON form, because a name repeated in one object takes its last value and
+   a prefix cannot see that; C rules it out with a bounded scan of the mate's
+   tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
+   the largest thing left here.
 2. **`--ignore` accepts a name that matches nothing, in silence** — in all four
    ports, where `--key` with a name that matches nothing is an error. A missing
    key makes the answer impossible; a missing ignore quietly makes it wider. It
@@ -208,9 +211,11 @@ tests/fixtures/          every shape that has broken an engine here
 3. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-4. **Compression.** Parquet here is uncompressed by choice; the C++ port reads
-   Snappy and nothing else does. What that costs against what it saves in bytes
-   read has never been measured on one host.
+4. **Compression.** Parquet here is generated uncompressed by choice, so no
+   table has ever measured a codec. Three ports could: Rust and Zig read snappy,
+   gzip, zstd, lz4 and brotli, C++ reads snappy alone, and C carries no codec at
+   all — the same choice its reader makes. What decompression costs against what
+   it saves in bytes read is unmeasured on one host.
 
 Three things that used to be on this list have been measured off it, and the
 numbers are in [BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
