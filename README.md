@@ -221,8 +221,18 @@ ls -ld .zig-cache .zig-cache/o
 
 | What you see | Fix |
 |---|---|
-| `pwd` is under `/mnt/c` | Clone into `~/` and build there. No flag works around it. |
+| `pwd` is under `/mnt/c` | Point the cache at a native path. The source tree can stay on the Windows drive; only `.zig-cache` cannot. |
 | `.zig-cache` is owned by `root` | A `sudo zig build` left it that way: `sudo rm -rf .zig-cache zig-out`, then build **without** sudo. |
+
+```bash
+export ZIG_LOCAL_CACHE_DIR=~/.cache/zig-csvdiff
+export ZIG_GLOBAL_CACHE_DIR=~/.cache/zig-global
+(cd zig && zig build --release=fast && bash test.sh)   # test.sh needs the same two exports
+```
+
+This fixes the build; it does not fix the speed. For anything you intend to
+measure, clone into `~/` as above -- the 9p mount is slow enough on its own
+to spoil a timing regardless of where the cache lives.
 
 The Zig install above needs `sudo` only to write into `/opt`. Nothing in this
 repository should be built with it — and if `/opt` is not yours to write to,
