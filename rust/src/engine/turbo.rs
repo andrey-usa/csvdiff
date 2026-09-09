@@ -42,7 +42,7 @@ mod text;
 mod thrift;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
@@ -415,19 +415,6 @@ struct RowIndex {
     dup_rows: i64,
 }
 
-/// How much of a candidate row a lookup has to parse.
-///
-/// The two directions of the join want different things from the row they land
-/// on. A's direction compares every column against its mate, so it needs the
-/// whole row and keeps it. B's direction is asking one question -- is this key
-/// in A? -- and discards the row it matched against; parsing the eighteen
-/// columns it will not look at is the largest thing that side was doing.
-#[derive(Clone, Copy, PartialEq)]
-enum Want {
-    Whole,
-    Keys,
-}
-
 impl RowIndex {
     /// Finds and hashes every row in parallel, then inserts them on one thread in
     /// file order.
@@ -621,14 +608,11 @@ impl RowIndex {
     /// probe. `probe` is scratch the caller owns: the join runs several ranges
     /// at once, and a buffer hanging off the index would be shared between them.
     ///
-    /// On `Some`, `probe` holds as much of that row as `want` asked for — it is
-    /// what the key columns were compared against. The join used to parse the row
+    /// On `Some`, `probe` holds that row's fields — it is what the key columns
+    /// were compared against. The join used to parse the row
     /// again on the line after this one returned, which is a second parse of
     /// every matched row in the file.
     ///
-    /// `want` is [`Want::Whole`] for the side that goes on to compare the
-    /// columns, and [`Want::Keys`] for the side that only asks whether the key
-    /// exists at all and throws the answer away.
     #[allow(clippy::too_many_arguments)]
     fn lookup(
         &self,
@@ -638,7 +622,6 @@ impl RowIndex {
         hash: u64,
         key_size: usize,
         opt: &Options,
-        want: Want,
         span: Option<(&[u8], u8)>,
         probe: &mut [Field],
     ) -> Option<(i32, bool)> {
@@ -662,10 +645,7 @@ impl RowIndex {
                     {
                         return Some((candidate, true));
                     }
-                    match want {
-                        Want::Whole => self.fields_of(side, candidate, probe),
-                        Want::Keys => self.keys_of(side, candidate, key_size, probe),
-                    }
+                    self.fields_of(side, candidate, probe);
                     if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
                         return Some((candidate, false));
                     }
@@ -981,13 +961,6 @@ impl Capped {
     }
 }
 
-/// What one chunk of the queue produced: A's chunks carry counts and picks,
-/// B's carry only the rows A never had.
-enum Piece {
-    A(Part),
-    B(Capped),
-}
-
 /// One chunk of A's keys.
 ///
 /// Each chunk keeps its own counts, column stats and capped lists; because the
@@ -1011,6 +984,22 @@ fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> 
     let mut fields = vec![ABSENT; side.width];
     idx.fields_of(side, row, &mut fields);
     fields.iter().map(|f| value(&side.slab, *f, opt)).collect()
+}
+
+/// Runs `work` on `threads` threads and returns everything they produced.
+///
+/// Each worker pulls from a queue `work` closes over until it is empty, so the
+/// split is by demand rather than by an even division: a chunk that turns out
+/// expensive delays one worker rather than the whole round.
+fn on_threads<T: Send>(threads: usize, work: impl Fn() -> Vec<T> + Sync) -> Vec<T> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..threads.max(1)).map(|_| scope.spawn(&work)).collect();
+        let mut all = work();
+        for handle in handles {
+            all.extend(handle.join().expect("a join worker"));
+        }
+        all
+    })
 }
 
 /// How many chunks `keys` divides into. One below the threshold, where finding
@@ -1062,6 +1051,30 @@ fn join(
         (Some(pa), Some(pb)) => shared_tail(pa, pb),
         _ => None,
     };
+    // Which of B's rows some key of A matched.
+    //
+    // B's half of the join used to answer "is this key in A?" for every key in
+    // B, which is ten million probes to find the ten thousand rows A never had.
+    // A's half has already asked the same question of the same pairs, from the
+    // other end, and thrown the answer away -- so it keeps it here instead, and
+    // B's half becomes a walk over a bitmap: a key nobody matched is a key A
+    // never had. One bit per row of B, 1.25 MB at ten million.
+    //
+    // A's chunks all finish before B's start, or the bitmap would be read while
+    // it was still being written; the join is two rounds rather than one queue
+    // for that reason alone.
+    let seen: Vec<AtomicU64> = std::iter::repeat_with(|| AtomicU64::new(0))
+        .take(bi.row_at.len().div_ceil(64))
+        .collect();
+    let mark = |row: i32| {
+        let bit = row as usize;
+        seen[bit >> 6].fetch_or(1 << (bit & 63), Ordering::Relaxed);
+    };
+    let matched_already = |row: i32| {
+        let bit = row as usize;
+        seen[bit >> 6].load(Ordering::Relaxed) & (1 << (bit & 63)) != 0
+    };
+
     let a_keys = ai.first_row.len();
     let b_keys = bi.first_row.len();
     let a_ways = ways_for(a_keys);
@@ -1113,7 +1126,7 @@ fn join(
                 Some((&data[from..to], delimiter))
             });
             let Some((mate, same_bytes)) =
-                bi.lookup(b, &a.slab, &fa, hash, key_size, opt, Want::Whole, span, &mut fb)
+                bi.lookup(b, &a.slab, &fa, hash, key_size, opt, span, &mut fb)
             else {
                 out.removed_total += 1;
                 if exporting || out.removed.len() <= cap {
@@ -1122,6 +1135,7 @@ fn join(
                 continue;
             };
             out.matched += 1;
+            mark(mate);
             // The two rows carry the same bytes across every column either file
             // wants, so no column differs and the mate was never read.
             if same_bytes {
@@ -1175,74 +1189,56 @@ fn join(
 
     let b_range = |p: usize| -> Capped {
         let mut added = Capped::new(cap, exporting);
-        let (mut fb, mut probe) = (vec![ABSENT; width], vec![ABSENT; width]);
         let lo = b_keys * p / b_ways;
         let hi = b_keys * (p + 1) / b_ways;
-        let keys = &bi.first_row[lo..hi];
-        for (i, &row) in keys.iter().enumerate() {
-            if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
-                ai.prefetch(bi.row_hash[soon as usize]);
-            }
-            // Only the key columns: this side compares nothing else, and the
-            // row it is about to probe against is discarded either way.
-            bi.keys_of(b, row, key_size, &mut fb);
-            let hash = bi.row_hash[row as usize];
-            if ai
-                .lookup(a, &b.slab, &fb, hash, key_size, opt, Want::Keys, None, &mut probe)
-                .is_none()
-            {
+        // `first_row` is in file order, so the bits are read in ascending order
+        // and this walk is sequential where the probe it replaces was random.
+        for &row in &bi.first_row[lo..hi] {
+            if !matched_already(row) {
                 added.push(Pick { row, mate: -1 });
             }
         }
         added
     };
 
-    // Chunk `t` is A's chunk `t` while `t` is below `a_ways` and B's after that.
-    // Threads take them in that order, so the merge below only has to sort the
-    // pieces back into it.
+    // Two rounds, both over a queue the workers pull from. A's chunks have to be
+    // finished before B's begin because B's read the bitmap A's write; within a
+    // round the order chunks are taken in does not matter, since each carries
+    // its own index and the merge sorts them back.
+    let mut phases = Phases::new("");
     let next = AtomicUsize::new(0);
-    let take_chunks = || -> Vec<(usize, Piece)> {
+    let mut parts = on_threads(threads, || -> Vec<(usize, Part)> {
         let mut mine = Vec::new();
         loop {
             let t = next.fetch_add(1, Ordering::Relaxed);
-            if t >= a_ways + b_ways {
+            if t >= a_ways {
                 return mine;
             }
-            mine.push(match t.checked_sub(a_ways) {
-                None => (t, Piece::A(a_range(t))),
-                Some(p) => (t, Piece::B(b_range(p))),
-            });
+            mine.push((t, a_range(t)));
         }
-    };
-
-    let mut phases = Phases::new("");
-    let mut pieces = std::thread::scope(|scope| {
-        let handles: Vec<_> = (1..threads.max(1))
-            .map(|_| {
-                let take_chunks = &take_chunks;
-                scope.spawn(take_chunks)
-            })
-            .collect();
-        let mut all = take_chunks();
-        for handle in handles {
-            all.extend(handle.join().expect("a join worker"));
-        }
-        all
     });
-    pieces.sort_by_key(|(t, _)| *t);
+    parts.sort_by_key(|(t, _)| *t);
 
-    let mut parts: Vec<Part> = Vec::with_capacity(a_ways);
-    let mut added = Capped::new(cap, exporting);
-    for (_, piece) in pieces {
-        match piece {
-            Piece::A(part) => parts.push(part),
-            Piece::B(chunk) => {
-                for pick in &chunk.held {
-                    added.push(*pick);
-                }
-                added.total += chunk.total - chunk.held.len() as i64;
+    let next = AtomicUsize::new(0);
+    let mut chunks = on_threads(threads, || -> Vec<(usize, Capped)> {
+        let mut mine = Vec::new();
+        loop {
+            let t = next.fetch_add(1, Ordering::Relaxed);
+            if t >= b_ways {
+                return mine;
             }
+            mine.push((t, b_range(t)));
         }
+    });
+    chunks.sort_by_key(|(t, _)| *t);
+
+    let parts: Vec<Part> = parts.into_iter().map(|(_, part)| part).collect();
+    let mut added = Capped::new(cap, exporting);
+    for (_, chunk) in chunks {
+        for pick in &chunk.held {
+            added.push(*pick);
+        }
+        added.total += chunk.total - chunk.held.len() as i64;
     }
 
     phases.mark("  join chunks (par)");
