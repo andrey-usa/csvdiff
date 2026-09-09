@@ -18,15 +18,15 @@ is what makes a number from one directly comparable with a number from another.
 
 Ten million rows × 20 columns, keyed on `(account_id, txn_id)`, `--ignore
 updated_at`, a per-cell diff over seventeen columns. One GitHub Actions runner
-(4 vCPU / 16 GB), all builds interleaved in one sitting, five rounds each,
-2026-09-09. Each cell is **wall · CPU · memory above the mapped input**, for
-each port's fastest build.
+(4 vCPU / 16 GB), every port compiled for that runner, all builds interleaved in
+one sitting, five rounds each, 2026-09-09. Each cell is **wall · CPU · memory
+above the mapped input**, for each port's fastest build.
 
 | Format | Input | C | C++ | Rust | Zig |
 |---|---:|---|---|---|---|
-| CSV | 3,509 MB | **2.05s** · 7.4s · 716 MB | 10.16s · 32.6s · 882 MB | 5.23s · 19.3s · 899 MB | 4.35s · 16.4s · 887 MB |
-| ndjson | 8,487 MB | **10.32s** · 36.3s · 717 MB | 26.11s · 80.8s · 901 MB | 16.14s · 62.8s · 899 MB | 14.95s · 58.8s · 888 MB |
-| Parquet | 2,074 MB | **1.40s** · 4.6s · 1,298 MB | 3.24s · 10.6s · 1,480 MB | 2.67s · 8.8s · 1,322 MB | 2.72s · 9.7s · 1,245 MB |
+| CSV | 3,509 MB | **1.97s** · 6.7s · 716 MB | 7.96s · 23.0s · 881 MB | 2.81s · 9.5s · 899 MB | 2.80s · 9.9s · 886 MB |
+| ndjson | 8,487 MB | **6.05s** · 19.6s · 716 MB | 17.68s · 50.7s · 924 MB | 9.95s · 38.1s · 899 MB | 9.07s · 35.1s · 882 MB |
+| Parquet | 2,074 MB | **1.67s** · 4.8s · 1,214 MB | 3.15s · 9.7s · 1,177 MB | 2.46s · 7.3s · 1,232 MB | 2.17s · 7.2s · **1,129 MB** |
 
 All builds returned identical counts — matched 9,990,000, changed 599,320, added
 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B. That is the
@@ -35,47 +35,41 @@ mean a bug in one of them, so the run fails and names it.
 
 Three things this table says.
 
-**Parquet is a different problem.** 1.40s against 2.05s for the same rows in
-CSV, on three-fifths of the bytes, because with both dictionaries interned into
-one id space a cell comparison becomes `int32 != int32` rather than a string
-comparison. ndjson, at the other end, costs 7x the Parquet time on four times
-the bytes.
+**The C lead is real and it is smaller than this project used to claim.** CSV by
+1.42x and Parquet by 1.30x, where the tables published earlier the same day said
+2.12x and 1.91x. The difference is not code: C and C++ had carried
+`-march=native` since the first table while Rust and Zig were built for a
+generic baseline, which compiles their wide scanners out entirely. Every port is
+now built for the machine it runs on. The lead that survives that is the one
+worth having.
 
-**One port holds all three formats** — CSV by 2.1x, ndjson by 1.4x, Parquet by
-1.9x over the next build. It also holds the memory column on both text formats
-by a wider margin than it holds any of the time ones: 716 MB above the mapped
-input against 882 MB and up, because a field here is one 64-bit word and never
-becomes a string.
+**Parquet is still a different problem,** but a narrower one: 1.67s against
+1.97s for the same rows in CSV on three-fifths of the bytes, because with both
+dictionaries interned into one id space a cell comparison becomes
+`int32 != int32`. It is also the one format where C does not hold the memory
+column — Zig's reader peaks 85 MB lower.
 
-**Read the CPU column, not the wall column.** Wall time mixes work with how many
-cores a design manages to use; CPU seconds do not. On CSV, C spends 7.4 CPU
-seconds where the next build spends 16.4 — it is not scheduling better, it is
-doing less than half the work, because most rows are proven unchanged from their
-raw bytes without either side being parsed.
+**Read the CPU column.** Wall time mixes work with how many cores a design
+manages to use; CPU seconds do not. C does 1.5x less work than the next build on
+CSV and 1.8x less on ndjson, which is where the byte proof shows: most matched
+rows are settled from their raw bytes without either side being parsed. On
+Parquet it leads by 1.5x on CPU but only 1.30x on wall — that gap is Zig using
+the four cores better, not doing less.
 
-> **Where the columns come from, and why you cannot compare this table with the
-> last one.** C is this tree at `c65f23b`; every other column is
-> `claude/data-comparison-rust-zig-jam00m` at `168ab59`, which is quicker than
-> this tree's C++, Rust and Zig on every format. One runner built both, because
-> two builds measured in two sittings are not compared at all.
+> **Where the columns come from.** C and this tree's C++ are `ef796d0`. The
+> Rust, Zig and best C++ columns are `claude/data-comparison-rust-zig-jam00m`
+> pinned at commit `c12f102`, checked out beside this tree and built on the same
+> runner — pinned to a commit rather than a branch name because that branch
+> moved mid-run twice while this table was being produced.
 >
-> That rule is not theoretical, and this run demonstrates it: against the run
-> three hours earlier, *every* build's ndjson number is about 20% slower and
-> *every* build's Parquet number is a few percent faster. Nothing changed in
-> those ports. Rows compare within a table; never across.
+> Both trees are built the same way: `-march=native` for C and C++,
+> `-C target-cpu=native` for Rust, `-Dcpu=native` for Zig. Each tree keeps its
+> own defaults for anything else, including that branch's `-Dscan=` width, which
+> is its tuning question rather than this workflow's to guess at.
 >
 > The ndjson row is measured over five builds rather than seven: that branch's
 > Rust and Zig read ndjson and this tree's do not, so this tree's two were
 > dropped by the harness rather than given a slow number.
->
-> **This table overstates the C lead, and is being re-measured.** C and C++
-> carry `-march=native` in their makefiles; Rust and Zig were built for a
-> generic baseline. That is not a codegen detail — the Rust scanner selects
-> itself on `cfg!(target_feature = "avx2")` and the Zig one on the cpu it is
-> given, so a baseline build compiles the wide scanner out of both. Some part
-> of the ratios above is a lead in build flags rather than in design. The
-> workflow now gives every port the machine it is measured on; this table
-> stands until the run under those flags replaces it.
 ---
 
 ## Using it
@@ -215,7 +209,7 @@ tests/fixtures/          every shape that has broken an engine here
    ceiling measured with a deliberately unsound build first — so what is left of
    the join is the 6% of rows that really changed and the rows the proof
    refuses. Past that, the floor is the byte scanning itself: this format costs
-   5x the Parquet time on four times the bytes, and no amount of join work
+   3.6x the Parquet time on four times the bytes, and no amount of join work
    changes that.
 2. **Where the C CSV path stops scaling.** The join has given up most of what
    it was doing, so the sequential table insertion is now the larger share of

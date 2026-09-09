@@ -52,14 +52,95 @@ half straddles 1.00x, there is no result to report.
 So: a difference under about 10% is invisible to a ratio of bests here, and
 about 3% is the floor for the paired one. Ratios below those are the machine.
 
-**Every cross-port table above 2026-09-09 10:00 was built unfairly**, and is
-kept rather than deleted because the numbers within each port are still that
-port's. C and C++ carry `-march=native`; Rust and Zig were given a generic
-baseline, which compiles their wide scanners out entirely — the Rust one is
-selected by `cfg!(target_feature = "avx2")` and the Zig one by the cpu it is
-handed. So the C-versus-Rust and C-versus-Zig ratios in those tables are
-partly build flags. The workflow now builds every port for the runner it is
-measured on. It was the other branch's agent that pointed this out.
+**Every cross-port table before the 11:23 run was built unfairly**, and is kept
+rather than deleted because the numbers within each port are still that port's.
+C and C++ carried `-march=native`; Rust and Zig were given a generic baseline,
+which compiles their wide scanners out entirely — the Rust one is selected by
+`cfg!(target_feature = "avx2")` and the Zig one by the cpu it is handed. So the
+C-versus-Rust and C-versus-Zig ratios in those tables are partly build flags,
+and correcting it cost about two thirds of the published C lead on CSV and on
+Parquet. Every port is now built for the runner it is measured on. It was the
+other branch's agent that pointed this out.
+
+---
+
+## 2026-09-09 (joint run, third) — the first one built fairly
+
+One GitHub Actions runner (4 vCPU / 16 GB), 10,000,000 rows × 20 columns, keyed
+on `(account_id, txn_id)`, `--ignore updated_at`, five interleaved rounds each.
+This tree at `ef796d0`; the pinned columns are
+`claude/data-comparison-rust-zig-jam00m` at commit `c12f102`, checked out beside
+it and built on the same runner. Run `34345272610`.
+
+**Every port compiled for the runner**: `-march=native` for C and C++,
+`-C target-cpu=native` for Rust, `-Dcpu=native` for Zig. The three tables above
+this one were not — Rust and Zig were built for a generic baseline, which
+compiles their wide scanners out — so this is the first joint table whose
+cross-port ratios mean what they say.
+
+### CSV — input 3,509 MB
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **1.97s** | 2.00s | 2.06s | **6.7s** | 4,225 MB | **716 MB** |
+| C++ | 17.51s | 17.89s | 18.17s | 53.9s | 4,437 MB | 929 MB |
+| Rust | 27.27s | 27.52s | 27.85s | 27.3s | 4,416 MB | 907 MB |
+| Zig | 17.29s | 17.59s | 17.90s | 30.6s | 4,234 MB | 725 MB |
+| C++ (c12f102) | 7.96s | 8.22s | 8.34s | 23.0s | 4,390 MB | 881 MB |
+| Rust (c12f102) | 2.81s | 2.88s | 3.07s | 9.5s | 4,408 MB | 899 MB |
+| Zig (c12f102) | 2.80s | 3.06s | 3.82s | 9.9s | 4,395 MB | 886 MB |
+
+### ndjson — input 8,487 MB
+
+Five builds, not seven: this tree's Rust and Zig do not read ndjson, and the
+harness drops a build that cannot read the pair rather than timing a failure.
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **6.05s** | 6.17s | 6.29s | **19.6s** | 9,204 MB | **716 MB** |
+| C++ | 18.13s | 18.36s | 19.36s | 52.4s | 9,383 MB | 895 MB |
+| C++ (c12f102) | 17.68s | 18.03s | 18.44s | 50.7s | 9,411 MB | 924 MB |
+| Rust (c12f102) | 9.95s | 10.22s | 10.60s | 38.1s | 9,387 MB | 899 MB |
+| Zig (c12f102) | 9.07s | 9.25s | 9.49s | 35.1s | 9,369 MB | 882 MB |
+
+### Parquet — input 2,074 MB, uncompressed
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **1.67s** | 1.70s | 1.72s | **4.8s** | 3,288 MB | 1,214 MB |
+| C++ | 3.15s | 3.19s | 3.27s | 9.7s | 3,250 MB | 1,177 MB |
+| Rust | 3.75s | 3.81s | 3.85s | 10.6s | 3,299 MB | 1,225 MB |
+| Zig | 7.27s | 7.33s | 7.43s | 10.4s | 3,208 MB | 1,134 MB |
+| C++ (c12f102) | 3.17s | 3.25s | 3.33s | 9.7s | 3,250 MB | 1,176 MB |
+| Rust (c12f102) | 2.46s | 2.51s | 2.55s | 7.3s | 3,305 MB | 1,232 MB |
+| Zig (c12f102) | 2.17s | 2.21s | 2.30s | 7.2s | 3,202 MB | **1,129 MB** |
+
+Counts agree across every build in every table: matched 9,990,000, changed
+599,320, added 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B.
+
+**What fair flags cost the headline.** The C lead over the next build, before
+and after — same tree, same rows, same runner class, the only change being that
+Rust and Zig are now compiled for the machine they run on:
+
+| Format | Lead as published | Lead now |
+|---|---:|---:|
+| CSV | 2.12x | **1.42x** |
+| ndjson | 1.45x | 1.50x |
+| Parquet | 1.91x | **1.30x** |
+
+Two thirds of the CSV margin and two thirds of the Parquet margin were build
+flags. ndjson is the exception, and only because both sides moved at once: the C
+byte proof landed in this tree and a key-only join landed in theirs.
+
+**What is still C's.** The memory column on both text formats, by 165 MB and
+more — a field there is one 64-bit word and never becomes a string. And the CPU
+column everywhere: 1.5x less work than the next build on CSV, 1.8x on ndjson,
+1.5x on Parquet. On Parquet that 1.5x of work shows up as only 1.30x of wall,
+which is their Zig using four cores better than this one does.
+
+**Do not compare this table with the three above it.** Different build flags on
+half the columns, and this runner's ndjson numbers moved 20% between two runs
+this morning with no code change at all.
 
 ---
 
