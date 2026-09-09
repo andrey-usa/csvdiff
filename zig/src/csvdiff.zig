@@ -40,6 +40,7 @@ const Dialect = slab_mod.Dialect;
 pub const Error = error{
     KeyColumnMissing,
     ComparedColumnMissing,
+    IgnoredColumnMissing,
     NoHeaderRow,
     FieldTooLong,
     CannotReadFile,
@@ -198,6 +199,7 @@ pub fn message(err: anyerror) []const u8 {
         error.OutOfMemory => "out of memory",
         Error.KeyColumnMissing => "key column(s) missing from one of the files",
         Error.ComparedColumnMissing => "compared column missing from one of the files",
+        Error.IgnoredColumnMissing => "ignore column(s) present in neither file",
         Error.NoHeaderRow => "file has no header row",
         Error.FieldTooLong => "a field is larger than this engine packs",
         Error.CannotReadFile => "cannot read one of the files",
@@ -1442,6 +1444,18 @@ pub fn compare(
 
     for (opt.key) |k| {
         if (!has(a_names, k) or !has(b_names, k)) return Error.KeyColumnMissing;
+    }
+
+    // A name in neither file is a typo, and this is the typo that hides. `--key`
+    // makes the answer impossible and `--compare` refuses; a misspelled
+    // `--ignore` silently compares the column it meant to drop and calls it
+    // changed on every row.
+    //
+    // In *neither* file rather than in both: ignore is subtractive, so a name
+    // only one side carries is real and does no harm -- that column is not
+    // compared either way. Only a name nothing has can be a mistake.
+    for (opt.ignore) |c| {
+        if (!has(a_names, c) and !has(b_names, c)) return Error.IgnoredColumnMissing;
     }
 
     var compared: std.ArrayList([]const u8) = .empty;

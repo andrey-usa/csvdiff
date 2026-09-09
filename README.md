@@ -510,12 +510,7 @@ tests/fixtures/          every shape that has broken an engine here
    a prefix cannot see that; C rules it out with a bounded scan of the mate's
    tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
    the largest thing left here.
-2. **`--ignore` accepts a name that matches nothing, in silence** — in all four
-   ports, where `--key` with a name that matches nothing is an error. A missing
-   key makes the answer impossible; a missing ignore quietly makes it wider. It
-   cost a benchmark run here that reported every row as changed. Whether to
-   warn or to refuse is a contract decision across four ports.
-3. **Zig does not build for Windows** — two things, neither of them the one
+2. **Zig does not build for Windows** — two things, neither of them the one
    this list used to name. `src/slab.zig` calls `std.posix.mmap`, whose `MAP`
    type is `void` there, so the port needs a `CreateFileMapping` backend before
    it compiles at all; and `src/main.zig` reads `CSVDIFF_PHASES` through
@@ -529,14 +524,21 @@ tests/fixtures/          every shape that has broken an engine here
    kernel that does not use them. That one is fixed: a `builtin.os.tag` switch,
    with a `@compileError` for any target that has no clock rather than a
    plausible-looking number.
-4. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
+3. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-5. **Compression is unmeasured.** Parquet here is generated uncompressed by
+4. **Compression is unmeasured.** Parquet here is generated uncompressed by
    choice, so no table has ever timed a codec. Three ports could: Rust and Zig
    read snappy, gzip, zstd and lz4, C++ reads snappy alone, and C carries no
    codec at all — the same choice its reader makes. What decompression costs
    against what it saves in bytes read is unmeasured on one host.
+
+`--ignore` used to be on this list, accepted in silence in all four ports where
+`--key` and `--compare` refuse. It is an error now in all four — a name that
+*neither* file has, since `--ignore` is subtractive and a name only one side
+carries is real. The check found a `-i x,y,z` against a `z2` column in this
+repository's own C suite, where the counts came out the same either way and
+nothing could see it.
 
 Three things that used to be on this list have been measured off it, and the
 numbers are in [BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):

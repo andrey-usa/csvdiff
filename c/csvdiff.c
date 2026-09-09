@@ -1672,6 +1672,16 @@ int main(int argc, char **argv) {
             fail("key column(s) missing from one of the files");
             goto done;
         }
+    /* A name in neither file is a typo, and this is the typo that hides: --key
+     * makes the answer impossible and --compare refuses, but a misspelled
+     * --ignore silently compares the column it meant to drop and calls it
+     * changed on every row. In *neither* file rather than in both: ignore is
+     * subtractive, so a name only one side carries is real and harmless. */
+    for (size_t i = 0; i < ignore.len; i++)
+        if (name_index(&a_head, ignore.items[i]) < 0 && name_index(&b_head, ignore.items[i]) < 0) {
+            fail("ignore column(s) present in neither file");
+            goto done;
+        }
     for (size_t i = 0; i < a_head.len; i++) {
         const char *c = a_head.items[i];
         if (name_index(&b_head, c) >= 0 && name_index(&key, c) < 0 && name_index(&ignore, c) < 0) {

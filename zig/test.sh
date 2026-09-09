@@ -85,6 +85,23 @@ case "$out" in
   *) echo "  FAIL  expected a refusal, got: $out"; fail=1 ;;
 esac
 
+# A misspelled --ignore used to widen the comparison in silence: the column it
+# meant to drop got compared and came back changed on every row. `--key` and
+# `--compare` have always refused an unknown name; this is the third.
+out=$($BIN compare "$tmp/small_a.csv" "$tmp/small_b.csv" -k k -i no_such_column 2>&1 | head -1)
+case "$out" in
+  *"present in neither file"*) echo "  ok    an unknown --ignore name is refused" ;;
+  *) echo "  FAIL  expected a refusal, got: $out"; fail=1 ;;
+esac
+
+# The other half: a name that is really there still works, so the check refuses
+# typos rather than refusing --ignore.
+out=$($BIN compare "$tmp/small_a.csv" "$tmp/small_b.csv" -k k -i v 2>&1 | head -1)
+case "$out" in
+  *"matched 20000"*) echo "  ok    a real --ignore name is still accepted" ;;
+  *) echo "  FAIL  a real --ignore name should be accepted, got: $out"; fail=1 ;;
+esac
+
 out=$($BIN compare "$tmp/small_a.csv" "$tmp/small_b.csv" -k k --max-memory 64 2>&1 | head -1)
 case "$out" in
   *"matched 20000"*) echo "  ok    a budget that is enough finishes inside it" ;;

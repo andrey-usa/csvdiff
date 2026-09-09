@@ -791,6 +791,14 @@ int pq_compare(const char *a_path, const char *b_path,
             pq_set_error("key column(s) missing from one of the files");
             goto done;
         }
+    /* Same rule as the text path: a name in neither file is a misspelling, and
+     * a misspelled --ignore widens the comparison without saying so. */
+    for (size_t j = 0; j < nignore; j++)
+        if (name_slot(&ameta, ignore[j]) == ameta.names_len &&
+            name_slot(&bmeta, ignore[j]) == bmeta.names_len) {
+            pq_set_error("ignore column(s) present in neither file");
+            goto done;
+        }
 
     compared = malloc((ameta.names_len ? ameta.names_len : 1) * sizeof *compared);
     if (!compared) { pq_set_error("out of memory"); goto done; }

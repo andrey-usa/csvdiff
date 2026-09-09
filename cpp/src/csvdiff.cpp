@@ -1307,6 +1307,15 @@ Resolved resolve(const std::vector<std::string>& a, const std::vector<std::strin
     for (const auto& k : opt.key)
         if (!has(a, k) || !has(b, k)) throw Error("key column(s) missing from one of the files: " + k);
 
+    // A name in neither file is a typo, and this is the typo that hides: `--key`
+    // makes the answer impossible and `--compare` refuses, but a misspelled
+    // `--ignore` silently compares the column it meant to drop and calls it
+    // changed on every row. In *neither* file rather than in both -- ignore is
+    // subtractive, so a name only one side carries is real and harmless.
+    for (const auto& c : opt.ignore)
+        if (!has(a, c) && !has(b, c))
+            throw Error("ignore column(s) present in neither file: " + c);
+
     Resolved out;
     for (const auto& c : a)
         if (!has(b, c) && !has(opt.key, c)) out.only_in_a.push_back(c);
