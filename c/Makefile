@@ -1,11 +1,23 @@
 # Two compilers, because the gap between them is a finding this port exists to
 # show: on 1M rows gcc takes 5.34s and clang 4.77s from the same source.
 #
-# -pthread is for the Parquet path: the CSV path is still single-threaded, and
-# the columnar one is not, because a column is the natural unit of parallel work
-# and pretending otherwise would measure the wrong thing.
+# -pthread is for both paths; the text one divides inside the file and the
+# columnar one by column.
+#
+# `-march=native` under `-Werror` is a hazard, and it fired: on a runner whose
+# CPU advertises avx10.1-256, clang 18 refuses with
+#
+#   invalid feature combination: +avx10.1-256; will be promoted to avx10.1-512
+#
+# before it reads a line of this code. That is the driver describing the host,
+# not a diagnostic about the source, and turning it into a build failure means
+# the port stops compiling when a cloud provider refreshes its fleet. The
+# warning is suppressed if the compiler in use knows the flag, and left alone if
+# it does not, so this stays quiet on gcc and on older clangs.
 CC     ?= cc
-CFLAGS ?= -std=c11 -O2 -march=native -Wall -Wextra -Werror -pthread
+NATIVE_QUIRK := $(shell $(CC) -Werror -Wno-invalid-feature-combination -E - </dev/null >/dev/null 2>&1 \
+                    && echo -Wno-invalid-feature-combination)
+CFLAGS ?= -std=c11 -O2 -march=native -Wall -Wextra -Werror -pthread $(NATIVE_QUIRK)
 LDFLAGS ?= -pthread
 BIN     = csvdiff
 # Two programs live here, each with its own main, so the sources are named
@@ -36,7 +48,7 @@ gen-data: $(GEN) pqwrite.h parallel.h
 # home: a second copy in CI is a copy that goes stale, and did.
 asan: $(ENGINE)
 	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -pthread \
-	    -o csvdiff-asan $(ENGINE)
+	    $(NATIVE_QUIRK) -o csvdiff-asan $(ENGINE)
 
 clean:
 	rm -f $(BIN) gen-data csvdiff-asan $(OBJ)
