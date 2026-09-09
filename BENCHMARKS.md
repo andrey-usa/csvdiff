@@ -70,6 +70,22 @@ Counts unchanged across 30 generated shapes (CSV and ndjson), the awkward
 fixture, and the cross-port suite with the Rust port as the oracle. That suite
 is what caught the `cc`/`cccccccc` case; the fast suite now catches it too.
 
+### The shape this project was not measuring
+
+Every table here compares two generated sides where a timestamp column moves on
+every row and is ignored. The other common shape is two snapshots of one table:
+compare every column, and most rows are untouched byte for byte. Same host, same
+sitting, eleven rounds — 2,000,000 rows, 5% of them carrying one changed cell,
+nothing ignored:
+
+| | Wall | CPU |
+|---|---:|---:|
+| before the proof (`5498bc4`) | 0.794s | 2.68s |
+| with it (`3ecbab1`) | **0.538s** | **1.74s** |
+
+1.48x, which is the same win the benchmark shape gets, for the same reason: the
+proof does not care *why* the rows agree.
+
 ### The day's five C changes, one sitting
 
 Each commit built from its own tree and run against the others, seven

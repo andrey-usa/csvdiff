@@ -178,8 +178,11 @@ tests/fixtures/          every shape that has broken an engine here
    to.
 2. **Where the C CSV path stops scaling.** The join has given up most of what
    it was doing, so the sequential table insertion is now the larger share of
-   the run rather than a tail on it — and it is the next thing to thread or to
-   fold into the sweep.
+   the run rather than a tail on it. Sharding it by hash was measured and lost
+   — the routing costs more than the serial insert it replaces — so what is
+   left is to pipeline it against the sweep, inserting a chunk's rows while the
+   next chunk is still being read. Total CPU over wall says the whole remaining
+   prize is about 1.25x.
 3. **Reconciling the two Zig Parquet readers.** This tree and
    `claude/data-comparison-rust-zig-jam00m` each wrote one; `git merge` reports
    them as an add/add conflict.
