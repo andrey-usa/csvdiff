@@ -209,4 +209,37 @@ echo "unit tests:"
 if "$ZIG" build test; then echo "  ok    scan, field, slab, text, thrift, codec, encoding, parquet"
 else echo "  FAIL  zig build test"; fail=1; fi
 
+# The columnar reader takes uncompressed and snappy; the reader beside it takes
+# zstd, gzip and lz4. A capability refusal falls through to that one, so a file
+# this binary carries a decoder for is read rather than turned away. Before the
+# fall-through a zstd pair was refused -- and, on a large enough file, the
+# refusal path freed an uninitialized column array and took the process down
+# with SIGSEGV.
+echo "parquet codecs, and which reader takes them:"
+fx=../tests/fixtures/formats
+for spec in "a_plain_none parquet" "a_dict_snappy parquet" \
+            "a_plain_zstd turbo" "a_dict_gzip turbo" "a_plain_lz4 turbo"; do
+  set -- $spec
+  out=$($BIN compare "$fx/$1.parquet" "$fx/$1.parquet" -k id 2>&1 | head -1)
+  case "$out" in
+    *"matched 301"*"| $2")
+      echo "  ok    $1 is read, by the $2 reader" ;;
+    *"matched 301"*)
+      echo "  FAIL  $1 was read but by the wrong reader: $out"; fail=1 ;;
+    *)
+      echo "  FAIL  $1 was not read: $out"; fail=1 ;;
+  esac
+done
+
+# A file that is actually broken must still fail, rather than being handed to
+# the second reader and failing there with a message about the wrong thing.
+trunc=$(mktemp -d)
+head -c 400 "$fx/a_plain_zstd.parquet" > "$trunc/cut.parquet"
+out=$($BIN compare "$trunc/cut.parquet" "$trunc/cut.parquet" -k id 2>&1 | head -1)
+case "$out" in
+  *"matched"*) echo "  FAIL  a truncated parquet file was read: $out"; fail=1 ;;
+  *) echo "  ok    a truncated parquet file is still refused" ;;
+esac
+rm -rf "$trunc"
+
 exit $fail

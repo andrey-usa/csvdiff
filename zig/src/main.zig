@@ -161,26 +161,29 @@ pub fn main(init: std.process.Init) !u8 {
     const both_parquet = pqdiff.isParquetFile(io, files.items[0]) and
         pqdiff.isParquetFile(io, files.items[1]);
 
-    var result = (if (both_parquet)
-        pqdiff.compare(io, gpa, files.items[0], files.items[1], opt)
-    else
-        csvdiff.compare(io, gpa, files.items[0], files.items[1], opt)) catch |err| {
-        // A budget that was not enough is the one failure worth naming in full:
-        // it is the answer to the question --max-memory was asked.
-        if (err == error.OutOfMemory) {
-            if (max_memory_mb) |mb| {
-                try stderr.interface.print(
-                    "error: the comparison needs more than the {d} MB it was given\n",
-                    .{mb},
-                );
-                try stderr.interface.flush();
-                return 2;
-            }
+    // The columnar path reads a narrow slice of Parquet on purpose -- uncompressed
+    // or snappy, BYTE_ARRAY, v1 pages -- and the reader beside it handles the
+    // rest: zstd, gzip, lz4, other column types, v2 pages. A refusal on
+    // capability grounds, and only that, falls through to that one rather than
+    // turning away a file this binary can in fact read. A truncated file or a
+    // missing key column still fails, as the columnar path's own error.
+    //
+    // Without this a zstd Parquet pair was refused by a binary carrying a zstd
+    // decoder. The Rust port had the same gap and closed it the same way.
+    var columnar_ran = both_parquet;
+    var early: ?csvdiff.Result = null;
+    if (both_parquet) {
+        if (pqdiff.compare(io, gpa, files.items[0], files.items[1], opt)) |r| {
+            early = r;
+        } else |err| {
+            if (!csvdiff.isUnsupported(err)) return failRun(&stderr, err, max_memory_mb);
+            columnar_ran = false;
         }
-        try stderr.interface.print("error: {s}\n", .{csvdiff.message(err)});
-        try stderr.interface.flush();
-        return 2;
-    };
+    }
+
+    var result = early orelse (csvdiff.compare(io, gpa, files.items[0], files.items[1], opt) catch |err| {
+        return failRun(&stderr, err, max_memory_mb);
+    });
 
     defer result.deinit(gpa);
 
@@ -215,11 +218,27 @@ pub fn main(init: std.process.Init) !u8 {
         .{
             c.a_rows,       c.b_rows,   c.matched,       c.changed,
             c.added,        c.removed,  c.a_dup_keys,    c.b_dup_keys,
-            if (both_parquet) @as([]const u8, "parquet") else "turbo",
+            if (columnar_ran) @as([]const u8, "parquet") else "turbo",
         },
     );
     try stdout.interface.flush();
     return if (result.identical()) 0 else 1;
+}
+
+/// A run that could not finish. A budget that was not enough is the one failure
+/// worth naming in full: it is the answer to the question `--max-memory` asked.
+fn failRun(stderr: anytype, err: anyerror, max_memory_mb: ?usize) !u8 {
+    if (err == error.OutOfMemory) {
+        if (max_memory_mb) |mb| {
+            try stderr.interface.print(
+                "error: the comparison needs more than the {d} MB it was given\n",
+                .{mb},
+            );
+            try stderr.interface.flush();
+            return 2;
+        }
+    }
+    return fail(stderr, csvdiff.message(err));
 }
 
 fn fail(stderr: anytype, message: []const u8) !u8 {

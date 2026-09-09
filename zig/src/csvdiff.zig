@@ -27,6 +27,9 @@ const fld = @import("field.zig");
 const slab_mod = @import("slab.zig");
 const text = @import("text.zig");
 const parquet = @import("pqread.zig");
+/// The columnar reader's own error set. Its refusals used to reach the user as
+/// "the comparison failed", because `message` only knew `pqread.zig`'s.
+const columnar = @import("parquet.zig");
 const codec = @import("codec.zig");
 const encoding = @import("encoding.zig");
 
@@ -191,6 +194,25 @@ pub const ColumnStat = struct {
     filled: i64 = 0,
 };
 
+/// A reader declining a file it does not handle, rather than a file being wrong.
+///
+/// The columnar path reads a narrow slice of Parquet on purpose -- uncompressed
+/// or snappy, BYTE_ARRAY, v1 pages -- while `pqread.zig` beside it reads zstd,
+/// gzip, lz4, other column types and v2 pages. A capability refusal is a reason
+/// to try that one; a truncated file or a missing column is not. The Rust port
+/// draws the line in the same five places, in `Error::is_unsupported`.
+pub fn isUnsupported(err: anyerror) bool {
+    return switch (err) {
+        columnar.Error.ParquetCodecUnsupported,
+        columnar.Error.ParquetTypeUnsupported,
+        columnar.Error.ParquetEncodingUnsupported,
+        columnar.Error.ParquetNestedColumn,
+        columnar.Error.ParquetPageV2,
+        => true,
+        else => false,
+    };
+}
+
 /// What went wrong, in words, for any error this engine or its readers can
 /// return. A switch here rather than in the command line, because the readers
 /// each have their own error set and the caller should not have to know them.
@@ -240,6 +262,25 @@ pub fn message(err: anyerror) []const u8 {
         thrift_error.TruncatedMetadata => "the Parquet metadata ends mid-value",
         thrift_error.UnknownThriftType => "the Parquet metadata holds a Thrift type this reader " ++
             "does not know",
+        // The columnar reader (`parquet.zig`, behind `pqdiff.zig`). Every one of
+        // these reached the user as "the comparison failed" until now -- a zstd
+        // Parquet pair said nothing at all about codecs.
+        columnar.Error.ParquetTruncated => "that Parquet file is truncated",
+        columnar.Error.ParquetMalformed => "that Parquet file is malformed",
+        columnar.Error.ParquetNestedColumn => "nested Parquet columns are not read by the columnar " ++
+            "path; a comparison needs a flat table of cells",
+        columnar.Error.ParquetNoSuchColumn => "a named column is not in that Parquet file",
+        columnar.Error.ParquetTypeUnsupported => "only BYTE_ARRAY Parquet columns are read by the " ++
+            "columnar path",
+        columnar.Error.ParquetCodecUnsupported => "only uncompressed and snappy Parquet are read by " ++
+            "the columnar path",
+        columnar.Error.ParquetEncodingUnsupported => "only PLAIN Parquet dictionaries are read by the " ++
+            "columnar path",
+        columnar.Error.ParquetPageV2 => "Parquet data page v2 is not read by the columnar path",
+        columnar.Error.ParquetValueTooLong => "a Parquet value is larger than this reader packs",
+        columnar.Error.ParquetMixedCompression => "that Parquet file compresses some chunks of a " ++
+            "column and not others, which this reader does not follow",
+        columnar.Error.ParquetSnappyFailed => "a snappy Parquet page did not decompress",
         else => "the comparison failed",
     };
 }
