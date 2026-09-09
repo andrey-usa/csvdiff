@@ -138,6 +138,30 @@ impl Side {
             }
         }
     }
+
+    /// The key columns of that row, and nothing else.
+    ///
+    /// The whole row is eighteen more fields than a key comparison reads, and a
+    /// parser stops at the last column it was asked for -- so asking for the two
+    /// key columns turns the rest of the row into one scan for the newline
+    /// instead of eighteen field boundaries packed into words nobody looks at.
+    /// This is the same saving the sweep already takes, in the other half of the
+    /// engine that only ever wanted a key.
+    ///
+    /// Fills `out[..key_size]` and leaves the rest of the buffer as it was:
+    /// every caller reads the key columns alone.
+    fn keys_at(&self, at: u64, key_size: usize, out: &mut [Field]) {
+        match &self.rows {
+            Rows::Text { keys, .. } => {
+                let data = self.slab.data();
+                keys.parse(data, at as usize, data.len(), out);
+            }
+            Rows::Columnar { fields, .. } => {
+                let from = at as usize * self.width;
+                out[..key_size].copy_from_slice(&fields[from..from + key_size]);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +407,19 @@ struct RowIndex {
     dup_rows: i64,
 }
 
+/// How much of a candidate row a lookup has to parse.
+///
+/// The two directions of the join want different things from the row they land
+/// on. A's direction compares every column against its mate, so it needs the
+/// whole row and keeps it. B's direction is asking one question -- is this key
+/// in A? -- and discards the row it matched against; parsing the eighteen
+/// columns it will not look at is the largest thing that side was doing.
+#[derive(Clone, Copy, PartialEq)]
+enum Want {
+    Whole,
+    Keys,
+}
+
 impl RowIndex {
     /// Finds and hashes every row in parallel, then inserts them on one thread in
     /// file order.
@@ -502,10 +539,10 @@ impl RowIndex {
                     // the sweep because the sweep produced ten million of them and
                     // this branch wants one.
                     if !mine_parsed {
-                        side.fields_at(at, mine);
+                        side.keys_at(at, key_size, mine);
                         mine_parsed = true;
                     }
-                    self.fields_of(side, candidate, probe);
+                    self.keys_of(side, candidate, key_size, probe);
                     if (0..key_size).all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt)) {
                         self.occurrences[key] += 1;
                         if self.occurrences[key] == 2 {
@@ -523,6 +560,10 @@ impl RowIndex {
 
     fn fields_of(&self, side: &Side, row: i32, out: &mut [Field]) {
         side.fields_at(self.row_at[row as usize], out);
+    }
+
+    fn keys_of(&self, side: &Side, row: i32, key_size: usize, out: &mut [Field]) {
+        side.keys_at(self.row_at[row as usize], key_size, out);
     }
 
     fn slot(&self, hash: u64) -> usize {
@@ -572,10 +613,14 @@ impl RowIndex {
     /// probe. `probe` is scratch the caller owns: the join runs several ranges
     /// at once, and a buffer hanging off the index would be shared between them.
     ///
-    /// On `Some`, `probe` holds that row's fields — it is what the key columns
-    /// were compared against. The join used to parse the row again on the line
-    /// after this one returned, which is a second parse of every matched row in
-    /// the file.
+    /// On `Some`, `probe` holds as much of that row as `want` asked for — it is
+    /// what the key columns were compared against. The join used to parse the row
+    /// again on the line after this one returned, which is a second parse of
+    /// every matched row in the file.
+    ///
+    /// `want` is [`Want::Whole`] for the side that goes on to compare the
+    /// columns, and [`Want::Keys`] for the side that only asks whether the key
+    /// exists at all and throws the answer away.
     #[allow(clippy::too_many_arguments)]
     fn lookup(
         &self,
@@ -585,6 +630,7 @@ impl RowIndex {
         hash: u64,
         key_size: usize,
         opt: &Options,
+        want: Want,
         probe: &mut [Field],
     ) -> Option<i32> {
         let mut slot = self.slot(hash);
@@ -596,7 +642,10 @@ impl RowIndex {
             if tag_is(word, hash) {
                 let candidate = self.first_row[pos_of(word)];
                 if self.row_hash[candidate as usize] == hash {
-                    self.fields_of(side, candidate, probe);
+                    match want {
+                        Want::Whole => self.fields_of(side, candidate, probe),
+                        Want::Keys => self.keys_of(side, candidate, key_size, probe),
+                    }
                     if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
                         return Some(candidate);
                     }
@@ -997,7 +1046,8 @@ fn join(
             let hash = ai.row_hash[row as usize];
             // `fb` is the lookup's scratch, and on a hit it already holds the
             // mate's fields: that is what the key columns were matched against.
-            let Some(mate) = bi.lookup(b, &a.slab, &fa, hash, key_size, opt, &mut fb) else {
+            let Some(mate) = bi.lookup(b, &a.slab, &fa, hash, key_size, opt, Want::Whole, &mut fb)
+            else {
                 out.removed_total += 1;
                 if exporting || out.removed.len() <= cap {
                     out.removed.push(Pick { row, mate: -1 });
@@ -1061,10 +1111,12 @@ fn join(
             if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
                 ai.prefetch(bi.row_hash[soon as usize]);
             }
-            bi.fields_of(b, row, &mut fb);
+            // Only the key columns: this side compares nothing else, and the
+            // row it is about to probe against is discarded either way.
+            bi.keys_of(b, row, key_size, &mut fb);
             let hash = bi.row_hash[row as usize];
             if ai
-                .lookup(a, &b.slab, &fb, hash, key_size, opt, &mut probe)
+                .lookup(a, &b.slab, &fb, hash, key_size, opt, Want::Keys, &mut probe)
                 .is_none()
             {
                 added.push(Pick { row, mate: -1 });
