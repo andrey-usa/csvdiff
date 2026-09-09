@@ -62,39 +62,84 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > numbers moved 20% between two runs one morning with no code change at all.
 ---
 
-## Using it
+## Building and running
 
-Each port builds from its own directory, with its own toolchain and no system
-dependencies:
+### What runs where
+
+Only Linux is tested — all eleven CI jobs are `ubuntu-latest` — so the other two
+columns are what the source implies rather than what a run has proved.
+
+| Port | Linux | macOS | Windows | Why |
+|---|---|---|---|---|
+| **C** | tested | should work | **WSL** | `sys/mman.h`, `pthread.h`, `unistd.h`: POSIX, and MSVC has none of them |
+| **C++** | tested | should work | **WSL** | the same POSIX headers, minus pthread — it uses `std::thread` |
+| **Rust** | tested | should work | **native** | no `std::os::unix` anywhere; `memmap2` maps files on Windows too |
+| **Zig** | tested | **no** | **WSL** | one call to `std.os.linux.clock_gettime`, which is Linux and not merely POSIX |
+
+`test.sh` and `scripts/bench_ab.sh` are bash. On Windows they need WSL or Git
+Bash; `scripts/bench_ports.py` needs Python 3.
+
+### Building
+
+Each port builds from its own directory with its own toolchain, in seconds, and
+pulls in nothing that contains a comparison engine.
 
 ```bash
+# Linux, macOS, or WSL
 (cd c    && make)                    # cc or clang, C11. Also builds c/gen-data
 (cd cpp  && make)                    # g++ or clang++, C++20
 (cd rust && cargo build --release)   # edition 2024
 (cd zig  && zig build --release=fast)
 ```
 
+```powershell
+# Windows, PowerShell — the Rust port is the one that builds without WSL
+cd rust
+cargo build --release
+.\target\release\csvdiff.exe compare july.csv august.csv -k id
+```
+
+For the other three on Windows, install WSL (`wsl --install`) and use the bash
+commands above inside it. A Windows path is reachable from WSL as
+`/mnt/c/Users/you/data.csv`.
+
+### Running
+
 ```bash
+# the smallest useful invocation: two files and a key
 c/csvdiff compare july.csv august.csv -k order_id,line_no
+
+# -i skips columns that always move; --json writes the counts and samples;
+# --threads caps the cores it takes
 c/csvdiff compare july.csv august.csv -k id -i updated_at --json summary.json --threads 4
+
+# the Rust port is the one with the self-contained HTML report
 rust/target/release/csvdiff compare july.csv august.csv -k id -o report.html
 ```
 
-Exit codes: **0** identical, **1** differences found, **2** error (**3**
-duplicate keys, where `--fail-on-dups` is supported). That makes any of them a
-drop-in CI or pipeline gate.
+**Exit codes** make any of them a CI or pipeline gate directly:
 
-Format is detected from the bytes. A Parquet file may only be compared against
-another Parquet file; CSV and ndjson compare against each other.
+| Code | Meaning |
+|---:|---|
+| `0` | the two files are identical on the compared columns |
+| `1` | differences found — this is a normal result, not a failure |
+| `2` | an error: a missing key column, an unreadable file, out of memory |
+| `3` | duplicate keys, where `--fail-on-dups` is given — the Rust port only |
+
+`1` is the usual outcome, so a script that treats any non-zero status as failure
+will misread a successful comparison. Test for `2` and above.
+
+Format is detected from the bytes, not the extension. A Parquet file may only be
+compared against another Parquet file; CSV and ndjson compare against each other.
 
 ### What each port carries
 
 | | Reads | Notable | Not there |
 |---|---|---|---|
-| **[`c/`](c/)** | CSV, ndjson, uncompressed Parquet | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
-| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet **including Snappy** | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report |
-| **[`rust/`](rust/)** | CSV, ndjson, Parquet | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
-| **[`zig/`](zig/)** | CSV, ndjson, Parquet | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report |
+| **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed only) | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
+| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report; no codec but snappy |
+| **[`rust/`](rust/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
+| **[`zig/`](zig/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for; the widest codec support here | no HTML report |
 
 Every port builds from its own toolchain alone, in seconds, and carries no
 runtime dependency with a comparison engine in it. What was removed to get
@@ -195,25 +240,37 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **ndjson, again.** It has the byte proof now — 1.29x of CPU, against a 1.47x
-   ceiling measured with a deliberately unsound build first — so what is left of
-   the join is the 6% of rows that really changed and the rows the proof
-   refuses. Past that, the floor is the byte scanning itself: this format costs
-   3.6x the Parquet time on four times the bytes, and no amount of join work
-   changes that.
-2. **Where the C CSV path stops scaling.** The join has given up most of what
-   it was doing, so the sequential table insertion is now the larger share of
-   the run rather than a tail on it. Sharding it by hash was measured and lost
-   — the routing costs more than the serial insert it replaces — so what is
-   left is to pipeline it against the sweep, inserting a chunk's rows while the
-   next chunk is still being read. Total CPU over wall says the whole remaining
-   prize is about 1.25x.
-3. **Reconciling the two Zig Parquet readers.** This tree and
-   `claude/data-comparison-rust-zig-jam00m` each wrote one; `git merge` reports
-   them as an add/add conflict.
+1. **The byte proof reaches ndjson in one port out of four.** Settling a matched
+   row from its raw bytes is not C's alone — all four do it for CSV, each with
+   the same guard that two headers ordering the same columns differently would
+   break it, and Zig's `sharedTail` says so in as many words. What is C-only is
+   the JSON form, because a name repeated in one object takes its last value and
+   a prefix cannot see that; C rules it out with a bounded scan of the mate's
+   tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
+   the largest thing left here.
+2. **`--ignore` accepts a name that matches nothing, in silence** — in all four
+   ports, where `--key` with a name that matches nothing is an error. A missing
+   key makes the answer impossible; a missing ignore quietly makes it wider. It
+   cost a benchmark run here that reported every row as changed. Whether to
+   warn or to refuse is a contract decision across four ports.
+3. **Zig is Linux-only for one line.** `Phases.now()` calls
+   `std.os.linux.clock_gettime` for a diagnostic that is off by default, and
+   that call is compiled unconditionally — so the port will not build on macOS
+   or on Windows, where the other three will. `std.time.Instant` or a
+   `builtin.os.tag` switch would settle it; nothing else in that port looks
+   Linux-bound.
 4. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-5. **Wide files.** Everything here is 20 columns. 200 would change the ratio of
-   key work to cell work, and probably the ranking — and would re-open the SIMD
-   question, since longer rows mean longer scans.
+5. **Compression.** Parquet here is generated uncompressed by choice, so no
+   table has ever measured a codec. Three ports could: Rust and Zig read snappy,
+   gzip, zstd, lz4 and brotli, C++ reads snappy alone, and C carries no codec at
+   all — the same choice its reader makes. What decompression costs against what
+   it saves in bytes read is unmeasured on one host.
+
+Three things that used to be on this list have been measured off it, and the
+numbers are in [BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
+the serial insert (blocked by allocation rather than ordering, and 1.4% of a
+200-column run), ndjson's cost per byte (the format, not a defect — name lookups
+are 12% of a 46% gap), and wide files (throughput flat from 20 columns to 200,
+and the SIMD question does not re-open there).
