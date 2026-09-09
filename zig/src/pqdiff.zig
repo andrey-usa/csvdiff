@@ -39,6 +39,7 @@ const Options = csvdiff.Options;
 const Counts = csvdiff.Counts;
 const ColumnStat = csvdiff.ColumnStat;
 const Result = csvdiff.Result;
+const Phases = csvdiff.Phases;
 
 pub const Error = error{
     ParquetKeyColumnMissing,
@@ -524,6 +525,31 @@ const IndexBuild = struct {
 /// `into`'s table. The A direction keeps the pairs it finds; the B direction
 /// only counts the keys that find nothing, which is why `keep_pairs` exists and
 /// why the two can run at once without sharing an output.
+/// Keys per chunk of the match sweep. Sized in rows rather than in threads, so a
+/// chunk is small enough that no single one of them is the last thing four cores
+/// are waiting on.
+const SWEEP_CHUNK: usize = 1 << 16;
+
+/// How many chunks `keys` divides into. One below the threshold, where finding
+/// the boundaries would cost more than the sweep it splits.
+fn sweepWays(keys: usize) usize {
+    if (keys < (1 << 14)) return 1;
+    return @max(1, std.math.divCeil(usize, keys, SWEEP_CHUNK) catch 1);
+}
+
+/// What one chunk of one direction found.
+const SweepPart = struct {
+    pair_a: std.ArrayList(i32) = .empty,
+    pair_b: std.ArrayList(i32) = .empty,
+    missing: i64 = 0,
+    err: ?anyerror = null,
+
+    fn deinit(self: *SweepPart, gpa: std.mem.Allocator) void {
+        self.pair_a.deinit(gpa);
+        self.pair_b.deinit(gpa);
+    }
+};
+
 const MatchSweep = struct {
     gpa: std.mem.Allocator,
     as_id: []const bool,
@@ -533,31 +559,28 @@ const MatchSweep = struct {
     from_keys: KeySide,
     opt: Options,
     keep_pairs: bool,
-    pair_a: std.ArrayList(i32) = .empty,
-    pair_b: std.ArrayList(i32) = .empty,
-    /// Keys on this side with no mate on the other: removed for A, added for B.
-    missing: i64 = 0,
-    err: ?anyerror = null,
+    parts: []SweepPart = &.{},
 
-    fn deinit(self: *MatchSweep, gpa: std.mem.Allocator) void {
-        self.pair_a.deinit(gpa);
-        self.pair_b.deinit(gpa);
-    }
-
-    fn run(self: *MatchSweep) void {
-        self.sweep() catch |e| {
-            self.err = e;
+    /// One chunk of this direction's keys, looked up in the other side's table.
+    fn one(self: *MatchSweep, p: usize) void {
+        self.chunk(p) catch |e| {
+            self.parts[p].err = e;
         };
     }
 
-    fn sweep(self: *MatchSweep) !void {
+    fn chunk(self: *MatchSweep, p: usize) !void {
         var sc = Scratch{};
         defer sc.deinit(self.gpa);
+        const firsts = self.from.firsts.items;
+        const hashes = self.from.hashes.items;
+        const lo = firsts.len * p / self.parts.len;
+        const hi = firsts.len * (p + 1) / self.parts.len;
+        var out = &self.parts[p];
         if (self.keep_pairs) {
-            try self.pair_a.ensureTotalCapacity(self.gpa, self.from.firsts.items.len);
-            try self.pair_b.ensureTotalCapacity(self.gpa, self.from.firsts.items.len);
+            try out.pair_a.ensureTotalCapacity(self.gpa, hi - lo);
+            try out.pair_b.ensureTotalCapacity(self.gpa, hi - lo);
         }
-        for (self.from.firsts.items, self.from.hashes.items) |row, h| {
+        for (firsts[lo..hi], hashes[lo..hi]) |row, h| {
             const mate = try lookup(
                 self.gpa,
                 self.as_id,
@@ -570,13 +593,37 @@ const MatchSweep = struct {
                 &sc,
             );
             if (mate < 0) {
-                self.missing += 1;
+                out.missing += 1;
                 continue;
             }
             if (self.keep_pairs) {
-                self.pair_a.appendAssumeCapacity(row);
-                self.pair_b.appendAssumeCapacity(mate);
+                out.pair_a.appendAssumeCapacity(row);
+                out.pair_b.appendAssumeCapacity(mate);
             }
+        }
+    }
+};
+
+/// Both directions of the join, chunked into one queue that every thread pulls
+/// from.
+///
+/// A thread per direction looked right -- the two share nothing and write to
+/// different places -- and it is what the CSV engine used to do too. Measuring
+/// says a direction is the wrong unit: the two are not the same size, so one
+/// finishes early and half the machine waits. Chunks do not care which direction
+/// they came from.
+const Sweeps = struct {
+    pairs: *MatchSweep,
+    counts: *MatchSweep,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn run(self: *Sweeps) void {
+        const first = self.pairs.parts.len;
+        const total = first + self.counts.parts.len;
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= total) return;
+            if (i < first) self.pairs.one(i) else self.counts.one(i - first);
         }
     }
 };
@@ -825,6 +872,7 @@ pub fn compare(
     b_path: []const u8,
     opt: Options,
 ) !Result {
+    var phases = Phases.start("");
     var a_slab = try csvdiff.Slab.map(io, a_path);
     defer a_slab.close();
     var b_slab = try csvdiff.Slab.map(io, b_path);
@@ -900,6 +948,7 @@ pub fn compare(
         for (1..n) |i| if (threads[i]) |t| t.join() else jobs[i].run();
         for (jobs[0..n]) |job| if (job.err) |e| return e;
     }
+    phases.mark("key columns (par)");
     a_keys.rows = if (key_size > 0) a_keys.col[0].rows() else 0;
     b_keys.rows = if (key_size > 0) b_keys.col[0].rows() else 0;
     for (0..key_size) |j| {
@@ -930,6 +979,7 @@ pub fn compare(
         }
     }
 
+    phases.mark("intern dicts (serial)");
     // --- the join ---------------------------------------------------------
     //
     // Two phases, and each is two independent halves, so each runs on two
@@ -947,12 +997,22 @@ pub fn compare(
     build_a.run();
     if (build_thread) |t| t.join() else build_b.run();
 
+    phases.mark("index build (2 ways)");
     var ai = build_a.index;
     defer ai.deinit(gpa);
     var bi = build_b.index;
     defer bi.deinit(gpa);
     if (build_a.err) |e| return e;
     if (build_b.err) |e| return e;
+
+    const a_ways = sweepWays(ai.firsts.items.len);
+    const b_ways = sweepWays(bi.firsts.items.len);
+    const parts = try gpa.alloc(SweepPart, a_ways + b_ways);
+    defer {
+        for (parts) |*part| part.deinit(gpa);
+        gpa.free(parts);
+    }
+    for (parts) |*part| part.* = .{};
 
     var pairs = MatchSweep{
         .gpa = gpa,
@@ -963,6 +1023,7 @@ pub fn compare(
         .from_keys = a_keys,
         .opt = opt,
         .keep_pairs = true,
+        .parts = parts[0..a_ways],
     };
     // The other direction only has to count the keys that find no mate, so it
     // shares nothing with the first -- not even an output array.
@@ -975,20 +1036,46 @@ pub fn compare(
         .from_keys = b_keys,
         .opt = opt,
         .keep_pairs = false,
+        .parts = parts[a_ways..],
     };
-    const join_thread = std.Thread.spawn(.{}, MatchSweep.run, .{&unmatched_b}) catch null;
-    pairs.run();
-    if (join_thread) |t| t.join() else unmatched_b.run();
+    var sweeps = Sweeps{ .pairs = &pairs, .counts = &unmatched_b };
+    // The same budget the column pass below uses: this path takes the machine
+    // rather than `--threads`, which bounds the CSV engine's chunking instead.
+    const ways = @max(1, if (opt.threads != 0) opt.threads else (std.Thread.getCpuCount() catch 1));
+    try csvdiff.runOnThreads(&sweeps, Sweeps.run, ways);
+    for (parts) |part| {
+        if (part.err) |e| return e;
+    }
 
-    var pair_a = pairs.pair_a;
+    phases.mark("match sweep (par)");
+    // Merged in chunk order, so the pairing does not depend on which thread took
+    // which chunk.
+    var pair_a: std.ArrayList(i32) = .empty;
     defer pair_a.deinit(gpa);
-    var pair_b = pairs.pair_b;
+    var pair_b: std.ArrayList(i32) = .empty;
     defer pair_b.deinit(gpa);
-    defer unmatched_b.deinit(gpa);
-    if (pairs.err) |e| return e;
-    if (unmatched_b.err) |e| return e;
-    const removed_total: i64 = pairs.missing;
-    const added_total: i64 = unmatched_b.missing;
+    var removed_total: i64 = 0;
+    var added_total: i64 = 0;
+    {
+        var kept: usize = 0;
+        for (parts[0..a_ways]) |part| kept += part.pair_a.items.len;
+        try pair_a.ensureTotalCapacity(gpa, kept);
+        try pair_b.ensureTotalCapacity(gpa, kept);
+        for (parts[0..a_ways]) |*part| {
+            pair_a.appendSliceAssumeCapacity(part.pair_a.items);
+            pair_b.appendSliceAssumeCapacity(part.pair_b.items);
+            removed_total += part.missing;
+            // Released as it is copied rather than at the end of the function:
+            // holding both the chunks and the merged lists is eighty megabytes
+            // of the same pairs, live across the column pass that follows.
+            // Emptied as well as freed, because the deferred cleanup runs too.
+            part.pair_a.deinit(gpa);
+            part.pair_b.deinit(gpa);
+            part.pair_a = .empty;
+            part.pair_b = .empty;
+        }
+        for (parts[a_ways..]) |part| added_total += part.missing;
+    }
 
     const npairs = pair_a.items.len;
     const words = (npairs + 63) / 64;
@@ -1054,6 +1141,7 @@ pub fn compare(
     for (any) |w| changed_total += @popCount(w);
 
     const matched: i64 = @intCast(npairs);
+    phases.mark("compared columns (par)");
     return Result{
         .counts = .{
             .a_rows = ai.rows,

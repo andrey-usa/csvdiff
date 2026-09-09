@@ -64,7 +64,7 @@ const JOIN_THRESHOLD: usize = 1 << 14;
 /// does the reading.
 pub var phases_on: bool = false;
 
-const Phases = struct {
+pub const Phases = struct {
     on: bool,
     tag: []const u8,
     last: i128,
@@ -80,7 +80,7 @@ const Phases = struct {
         return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
     }
 
-    fn start(tag: []const u8) Phases {
+    pub fn start(tag: []const u8) Phases {
         return .{
             .on = phases_on,
             .tag = tag,
@@ -88,7 +88,7 @@ const Phases = struct {
         };
     }
 
-    fn mark(self: *Phases, what: []const u8) void {
+    pub fn mark(self: *Phases, what: []const u8) void {
         const at = now();
         if (self.on) {
             const seconds = @as(f64, @floatFromInt(at - self.last)) / 1e9;
@@ -1022,7 +1022,7 @@ fn sweep(
 
 /// Runs `entry` on `ways` threads, or on this one where a thread cannot be had:
 /// a thread that will not spawn is not a reason to fail, it is the same work.
-fn runOnThreads(state: anytype, comptime entry: anytype, ways: usize) !void {
+pub fn runOnThreads(state: anytype, comptime entry: anytype, ways: usize) !void {
     var workers: [64]?std.Thread = undefined;
     const spawned = @min(if (ways > 0) ways - 1 else 0, workers.len);
     for (0..spawned) |i| workers[i] = std.Thread.spawn(.{}, entry, .{state}) catch null;
