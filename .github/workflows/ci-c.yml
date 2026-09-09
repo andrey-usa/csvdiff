@@ -15,9 +15,12 @@ name: CI (C)
 on:
   push:
     branches: [main, "claude/**"]
-    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports.py"]
+    # `scripts/**`, not just the one harness: the shell-syntax step below covers
+    # every script here, and a gate that does not fire on the file it guards is
+    # not a gate.
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/**"]
   pull_request:
-    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/bench_ports.py"]
+    paths: ["c/**", "cpp/**", ".github/workflows/ci-c.yml", "scripts/**"]
   workflow_dispatch:
 
 concurrency:
