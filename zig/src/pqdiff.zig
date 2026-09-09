@@ -423,6 +423,7 @@ fn buildIndex(
     as_id: []const bool,
     s: KeySide,
     o: Options,
+    ways: usize,
 ) !Index {
     var ix = Index{ .rows = @intCast(s.rows) };
     errdefer ix.deinit(gpa);
@@ -432,7 +433,22 @@ fn buildIndex(
 
     const hs = try gpa.alloc(u64, s.rows);
     defer gpa.free(hs);
-    for (hs, 0..) |*h, r| h.* = try rowHash(gpa, as_id, s, r, o, &sc);
+    {
+        const chunks = @max(1, std.math.divCeil(usize, s.rows, HashRows.rows_per_chunk) catch 1);
+        const errs = try gpa.alloc(?anyerror, chunks);
+        defer gpa.free(errs);
+        @memset(errs, null);
+        var work = HashRows{
+            .gpa = gpa,
+            .as_id = as_id,
+            .side = s,
+            .opt = o,
+            .hs = hs,
+            .errs = errs,
+        };
+        try csvdiff.runOnThreads(&work, HashRows.run, ways);
+        for (errs) |e| if (e) |err| return err;
+    }
 
     // Sized to about a two-thirds load: linear probing is still short there, and
     // a smaller table is a smaller working set, which is what this phase is
@@ -519,14 +535,54 @@ const IndexBuild = struct {
     as_id: []const bool,
     side: KeySide,
     opt: Options,
+    /// How many threads this side's hash pass may use. The two sides build at
+    /// once, so this is half the machine each.
+    ways: usize = 1,
     index: Index = .{},
     err: ?anyerror = null,
 
     fn run(self: *IndexBuild) void {
-        self.index = buildIndex(self.gpa, self.as_id, self.side, self.opt) catch |e| {
+        self.index = buildIndex(self.gpa, self.as_id, self.side, self.opt, self.ways) catch |e| {
             self.err = e;
             return;
         };
+    }
+};
+
+/// The hash half of the index build, chunked.
+///
+/// A row's hash depends on nothing but that row, which is the whole reason the
+/// build is written as hash-then-insert -- and this half was still walking ten
+/// million rows on one thread while the insert it feeds is the part that has to
+/// be serial. The Rust port has threaded this since it was written; this one had
+/// not.
+const HashRows = struct {
+    const rows_per_chunk: usize = 1 << 16;
+
+    gpa: std.mem.Allocator,
+    as_id: []const bool,
+    side: KeySide,
+    opt: Options,
+    hs: []u64,
+    /// One slot per chunk, so a failing chunk writes only its own.
+    errs: []?anyerror,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn run(self: *HashRows) void {
+        var sc = Scratch{};
+        defer sc.deinit(self.gpa);
+        while (true) {
+            const c = self.next.fetchAdd(1, .monotonic);
+            if (c >= self.errs.len) return;
+            const lo = c * rows_per_chunk;
+            const hi = @min(lo + rows_per_chunk, self.hs.len);
+            for (lo..hi) |r| {
+                self.hs[r] = rowHash(self.gpa, self.as_id, self.side, r, self.opt, &sc) catch |e| {
+                    self.errs[c] = e;
+                    return;
+                };
+            }
+        }
     }
 };
 
@@ -1004,8 +1060,12 @@ pub fn compare(
     // one thread per file, one per direction -- and it is what this path was
     // missing: it was building both indexes and walking both directions on one
     // thread while the column pass below it used every core.
-    var build_a = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = a_keys, .opt = opt };
-    var build_b = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = b_keys, .opt = opt };
+    // The same budget the sweep and the column pass take, halved: the two sides
+    // build at the same time, so each gets half the machine for its hash pass.
+    const machine = @max(1, if (opt.threads != 0) opt.threads else (std.Thread.getCpuCount() catch 1));
+    const per_side = @max(1, machine / 2);
+    var build_a = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = a_keys, .opt = opt, .ways = per_side };
+    var build_b = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = b_keys, .opt = opt, .ways = per_side };
     // A thread that cannot be spawned is not a reason to fail: the work runs
     // here instead, which is slower and still right.
     const build_thread = std.Thread.spawn(.{}, IndexBuild.run, .{&build_b}) catch null;
@@ -1056,8 +1116,7 @@ pub fn compare(
     var sweeps = Sweeps{ .pairs = &pairs, .counts = &unmatched_b };
     // The same budget the column pass below uses: this path takes the machine
     // rather than `--threads`, which bounds the CSV engine's chunking instead.
-    const ways = @max(1, if (opt.threads != 0) opt.threads else (std.Thread.getCpuCount() catch 1));
-    try csvdiff.runOnThreads(&sweeps, Sweeps.run, ways);
+    try csvdiff.runOnThreads(&sweeps, Sweeps.run, machine);
     for (parts) |part| {
         if (part.err) |e| return e;
     }
