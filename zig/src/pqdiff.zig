@@ -986,6 +986,13 @@ pub fn compare(
         .col = try gpa.alloc(Col, key_size),
         .id = try gpa.alloc([]i32, key_size),
     };
+    // `alloc` hands back uninitialized memory and the `defer` below deinits
+    // every entry, so a read that fails partway -- an unsupported codec, a
+    // truncated file -- would free whatever bytes happened to be there. `id`
+    // was already being cleared for exactly this reason; `col` was not, and a
+    // zstd pair reached `gpa.free` on a garbage pointer.
+    for (a_keys.col) |*c| c.* = .{ .c = .{}, .map = &.{} };
+    for (b_keys.col) |*c| c.* = .{ .c = .{}, .map = &.{} };
     for (a_keys.id) |*v| v.* = &.{};
     for (b_keys.id) |*v| v.* = &.{};
     defer a_keys.deinit(gpa);
