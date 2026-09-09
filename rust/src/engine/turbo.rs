@@ -98,7 +98,19 @@ enum Rows {
     /// stores where a row starts rather than its fields, because an offset is
     /// eight bytes where the fields would be twenty times that, and re-parsing is
     /// cheap because the parser stops at the last needed column.
-    Text { parser: RowParser, from: usize },
+    Text {
+        parser: RowParser,
+        /// The same parser configured with the key columns alone, for the sweep.
+        ///
+        /// The sweep reads every row of the file and wants two things from each:
+        /// its hash, which is computed from the key columns, and where the next
+        /// row starts. It has never wanted the other seventeen, and packing them
+        /// was most of what it cost -- a parser stops at the last column it was
+        /// asked for, and asking for less makes the rest of the row a plain scan
+        /// for the newline rather than a field-by-field walk.
+        keys: RowParser,
+        from: usize,
+    },
     /// Parquet: there is no row to re-read, so the fields are materialised once,
     /// row-major, and a row is an index into them.
     Columnar { fields: Vec<Field>, rows: usize },
@@ -605,7 +617,9 @@ impl RowIndex {
 
 fn sweep(side: &Side, key_size: usize, opt: &Options, threads: usize) -> Result<Vec<Chunk>> {
     match &side.rows {
-        Rows::Text { parser, from } => sweep_text(side, parser, *from, key_size, opt, threads),
+        Rows::Text { parser, keys, from } => {
+            sweep_text(side, keys, parser, *from, key_size, opt, threads)
+        }
         Rows::Columnar { rows, .. } => sweep_columnar(side, *rows, key_size, opt, threads),
     }
 }
@@ -684,7 +698,8 @@ where
 /// Parses and hashes every row of a mapped text file, in `threads` chunks.
 fn sweep_text(
     side: &Side,
-    parser: &RowParser,
+    keys: &RowParser,
+    whole: &RowParser,
     from: usize,
     key_size: usize,
     opt: &Options,
@@ -703,7 +718,8 @@ fn sweep_text(
             at: Vec::new(),
             hash: Vec::new(),
         };
-        let mut fields = vec![ABSENT; side.width];
+        let mut fields = vec![ABSENT; key_size.max(1)];
+        let mut whole_fields = vec![ABSENT; side.width];
         let mut pos = begin;
         // Rows that *start* in this chunk belong to it; the last one is finished
         // past the boundary rather than cut in half.
@@ -720,8 +736,19 @@ fn sweep_text(
                 }
                 _ => {}
             }
-            let next = parser.parse(data, pos, data.len(), &mut fields);
-            if fields.contains(&TOO_LONG) {
+            let next = keys.parse(data, pos, data.len(), &mut fields);
+            // A field cannot be longer than the row that holds it, so only a row
+            // over the cap can hide an over-long column the key parser did not
+            // look at. That row is re-read in full to find it. At a hundred and
+            // eighty bytes a row this is one comparison and never taken; the
+            // check it replaces walked twenty fields of every row of the file.
+            let over = next.saturating_sub(pos) as u64 > MAX_FIELD_LEN;
+            if fields.contains(&TOO_LONG)
+                || (over && {
+                    whole.parse(data, pos, data.len(), &mut whole_fields);
+                    whole_fields.contains(&TOO_LONG)
+                })
+            {
                 return Err(Error::new(format!(
                     "a field larger than {MAX_FIELD_LEN} bytes is more than this engine packs; \
                      use --engine native"
@@ -1334,7 +1361,7 @@ impl Input {
     }
 
     /// Reads the file into the join's representation, keeping only `wanted`.
-    fn project(self, wanted: &[&String], threads: usize) -> Result<Side> {
+    fn project(self, wanted: &[&String], key_size: usize, threads: usize) -> Result<Side> {
         let width = wanted.len();
         match self {
             Input::Text {
@@ -1344,25 +1371,27 @@ impl Input {
                 header,
             } => {
                 let has = |n: &String| header.iter().any(|c| c == n);
-                let parser = if slab.dialect() == Dialect::Json {
-                    RowParser::json(
-                        wanted
-                            .iter()
-                            .map(|n| has(n).then(|| (*n).clone()))
-                            .collect(),
-                    )
-                } else {
-                    RowParser::csv(
-                        delimiter,
-                        wanted
-                            .iter()
-                            .map(|n| header.iter().position(|c| &c == n))
-                            .collect(),
-                    )
+                let json = slab.dialect() == Dialect::Json;
+                let build = |names: &[&String]| -> RowParser {
+                    if json {
+                        RowParser::json(
+                            names.iter().map(|n| has(n).then(|| (*n).clone())).collect(),
+                        )
+                    } else {
+                        RowParser::csv(
+                            delimiter,
+                            names
+                                .iter()
+                                .map(|n| header.iter().position(|c| &c == n))
+                                .collect(),
+                        )
+                    }
                 };
+                let parser = build(wanted);
+                let keys = build(&wanted[..key_size.min(wanted.len())]);
                 Ok(Side {
                     slab,
-                    rows: Rows::Text { parser, from },
+                    rows: Rows::Text { parser, keys, from },
                     width,
                 })
             }
@@ -1406,7 +1435,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // each, so the whole machine is busy rather than half of it.
     let per_file = (total / 2).max(1);
     let prepare = |input: Input, tag: &'static str| -> Result<(Side, RowIndex)> {
-        let side = input.project(&wanted, per_file)?;
+        let side = input.project(&wanted, key_size, per_file)?;
         let index = RowIndex::build(&side, key_size, opt, per_file, tag)?;
         Ok((side, index))
     };

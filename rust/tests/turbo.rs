@@ -186,3 +186,43 @@ fn duplicate_keys_join_on_the_first_occurrence() {
         false,
     );
 }
+
+/// An over-long field in a column the sweep no longer parses.
+///
+/// The sweep reads each row with a parser configured for the key columns alone,
+/// so it never packs the compared ones and cannot see that one of them is past
+/// what a field word holds. What catches it instead is arithmetic: a field
+/// cannot be longer than the row around it, so a row over the cap is re-read in
+/// full. This checks the refusal still happens, and that it happens for a
+/// non-key column — the case the cheap check does not cover on its own.
+#[test]
+fn an_over_long_field_is_still_refused_when_it_is_not_a_key() {
+    let big = "x".repeat((1 << 23) + 8); // one field past the twenty-three-bit length
+    let a = format!("k,v\nK1,{big}\n");
+    let b = format!("k,v\nK1,{big}\n");
+    let f = Fixture::new(&a, &b);
+    let mut opt = Options::with_key(["k"]);
+    opt.engine = Engine::Turbo.label().to_string();
+    let err = compare(&f.a, &f.b, &mut opt).expect_err("an over-long field must be refused");
+    assert!(
+        err.to_string().contains("more than this engine packs"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The same row length, split so that no single field is over the cap. The
+/// row-length guard fires here and must then find nothing, because re-reading a
+/// long row is only a way to look, not a way to refuse.
+#[test]
+fn a_long_row_of_short_fields_is_fine() {
+    let cell = "x".repeat(1 << 20);
+    let row: Vec<String> = (0..12).map(|_| cell.clone()).collect();
+    let head: Vec<String> = (0..12).map(|i| format!("c{i}")).collect();
+    let body = format!("k,{}\nK1,{}\n", head.join(","), row.join(","));
+    let f = Fixture::new(&body, &body);
+    let mut opt = Options::with_key(["k"]);
+    opt.engine = Engine::Turbo.label().to_string();
+    let r = compare(&f.a, &f.b, &mut opt).expect("a long row of short fields is legal");
+    assert_eq!(r.counts.matched, 1);
+    assert_eq!(r.counts.changed, 0);
+}
