@@ -20,6 +20,30 @@ fn main() -> ExitCode {
     }
 }
 
+const USAGE: &str = "\
+usage: gen-data [options]
+
+  -n, --rows N          rows a side: 10000, 10k, 1m, 2.5m (default 10k)
+  -o, --out-dir DIR     where the pair is written, created if missing (default data)
+      --prefix P        filename stem (default: the --rows text, so 50m_a.csv)
+      --seed N          the recipe's seed; the same seed writes the same bytes (default 7)
+  -f, --format F        csv | ndjson | parquet (default csv)
+      --compression C   none | zstd, Parquet only (default none)
+  -h, --help            this
+
+Writes <prefix>_a.<ext> and <prefix>_b.<ext>. Fifty million rows of CSV is
+about 9.2 GB a side, so check the disk before asking for one.";
+
+/// One `--flag value` or `--flag=value`, whichever was written.
+///
+/// This used to be a loop that skipped anything it did not recognise, so
+/// `--rows=50m` -- the spelling every GNU tool takes -- was dropped on the
+/// floor and the run silently produced the 10k default. It printed
+/// `rust: 10000 rows` and nothing about the flag it ignored. A generator that
+/// quietly writes a different dataset than the one asked for is the same class
+/// of fault as `--ignore` matching nothing in silence: the run completes, the
+/// numbers are wrong, and nothing says so. Unknown flags are an error now, and
+/// the C generator has always rejected them.
 fn run() -> csvdiff::Result<()> {
     let mut rows_arg = "10k".to_string();
     let mut out_dir = "data".to_string();
@@ -30,16 +54,56 @@ fn run() -> csvdiff::Result<()> {
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
-    while i + 1 < argv.len() {
-        let value = argv[i + 1].clone();
-        match argv[i].as_str() {
-            "--rows" | "-n" => rows_arg = value,
-            "--out-dir" | "-o" => out_dir = value,
-            "--prefix" => prefix = Some(value),
-            "--seed" => seed = value.parse().unwrap_or(7),
-            "--format" | "-f" => format = Format::parse(&value)?,
+    while i < argv.len() {
+        let arg = argv[i].clone();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) => (f.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+
+        if flag == "-h" || flag == "--help" {
+            println!("{USAGE}");
+            std::process::exit(0);
+        }
+
+        // Every remaining flag takes a value, from `=` or the next argument.
+        let mut take = || -> csvdiff::Result<String> {
+            if let Some(v) = inline.clone() {
+                return Ok(v);
+            }
+            let v = argv
+                .get(i + 1)
+                .cloned()
+                .ok_or_else(|| csvdiff::Error::new(format!("{flag} needs a value\n\n{USAGE}")))?;
+            // A value that is itself a flag means the one before it was left
+            // empty. Saying so beats parsing `--out-dir` as a row count, which
+            // is what the old loop did.
+            if v.starts_with('-')
+                && v.len() > 1
+                && !v[1..].starts_with(|c: char| c.is_ascii_digit())
+            {
+                return Err(csvdiff::Error::new(format!(
+                    "{flag} needs a value, got the next flag: {v}\n\n{USAGE}"
+                )));
+            }
+            i += 1;
+            Ok(v)
+        };
+
+        match flag.as_str() {
+            "--rows" | "-n" => rows_arg = take()?,
+            "--out-dir" | "-o" => out_dir = take()?,
+            "--prefix" => prefix = Some(take()?),
+            "--seed" => {
+                let v = take()?;
+                seed = v.parse().map_err(|_| {
+                    csvdiff::Error::new(format!("--seed must be a number, got: {v}"))
+                })?;
+            }
+            "--format" | "-f" => format = Format::parse(&take()?)?,
             "--compression" => {
-                compression = match value.trim().to_ascii_lowercase().as_str() {
+                let v = take()?;
+                compression = match v.trim().to_ascii_lowercase().as_str() {
                     "none" | "uncompressed" => Compression::None,
                     "zstd" => Compression::Zstd,
                     other => {
@@ -49,12 +113,13 @@ fn run() -> csvdiff::Result<()> {
                     }
                 }
             }
-            _ => {
-                i += 1;
-                continue; // keeps the harness forgiving about unknown flags
+            other => {
+                return Err(csvdiff::Error::new(format!(
+                    "unknown option: {other}\n\n{USAGE}"
+                )));
             }
         }
-        i += 2;
+        i += 1;
     }
 
     let rows = parse_rows(&rows_arg)?;
