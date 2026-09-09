@@ -74,6 +74,7 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Threading the generator** | 2.3x to 2.8x on wall for no more CPU -- flat on CSV, 12% *down* on ndjson. This was in the "not worth it" table above on the strength of a comparison that turned out to be unsound; it was a scope decision recorded as a measurement |
 | **Framing ndjson rows on the newline byte alone** | valid JSON cannot hold a raw control character in a string, so the quote-tracking scan the row end used was guarding against something the format forbids: 1.58x wall and 1.72x CPU on ndjson, with about twenty string walks a row removed |
 | **Stopping the key-only JSON parse once the keys are found** | needs the key columns to be first-wins in both parses, or the two disagree about a row's key and the lookup misses its own row |
+| **A tag in the index slot, text path** | the Parquet index had it and the text index did not: 1.26x on CSV and 1.20x on ndjson, with the table the same four bytes a slot, because rejecting a collision cost two dependent misses that the loaded word can settle |
 | **Reading only the key columns where only keys are read** | C's CSV path: 2.66x at two million rows, **3.65x at ten million** — the gain grows with the size, because past cache the parses removed were memory traffic and not only instructions |
 | **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries — on the host that measured it; see the row below, where the same change loses on another machine |
 | **Writing the generator's two sides at once** | 2.0x on Parquet by itself, where splitting a row group's twenty columns — the split the design points at — is 1.28x |
@@ -103,6 +104,7 @@ that branch's own record; what this project measured of them is the joint run in
 | **Widening the hash to 8 bytes at a time** | no measurable effect |
 | **A wave size other than 8,192 rows in the generator** | 2k, 32k and 131k all cost more on CSV (0.93s against 1.29s at 32k); ndjson is nearly flat, so the sensitive format chose it |
 | **Splitting a row group's columns as the main Parquet lever** | 1.28x, against 2.0x for writing the two sides at once. Most of a Parquet run is the serial feeding of cell values into the column arenas, not the encoding |
+| **A shape cache for ndjson field names** | not built. A throwaway build that skipped the name lookup *entirely* -- unsound, but it bounds the prize -- was worth 6% of wall and 9% of CPU, and a real cache keeps less. Ten minutes of probe against a day of implementation |
 | **Chasing a CPU regression that was noise** | an hour spent on a 1.9s→3.5s "regression" in the threaded generator that a nine-round measurement showed was 2.66s→2.61s. On this container a wall-clock difference under about 1.5x is not signal; use min-of-N CPU in one interleaved sitting |
 | **GPU offload** | not attempted. Per-row cost doubles between 1M and 3M as the index leaves L3, putting the plausible crossover at 370k-4M rows — but every GPU-side number would have been an estimate, since there is no GPU here |
 

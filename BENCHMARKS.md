@@ -34,6 +34,26 @@ a different question.
 
 ---
 
+## 2026-09-09 (later) — a tag in the text index's slot
+
+One 4-core / 16 GB container, 2,000,000 rows, five interleaved rounds, both
+binaries from the same tree.
+
+| Format | Before | After | | CPU before | CPU after | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| CSV, 702 MB | 1.07s | **0.85s** | 1.26x | 3.5s | **2.7s** | 126 MB, unchanged |
+| ndjson, 1,697 MB | 2.31s | **1.93s** | 1.20x | 7.2s | **6.3s** | 126 MB, unchanged |
+
+The Parquet index has held a tag beside the position for weeks; the text index
+held only the position, so rejecting a collision cost two further dependent
+misses. The slot is still four bytes — the width is taken from the row count,
+24 bits of position and 8 of tag at ten million rows — so the memory column does
+not move, which is the column this port leads on.
+
+Counts agree across every port in both tables.
+
+---
+
 ## 2026-09-09 — the other branch's Parquet, on its own runner
 
 Not this project's harness and **not comparable with the tables below** — one

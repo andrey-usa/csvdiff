@@ -727,7 +727,23 @@ typedef struct {
     uint64_t *row_start;
     uint64_t *row_hash;
     size_t rows, rows_cap;
-    int32_t *table;
+    /*
+     * Tag in the slot. A slot is empty (0) or holds a key index in its low
+     * `pos_bits` and the top bits of that key's hash above them, so a probe
+     * that lands on the wrong key is rejected by the word it has already
+     * loaded. Without it, rejecting a collision costs two more dependent loads
+     * -- `first_row[at]`, then `row_hash[candidate]` -- each a miss on an array
+     * far too big to cache, and each waiting on the one before it.
+     *
+     * The width is chosen from the row count rather than fixed, so the slot
+     * stays four bytes and the table stays the size it was: at ten million rows
+     * the index needs 24 bits and the tag gets the other 8. A tag that runs out
+     * of bits (past two billion rows) degrades to no tag, not to a wrong
+     * answer, because the key comparison behind it is unchanged.
+     */
+    uint32_t *table;
+    unsigned  pos_bits;
+    uint32_t  pos_mask;
     size_t mask;
     int32_t *first_row;
     uint32_t *occurrences;
@@ -738,7 +754,23 @@ typedef struct {
     bool failed;       /* a field too long for the packed length */
 } RowIndex;
 
-#define TABLE_EMPTY (-1)
+#define TABLE_EMPTY 0u
+
+static inline uint32_t slot_pack(const RowIndex *ix, uint64_t hash, size_t pos) {
+    const unsigned tag_bits = 32u - ix->pos_bits;
+    const uint32_t tag = tag_bits ? (uint32_t)(hash >> (64u - tag_bits)) : 0u;
+    return (tag << ix->pos_bits) | (uint32_t)(pos + 1);
+}
+
+static inline int slot_tag_is(const RowIndex *ix, uint32_t v, uint64_t hash) {
+    const unsigned tag_bits = 32u - ix->pos_bits;
+    if (!tag_bits) return 1;
+    return (v >> ix->pos_bits) == (uint32_t)(hash >> (64u - tag_bits));
+}
+
+static inline size_t slot_pos(const RowIndex *ix, uint32_t v) {
+    return (size_t)(v & ix->pos_mask) - 1;
+}
 
 static size_t slot_of(const RowIndex *ix, uint64_t hash) {
     /* The high bits of an FNV hash are the well-mixed ones; fold them down. */
@@ -957,13 +989,17 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     /* Sized once, to under a half load, so nothing ever rehashes. */
     size_t cap = 1u << 12;
     while (cap < ix->rows * 2 + 16) cap <<= 1;
+    /* Wide enough to hold every key index plus the +1 that keeps 0 for empty. */
+    ix->pos_bits = 1;
+    while (ix->pos_bits < 32 && ((size_t)1 << ix->pos_bits) < ix->rows + 2) ix->pos_bits++;
+    ix->pos_mask = ix->pos_bits >= 32 ? 0xFFFFFFFFu : (uint32_t)(((uint64_t)1 << ix->pos_bits) - 1);
     ix->table = alloc_huge(cap * sizeof *ix->table);
     ix->first_row = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->first_row);
     ix->occurrences = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->occurrences);
     if (!ix->table || !ix->first_row || !ix->occurrences) return false;
     ix->keys_cap = ix->rows;
     ix->mask = cap - 1;
-    memset(ix->table, 0xFF, cap * sizeof *ix->table);   /* TABLE_EMPTY is -1 */
+    memset(ix->table, 0, cap * sizeof *ix->table);      /* TABLE_EMPTY is 0 */
 
     for (size_t r = 0; r < ix->rows; r++) {
         /* Every insert is a cache miss on a table too big to hold, and the hash
@@ -973,14 +1009,18 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
         const uint64_t hash = ix->row_hash[r];
         size_t slot = slot_of(ix, hash);
         for (;;) {
-            const int32_t at = ix->table[slot];
-            if (at == TABLE_EMPTY) {
-                ix->table[slot] = (int32_t)ix->keys;
+            const uint32_t v = ix->table[slot];
+            if (v == TABLE_EMPTY) {
+                ix->table[slot] = slot_pack(ix, hash, ix->keys);
                 ix->first_row[ix->keys] = (int32_t)r;
                 ix->occurrences[ix->keys] = 1;
                 ix->keys++;
                 break;
             }
+            /* The tag rejects a foreign key from this word alone; only a tag
+             * that matches is worth two more misses to disprove. */
+            if (!slot_tag_is(ix, v, hash)) { slot = (slot + 1) & ix->mask; continue; }
+            const size_t at = slot_pos(ix, v);
             const int32_t candidate = ix->first_row[at];
             if (ix->row_hash[candidate] == hash) {
                 index_keys(ix, candidate, ix->probe);
@@ -1034,8 +1074,10 @@ static int32_t index_lookup(const RowIndex *ix, const Slab *other, const Field *
                             uint64_t hash, Field *probe) {
     size_t slot = slot_of(ix, hash);
     for (;;) {
-        int32_t at = ix->table[slot];
-        if (at == TABLE_EMPTY) return -1;
+        const uint32_t v = ix->table[slot];
+        if (v == TABLE_EMPTY) return -1;
+        if (!slot_tag_is(ix, v, hash)) { slot = (slot + 1) & ix->mask; continue; }
+        const size_t at = slot_pos(ix, v);
         int32_t candidate = ix->first_row[at];
         if (ix->row_hash[candidate] == hash) {
             index_keys(ix, candidate, probe);

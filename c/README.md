@@ -288,6 +288,47 @@ previous binary answers it `added 1 removed 1` where this one answers
 `changed 1`. The first does not, and is a regression guard rather than a
 discriminator, which is worth saying rather than implying.
 
+## A tag in the slot, on the text path too
+
+The Parquet index has carried one for weeks: a slot holds a key's position *and*
+the top bits of its hash, so a probe that lands on the wrong key is rejected by
+the word it has already loaded. The text index did not. Rejecting a collision
+there cost two more dependent loads -- `first_row[at]`, then
+`row_hash[candidate]` -- each a miss on an array far too big to cache, and each
+waiting on the one before it.
+
+The slot stays four bytes. The width is chosen from the row count rather than
+fixed: at ten million rows the position needs 24 bits and the tag takes the
+other 8, so the table is exactly the size it was and the memory column does not
+move. A tag that runs out of bits, past two billion rows, degrades to no tag
+rather than to a wrong answer, because the key comparison behind it is
+unchanged.
+
+Two million rows, five interleaved rounds:
+
+| Format | Before | After | | CPU before | CPU after | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| CSV | 1.07s | **0.85s** | 1.26x | 3.5s | **2.7s** | 126 MB, both |
+| ndjson | 2.31s | **1.93s** | 1.20x | 7.2s | **6.3s** | 126 MB, both |
+
+### The probe that said not to build the other thing
+
+The obvious ndjson target was the per-field name lookup: every field of every
+object is hashed and probed against the name table, which is work CSV never does
+because it counts columns instead. Before building a shape cache for it, a
+throwaway build measured the ceiling by skipping the lookup entirely -- wrong for
+any input whose key order varies, fine for measuring.
+
+**6% of wall and 9% of CPU.** The whole lookup, removed unsoundly, and a real
+cache would have kept only part of that. So it was not built. What remains in
+the ndjson walk is the byte scanning itself, which is the floor for a design
+that reads every value; the way past it is to not read them, which is what
+Parquet does and why it is 1.63s against 20.13s on the same rows.
+
+Ten minutes of experiment against a day of implementation is the trade this file
+keeps recommending, and this is the first time it has been taken before the day
+was spent rather than after.
+
 ## The generator, on every core
 
 Every row is a pure function of its index, and whether a row is emitted at all
