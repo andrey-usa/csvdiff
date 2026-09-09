@@ -1,8 +1,12 @@
 name: CI (Rust)
 
+# `claude/**` as well as main, like ci-c.yml and parity.yml: a Rust change on a
+# feature branch had no Rust gate at all until this line, which is how a commit
+# that deleted two engines and rewrote the Engine enum reached the remote with
+# only a local `cargo test` behind it.
 on:
   push:
-    branches: [main]
+    branches: [main, "claude/**"]
     paths: ["rust/**", ".github/workflows/ci-rust.yml"]
   pull_request:
     paths: ["rust/**", ".github/workflows/ci-rust.yml"]
