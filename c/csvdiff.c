@@ -1135,6 +1135,38 @@ static inline size_t common_prefix(const char *x, const char *y, size_t n) {
     return i;
 }
 
+/*
+ * Does the mate's tail name anything this run tracks?
+ *
+ * The CSV proof rests on a column sitting at a fixed offset. JSON has no such
+ * promise: a value is found by name, and a name repeated in one object takes
+ * its *last* value for a compared column -- which the C++ port does too and
+ * test.sh cross-checks -- so a second `"amount"` past the diverging byte would
+ * carry a value the prefix never saw.
+ *
+ * It cannot be ruled out in general, but it can be ruled out here, because the
+ * proof only reaches this point when the two rows agree all the way through the
+ * last compared value: whatever is left is the trailing ignored columns, a few
+ * bytes. A name is a quoted string, so every quote in those bytes is a
+ * candidate. Taking a closing quote for an opening one costs a lookup that
+ * fails, which is a fallback rather than a wrong answer -- and an escaped name
+ * is treated as a hit for the same reason, since `want` holds names unescaped.
+ */
+static bool json_tail_is_clean(const RowParser *p, const char *d, size_t at, size_t end) {
+    while (at < end) {
+        const size_t q = next_of1(d, at, end, '"');
+        if (q >= end) return true;
+        bool escaped = false;
+        const size_t close = skip_json_string(d, q, end, &escaped);
+        if (escaped) return false;
+        const size_t from = q + 1, to = close > q + 1 ? close - 1 : q + 1;
+        if (to > from && parser_slot_for(p, d + from, to - from) >= 0) return false;
+        if (close <= q) return false;
+        at = close;
+    }
+    return true;
+}
+
 typedef struct {
     int64_t  matched, changed, removed, added;
     int64_t *col_changed, *col_blanked, *col_filled;
@@ -1163,6 +1195,9 @@ typedef struct {
     bool            aligned;
     size_t          guard;
     char            delim;
+    /* The same proof, on objects: no column order to check, because a name maps
+     * to the same slot in both files whatever order the objects list them in. */
+    bool            json;
 } CmpCtx;
 
 /*
@@ -1215,13 +1250,38 @@ static void compare_part(void *vctx, unsigned p) {
             const int32_t mate = index_lookup(c->bi, c->a, out->fa, hash, out->probe);
             if (mate < 0) { out->removed++; continue; }
             out->matched++;
-            const Field g = out->fa[c->guard];
+            if (c->json &&
+                (refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0)) {
+                const size_t a_lo = (size_t)c->ai->row_start[row];
+                const size_t b_lo = (size_t)c->bi->row_start[mate];
+                const size_t a_end = row_end(c->ai, row);
+                const size_t b_n = row_end(c->bi, mate) - b_lo;
+                /* Through the byte that closes the last compared value --
+                 * whichever it turns out to be, since objects need not list
+                 * their names in the same order twice. */
+                size_t t = a_lo;
+                for (size_t i = 0; i < nc; i++) {
+                    const Field x = out->fa[key_size + i];
+                    if (!field_real(x)) continue;
+                    const size_t e = field_off(x) + field_len(x);
+                    if (e > t) t = e;
+                }
+                const size_t need = t + 1 - a_lo;
+                if (t < a_end && need <= b_n &&
+                    common_prefix(c->a->data + a_lo, c->b->data + b_lo, need) == need &&
+                    json_tail_is_clean(c->bi->parser, c->b->data, b_lo + need, b_lo + b_n)) {
+                    refused = 0;
+                    continue;
+                }
+                if (refused < PROOF_BACKOFF) refused++;
+            }
             /*
              * A proof that keeps failing is a scan for nothing -- two files
              * where every row really has changed pay for it on every row. So
              * after PROOF_BACKOFF failures in a row it is only attempted every
              * PROOF_BACKOFF rows, until one succeeds and it is on again.
              */
+            const Field g = c->aligned ? out->fa[c->guard] : ABSENT;
             if (c->aligned && field_real(g) &&
                 (refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0)) {
                 const size_t a_lo = (size_t)c->ai->row_start[row];
@@ -1711,8 +1771,10 @@ int main(int argc, char **argv) {
         for (size_t i = key_size; aligned && i < width; i++)
             aligned = a_src[i] >= 0 && a_src[i] == b_src[i] &&
                       (i == key_size || a_src[i] > a_src[i - 1]);
+        const bool json_proof =
+            a.dialect == DIALECT_JSON && b.dialect == DIALECT_JSON && nc > 0;
         CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts,
-                      aligned, width - 1, a_delim };
+                      aligned, width - 1, a_delim, json_proof };
         run_parts(compare_part, &cc, ways + b_ways);
         phase_mark(&whole, "join and compare");
 

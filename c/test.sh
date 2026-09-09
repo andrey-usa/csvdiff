@@ -482,6 +482,38 @@ pcase "a mate whose last column carries on" "1 0 0" pre_a.csv pre_b.csv -k k
 printf 'id,a,ts\nk1,"ab",T1\n'      > "$pdir/dq_a.csv"
 printf 'id,a,ts\nk1,"ab""x",T2\n'   > "$pdir/dq_b.csv"
 pcase "a mate that reopens on a doubled quote" "1 0 0" dq_a.csv dq_b.csv -k id -i ts
+
+# The same proof on objects, where a value is found by name rather than by
+# position -- and a name repeated in one object takes its *last* value for a
+# compared column. A duplicate past the diverging byte is the shape that breaks
+# it, so the mate's tail is checked for anything this run tracks.
+echo "proving an object unchanged from the bytes:"
+printf '{"id":"k1","a":"p","ts":"T1"}\n' > "$pdir/j_a.ndjson"
+printf '{"id":"k1","a":"p","ts":"T2"}\n' > "$pdir/j_b.ndjson"
+pcase "an ignored last field that always differs" "0 0 0" j_a.ndjson j_b.ndjson -k id -i ts
+
+# The mate repeats the compared name after the bytes stop agreeing, and last
+# wins -- so the value the prefix proved is not the value the row has.
+printf '{"id":"k1","a":"p","ts":"T1"}\n'              > "$pdir/jd_a.ndjson"
+printf '{"id":"k1","a":"p","ts":"T2","a":"LATER"}\n'  > "$pdir/jd_b.ndjson"
+pcase "a mate that repeats the column past the prefix" "1 0 0" jd_a.ndjson jd_b.ndjson -k id -i ts
+
+# The same duplicate, but inside the agreeing prefix: both objects read it the
+# same way, so there is nothing to catch and the proof may stand.
+printf '{"id":"k1","a":"p","a":"q","ts":"T1"}\n' > "$pdir/jp_a.ndjson"
+printf '{"id":"k1","a":"p","a":"q","ts":"T2"}\n' > "$pdir/jp_b.ndjson"
+pcase "a duplicate inside the prefix, agreeing"  "0 0 0" jp_a.ndjson jp_b.ndjson -k id -i ts
+
+# Objects need not list their names in the same order. The bytes diverge at the
+# first name, so the proof refuses and the values are compared properly.
+printf '{"id":"k1","a":"p","b":"q","ts":"T1"}\n' > "$pdir/jo_a.ndjson"
+printf '{"id":"k1","b":"q","a":"p","ts":"T2"}\n' > "$pdir/jo_b.ndjson"
+pcase "the same values under a different name order" "0 0 0" jo_a.ndjson jo_b.ndjson -k id -i ts
+
+# A change in the compared value itself, with the ignored field moving too.
+printf '{"id":"k1","a":"p","ts":"T1"}\n' > "$pdir/jc_a.ndjson"
+printf '{"id":"k1","a":"X","ts":"T2"}\n' > "$pdir/jc_b.ndjson"
+pcase "a change in the compared value"          "1 0 0" jc_a.ndjson jc_b.ndjson -k id -i ts
 rm -rf "$pdir"
 
 if [ "$with_ports" = 1 ]; then
