@@ -216,6 +216,14 @@ before timing anything.
   tarball and `pip install ziglang`) are the ones `parity` and `formats` use, so they are known to
   work rather than assumed to. Bump the workflows and the README together, or the instructions
   quietly start installing a toolchain CI no longer builds with.
+- **The Rust port groups the digits in its summary line and the other three do not.**
+  `A 130,131 rows` against `A 130131 rows` -- the counts agree, the strings do not. Every
+  cross-port check that compares those lines is therefore fine until someone grows a fixture past
+  a thousand rows, and then reads as a disagreement about counts; it cost an afternoon's confusion
+  once. All four suites normalise it now (`summary()` in `c/` and `cpp/`, `answer()` in `zig/`,
+  each stripping the engine label and the separators), so compare through the helper rather than
+  inlining a `sed`. The JSON is the contract and never had this problem -- `c/test.sh` compares
+  that for its large fixture, which is the more robust pattern where a check can use it.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
