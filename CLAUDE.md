@@ -222,3 +222,12 @@ before timing anything.
   benchmark or dispatching one by hand. The benchmark workflows name a single `benchmark-host`
   concurrency group so GitHub queues them; a per-ref group does not, because another branch is
   another group.
+- **A Windows checkout can hand WSL scripts CRLF, even though every blob in the repository is
+  LF.** Git for Windows ships `core.autocrlf=true` in its system-wide config, not just as a user
+  opt-in, so a plain `git clone` on the Windows side rewrites every tracked `.sh` on checkout —
+  `bash test.sh` then fails as `set: pipefail: invalid option name` or `$'.\r': No such file or
+  directory`, naming neither Windows nor line endings. `git show HEAD:path` on the same file comes
+  back clean, which is the tell: the corruption is in the checkout, not the commit. `.gitattributes`
+  now pins `*.sh` to `eol=lf`, which overrides `core.autocrlf` for those paths regardless of which
+  side cloned; a checkout from before it existed needs `git add --renormalize .` plus a re-checkout
+  of the affected files to actually rewrite what is already on disk.
