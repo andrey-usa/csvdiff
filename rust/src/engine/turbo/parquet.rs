@@ -193,13 +193,19 @@ impl Reader {
     /// Decoding all of them first and stitching afterwards holds two copies of
     /// every field word at the peak, which at ten million rows over nineteen
     /// columns is 1.5 GB per file for nothing.
+    ///
+    /// `limit` caps the rows decoded, for a preview that must not pay for the
+    /// file: pass `usize::MAX` for the whole thing. Decoding stops on a page
+    /// boundary at or past the limit, so a ten-row preview of a four-gigabyte
+    /// file reads one page per column rather than all of them.
     pub(super) fn project(
         &self,
         wanted: &[Option<&str>],
         threads: usize,
+        limit: usize,
     ) -> Result<(Vec<Field>, Vec<u8>)> {
         let width = wanted.len();
-        let rows = self.rows;
+        let rows = self.rows.min(limit);
         let jobs: Vec<(usize, usize)> = wanted
             .iter()
             .enumerate()
@@ -219,9 +225,9 @@ impl Reader {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = wave[1..]
                     .iter()
-                    .map(|&(_, leaf)| scope.spawn(move || self.decode_column(leaf)))
+                    .map(|&(_, leaf)| scope.spawn(move || self.decode_column(leaf, limit)))
                     .collect();
-                decoded.push(self.decode_column(wave[0].1));
+                decoded.push(self.decode_column(wave[0].1, limit));
                 for handle in handles {
                     decoded.push(
                         handle.join().unwrap_or_else(|_| {
@@ -242,8 +248,11 @@ impl Reader {
                 // row-major, so a whole column in one pass would touch every
                 // cache line of the output once per column.
                 const BLOCK: usize = 1024;
-                for from in (0..rows).step_by(BLOCK) {
-                    let to = (from + BLOCK).min(rows);
+                // A limited decode stops on a page boundary, so a column can
+                // hold fewer rows than `rows` only if the file itself does.
+                let have = rows.min(column.fields.len());
+                for from in (0..have).step_by(BLOCK) {
+                    let to = (from + BLOCK).min(have);
                     for row in from..to {
                         let f = column.fields[row];
                         fields[row * width + slot] = if is_real(f) { f + base } else { f };
@@ -712,16 +721,23 @@ fn read_page_header(data: &[u8], at: usize) -> Result<PageHeader> {
 
 impl Reader {
     /// Decodes one column across every row group into a field per row.
-    fn decode_column(&self, leaf: usize) -> Result<Decoded> {
+    fn decode_column(&self, leaf: usize, limit: usize) -> Result<Decoded> {
         let info = &self.columns[leaf];
         let data = self.slab.data();
         let mut out = Decoded {
-            fields: Vec::with_capacity(self.rows),
+            fields: Vec::with_capacity(self.rows.min(limit)),
             arena: Vec::new(),
         };
         let mut scratch: Vec<u8> = Vec::with_capacity(64);
 
         for group in &self.row_groups {
+            if out.fields.len() >= limit {
+                break;
+            }
+            // Set when the page loop stopped for the limit rather than for the
+            // end of the chunk: the row-count check below is only meaningful
+            // for a group that was decoded whole.
+            let mut truncated = false;
             let chunk = &group.chunks[leaf];
             let start = match chunk.dictionary_page_offset {
                 Some(dict) if dict < chunk.data_page_offset => dict,
@@ -769,10 +785,14 @@ impl Reader {
                     // type that did not exist when this was written.
                     _ => {}
                 }
+                if out.fields.len() >= limit {
+                    truncated = true;
+                    break;
+                }
             }
 
             let got = out.fields.len() - group_from;
-            if got != group.num_rows {
+            if !truncated && got != group.num_rows {
                 return Err(Error::new(format!(
                     "column {} yielded {got} values for a row group of {} rows",
                     info.name, group.num_rows

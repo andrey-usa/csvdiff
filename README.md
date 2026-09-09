@@ -66,10 +66,18 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 
 > **Run every command in this section from the repository root** — the directory
 > holding `c/`, `rust/` and this file. Every path below is written relative to it,
-> in bash and in PowerShell alike, so that one rule covers the whole section. If
-> you are inside a port's directory, `cd ..` first: from `c/`, `c/gen-data` is
-> `No such file or directory`, and `./gen-data` would work but write its pair
-> into `c/data/` rather than the `data/` the commands below then read.
+> in bash and in PowerShell alike, so that one rule covers the whole section.
+>
+> ```powershell
+> cd C:\path\to\csvdiff     # PowerShell: the folder holding c\, rust\ and README.md
+> ```
+> ```bash
+> cd ~/path/to/csvdiff       # bash
+> ```
+>
+> If you are inside a port's directory, `cd ..` first. From `c\`, `c/gen-data`
+> is `No such file or directory`, and `.\gen-data` would run but write its pair
+> into `c\data\` rather than the `data\` the commands below then read.
 
 ### What runs where
 
@@ -131,8 +139,10 @@ c/gen-data --rows 1m --out-dir data --prefix demo
 ```
 
 ```powershell
-# Windows, PowerShell — after the build above
-rust\target\release\gen-data.exe --rows 1m --out-dir data --prefix demo
+# Windows, PowerShell — after the build above.
+# The leading .\ is not decoration: PowerShell will not run a program from the
+# current directory without it, and a relative path is safer than trusting PATH.
+.\rust\target\release\gen-data.exe --rows 1m --out-dir data --prefix demo
 ```
 
 Either writes `data/demo_a.csv` and `data/demo_b.csv`, 184 MB each: 1,000,100
@@ -148,9 +158,67 @@ same rows in the other two formats.
 the Rust one is single-threaded. Both write all three formats. Reach for the
 Rust generator when you are on Windows without WSL, or want a single toolchain.
 
+### Looking at one file first
+
+Before comparing anything you usually need two facts about a file: what its
+columns are called, and what the values look like. Both are one command, and
+neither reads more of the file than it has to.
+
+```bash
+# Linux, macOS, or WSL
+rust/target/release/csvdiff columns data/demo_a.parquet   # names, one per line
+rust/target/release/csvdiff head    data/demo_a.parquet   # the first 10 rows
+rust/target/release/csvdiff head    data/demo_a.csv -n 3  # or however many
+```
+
+```powershell
+# Windows, PowerShell
+.\rust\target\release\csvdiff.exe columns data\demo_a.parquet
+.\rust\target\release\csvdiff.exe head    data\demo_a.parquet
+.\rust\target\release\csvdiff.exe head    data\demo_a.csv -n 3
+```
+
+```
+account_id    txn_id           posting_date  value_date  currency  amount
+------------  ---------------  ------------  ----------  --------  ----------
+ACC-00000000  TXN-00000000000  2026-02-10    2026-03-10  USD       1792961.62
+ACC-00007919  TXN-00000000001  2026-02-05    2026-01-10  JPY       844636.46
+ACC-00015838  TXN-00000000002  2026-03-18    2026-08-19  GBP       1142001.50
+```
+
+Both read **CSV, newline-delimited JSON and Parquet**, and the format is decided
+by the bytes rather than the extension. `head --csv` prints machine-readable
+rows instead of the aligned table.
+
+**Neither pays for the file.** `columns` on Parquet reads the footer; `head`
+stops decoding at the first page — ten rows of a 384 MB Parquet file take
+**0.18s**, not the seconds a full decode would. That is the whole point of the
+option: columnar data is otherwise only readable here by comparing it against
+something.
+
+`columns` writes the names to stdout and its one-line summary to stderr, so the
+names pipe cleanly into the `--key` you were about to write:
+
+```bash
+# every column as the key -- which is SQL's EXCEPT, see "Duplicate keys" below
+KEY=$(rust/target/release/csvdiff columns data/demo_a.csv 2>/dev/null | paste -sd,)
+```
+
+```powershell
+$KEY = (.\rust\target\release\csvdiff.exe columns data\demo_a.csv) -join ','
+```
+
+The values come back through the engine's own parsers — a quoted CSV field is
+unquoted here exactly as the comparison would unquote it, and the same rows
+written as CSV, as ndjson and as Parquet preview identically. A preview that
+disagreed with the comparison would be worse than none, so a test asserts they
+do not.
+
 ### Running
 
 ```bash
+# Linux, macOS, or WSL
+
 # the smallest useful invocation: two files and a key
 c/csvdiff compare data/demo_a.csv data/demo_b.csv -k account_id,txn_id
 
@@ -159,15 +227,45 @@ c/csvdiff compare data/demo_a.csv data/demo_b.csv -k account_id,txn_id
 c/csvdiff compare data/demo_a.csv data/demo_b.csv -k account_id,txn_id \
   -i updated_at --json summary.json --threads 4
 
-# the Rust port is the one with the self-contained HTML report -- and the one
-# that runs on Windows, as `rust\target\release\csvdiff.exe` with the same flags
+# the Rust port is the one with the self-contained HTML report
 rust/target/release/csvdiff compare data/demo_a.csv data/demo_b.csv \
+  -k account_id,txn_id -i updated_at -o report.html
+```
+
+```powershell
+# Windows, PowerShell — the same three, with the Rust port throughout.
+# A line is continued with a backtick, not a backslash, and paths use \.
+
+.\rust\target\release\csvdiff.exe compare data\demo_a.csv data\demo_b.csv -k account_id,txn_id
+
+.\rust\target\release\csvdiff.exe compare data\demo_a.csv data\demo_b.csv `
+  -k account_id,txn_id -i updated_at --json summary.json --threads 4
+
+.\rust\target\release\csvdiff.exe compare data\demo_a.csv data\demo_b.csv `
   -k account_id,txn_id -i updated_at -o report.html
 ```
 
 The second and third print `matched 999,000 (changed 60,049) | added 1,000 |
 removed 1,000`. Without `-i updated_at` the first one reports all 999,000
 matched rows as changed, correctly: that column really did move on every row.
+
+**Three PowerShell details** worth having up front, because each of them stops a
+copied command dead:
+
+| | PowerShell | bash |
+|---|---|---|
+| run a program here | `.\rust\target\release\csvdiff.exe` — the `.\` is required | `rust/target/release/csvdiff` |
+| continue a line | a backtick `` ` `` at the end | a backslash `\` |
+| the exit code | `$LASTEXITCODE` | `$?` |
+
+`$LASTEXITCODE` matters more than it looks: **a comparison that finds differences
+exits 1**, which is the normal result and not a failure. In a script that stops
+on errors, catch it rather than let it end the run:
+
+```powershell
+.\rust\target\release\csvdiff.exe compare data\demo_a.csv data\demo_b.csv -k account_id,txn_id
+if ($LASTEXITCODE -ge 2) { throw "csvdiff failed with $LASTEXITCODE" }
+```
 
 **Exit codes** make any of them a CI or pipeline gate directly:
 
