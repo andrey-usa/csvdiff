@@ -54,6 +54,69 @@ case "$out" in
 esac
 rm -rf "$tmpj"
 
+echo "the threaded csv sweep, over quoted newlines and chunk boundaries:"
+# --- the threaded CSV sweep -------------------------------------------------
+#
+# Rows are found on every core, so a thread starts mid-file and has to work out
+# whether it landed inside a quoted field. Nothing else in this suite reaches
+# the 4 MB size where that splitting turns on, so this builds a file that does,
+# out of the shapes that make a boundary hard: newlines inside quotes, doubled
+# quotes, delimiters inside quotes, CRLF, blank lines, duplicate keys and rows
+# present on one side only.
+#
+# Getting the in-quote state wrong at a boundary does not fail loudly -- it cuts
+# a row in half, and the counts move. The check is that the thread count cannot
+# change the answer. Modelled on the same section in `c/test.sh`.
+thr=$(mktemp -d)
+python3 - "$thr" <<'PYEOF'
+import sys
+out_dir = sys.argv[1]
+FIELDS = ["plain", '"has,comma"', '"has\nnewline\nand more"',
+          '"doubled ""quote"" inside"', '"comma, and\nnewline together"', '""']
+def rows(side):
+    out = ["k,a,b,c\n"]
+    for i in range(130000):
+        if side == "b" and i % 5000 == 0:
+            continue                                   # removed from B
+        a = FIELDS[(i * 7 + (3 if side == "b" and i % 41 == 0 else 0)) % len(FIELDS)]
+        b = str(i * 3 + (1 if side == "b" and i % 23 == 0 else 0))
+        c = '"tail\nwith newline"' if i % 11 == 0 else "tail"
+        sep = "\r\n" if i % 13 == 0 else "\n"
+        out.append(f"K{i:07d},{a},{b},{c}{sep}")
+        if i % 997 == 0:
+            out.append(f"K{i:07d},{a},{b},{c}{sep}")    # a duplicate key
+        if i % 1499 == 0:
+            out.append("\n")                           # a blank line is not a row
+    if side == "b":
+        for i in range(40):
+            out.append(f"NEW{i:05d},plain,0,tail\n")    # added in B
+    return "".join(out)
+for side in ("a", "b"):
+    open(f"{out_dir}/t_{side}.csv", "w").write(rows(side))
+PYEOF
+bytes=$(wc -c < "$thr/t_a.csv")
+if [ "$bytes" -lt 4194304 ]; then
+  echo "  FAIL  the threading fixture is $bytes bytes, under the 4 MB split threshold"; fail=1
+else
+  # The Rust port groups its digits and this one does not, which no other check
+  # here notices because their fixtures hold fewer than a thousand rows.
+  plain() { head -1 | sed 's/ | turbo.*//' | tr -d ','; }
+  one=$(build/csvdiff compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --threads 1 2>&1 | plain) || true
+  for t in 2 3 4 7 16; do
+    many=$(build/csvdiff compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --threads $t 2>&1 | plain) || true
+    if [ "$one" = "$many" ]; then
+      printf '  ok    %s threads finds what 1 thread finds\n' "$t"
+    else
+      printf '  FAIL  %s threads disagrees with 1 thread\n    1 : %s\n    %s : %s\n' \
+             "$t" "$one" "$t" "$many"; fail=1
+    fi
+  done
+  r=$("$RUST" compare "$thr/t_a.csv" "$thr/t_b.csv" -k k --engine turbo -o /dev/null 2>&1 | plain) || true
+  [ "$one" = "$r" ] && echo "  ok    and what the rust port finds" \
+    || { echo "  FAIL  the threaded sweep disagrees with the rust port"; echo "    rust: $r"; fail=1; }
+fi
+rm -rf "$thr"
+
 echo "quoting, ragged rows and keys near the end of the file:"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 printf 'a,k,c\nx,K1,c1\ny,K2,cc\n'        > "$tmp/a.csv"

@@ -827,15 +827,27 @@ static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_
     }
     unsigned n = 0;
     bounds[n++] = from;
+    /*
+     * The count is carried forward rather than restarted.
+     *
+     * Counting from `from` to each split in turn reads the first slice of the
+     * file for every split, the second for all but one, and so on: (threads-1)/2
+     * passes over the file, all of them here, to prepare a sweep whose whole
+     * purpose is to use the other cores. Only the slice since the last split is
+     * new, so counting that and adding it keeps a running total of the quotes
+     * before `nominal` for one pass in total.
+     */
+    size_t quotes = 0;
+    size_t counted = from;
     for (unsigned i = 1; i < threads; i++) {
         const size_t nominal = from + (end - from) * i / threads;
-        size_t quotes = 0;
-        for (size_t at = from; at < nominal;) {
+        for (size_t at = counted; at < nominal;) {
             const size_t q = next_of1(d, at, nominal, '"');
             if (q >= nominal) break;
             quotes++;
             at = q + 1;
         }
+        counted = nominal;
         bool in_quotes = (quotes & 1) != 0;
         size_t at = nominal;
         for (; at < end; at++) {

@@ -1039,13 +1039,23 @@ class RowIndex {
         for (unsigned i = 1; i < threads; ++i)
             nominal.push_back(from + (end - from) * i / threads);
 
-        // Quotes before each nominal split, counted in parallel.
+        // Quotes before each nominal split: each slice counted once, in
+        // parallel, then a prefix sum.
+        //
+        // Asking each task for the count from `from` to its own split reads the
+        // first slice of the file in every task, the second in all but one, and
+        // so on -- (threads-1)/2 passes over the file in total, and the last task
+        // alone reads nearly all of it, so the step costs about a whole pass
+        // however many threads run it. That grows with the thread count while
+        // the work it prepares shrinks. Counting the slice *since* the previous
+        // split gives the same numbers from one pass split evenly.
         std::vector<std::size_t> quotes(nominal.size(), 0);
         {
             std::vector<std::thread> counters;
             auto count = [&](std::size_t i) {
+                const std::size_t begin = i == 0 ? from : nominal[i - 1];
                 std::size_t n = 0;
-                for (std::size_t at = from; at < nominal[i];) {
+                for (std::size_t at = begin; at < nominal[i];) {
                     const std::size_t q = next_of1(d, at, nominal[i], '"');
                     if (q >= nominal[i]) break;
                     ++n;
@@ -1063,6 +1073,9 @@ class RowIndex {
             }
             count(0);
             for (auto& c : counters) c.join();
+            // Each entry holds its own slice; the running total is what the
+            // parity test below wants.
+            for (std::size_t i = 1; i < quotes.size(); ++i) quotes[i] += quotes[i - 1];
         }
 
         std::vector<std::size_t> bounds{from};
