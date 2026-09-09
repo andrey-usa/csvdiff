@@ -62,3 +62,9 @@ gh workflow run Benchmark -f scales=10k       # CI
   Changing that changes the matched/added/removed counts, so it is a behaviour change, not a fix.
 - The report decodes its gzip payload with `DecompressionStream`, which needs a 2023+ browser.
   `--no-compress` is the escape hatch.
+- **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
+  measure each other's contention, which spoils both — including the one already running that
+  somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
+  benchmark or dispatching one by hand. The benchmark workflows name a single `benchmark-host`
+  concurrency group so GitHub queues them; a per-ref group does not, because another branch is
+  another group.

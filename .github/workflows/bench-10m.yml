@@ -61,8 +61,17 @@ on:
         type: boolean
         default: true
 
+# One benchmark at a time in this repository, whatever the workflow or the
+# branch. Two benchmark jobs running at once share a host and measure each
+# other's contention as well as their own code, which makes both runs worth
+# less than one run would have been -- and a per-ref group, which this was,
+# does not prevent it: a different branch is a different group.
+#
+# `cancel-in-progress: false` because the later run must queue rather than
+# replace the earlier one; the earlier one is a measurement someone is waiting
+# for. Any other workflow that measures timings should name this same group.
 concurrency:
-  group: bench-10m-${{ github.ref }}
+  group: benchmark-host
   cancel-in-progress: false
 
 # A push carries no inputs, so the defaults live here and both events read them.
