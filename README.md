@@ -24,9 +24,9 @@ each port's fastest build.
 
 | Format | Input | C | C++ | Rust | Zig |
 |---|---:|---|---|---|---|
-| CSV | 3,509 MB | **3.06s** · 11.1s · 716 MB | 8.90s · 27.5s · 882 MB | 4.94s · 17.9s · 899 MB | 4.20s · 15.6s · 888 MB |
-| ndjson | 8,487 MB | **8.59s** · 29.3s · 716 MB | 21.18s · 64.0s · 887 MB | 13.17s · 50.9s · 899 MB | 12.62s · 49.5s · 886 MB |
-| Parquet | 2,074 MB | **1.67s** · 5.5s · 1,303 MB | 3.19s · 10.4s · 1,404 MB | 2.95s · 9.9s · 1,322 MB | 2.83s · 10.0s · 1,218 MB |
+| CSV | 3,509 MB | **2.05s** · 7.4s · 716 MB | 10.16s · 32.6s · 882 MB | 5.23s · 19.3s · 899 MB | 4.35s · 16.4s · 887 MB |
+| ndjson | 8,487 MB | **10.32s** · 36.3s · 717 MB | 26.11s · 80.8s · 901 MB | 16.14s · 62.8s · 899 MB | 14.95s · 58.8s · 888 MB |
+| Parquet | 2,074 MB | **1.40s** · 4.6s · 1,298 MB | 3.24s · 10.6s · 1,480 MB | 2.67s · 8.8s · 1,322 MB | 2.72s · 9.7s · 1,245 MB |
 
 All builds returned identical counts — matched 9,990,000, changed 599,320, added
 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B. That is the
@@ -35,32 +35,38 @@ mean a bug in one of them, so the run fails and names it.
 
 Three things this table says.
 
-**Parquet is a different problem.** 1.67s against 3.06s for the same rows in
+**Parquet is a different problem.** 1.40s against 2.05s for the same rows in
 CSV, on three-fifths of the bytes, because with both dictionaries interned into
 one id space a cell comparison becomes `int32 != int32` rather than a string
-comparison. It is the cheapest row in the table by a factor of five.
+comparison. ndjson, at the other end, costs 7x the Parquet time on four times
+the bytes.
 
-**One port now holds all three formats,** which was not true a day ago: C leads
-CSV by 1.37x, ndjson by 1.47x and Parquet by 1.7x over the next build. The
-ndjson row is the one that moved — 20.13s to 8.59s, from framing rows on the
-newline byte and letting the key-only parse stop once it has the keys — and it
-went from last place to first.
+**One port holds all three formats** — CSV by 2.1x, ndjson by 1.4x, Parquet by
+1.9x over the next build. It also holds the memory column on both text formats
+by a wider margin than it holds any of the time ones: 716 MB above the mapped
+input against 882 MB and up, because a field here is one 64-bit word and never
+becomes a string.
 
 **Read the CPU column, not the wall column.** Wall time mixes work with how many
-cores a design manages to use; CPU seconds do not. On ndjson C spends 29.3 CPU
-seconds where the next build spends 49.5, and on CSV 11.1 against 15.6: the lead
-is work not done, not cores used harder. Every row here is within 4x of its own
-CPU on four cores, so nothing in the table is winning on scheduling.
+cores a design manages to use; CPU seconds do not. On CSV, C spends 7.4 CPU
+seconds where the next build spends 16.4 — it is not scheduling better, it is
+doing less than half the work, because most rows are proven unchanged from their
+raw bytes without either side being parsed.
 
-> **Where the columns come from.** C is this tree at `5498bc4`. Every other
-> column is `claude/data-comparison-rust-zig-jam00m` at `168ab59`, which is
-> quicker than this tree's C++, Rust and Zig on every format. One runner built
-> both, because two builds measured in two sittings are not compared at all.
+> **Where the columns come from, and why you cannot compare this table with the
+> last one.** C is this tree at `c65f23b`; every other column is
+> `claude/data-comparison-rust-zig-jam00m` at `168ab59`, which is quicker than
+> this tree's C++, Rust and Zig on every format. One runner built both, because
+> two builds measured in two sittings are not compared at all.
+>
+> That rule is not theoretical, and this run demonstrates it: against the run
+> three hours earlier, *every* build's ndjson number is about 20% slower and
+> *every* build's Parquet number is a few percent faster. Nothing changed in
+> those ports. Rows compare within a table; never across.
 >
 > The ndjson row is measured over five builds rather than seven: that branch's
 > Rust and Zig read ndjson and this tree's do not, so this tree's two were
 > dropped by the harness rather than given a slow number.
-
 ---
 
 ## Using it
@@ -196,7 +202,8 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **ndjson, again.** 2.34x at ten million rows came from framing rows on the
+1. **ndjson, again.** It is now 5x the CSV time on 2.4x the bytes, and the only
+   format where the C lead is under 2x. 2.34x at ten million rows came from framing rows on the
    newline byte and letting the key-only parse stop once it has the keys. What
    is left is the join, which still parses a matched row in full on both sides.
    CSV no longer does — it proves most rows unchanged from their raw bytes —

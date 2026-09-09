@@ -54,6 +54,70 @@ about 3% is the floor for the paired one. Ratios below those are the machine.
 
 ---
 
+## 2026-09-09 (joint run, second) — the byte proof at ten million rows
+
+One GitHub Actions runner (4 vCPU / 16 GB), 10,000,000 rows × 20 columns, keyed
+on `(account_id, txn_id)`, `--ignore updated_at`, five interleaved rounds each.
+C and this tree's C++/Rust/Zig from `c65f23b`; the `(jam00m)` columns from
+`claude/data-comparison-rust-zig-jam00m` at `168ab59`, checked out beside it and
+built on the same runner. Run `34315176054`.
+
+### CSV — input 3,509 MB
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **2.05s** | 2.06s | 2.09s | **7.4s** | 4,225 MB | **716 MB** |
+| C++ | 19.77s | 19.93s | 20.05s | 63.3s | 4,391 MB | 882 MB |
+| Rust | 35.57s | 36.31s | 37.34s | 35.6s | 4,420 MB | 911 MB |
+| Zig | 19.99s | 20.08s | 20.45s | 34.4s | 4,234 MB | 725 MB |
+| C++ (jam00m) | 10.16s | 10.20s | 10.40s | 32.6s | 4,391 MB | 882 MB |
+| Rust (jam00m) | 5.23s | 5.26s | 5.31s | 19.3s | 4,408 MB | 899 MB |
+| Zig (jam00m) | 4.35s | 4.38s | 4.52s | 16.4s | 4,396 MB | 887 MB |
+
+### ndjson — input 8,487 MB
+
+Five builds, not seven: this tree's Rust and Zig do not read ndjson, and the
+harness drops a build that cannot read the pair rather than timing a failure.
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **10.32s** | 10.34s | 10.40s | **36.3s** | 9,204 MB | **717 MB** |
+| C++ | 27.32s | 27.50s | 27.85s | 84.4s | 9,413 MB | 926 MB |
+| C++ (jam00m) | 26.11s | 26.19s | 26.42s | 80.8s | 9,388 MB | 901 MB |
+| Rust (jam00m) | 16.14s | 16.18s | 16.77s | 62.8s | 9,387 MB | 899 MB |
+| Zig (jam00m) | 14.95s | 15.13s | 15.16s | 58.8s | 9,375 MB | 888 MB |
+
+### Parquet — input 2,074 MB, uncompressed
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **1.40s** | 1.41s | 1.43s | **4.6s** | 3,371 MB | 1,298 MB |
+| C++ | 3.24s | 3.27s | 3.30s | 10.6s | 3,553 MB | 1,480 MB |
+| Rust | 4.04s | 4.11s | 4.14s | 11.8s | 3,396 MB | 1,322 MB |
+| Zig | 6.72s | 6.88s | 7.14s | 11.3s | 3,387 MB | 1,313 MB |
+| C++ (jam00m) | 3.24s | 3.29s | 3.32s | 10.7s | 3,553 MB | 1,480 MB |
+| Rust (jam00m) | 2.67s | 2.72s | 2.76s | 8.8s | 3,395 MB | 1,322 MB |
+| Zig (jam00m) | 2.72s | 2.74s | 2.75s | 9.7s | 3,319 MB | **1,245 MB** |
+
+Counts agree across every build in every table: matched 9,990,000, changed
+599,320, added 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B.
+
+**What this run is for.** The byte proof landed between it and the run three
+hours earlier, and CSV is where it shows: **3.06s → 2.05s with CPU 11.1s →
+7.4s**, taking C's lead over the next build from 1.37x to 2.12x on the format
+that carries the most bytes per row of work.
+
+**And what it is a warning about.** Do not read the other two formats that way.
+Against the earlier run, *every* build's ndjson number here is about 20% slower
+and *every* build's Parquet number a few percent faster — C, C++, Rust and Zig
+alike, from two branches, with no change to any of those ports. That is the
+runner, not the code, and it is exactly why the rule at the top of this file
+says to compare rows within a table and never across tables. The CSV claim above
+survives only because the change is 1.5x and the drift is 20%; a 20% claim made
+the same way would be worth nothing.
+
+---
+
 ## 2026-09-09 (later still, again) — proving a row unchanged from its bytes
 
 One 4-core / 16 GB container, 2,000,000 rows, every binary from this tree,
