@@ -195,25 +195,26 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **ndjson, again.** It has the byte proof now — 1.29x of CPU, against a 1.47x
-   ceiling measured with a deliberately unsound build first — so what is left of
-   the join is the 6% of rows that really changed and the rows the proof
-   refuses. Past that, the floor is the byte scanning itself: this format costs
-   3.6x the Parquet time on four times the bytes, and no amount of join work
-   changes that.
-2. **Where the C CSV path stops scaling.** The join has given up most of what
-   it was doing, so the sequential table insertion is now the larger share of
-   the run rather than a tail on it. Sharding it by hash was measured and lost
-   — the routing costs more than the serial insert it replaces — so what is
-   left is to pipeline it against the sweep, inserting a chunk's rows while the
-   next chunk is still being read. Total CPU over wall says the whole remaining
-   prize is about 1.25x.
-3. **Reconciling the two Zig Parquet readers.** This tree and
-   `claude/data-comparison-rust-zig-jam00m` each wrote one; `git merge` reports
-   them as an add/add conflict.
-4. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
+1. **The byte proof is C's alone.** It settles most matched rows from their raw
+   bytes without parsing either side, and it is why C leads ndjson by 1.9x and
+   CSV by 1.15x. The other three ports parse both rows for every match. Porting
+   it is the single largest thing left in this repository, and the JSON version
+   needs the bounded tail scan that rules out a repeated name.
+2. **`--ignore` accepts a name that matches nothing, in silence** — in all four
+   ports, where `--key` with a name that matches nothing is an error. A missing
+   key makes the answer impossible; a missing ignore quietly makes it wider. It
+   cost a benchmark run here that reported every row as changed. Whether to
+   warn or to refuse is a contract decision across four ports.
+3. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-5. **Wide files.** Everything here is 20 columns. 200 would change the ratio of
-   key work to cell work, and probably the ranking — and would re-open the SIMD
-   question, since longer rows mean longer scans.
+4. **Compression.** Parquet here is uncompressed by choice; the C++ port reads
+   Snappy and nothing else does. What that costs against what it saves in bytes
+   read has never been measured on one host.
+
+Three things that used to be on this list have been measured off it, and the
+numbers are in [BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
+the serial insert (blocked by allocation rather than ordering, and 1.4% of a
+200-column run), ndjson's cost per byte (the format, not a defect — name lookups
+are 12% of a 46% gap), and wide files (throughput flat from 20 columns to 200,
+and the SIMD question does not re-open there).
