@@ -71,11 +71,13 @@ on:
         default: ""
 
 concurrency:
-  # A dispatched run gets its own group keyed on the run id, so it is never
-  # cancelled by somebody pushing to the branch it was launched from. That is
-  # what ate three 10M runs in a morning.
-  group: bench-native-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
-  cancel-in-progress: true
+  # One group for every benchmark in the repository, and a queue rather than a
+  # cancellation. Taken from bench-10m.yml on the Rust/Zig branch, which had the
+  # better answer here: a benchmark that is cancelled has produced nothing, so
+  # two runs that overlap should wait for each other instead of one killing the
+  # other. Three 10M runs were lost to a cancelling group in one morning.
+  group: benchmark-host
+  cancel-in-progress: false
 
 jobs:
   bench:
