@@ -1194,15 +1194,16 @@ pub const Result = struct {
     }
 };
 
-/// One chunk of the join queue. A chunk of A's keys fills the matched, changed
-/// and removed counts and the column stats; a chunk of B's fills `added`. The
-/// merge is a sum, so the answer does not depend on how many chunks there are or
-/// on which thread took which.
+/// One chunk of A's keys: the matched, changed and removed counts and the column
+/// stats. The merge is a sum, so the answer does not depend on how many chunks
+/// there are or on which thread took which.
+///
+/// There are no chunks of B. `added` is not counted by a pass any more; see the
+/// join's caller.
 const Part = struct {
     matched: i64 = 0,
     changed: i64 = 0,
     removed: i64 = 0,
-    added: i64 = 0,
     columns: []ColumnStat,
     /// Written only by the thread that owns this range, read only once every
     /// thread has been joined.
@@ -1219,8 +1220,6 @@ const Join = struct {
     nc: usize,
     width: usize,
     parts: []Part,
-    /// Chunk `i` is A's chunk `i` below this and B's above it.
-    a_ways: usize,
     /// Where a byte comparison may stand in for a parse, when the two files are
     /// the same shape; see `text.sharedTail`. Null compares every pair column by
     /// column, which is what a mixed pair, a columnar side or JSON gets.
@@ -1231,7 +1230,7 @@ const Join = struct {
         while (true) {
             const i = self.next.fetchAdd(1, .monotonic);
             if (i >= self.parts.len) return;
-            const work = if (i < self.a_ways) self.range(i) else self.added(i);
+            const work = self.range(i);
             work catch |e| {
                 self.parts[i].failure = e;
                 return;
@@ -1251,8 +1250,8 @@ const Join = struct {
         var out = &self.parts[p];
 
         const keys = self.ai.first_row.items;
-        const lo = keys.len * p / self.a_ways;
-        const hi = keys.len * (p + 1) / self.a_ways;
+        const lo = keys.len * p / self.parts.len;
+        const hi = keys.len * (p + 1) / self.parts.len;
         // Nothing to normalise and no tolerance: the cell comparison cannot
         // fail, so it need not be asked through an error union.
         const plain = !needsNormalising(self.opt);
@@ -1323,46 +1322,6 @@ const Join = struct {
                 }
             }
             if (any) out.changed += 1;
-        }
-    }
-
-    /// B's side of the join: which of B's keys are not in A at all.
-    ///
-    /// It looked like the cheap half -- it asks one question per key where A's
-    /// side reads both rows and every compared column -- and so it was given one
-    /// thread while A got the rest. Timing each task says otherwise: at four
-    /// million rows B's single thread took 3.1s where A's three ranges took 1.6s
-    /// each, and the join sat waiting on B with three cores idle. A key does cost
-    /// B less than it costs A, about two thirds, but B has just as many of them,
-    /// and no ratio like that makes "one thread" the right unit for either side.
-    /// So B is chunked into the same queue, and chunks do not care which side
-    /// they came from.
-    fn added(self: *Join, i: usize) !void {
-        const p = i - self.a_ways;
-        const gpa = self.b.gpa;
-        const fb = try gpa.alloc(Field, self.width);
-        defer gpa.free(fb);
-        const probe = try gpa.alloc(Field, self.width);
-        defer gpa.free(probe);
-        var s = Scratch{};
-        var out = &self.parts[i];
-
-        const keys = self.bi.first_row.items;
-        const b_ways = self.parts.len - self.a_ways;
-        const lo = keys.len * p / b_ways;
-        const hi = keys.len * (p + 1) / b_ways;
-        const mine = keys[lo..hi];
-        for (mine, 0..) |row, j| {
-            if (j + PREFETCH_AHEAD < mine.len) {
-                self.ai.prefetch(self.bi.row_hash.items[@intCast(mine[j + PREFETCH_AHEAD])]);
-            }
-            // Only the key columns: this side compares nothing else, and the row
-            // it is about to probe against is discarded either way.
-            self.bi.keysOf(row, fb);
-            const hash = self.bi.row_hash.items[@intCast(row)];
-            if ((try self.ai.lookup(self.b.slab, fb, hash, .keys, null, &s, probe)) == null) {
-                out.added += 1;
-            }
         }
     }
 };
@@ -1507,11 +1466,10 @@ pub fn compare(
         made += 1;
     }
 
-    // Both sides are chunked into one queue and every thread pulls from it; see
-    // `Join.added` for why B is not worth a thread of its own.
+    // A's keys, chunked into one queue every thread pulls from. B has no pass of
+    // its own any more: see `counts.added` below.
     const a_ways = waysFor(ai.first_row.items.len);
-    const b_ways = waysFor(bi.first_row.items.len);
-    const parts = try gpa.alloc(Part, a_ways + b_ways);
+    const parts = try gpa.alloc(Part, a_ways);
     defer {
         for (parts) |p| gpa.free(p.columns);
         gpa.free(parts);
@@ -1535,7 +1493,6 @@ pub fn compare(
         .nc = nc,
         .width = width,
         .parts = parts,
-        .a_ways = a_ways,
         .span_tail = if (a.parser()) |pa| (if (b.parser()) |pb| text.sharedTail(pa, pb) else null) else null,
         .next = std.atomic.Value(usize).init(0),
     };
@@ -1551,7 +1508,6 @@ pub fn compare(
         counts.matched += part.matched;
         counts.changed += part.changed;
         counts.removed += part.removed;
-        counts.added += part.added;
         for (columns, part.columns) |*into, from| {
             into.changed += from.changed;
             into.blanked += from.blanked;
@@ -1563,6 +1519,21 @@ pub fn compare(
     counts.b_rows = bi.rows;
     counts.a_keys = ai.uniqueKeys();
     counts.b_keys = bi.uniqueKeys();
+    // `added` is arithmetic, not a pass.
+    //
+    // B's half of the join used to ask "is this key in A?" for every key in B --
+    // ten million probes to find the ten thousand rows A never had -- while A's
+    // half had already asked the same question of the same pairs from the other
+    // end. It does not need asking twice: every distinct key of A finds at most
+    // one distinct key of B, two distinct keys of A cannot find the same key of
+    // B, and the key comparison is symmetric, so the keys of B that nothing
+    // matched are simply the ones the A pass did not account for.
+    //
+    // This port can stop there because it reports counts and column stats and
+    // never names an added row. The Rust port renders those rows, so it keeps a
+    // bitmap of B's matched rows instead and walks that for the sample; the C++
+    // port takes this same subtraction and runs a pass only for `--json`.
+    counts.added = counts.b_keys - counts.matched;
     counts.unchanged = counts.matched - counts.changed;
     counts.a_dup_keys = ai.dup_keys;
     counts.a_dup_rows = ai.dup_rows;
