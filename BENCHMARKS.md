@@ -34,6 +34,71 @@ a different question.
 
 ---
 
+## 2026-09-09 (joint run) — ten million rows, seven builds, one runner
+
+One GitHub Actions runner (4 vCPU / 16 GB), 10,000,000 rows × 20 columns, keyed
+on `(account_id, txn_id)`, `--ignore updated_at`, five interleaved rounds each.
+C and this tree's C++/Rust/Zig from `5498bc4`; the `(jam00m)` columns from
+`claude/data-comparison-rust-zig-jam00m` at `168ab59`, checked out beside it and
+built on the same runner. Run `34311464257`.
+
+### CSV — input 3,509 MB
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **3.06s** | 3.06s | 3.11s | **11.1s** | 4,225 MB | **716 MB** |
+| C++ | 18.67s | 18.94s | 19.38s | 59.4s | 4,428 MB | 919 MB |
+| Rust | 32.03s | 32.22s | 32.40s | 32.0s | 4,416 MB | 907 MB |
+| Zig | 21.74s | 21.84s | 21.93s | 37.8s | 4,234 MB | 725 MB |
+| C++ (jam00m) | 8.90s | 8.97s | 8.99s | 27.5s | 4,391 MB | 882 MB |
+| Rust (jam00m) | 4.94s | 4.95s | 4.96s | 17.9s | 4,408 MB | 899 MB |
+| Zig (jam00m) | 4.20s | 4.20s | 4.59s | 15.6s | 4,397 MB | 888 MB |
+
+### ndjson — input 8,487 MB
+
+Five builds, not seven: this tree's Rust and Zig do not read ndjson, and the
+harness drops a build that cannot read the pair rather than timing a failure.
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **8.59s** | 8.61s | 8.70s | **29.3s** | 9,204 MB | **716 MB** |
+| C++ | 22.04s | 22.37s | 22.68s | 66.2s | 9,404 MB | 917 MB |
+| C++ (jam00m) | 21.18s | 21.42s | 21.67s | 64.0s | 9,374 MB | 887 MB |
+| Rust (jam00m) | 13.17s | 13.19s | 13.25s | 50.9s | 9,387 MB | 899 MB |
+| Zig (jam00m) | 12.62s | 13.18s | 13.22s | 49.5s | 9,374 MB | 886 MB |
+
+### Parquet — input 2,074 MB, uncompressed
+
+| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|---:|
+| C | **1.67s** | 1.75s | 1.77s | **5.5s** | 3,377 MB | 1,303 MB |
+| C++ | 3.31s | 3.34s | 3.35s | 10.9s | 3,553 MB | 1,480 MB |
+| Rust | 3.96s | 3.98s | 4.01s | 11.6s | 3,395 MB | 1,321 MB |
+| Zig | 6.60s | 6.74s | 6.76s | 10.6s | 3,421 MB | 1,347 MB |
+| C++ (jam00m) | 3.19s | 3.22s | 3.31s | 10.4s | 3,478 MB | 1,404 MB |
+| Rust (jam00m) | 2.95s | 2.98s | 3.01s | 9.9s | 3,396 MB | 1,322 MB |
+| Zig (jam00m) | 2.83s | 2.86s | 2.87s | 10.0s | 3,292 MB | **1,218 MB** |
+
+Counts agree across every build in every table: matched 9,990,000, changed
+599,320, added 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B.
+
+**What moved since the 2026-09-08 joint run** (the only other run at this size
+on this harness, so the only one these are comparable with):
+
+| Format | C then | C now | | Best rival then | Best rival now |
+|---|---:|---:|---:|---|---|
+| CSV | 4.16s | **3.06s** | 1.36x | Zig 4.55s | Zig 4.20s |
+| ndjson | 20.13s | **8.59s** | 2.34x | Zig 15.58s | Zig 12.62s |
+| Parquet | 1.63s | 1.67s | — | Zig 4.42s | Zig 2.83s |
+
+C's ndjson row went from last of four to first of five, and the format C led by
+2.7x on Parquet it now leads by 1.7x — their Zig closed 4.42s to 2.83s in the
+same day. Parquet's 1.63s → 1.67s is inside this harness's noise at 10M and is
+not read as a regression; the same binary's Parquet path measured 1.44x quicker
+at two million rows the same morning.
+
+---
+
 ## 2026-09-09 (later still) — the second join pass, removed
 
 One 4-core / 16 GB container, 2,000,000 rows, five interleaved rounds.
