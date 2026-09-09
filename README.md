@@ -169,10 +169,17 @@ tests/fixtures/          every shape that has broken an engine here
 
 1. **ndjson, again.** 2.34x at ten million rows came from framing rows on the
    newline byte and letting the key-only parse stop once it has the keys. What
-   is left is the join, which still parses a matched row in full on both sides
-   — and ndjson is still 2.8x the CSV time on 2.4x the bytes.
-2. **Where the C CSV path stops scaling.** 11.1 CPU-seconds over 3.06s of wall
-   is 3.63 of four cores, and what is left sequential is the table insertion.
+   is left is the join, which still parses a matched row in full on both sides.
+   CSV no longer does — it proves most rows unchanged from their raw bytes —
+   but that proof cannot be used here as it stands: a JSON value is found by
+   name, and a name repeated in one object takes its *last* value, which a
+   prefix cannot see. Making non-key columns first-wins, as key columns already
+   are, would open it, and is a contract change the other ports have to agree
+   to.
+2. **Where the C CSV path stops scaling.** The join has given up most of what
+   it was doing, so the sequential table insertion is now the larger share of
+   the run rather than a tail on it — and it is the next thing to thread or to
+   fold into the sweep.
 3. **Reconciling the two Zig Parquet readers.** This tree and
    `claude/data-comparison-rust-zig-jam00m` each wrote one; `git merge` reports
    them as an add/add conflict.

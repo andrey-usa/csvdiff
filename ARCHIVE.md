@@ -79,6 +79,8 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Reading only the key columns where only keys are read** | C's CSV path: 2.66x at two million rows, **3.65x at ten million** — the gain grows with the size, because past cache the parses removed were memory traffic and not only instructions |
 | **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries — on the host that measured it; see the row below, where the same change loses on another machine |
 | **Writing the generator's two sides at once** | 2.0x on Parquet by itself, where splitting a row group's twenty columns — the split the design points at — is 1.28x |
+| **Proving a CSV row unchanged from its raw bytes** | rows that match usually match because they are the same row with one column moved, so agreeing byte for byte through the byte that closes the last compared column proves every compared column equal and the mate is never parsed: **1.48x wall, 1.52x CPU** at two million rows. It refuses on headers that order columns differently, on a mate whose field carries on where this one stopped (`cc` against `cccccccc`, or a doubled quote), and on JSON, where a value is found by name and a repeated name takes its last value |
+| **Backing a failing proof off** | two files where every row really has changed pay for a scan that never succeeds; retrying only every 64th row after 64 failures took that case from 5% to parity on wall |
 | **Deleting the dataframe engines from the Rust port** | a cold build went from twenty minutes to twenty seconds; nothing measured them any more |
 
 Measured on `claude/data-comparison-rust-zig-jam00m`, not here, and taken from

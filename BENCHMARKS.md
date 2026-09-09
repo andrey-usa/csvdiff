@@ -34,6 +34,64 @@ a different question.
 
 ---
 
+## 2026-09-09 (later still, again) — proving a row unchanged from its bytes
+
+One 4-core / 16 GB container, 2,000,000 rows, every binary from this tree,
+interleaved rounds.
+
+| CSV, 702 MB | Before | After | | CPU before | CPU after |
+|---|---:|---:|---:|---:|---:|
+| `--ignore updated_at` (the benchmark shape) | 0.705s | **0.476s** | 1.48x | 2.32s | **1.53s** |
+| nothing ignored, so the proof always refuses | 0.929s | 0.867s | — | 3.04s | 2.79s |
+
+The join looked up a mate and then parsed its row a second time and compared all
+seventeen columns field by field. Rows that match usually match because they are
+the same row with one column moved, so comparing the two rows' raw bytes from
+the front — a word at a time — proves every compared column equal when the
+agreement reaches the byte that closes the last of them, and the mate is never
+parsed. On this pair that is 94% of matched rows.
+
+The second row is the shape the proof cannot help: `updated_at` compared rather
+than ignored means every row really has changed, and the scan is work for
+nothing. After 64 refusals in a row it is attempted only every 64th row. Two
+sittings put that case at 3.6% of CPU either side of parity — it is inside this
+host's noise, which is what the backoff is for; without it the loss was 5% and
+repeatable.
+
+The proof refuses where equal bytes would not mean equal columns: two headers
+ordering the same columns differently, a mate whose field carries on where this
+one stopped (`cc` against `cccccccc`, or a quoted field the mate continues with
+a doubled quote), and JSON, where a value is found by name and a repeated name
+takes its last value — a duplicate past the diverging byte would carry a value
+the prefix never saw. Each has a test, and each guard was checked by removing it
+and watching the test fail.
+
+Counts unchanged across 30 generated shapes (CSV and ndjson), the awkward
+fixture, and the cross-port suite with the Rust port as the oracle. That suite
+is what caught the `cc`/`cccccccc` case; the fast suite now catches it too.
+
+### The day's five C changes, one sitting
+
+Each commit built from its own tree and run against the others, seven
+interleaved rounds, best of each. This is the only honest way to add them up:
+the four entries below were each measured against their own predecessor in their
+own sitting, and those numbers do not chain.
+
+| 2,000,000 rows | CSV | CPU | ndjson | CPU |
+|---|---:|---:|---:|---:|
+| day start (`22cc05b`) | 1.174s | 3.56s | 3.472s | 11.95s |
+| + ndjson framed on the newline (`b8dbf44`) | 1.169s | 3.56s | 2.110s | 6.79s |
+| + a tag in the text index's slot (`b3ae48e`) | 0.835s | 2.79s | 1.867s | 6.06s |
+| + `added` derived (`5498bc4`) | 0.705s | 2.32s | 1.750s | 5.50s |
+| + the byte proof (`3ecbab1`) | **0.476s** | **1.53s** | 1.785s | 5.69s |
+| | **2.47x** | **2.33x** | **1.95x** | **2.10x** |
+
+None of it is from threading harder — CPU falls with wall throughout. The byte
+proof does nothing for ndjson by design, and its last ndjson row is that: noise
+around no change.
+
+---
+
 ## 2026-09-09 (joint run) — ten million rows, seven builds, one runner
 
 One GitHub Actions runner (4 vCPU / 16 GB), 10,000,000 rows × 20 columns, keyed
@@ -114,8 +172,10 @@ distinct keys minus `matched`. Counts agree with four other ports on both
 formats, and `CSVDIFF_VERIFY_ADDED=1` runs the removed pass to check the
 derivation rather than trusting it.
 
-The CSV path across the day's three changes: **1.27s → 0.68s, 1.9x, with CPU
-3.9s → 2.3s** — none of it from threading harder.
+The CSV path across the day's changes was first written up here by chaining
+three sittings, which is the one thing this file says not to do. The entry above
+replaces it with all five commits built and run against each other in one
+sitting.
 
 ---
 
