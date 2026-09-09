@@ -143,6 +143,12 @@ before timing anything.
   the port measured finishes in 0.4s where the other takes 0.7s and the noise is
   absolute rather than proportional. "No result" is a request for more rounds
   before it is evidence of absence.
+- **A scaffold can price the wrong thing, and the counts will not always say
+  so.** Doubling the index insert's probing to price it measured *no result* —
+  because the second walk reads the slot the insert has just written, so it is an
+  L1 hit rather than the random access the phase actually pays. The counts were
+  perfect, because nothing was mutated. Ask what the scaffold makes the machine
+  *do*, not only what it makes the program *report*.
 - **Never compare across tables.** Two numbers from two sittings compare machine
   states. This runner's ndjson figures moved 20% between two runs one morning
   with no code change in any port.

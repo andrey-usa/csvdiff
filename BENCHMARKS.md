@@ -64,6 +64,50 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-09 (bound) — the serial index insert does not want more threads
+
+One 4-core / 16 GB container, 1,000,000 rows, `--max-rows 1` so only the engine
+is in the number, medians of fifteen runs of the phase timer.
+
+| Phase | Median | Share of engine |
+|---|---:|---:|
+| join chunks (parallel) | 0.053s | 36% |
+| sweep, A and B at once (parallel) | 0.046s | 31% |
+| index insert, A and B at once (**serial each**) | 0.042s | 28% |
+
+The insert is the one phase still serial per side, so while it runs two of the
+four cores have nothing to do. Sharding the table by hash and giving each side
+two threads is an obvious thing to try, and it is a day of work: per-shard key
+lists, a slot that means a shard-local index, a merge to put the join's iteration
+back in file order.
+
+**It is worth nothing.** A throwaway build that splits each side's insert across
+two threads, each with its own half-sized table, runs the phase in 0.049s and
+0.047s against 0.046s and 0.049s for the serial one. Four threads instead of two,
+same time.
+
+That says the phase is not short of CPU. It is waiting on memory — every probe is
+a random access into a table far larger than cache, the prefetch already covers
+what can be covered, and threads do not make a bandwidth-bound pass faster. The
+two changes that *did* move this phase both removed work rather than spreading
+it: writing the table's zeroes instead of asking the kernel for them, and
+rehashing at the load the table was actually sized for.
+
+The build is unsound on purpose — the join sees one of the two halves, and it
+reports `matched 499,854` against the true 999,000. That is the check that says
+the scaffold measured what it claimed: the number read from it is the insert
+phase timer alone, which the join's distortion does not touch.
+
+**A scaffold that priced the wrong thing first, recorded so the next person does
+not build it.** The first attempt at this bound had each row's insert followed by
+a second walk of the same probe chain, on the theory that doubling the probing
+would price it. It measured 1.00x, middle half 0.98–1.03 — *no result* — and the
+reason is that the second walk reads the slot the insert has just written. It is
+an L1 hit. It priced a cache hit, not the random access the insert actually pays,
+and it would have said "the insert's probing is free" if it had been believed.
+
+---
+
 ## 2026-09-09 (verification) — the same two changes, through `bench_ab.sh`
 
 The `added` changes in both ports were measured with a hand-rolled interleaved
