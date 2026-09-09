@@ -53,6 +53,12 @@ impl Slab {
         // hazard of every mapping engine here and of DuckDB's reader too.
         let map = unsafe { Mmap::map(&file) }
             .map_err(|e| Error::new(format!("cannot map {}: {e}", path.display())))?;
+        // Unix only: memmap2 gates `Advice` and `advise` behind `#[cfg(unix)]`,
+        // because it is `madvise` underneath and Windows has no equivalent worth
+        // wrapping. The hint is an optimisation the kernel may ignore anyway, so
+        // its absence costs nothing but readahead on a platform that does its
+        // own. Without the gate this port does not compile on Windows at all.
+        #[cfg(unix)]
         let _ = map.advise(memmap2::Advice::Sequential);
         Ok(Slab {
             bytes: Bytes::Mapped { _file: file, map },

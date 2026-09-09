@@ -66,15 +66,22 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 
 ### What runs where
 
-Only Linux is tested — all eleven CI jobs are `ubuntu-latest` — so the other two
-columns are what the source implies rather than what a run has proved.
+Linux and Windows are tested. macOS is not, so that column is what the source
+implies rather than what a run has proved.
 
 | Port | Linux | macOS | Windows | Why |
 |---|---|---|---|---|
 | **C** | tested | should work | **WSL** | `sys/mman.h`, `pthread.h`, `unistd.h`: POSIX, and MSVC has none of them |
 | **C++** | tested | should work | **WSL** | the same POSIX headers, minus pthread — it uses `std::thread` |
-| **Rust** | tested | should work | **native** | no `std::os::unix` anywhere; `memmap2` maps files on Windows too |
+| **Rust** | tested | should work | **tested, native** | builds and runs on `windows-latest` in CI |
 | **Zig** | tested | **no** | **WSL** | one call to `std.os.linux.clock_gettime`, which is Linux and not merely POSIX |
+
+The Rust row says "tested" because of a mistake. It first said "native" on the
+strength of a grep for `std::os::unix` finding nothing — which cannot see inside
+a dependency, and `memmap2::Advice` is gated `#[cfg(unix)]` in that crate, so the
+port did not compile on Windows at all. A reader hit it within the hour. There is
+a `windows-latest` job in `ci-rust.yml` now: a claim about a platform is worth
+what the runner that proves it is worth.
 
 `test.sh` and `scripts/bench_ab.sh` are bash. On Windows they need WSL or Git
 Bash; `scripts/bench_ports.py` needs Python 3.
