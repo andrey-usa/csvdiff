@@ -149,8 +149,12 @@ Either writes `data/demo_a.csv` and `data/demo_b.csv`, 184 MB each: 1,000,100
 and 1,000,050 rows of 20 columns, keyed on `(account_id, txn_id)`, with 1,000
 keys only in A, 1,000 only in B, a scattering of changed values, and
 `updated_at` moved on **every** row — which is what the `-i` flag below is for.
-`--rows` also takes `10k`, `10m`, and so on; `--format json|parquet` writes the
-same rows in the other two formats.
+`--rows` also takes `10k`, `10m`, and so on, in either spelling (`--rows 10m` or
+`--rows=10m`); `--format json|parquet` writes the same rows in the other two
+formats. `rust/target/release/gen-data --help` lists the rest. Both generators
+**reject a flag they do not know** rather than ignoring it — the Rust one used
+to skip unknown flags silently, so `--rows=50m` produced the 10k default and
+said nothing about it.
 
 **The C generator is the faster of the two**, by 4.3x on wall time: 2m rows in
 1.05s against the Rust generator's 5.49s on this 4-vCPU runner (paired rounds,
