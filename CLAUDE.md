@@ -148,9 +148,12 @@ before timing anything.
 - **Every command in README.md has to run as written, from a fresh clone.** Its examples named
   `july.csv` and `august.csv` — placeholder names for files nothing in the tree produces — so the
   first thing a new reader pasted failed, and a reader reported it. The examples generate the pair
-  first now. Change a flag, a column name or a binary name, and run the README's commands before
-  claiming the change is done; the `windows-latest` job in `ci-rust.yml` runs the PowerShell pair
-  for this reason.
+  first now, and **every path in that section is written from the repository root**, in bash and
+  in PowerShell alike -- the PowerShell block used to be written from `rust\`, which is how a
+  reader standing in `c/` got `No such file or directory` for `c/gen-data`. Change a flag, a
+  column name, a binary name or a working directory, and run the README's commands before claiming
+  the change is done; the `windows-latest` job in `ci-rust.yml` runs the PowerShell ones from the
+  root for this reason.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
