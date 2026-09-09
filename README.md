@@ -144,7 +144,7 @@ Two specific symptoms, and what causes each:
 
 | Symptom | Cause |
 |---|---|
-| `error: rustc 1.86.0 is not supported by the following packages: csvdiff@1.0.0 requires rustc 1.90` | Rust came from `apt install rustc cargo`. Distro packages are frozen at whatever the release shipped and never follow stable. |
+| `error: rustc 1.86.0 is not supported by the following packages: csvdiff@1.0.0 requires rustc 1.88` | Rust came from `apt install rustc cargo`. Distro packages are frozen at whatever the release shipped and never follow stable. |
 | `zig: command not found` | Zig is not in Ubuntu's default repositories in a usable version. It is normally installed by unpacking a tarball, so a fresh WSL has none. |
 
 Fix both from inside WSL. **Rust**, via rustup rather than apt:
@@ -155,7 +155,7 @@ which -a rustc                           # /usr/bin/rustc means apt installed it
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
-rustc --version                          # 1.90 or newer
+rustc --version                          # 1.88 or newer
 ```
 
 rustup installs to `~/.cargo/bin` and puts it at the front of `PATH`, which is

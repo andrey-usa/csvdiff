@@ -188,3 +188,37 @@ jobs:
               -k account_id,txn_id -i updated_at
           if ($LASTEXITCODE -ne 1) { throw "expected exit 1 (differences found), got $LASTEXITCODE" }
           exit 0
+
+  # The floor the manifest claims, actually built. `rust-version` said 1.90 for
+  # months while the code compiled on 1.88 -- nothing tested it, so it drifted
+  # to whatever stable happened to be when it was written, and turned away two
+  # releases of Rust that would have worked. An MSRV nobody builds is a guess.
+  msrv:
+    name: build at the declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Read from the manifest rather than written here as well: a version in
+      # two places is a version that drifts, which is the fault this job exists
+      # to catch.
+      - id: msrv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - run: cargo --version && rustc --version
+
+      # No fmt or clippy here. Both track stable and would fail on an older
+      # toolchain for reasons that say nothing about whether the floor holds.
+      - name: Test
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release

@@ -213,6 +213,14 @@ before timing anything.
   tarball and `pip install ziglang`) are the ones `parity` and `formats` use, so they are known to
   work rather than assumed to. Bump the workflows and the README together, or the instructions
   quietly start installing a toolchain CI no longer builds with.
+- **`rust-version` is built, not asserted.** It said `1.90` for months while the code compiled
+  and passed every test on `1.88`; nothing tested the floor, so it drifted to whatever stable was
+  the day it was written and turned away two releases that would have worked. The `msrv` job in
+  `ci-rust.yml` now builds and tests at exactly the version the manifest names, reading it from
+  `Cargo.toml` rather than repeating it -- a version in two places is a version that drifts. It
+  runs no fmt or clippy: both track stable and would fail on an older toolchain for reasons that
+  say nothing about the floor. Raise the floor only when something actually needs it, and let the
+  job prove it.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
