@@ -85,6 +85,11 @@ int main(int argc, char** argv) {
         b_path = positional[1];
         if (opt.key.empty()) throw csvdiff::Error("--key is required");
 
+        // Nothing but the summary line is printed unless --json was given, and
+        // the summary is counts. Collecting the row samples then costs a pass
+        // over B for output nobody asked for.
+        opt.row_lists = !json_path.empty();
+
         const csvdiff::Result r = csvdiff::compare(a_path, b_path, opt);
 
         if (!json_path.empty()) {

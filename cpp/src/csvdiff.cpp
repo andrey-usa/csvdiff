@@ -1628,17 +1628,88 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             removed.total += part.removed_total - static_cast<std::int64_t>(part.removed.size());
         }
     };
-    auto b_side = [&] {
+    // B's keys, over every core rather than one.
+    //
+    // This pass was the wall clock. The A side already ran on `join_ways`
+    // threads while this one walked all of B on a single thread beside it, and
+    // a throwaway build that skipped it entirely measured 1.29x of wall -- so it
+    // was not a tail on the run, it was most of it. Every key here is
+    // independent of every other, exactly as on the A side.
+    //
+    // Each part keeps its own added rows, and the parts are concatenated in
+    // order afterwards. That matters: the report keeps the first `max_rows` of
+    // them, and pushing from several threads into one list would make *which*
+    // rows a truncated report shows depend on thread scheduling. `first_rows()`
+    // is in first-occurrence order, each part takes a contiguous range of it,
+    // so the concatenation is the order the single thread produced.
+    const std::vector<int>& b_keys = bi.first_rows();
+    const unsigned b_ways = b_keys.size() < (1u << 14) ? 1u : join_ways;
+    std::vector<std::vector<std::pair<int, int>>> b_parts(b_ways);
+    std::vector<std::int64_t> b_totals(b_ways, 0);
+    auto b_range = [&](unsigned p) {
         std::vector<Field> fb(width), probe(width);
-        for (int row : bi.first_rows()) {
+        const std::size_t lo = b_keys.size() * p / b_ways;
+        const std::size_t hi = b_keys.size() * (p + 1) / b_ways;
+        for (std::size_t at = lo; at < hi; ++at) {
+            const int row = b_keys[at];
             // Keys only: this pass asks whether B's key exists in A, and the
             // lookup compares key fields. The row's other nineteen columns are
             // parsed later, and only for the rows the report actually keeps.
             bi.keys_of(row, fb.data());
-            if (ai.lookup(b, fb.data(), bi.hash_of(row), probe.data()) < 0) added.push(row, -1);
+            if (ai.lookup(b, fb.data(), bi.hash_of(row), probe.data()) < 0) {
+                ++b_totals[p];
+                if (b_parts[p].size() <= opt.max_rows) b_parts[p].emplace_back(row, -1);
+            }
         }
     };
-    {
+    auto b_side = [&] {
+        std::vector<std::thread> workers;
+        std::vector<std::exception_ptr> failures(b_ways);
+        workers.reserve(b_ways - 1);
+        auto guarded = [&](unsigned p) {
+            try {
+                b_range(p);
+            } catch (...) {
+                failures[p] = std::current_exception();
+            }
+        };
+        for (unsigned p = 1; p < b_ways; ++p) {
+            try {
+                workers.emplace_back(guarded, p);
+            } catch (const std::system_error&) {
+                guarded(p);  // no thread to be had: the same work, here
+            }
+        }
+        guarded(0);
+        for (auto& w : workers) w.join();
+        for (const auto& f : failures)
+            if (f) std::rethrow_exception(f);
+        for (unsigned p = 0; p < b_ways; ++p) {
+            added.total += b_totals[p];
+            for (const auto& e : b_parts[p])
+                if (added.held.size() <= added.cap) added.held.push_back(e);
+        }
+    };
+    // `added` does not need a pass of its own to be *counted*.
+    //
+    // Every distinct key of A finds at most one distinct key of B, distinct
+    // keys of A cannot find the same key of B, and the comparison behind the
+    // lookup is symmetric -- so the number of B's keys with an A counterpart is
+    // exactly the `matched` the A pass already produced, and `added` is B's
+    // distinct keys minus it.
+    //
+    // What the pass is still for is the *sample*: this port has a report, and
+    // its added section names rows. So it runs when something will print them
+    // and not otherwise. Skipping it is worth 1.29x of wall -- it is a full
+    // random-probed pass over a second table, and threading it changed nothing
+    // because the machine was already busy with the A side. That is the whole
+    // difference between work moved and work removed.
+    if (!opt.row_lists) {
+        a_side();
+        std::int64_t seen = 0;
+        for (const Part& part : parts) seen += part.matched;
+        added.total = bi.unique_keys() - seen;
+    } else {
         std::exception_ptr failure;
         std::thread worker([&] {
             try {
