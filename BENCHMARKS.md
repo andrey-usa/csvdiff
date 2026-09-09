@@ -32,6 +32,26 @@ returning identical counts. A build that disagrees fails the run and is named;
 none of the tables here contains a build that was fast because it was answering
 a different question.
 
+**What this harness can and cannot resolve.** Measured, not assumed: running one
+build against a copy of itself, where the true answer is 1.00x.
+
+| Comparing two builds by | Same build twice reads as |
+|---|---:|
+| separate bests, one build's runs then the other's (hyperfine's model) | 15.8% apart, worst of eight |
+| separate bests, interleaved rounds | 8.3% apart, worst of eight |
+| separate bests, interleaved, 5 rounds → 15 rounds | 9.1% → **9.4%** |
+| the median of the per-round paired ratios | **1.01x** |
+
+The third row is the one that matters: three times the rounds did not help,
+because what this machine does is *drift*, not jitter, and averaging does not
+touch drift. Comparing the two builds *within* each round does, because the two
+runs are seconds apart under one machine state. `scripts/bench_ab.sh` does that
+and prints the middle half of the per-round ratios beside the median; where that
+half straddles 1.00x, there is no result to report.
+
+So: a difference under about 10% is invisible to a ratio of bests here, and
+about 3% is the floor for the paired one. Ratios below those are the machine.
+
 ---
 
 ## 2026-09-09 (later still, again) — proving a row unchanged from its bytes

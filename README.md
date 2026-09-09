@@ -119,9 +119,37 @@ instead, silently. See [ARCHIVE.md](ARCHIVE.md#the-field-measured-once-2026-surv
 # the data, in any of the three formats, on every core
 c/gen-data --rows 10m --out-dir /tmp/d --prefix p [--format json|parquet] [--threads N]
 
-# every port that reads the pair, interleaved, with a counts gate
+# two builds of one engine -- the inner loop of working on a port
+scripts/bench_ab.sh old/csvdiff new/csvdiff -- compare A.csv B.csv -k id
+scripts/bench_ab.sh --self-test c/csvdiff  -- compare A.csv B.csv -k id
+
+# every port that reads the pair, interleaved, with a counts gate and peak RSS
 python3 scripts/bench_ports.py A.csv B.csv --repeats 5
 ```
+
+### Measuring, and what this machine will let you see
+
+`bench_ab.sh` answers "did that change pay?" and is the one to reach for while
+working. It runs both builds once per round and reports the **median of the
+per-round ratios**, with the middle half of them beside it; where that half
+straddles 1.00x it says there is no result rather than leaving a ratio to be
+argued about.
+
+That design is not taste. Running all of one build's rounds and then all of the
+other's — which is what `hyperfine` and most harnesses do — reads **two copies
+of the same binary as 15.8% apart** on a shared runner, and going from five
+rounds to fifteen makes it *worse*, because what a shared machine does is drift
+rather than jitter and averaging does not touch drift. Comparing the two builds
+inside each round does: the same A/A test then reads 1.01x. `--self-test` runs
+exactly that, one build against a copy of itself, so the claim can be rechecked
+on whatever machine you are on rather than believed. The numbers are in
+[BENCHMARKS.md](BENCHMARKS.md#how-to-read-these).
+
+`hyperfine` is still worth having installed for a quick look — its warmup,
+standard deviation and `1.07 ± 0.20 times faster` are all better than a bare
+ratio, and that ± is the honest part. Just do not read its point estimate on
+anything under about 1.2x here: on two identical binaries it named a winner
+twice out of three and changed its mind about which.
 
 `c/gen-data` writes the same bytes as the C++ generator and is checked against
 it on sixteen shapes, including every thread count — it renders rows in waves
@@ -158,6 +186,7 @@ c/     the leading port on all three formats: CSV, ndjson, Parquet, plus gen-dat
 cpp/   the C++ port, and the generator that also writes Snappy
 rust/  the full contract and the HTML report
 zig/   the enforced memory budget
+scripts/bench_ab.sh      two builds of one engine, paired by round, with a no-result verdict
 scripts/bench_ports.py   every port on one pair, interleaved, with a counts gate
 scripts/bench_scale.py   one engine across every size, generating and deleting in turn
 tests/fixtures/          every shape that has broken an engine here

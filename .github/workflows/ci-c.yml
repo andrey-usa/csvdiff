@@ -59,6 +59,16 @@ jobs:
             exit 1
           fi
 
+      - name: Shell scripts parse
+        run: |
+          # The measurement harness and the suites are shell; a syntax error in
+          # one of them is only found when somebody reaches for it, which is
+          # exactly when they least want to debug it.
+          for f in scripts/*.sh c/test.sh cpp/test.sh rust/test.sh zig/test.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f" || { echo "::error::$f does not parse"; exit 1; }
+          done
+
       - name: What this runner is
         run: |
           ${{ matrix.cc }} --version | head -1
