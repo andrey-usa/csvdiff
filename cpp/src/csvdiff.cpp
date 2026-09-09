@@ -40,6 +40,7 @@ constexpr unsigned kLengthShift = 40;
 constexpr std::uint64_t kLengthMask = (1ULL << 23) - 1;
 constexpr std::uint64_t kEscaped = 1ULL << 63;
 constexpr std::uint64_t kMaxFieldLen = kLengthMask;
+constexpr unsigned kProofBackoff = 64;  // a power of two: the loop tests against it
 
 Field pack(std::size_t offset, std::size_t len, bool escaped) {
     if (len > kMaxFieldLen) return kTooLong;
@@ -81,11 +82,31 @@ std::uint64_t match_bits(std::uint64_t word, std::uint64_t target) {
 
 // Reads eight bytes as one little-endian word. The SWAR tricks below all assume
 // the first byte of the file is the lowest byte of the word.
+// How far two byte ranges agree, a word at a time.
+//
+// The join's expensive half is not the lookup -- it is what happens after one:
+// the mate's row is parsed a second time and every compared column is compared
+// byte by byte. But rows that match usually match because they are the same row
+// with one column moved, so comparing the two rows' raw bytes from the front
+// finds where they first diverge, and every compared column that closes before
+// that point is proven equal without the mate being parsed at all.
+inline std::size_t common_prefix(const char* x, const char* y, std::size_t n);
+
 std::uint64_t load64(const char* p) {
     std::uint64_t w;
     std::memcpy(&w, p, sizeof w);
     if constexpr (std::endian::native == std::endian::big) w = bswap64(w);
     return w;
+}
+
+inline std::size_t common_prefix(const char* x, const char* y, std::size_t n) {
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const std::uint64_t a = load64(x + i), b = load64(y + i);
+        if (a != b) return i + (static_cast<std::size_t>(__builtin_ctzll(a ^ b)) >> 3);
+    }
+    for (; i < n && x[i] == y[i]; ++i) {}
+    return i;
 }
 
 // The three scanners, chosen at build time rather than dispatched at run time:
@@ -655,6 +676,10 @@ class RowParser {
         return dialect_ == Dialect::Json ? wanted_.size() : source_.size();
     }
 
+    /// Slot -> the column it reads. The join needs it to decide whether the two
+    /// files lay their compared columns out the same way.
+    const std::vector<int>& source() const { return source_; }
+
     /// Key slots come first, so this is how far a key-only parse has to go.
     void set_key_size(std::size_t n) {
         key_size_ = n;
@@ -939,6 +964,13 @@ class RowIndex {
     void fields_of(int row, Field* out) const {
         parser_.parse(slab_.bytes(), row_start_[row], slab_.bytes().size(), out);
     }
+
+    /// Where this row's bytes stop: the next row's start, or the end of the file.
+    std::size_t row_end(int row) const {
+        const std::size_t next = static_cast<std::size_t>(row) + 1;
+        return next < row_start_.size() ? row_start_[next] : slab_.bytes().size();
+    }
+    std::size_t row_begin(int row) const { return row_start_[static_cast<std::size_t>(row)]; }
 
     /// This row's key fields, for a caller that compares nothing else.
     void keys_of(int row, Field* out) const {
@@ -1403,6 +1435,27 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     ap.set_key_size(key_size);
     bp.set_key_size(key_size);
 
+    // Can a prefix prove a row equal? Only where both files are CSV read with
+    // the same delimiter and every compared column sits at the same column
+    // number on both sides, ascending -- then equal bytes mean equal columns,
+    // and the last compared column is the one that closes last. Two headers
+    // that order the same columns differently would put the same bytes under
+    // different names, which is exactly what this refuses.
+    //
+    // JSON is excluded here. A value there is found by name, and a name
+    // repeated in one object takes its last value for a compared column, so a
+    // duplicate past the diverging byte could carry a value the prefix never
+    // saw. The C port rules that out with a bounded scan of the mate's tail;
+    // this one has not caught up yet.
+    const std::vector<int>& a_src = ap.source();
+    const std::vector<int>& b_src = bp.source();
+    bool aligned = a.dialect() != Dialect::Json && b.dialect() != Dialect::Json &&
+                   a_delim == b_delim && nc > 0 && a_src.size() == width &&
+                   b_src.size() == width;
+    for (std::size_t i = key_size; aligned && i < width; ++i)
+        aligned = a_src[i] >= 0 && a_src[i] == b_src[i] &&
+                  (i == key_size || a_src[i] > a_src[i - 1]);
+
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
     // each -- so the whole machine is busy, not just two of it. An exception
@@ -1476,6 +1529,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         const std::size_t lo = a_keys.size() * p / join_ways;
         const std::size_t hi = a_keys.size() * (p + 1) / join_ways;
         std::vector<Field> fa(width), fb(width), probe(width);
+        unsigned refused = 0;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
             ai.fields_of(row, fa.data());
@@ -1489,6 +1543,35 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
                 continue;
             }
             ++out.matched;
+            // A proof that keeps failing is a scan for nothing -- two files
+            // where every row really has changed pay for it on every row -- so
+            // after kProofBackoff failures in a row it is only attempted every
+            // kProofBackoff rows, until one succeeds and it is on again.
+            if (aligned && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+                const Field g = fa[width - 1];
+                if (is_real(g)) {
+                    const char* d = a.bytes().data();
+                    const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+                    const std::size_t b_lo = bi.row_begin(mate);
+                    const std::size_t b_n = bi.row_end(mate) - b_lo;
+                    // Through the byte that closes the last compared column,
+                    // not up to it. Agreeing as far as the field's last byte
+                    // says only that the mate's field starts the same way: `cc`
+                    // is a prefix of `cccccccc`, and a quoted field the mate
+                    // carries on with a doubled quote reads the same that far
+                    // too. It is the delimiter or the line ending after it that
+                    // says the mate's field stopped where this one did.
+                    std::size_t t = offset_of(g) + len_of(g);
+                    while (t < a_end && d[t] != a_delim && d[t] != '\n' && d[t] != '\r') ++t;
+                    const std::size_t need = t + 1 - a_lo;
+                    if (t < a_end && need <= b_n &&
+                        common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need) {
+                        refused = 0;
+                        continue;
+                    }
+                    if (refused < kProofBackoff) ++refused;
+                }
+            }
             bi.fields_of(mate, fb.data());
             bool any = false;
             for (std::size_t i = 0; i < nc; ++i) {
