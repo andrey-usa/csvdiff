@@ -430,6 +430,15 @@ const Rows = union(enum) {
     columnar: struct { fields: []Field, rows: usize },
 };
 
+/// How much of a candidate row a lookup has to parse.
+///
+/// The two directions of the join want different things from the row they land
+/// on. A's direction compares every column against its mate, so it needs the
+/// whole row and keeps it. B's direction is asking one question -- is this key in
+/// A? -- and discards the row it matched against; parsing the eighteen columns it
+/// will not look at is the largest thing that side was doing.
+const Want = enum { whole, keys };
+
 const Side = struct {
     gpa: std.mem.Allocator,
     slab: Slab,
@@ -447,6 +456,27 @@ const Side = struct {
             .columnar => |c| {
                 const from = @as(usize, @intCast(at)) * self.width;
                 @memcpy(out, c.fields[from..][0..self.width]);
+            },
+        }
+    }
+
+    /// The key columns of that row, and nothing else.
+    ///
+    /// The whole row is eighteen more fields than a key comparison reads, and a
+    /// parser stops at the last column it was asked for -- so asking for the two
+    /// key columns turns the rest of the row into one scan for the newline
+    /// instead of eighteen field boundaries packed into words nobody looks at.
+    /// This is the saving the sweep already takes, in the half of the engine
+    /// that only ever wanted a key.
+    ///
+    /// Fills `out[0..key_size]` and leaves the rest of the buffer as it was:
+    /// every caller reads the key columns alone.
+    fn keysAt(self: Side, at: u64, key_size: usize, out: []Field) void {
+        switch (self.rows) {
+            .text => |t| _ = t.keys.parse(self.slab.data, @intCast(at), self.slab.data.len, out),
+            .columnar => |c| {
+                const from = @as(usize, @intCast(at)) * self.width;
+                @memcpy(out[0..key_size], c.fields[from..][0..key_size]);
             },
         }
     }
@@ -758,10 +788,10 @@ const RowIndex = struct {
                     // the sweep because the sweep produced ten million of them and
                     // this branch wants one.
                     if (!mine_parsed) {
-                        self.side.fieldsAt(at, self.mine);
+                        self.side.keysAt(at, self.key_size, self.mine);
                         mine_parsed = true;
                     }
-                    self.fieldsOf(candidate, self.probe);
+                    self.keysOf(candidate, self.probe);
                     var ok = true;
                     for (0..self.key_size) |i| {
                         if (!(try same(self.side.slab, self.probe[i], self.side.slab, self.mine[i], self.opt, s))) {
@@ -786,6 +816,10 @@ const RowIndex = struct {
 
     fn fieldsOf(self: RowIndex, row: i32, out: []Field) void {
         self.side.fieldsAt(self.row_at.items[@intCast(row)], out);
+    }
+
+    fn keysOf(self: RowIndex, row: i32, out: []Field) void {
+        self.side.keysAt(self.row_at.items[@intCast(row)], self.key_size, out);
     }
 
     /// The high bits of an FNV hash are the well-mixed ones; fold them down.
@@ -825,15 +859,20 @@ const RowIndex = struct {
     /// scratch the caller owns: the join runs several chunks at once, and a buffer
     /// hanging off the index would be shared between them.
     ///
-    /// On a hit, `probe` holds that row's fields — it is what the key columns were
-    /// compared against. The join used to read the row again on the line after
-    /// this one returned, which is a second parse of every matched row in the
-    /// file.
+    /// On a hit, `probe` holds as much of that row as `want` asked for — it is
+    /// what the key columns were compared against. The join used to read the row
+    /// again on the line after this one returned, which is a second parse of
+    /// every matched row in the file.
+    ///
+    /// `want` is `.whole` for the side that goes on to compare the columns, and
+    /// `.keys` for the side that only asks whether the key exists at all and
+    /// throws the answer away.
     fn lookup(
         self: *const RowIndex,
         other: Slab,
         fields: []const Field,
         hash: u64,
+        want: Want,
         s: *Scratch,
         probe: []Field,
     ) !?i32 {
@@ -845,7 +884,10 @@ const RowIndex = struct {
             if (tagIs(word, hash)) {
                 const candidate = self.first_row.items[posOf(word)];
                 if (self.row_hash.items[@intCast(candidate)] == hash) {
-                    self.fieldsOf(candidate, probe);
+                    switch (want) {
+                        .whole => self.fieldsOf(candidate, probe),
+                        .keys => self.keysOf(candidate, probe),
+                    }
                     var ok = true;
                     for (0..self.key_size) |i| {
                         if (!(try same(self.side.slab, probe[i], other, fields[i], self.opt, s))) {
@@ -1175,7 +1217,7 @@ const Join = struct {
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             const hash = self.ai.row_hash.items[@intCast(row)];
-            _ = (try self.bi.lookup(self.a.slab, fa, hash, &s, fb)) orelse {
+            _ = (try self.bi.lookup(self.a.slab, fa, hash, .whole, &s, fb)) orelse {
                 out.removed += 1;
                 continue;
             };
@@ -1246,9 +1288,11 @@ const Join = struct {
             if (j + PREFETCH_AHEAD < mine.len) {
                 self.ai.prefetch(self.bi.row_hash.items[@intCast(mine[j + PREFETCH_AHEAD])]);
             }
-            self.bi.fieldsOf(row, fb);
+            // Only the key columns: this side compares nothing else, and the row
+            // it is about to probe against is discarded either way.
+            self.bi.keysOf(row, fb);
             const hash = self.bi.row_hash.items[@intCast(row)];
-            if ((try self.ai.lookup(self.b.slab, fb, hash, &s, probe)) == null) out.added += 1;
+            if ((try self.ai.lookup(self.b.slab, fb, hash, .keys, &s, probe)) == null) out.added += 1;
         }
     }
 };
