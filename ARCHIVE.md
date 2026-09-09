@@ -75,7 +75,7 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Framing ndjson rows on the newline byte alone** | valid JSON cannot hold a raw control character in a string, so the quote-tracking scan the row end used was guarding against something the format forbids: 1.58x wall and 1.72x CPU on ndjson, with about twenty string walks a row removed |
 | **Stopping the key-only JSON parse once the keys are found** | needs the key columns to be first-wins in both parses, or the two disagree about a row's key and the lookup misses its own row |
 | **Reading only the key columns where only keys are read** | C's CSV path: 2.66x at two million rows, **3.65x at ten million** — the gain grows with the size, because past cache the parses removed were memory traffic and not only instructions |
-| **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries |
+| **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries — on the host that measured it; see the row below, where the same change loses on another machine |
 | **Writing the generator's two sides at once** | 2.0x on Parquet by itself, where splitting a row group's twenty columns — the split the design points at — is 1.28x |
 | **Deleting the dataframe engines from the Rust port** | a cold build went from twenty minutes to twenty seconds; nothing measured them any more |
 
@@ -91,6 +91,7 @@ that branch's own record; what this project measured of them is the joint run in
 | **Joining both sides from one queue** | replaces two passes with one, and stops deep-copying the sorted rows |
 | **Writing the index's zeroes rather than asking the kernel** | faulting a fresh mapping in costs more than touching memory already owned |
 | **Prefetch distance 32** | their tuning; this port measured 24 on the same shape, so the optimum is a property of the machine as much as the code |
+| **Huge pages on the slot table — on this host only** | 1.38s → 0.59s here, and a **loss** on theirs (+0.7% to +3.2% wall, CPU −3%, with the pages confirmed granted). One change, two machines, opposite verdicts: it is not general advice |
 | **AVX-512** | wins on a CPU that has it, which hosted runners mostly do not — their own note says the 64-byte builds skip themselves |
 
 ### Not worth it — measured, and recorded so it is not retried

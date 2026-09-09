@@ -41,9 +41,7 @@ one id space a cell comparison becomes `int32 != int32` rather than a string
 comparison. No port is within 2x of the C one there.
 
 **Nobody holds all three.** C takes Parquet by 2x and CSV by 9%; Zig takes
-ndjson by 23%. The C JSON path still walks every object to its closing brace,
-which is the cost the rest of its parse work could not remove — that is a known
-open item, not a mystery.
+ndjson by 23%.
 
 **Read the CPU column, not the wall column.** Wall time mixes work with how many
 cores a design manages to use; CPU seconds do not. Every row here is within 4x
@@ -52,14 +50,18 @@ scheduling — which is exactly how the C port found the change that took its CS
 row from 14.82s to 4.16s in a day: not by threading harder, but because 57
 CPU-seconds against a rival's 24 said it was doing twice the work.
 
-> Every Rust and Zig cell above, and the C++ cells on CSV and ndjson, come from
-> `claude/data-comparison-rust-zig-jam00m` at `0569a39`, which carries those
-> ports' rewritten engines; the C cells and C++ on Parquet come from this tree.
-> The run built both trees and gave each its own column rather than merging two
-> branches in order to measure them — two builds compared across two sittings
-> are not compared at all. This tree's own Rust and Zig are superseded by those
-> columns and are left out here; they are in
-> [BENCHMARKS.md](BENCHMARKS.md), which keeps every row a run produced.
+> **Where the columns come from, and how stale they are.** Rust and Zig, and
+> C++ on the text formats, are built from
+> `claude/data-comparison-rust-zig-jam00m` at `0569a39`; C and C++ on Parquet
+> from this tree. One runner built both, because two builds measured in two
+> sittings are not compared at all.
+>
+> Both trees have moved since. The C ndjson path is 1.58x quicker than the cell
+> above (measured at two million rows, not yet at ten), and that branch's
+> Parquet is near 3.6s in its own runs. Neither number belongs in this table
+> until one runner produces them together — which is the whole point of the
+> table, and the reason it is a snapshot with a date on it rather than a
+> scoreboard.
 
 ---
 
@@ -97,9 +99,9 @@ another Parquet file; CSV and ndjson compare against each other.
 | **[`rust/`](rust/)** | CSV, Parquet | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | ndjson |
 | **[`zig/`](zig/)** | CSV, Parquet | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report, no ndjson |
 
-Every port now builds from its own toolchain alone, in seconds: the Rust one
-carried a bundled DuckDB and the polars and arrow chain until they were removed,
-and a cold build went from twenty minutes to twenty seconds.
+Every port builds from its own toolchain alone, in seconds, and carries no
+runtime dependency with a comparison engine in it. What was removed to get
+there, and what it measured before it went, is in [ARCHIVE.md](ARCHIVE.md).
 
 ### Duplicate keys
 
@@ -145,6 +147,7 @@ blank row, and a short key in the last bytes of the file.
 | Workflow | Runs |
 |---|---|
 | `ci-c.yml` | the C port on gcc and clang, sanitizers, and the cross-port checks |
+| `ci-rust.yml` | `fmt`, `clippy -D warnings`, `cargo test`, and the engines agreeing on 200k rows |
 | `parity.yml` | every port returns identical counts, and every generator emits byte-identical files |
 | `benchmark-native.yml` | C and C++ on every push; all four, and any second ref, on demand |
 
@@ -169,8 +172,8 @@ tests/fixtures/          every shape that has broken an engine here
 1. **ndjson, again.** 1.58x came from framing rows on the newline byte and
    letting the key-only parse stop once it has the keys. What is left is the
    join, which still parses a matched row in full on both sides.
-2. **Where the C CSV path stops scaling.** 14.5 CPU-seconds over 4.06s of wall
-   is 3.57 of four cores, and what is left sequential is the table insertion.
+2. **Where the C CSV path stops scaling.** 14.9 CPU-seconds over 4.16s of wall
+   is 3.58 of four cores, and what is left sequential is the table insertion.
 3. **Reconciling the two Zig Parquet readers.** This tree and
    `claude/data-comparison-rust-zig-jam00m` each wrote one; `git merge` reports
    them as an add/add conflict.

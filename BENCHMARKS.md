@@ -34,6 +34,33 @@ a different question.
 
 ---
 
+## 2026-09-09 — the other branch's Parquet, on its own runner
+
+Not this project's harness and **not comparable with the tables below** — one
+tree, its own workflow (`bench-10m.yml`), its own runner. Recorded because they
+are real measurements of ports this project's table has columns for, and because
+the next joint run will want a baseline to be surprised against.
+
+Ten million rows, uncompressed Parquet, from
+`claude/data-comparison-rust-zig-jam00m`:
+
+| Build | Before | After | | Run |
+|---|---:|---:|---:|---|
+| Zig columnar | 4.627s | 3.624s | −21.7% | [22](https://github.com/andrey-usa/csvdiff/actions/runs/34304998876) |
+| Rust columnar | 5.711s | 3.688s | −35.4% | [23](https://github.com/andrey-usa/csvdiff/actions/runs/34305285040) |
+
+Both from prefetching the index probe — the change this port measured at
+1.79s → 1.39s on its build and 1.21s → 0.88s on its join. Their write-up notes
+one divergence worth keeping: **huge pages on the slot table are a loss on their
+host**, +0.7% to +3.2% on wall with CPU down 3%, where this port measured
+1.38s → 0.59s. Two machines, one change, opposite verdicts. Same shape as the
+AVX-512 result, and a reason neither of us should commit that advice as general.
+
+For where those ports stood against this one on a single runner, see the joint
+run below; it is the last measurement in which all four were built together.
+
+---
+
 ## 2026-09-09 (later) — the C ndjson path
 
 One 4-core / 16 GB container, 2,000,000 rows, five interleaved rounds, both
