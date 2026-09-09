@@ -64,7 +64,7 @@ other branch's agent that pointed this out.
 
 ---
 
-## 2026-09-09 (later) — what a row parse costs, and a change that did not pay
+## 2026-09-09 (after the `added` pass) — what a row parse costs, and a change that did not pay
 
 One 4-core / 16 GB container, 1,000,000 rows, thirteen interleaved rounds,
 `--max-rows 1` so the capped report does not sit in the denominator.
@@ -112,6 +112,80 @@ is a statement about one million rows and not about ten: the row sections are
 capped at fifty thousand, so everything under "report" here is roughly constant
 while the rest grows with the file. At ten million the same split reads 1.81s of
 engine against 0.40s of report.
+
+---
+
+## 2026-09-09 (profiling) — three questions, and what the answers cost
+
+One 4-core / 16 GB container. Not a table of ports against each other: three
+things the README listed as open, measured until they stopped being open.
+
+### 1. The serial index insert
+
+The claim was that CPU over wall bounds the remaining parallelism at about
+1.25x, and that pipelining the insert against the sweep had not been tried.
+Both halves need correcting.
+
+**The prize is real but small, and it shrinks with width.** The insert is
+0.08–0.18s per file inside a ~0.47s run at 2M rows and 20 columns. At 200
+columns it is **0.006s of a 0.43s run — 1.4%**.
+
+**And it is blocked by allocation rather than by ordering**, which is why
+nobody had tried it: `row_start`, `row_hash` and the table capacity are all
+sized from the total row count, and that is only known once the last chunk is
+swept. An insert cannot start on chunk 0 while chunk 3 is still being read,
+because it has nowhere to put anything yet. Past that needs a counting pass
+over the bytes first — about 0.35s at 10M against a 0.09s prize — or a size
+estimate, which puts back the rehash that sizing-once removed.
+
+### 2. ndjson, at 0.34 GB/s per core against CSV's 0.45
+
+The format costs **1.46x more per byte**, and the standing hypothesis was the
+per-field name lookup, which CSV does not do at all. An unsound build that
+resolves fields positionally instead of by name prices it:
+
+| | Wall | CPU |
+|---|---:|---:|
+| name lookup removed entirely | 1.10x | **1.14x** |
+
+So 12% of CPU, against a 46% gap. It is not the explanation, and nothing else
+structural is hiding either: what is left is the format — two delimiters to
+scan for instead of one, escape handling, and a quote pair around every value.
+ndjson is 2.4x the bytes of CSV for the same rows and costs 3.5x the CPU; the
+1.46x between those is the format being self-describing, not a defect.
+
+That number moved, and how it moved is worth keeping. The same probe measured
+**9% before** the byte proof and the key-only parse landed. The lookup did not
+get slower; everything around it got faster.
+
+### 3. Wide files
+
+200,000 rows at 20 columns against the same rows widened to 200, same keys,
+same diffs — only the ratio of key work to cell work changes.
+
+| | Input | Wall | CPU | Per core-second |
+|---|---:|---:|---:|---:|
+| 20 columns | 70 MB | 0.053s | 0.16s | 0.42 GB/s |
+| 200 columns | 661 MB | 0.435s | 1.58s | **0.41 GB/s** |
+
+**Throughput is flat across a tenfold change in width.** What changes is where
+the time is: the join goes from about half the run to **74%**, the whole index
+build falls to 24%, and the serial insert of question 1 becomes 1.4%.
+
+**The SIMD question does not re-open there.** That was the reason to look: a
+200-column row is 1.6 KB, and the byte proof scans nearly all of it. Widening
+the compare from 8 bytes a step to 32 measured **no result at either width** —
+so even where the scan is longest, the compare is not what the loop waits on.
+
+### A trap worth naming
+
+The first wide run reported `changed 199,800` of 199,800 matched. `--ignore
+updated_at` named a column that does not exist in a widened file, where the
+eleven copies are `updated_at_0` … `updated_at_10`; nothing was ignored, every
+row differed, and the byte proof never fired. **All four ports accept an
+`--ignore` name that matches nothing, in silence** — where `--key` with a name
+that matches nothing is an error. The asymmetry is the trap: a missing key
+makes the answer impossible, and a missing ignore quietly makes it wider.
 
 ---
 
