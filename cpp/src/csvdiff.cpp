@@ -940,6 +940,11 @@ class RowIndex {
         parser_.parse(slab_.bytes(), row_start_[row], slab_.bytes().size(), out);
     }
 
+    /// This row's key fields, for a caller that compares nothing else.
+    void keys_of(int row, Field* out) const {
+        parser_.parse_keys(slab_.bytes(), row_start_[row], slab_.bytes().size(), out);
+    }
+
     // The row carrying `fields`' key, or -1. `other` is the slab those fields
     // live in, which is the opposite file when this is a join probe. `probe` is
     // scratch the caller owns: the join runs both directions at once, and a
@@ -951,7 +956,7 @@ class RowIndex {
             if (at == kEmpty) return -1;
             const int candidate = first_row_[at];
             if (row_hash_[candidate] == hash) {
-                fields_of(candidate, probe);
+                keys_of(candidate, probe);
                 bool ok = true;
                 for (std::size_t i = 0; i < key_size_ && ok; ++i)
                     ok = same(slab_, probe[i], other, fields[i], opt_);
@@ -1106,10 +1111,13 @@ class RowIndex {
             const int candidate = first_row_[at];
             if (row_hash_[candidate] == hash) {
                 if (!mine_parsed) {
-                    parser_.parse(slab_.bytes(), start, slab_.bytes().size(), mine);
+                    // Keys only, like the candidate it is about to be compared
+                    // with: this branch decides whether two rows carry the same
+                    // key, and looks at nothing else.
+                    parser_.parse_keys(slab_.bytes(), start, slab_.bytes().size(), mine);
                     mine_parsed = true;
                 }
-                fields_of(candidate, probe);
+                keys_of(candidate, probe);
                 bool ok = true;
                 for (std::size_t i = 0; i < key_size_ && ok; ++i)
                     ok = same(slab_, probe[i], slab_, mine[i], opt_);
@@ -1540,7 +1548,10 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     auto b_side = [&] {
         std::vector<Field> fb(width), probe(width);
         for (int row : bi.first_rows()) {
-            bi.fields_of(row, fb.data());
+            // Keys only: this pass asks whether B's key exists in A, and the
+            // lookup compares key fields. The row's other nineteen columns are
+            // parsed later, and only for the rows the report actually keeps.
+            bi.keys_of(row, fb.data());
             if (ai.lookup(b, fb.data(), bi.hash_of(row), probe.data()) < 0) added.push(row, -1);
         }
     };
