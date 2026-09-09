@@ -109,9 +109,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: env.ALL_PORTS == '1'
         with:
+          # `alt/rust` only exists when an alt ref was checked out. Listing it
+          # unconditionally makes the cache's cleanup step run `cargo metadata`
+          # in a directory that is not there and print an error -- harmless, the
+          # run still passes, but an error in a green log is how a real one gets
+          # scrolled past. Now that both branches are merged the usual run has
+          # no alt ref at all.
           workspaces: |
             rust
-            alt/rust
+            ${{ github.event.inputs.alt_ref != '' && 'alt/rust' || '' }}
       - name: Install Zig
         if: env.ALL_PORTS == '1'
         run: |
