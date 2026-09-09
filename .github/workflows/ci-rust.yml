@@ -163,13 +163,16 @@ jobs:
               --engine turbo -o report.html --no-compress || code=$?
           [ "$code" = 1 ] || { echo "::error::expected exit 1 (differences found), got $code"; exit 1; }
           grep -q "CHANGED" report.html || { echo "::error::the report does not name the changed value"; exit 1; }
-      # The README hands a Windows reader these two commands, in this order,
-      # from `rust\`. They used to name two files that did not exist, so the
-      # first thing a new reader ran failed. Run them here rather than trust
-      # that they still line up: the generator is the only way a Windows user
-      # without WSL gets a pair to compare at all.
-      - name: Generate a pair the README's way, and compare it
+      # The README hands a Windows reader these three commands, in this order,
+      # and says to run them from the repository root. Both halves have already
+      # been wrong once: the examples named two files nothing produces, and then
+      # the paths were written from `rust\` while the bash ones were written from
+      # the root, so a reader in the wrong directory got `No such file`. This
+      # step runs them as written, from the root -- note `working-directory`
+      # overriding the workflow default -- so neither can drift again.
+      - name: Run the README's Windows commands, from the repository root
         shell: pwsh
+        working-directory: ${{ github.workspace }}
         run: |
           # A compare exits 1 by design, and two things in GitHub's pwsh would
           # turn that into a failed step: from PowerShell 7.4 a native command's
@@ -177,9 +180,11 @@ jobs:
           # the wrapper sets; and the wrapper appends `exit $LASTEXITCODE`. So
           # opt out of the first and end with an explicit `exit 0`.
           $PSNativeCommandUseErrorActionPreference = $false
-          .\target\release\gen-data.exe --rows 10k --out-dir ..\data --prefix demo
+          cargo build --release --manifest-path rust\Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw "the README's build line exited $LASTEXITCODE" }
+          rust\target\release\gen-data.exe --rows 10k --out-dir data --prefix demo
           if ($LASTEXITCODE -ne 0) { throw "gen-data exited $LASTEXITCODE" }
-          .\target\release\csvdiff.exe compare ..\data\demo_a.csv ..\data\demo_b.csv `
+          rust\target\release\csvdiff.exe compare data\demo_a.csv data\demo_b.csv `
               -k account_id,txn_id -i updated_at
           if ($LASTEXITCODE -ne 1) { throw "expected exit 1 (differences found), got $LASTEXITCODE" }
           exit 0

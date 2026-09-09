@@ -64,6 +64,13 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 
 ## Building and running
 
+> **Run every command in this section from the repository root** — the directory
+> holding `c/`, `rust/` and this file. Every path below is written relative to it,
+> in bash and in PowerShell alike, so that one rule covers the whole section. If
+> you are inside a port's directory, `cd ..` first: from `c/`, `c/gen-data` is
+> `No such file or directory`, and `./gen-data` would work but write its pair
+> into `c/data/` rather than the `data/` the commands below then read.
+
 ### What runs where
 
 Linux and Windows are tested. macOS is not, so that column is what the source
@@ -100,9 +107,10 @@ pulls in nothing that contains a comparison engine.
 ```
 
 ```powershell
-# Windows, PowerShell — the Rust port is the one that builds without WSL
-cd rust
-cargo build --release
+# Windows, PowerShell — the Rust port is the one that builds without WSL.
+# --manifest-path so this runs from the root like everything else; the
+# binaries still land in rust\target\release\.
+cargo build --release --manifest-path rust\Cargo.toml
 ```
 
 For the other three on Windows, install WSL (`wsl --install`) and use the bash
@@ -123,8 +131,8 @@ c/gen-data --rows 1m --out-dir data --prefix demo
 ```
 
 ```powershell
-# Windows, PowerShell — from the rust\ directory, after the build above
-.\target\release\gen-data.exe --rows 1m --out-dir ..\data --prefix demo
+# Windows, PowerShell — after the build above
+rust\target\release\gen-data.exe --rows 1m --out-dir data --prefix demo
 ```
 
 Either writes `data/demo_a.csv` and `data/demo_b.csv`, 184 MB each: 1,000,100
@@ -152,7 +160,7 @@ c/csvdiff compare data/demo_a.csv data/demo_b.csv -k account_id,txn_id \
   -i updated_at --json summary.json --threads 4
 
 # the Rust port is the one with the self-contained HTML report -- and the one
-# that runs on Windows, as `.\target\release\csvdiff.exe` with the same flags
+# that runs on Windows, as `rust\target\release\csvdiff.exe` with the same flags
 rust/target/release/csvdiff compare data/demo_a.csv data/demo_b.csv \
   -k account_id,txn_id -i updated_at -o report.html
 ```
