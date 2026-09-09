@@ -91,10 +91,10 @@ another Parquet file; CSV and ndjson compare against each other.
 
 | | Reads | Notable | Not there |
 |---|---|---|---|
-| **[`c/`](c/)** | CSV, ndjson, uncompressed Parquet | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
-| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet **including Snappy** | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report |
-| **[`rust/`](rust/)** | CSV, ndjson, Parquet | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
-| **[`zig/`](zig/)** | CSV, ndjson, Parquet | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report |
+| **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed only) | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
+| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report; no codec but snappy |
+| **[`rust/`](rust/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
+| **[`zig/`](zig/)** | CSV, ndjson, Parquet (snappy, gzip, zstd, lz4, brotli) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for; the widest codec support here | no HTML report |
 
 Every port builds from its own toolchain alone, in seconds, and carries no
 runtime dependency with a comparison engine in it. What was removed to get
@@ -195,25 +195,31 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **ndjson, again.** It has the byte proof now — 1.29x of CPU, against a 1.47x
-   ceiling measured with a deliberately unsound build first — so what is left of
-   the join is the 6% of rows that really changed and the rows the proof
-   refuses. Past that, the floor is the byte scanning itself: this format costs
-   3.6x the Parquet time on four times the bytes, and no amount of join work
-   changes that.
-2. **Where the C CSV path stops scaling.** The join has given up most of what
-   it was doing, so the sequential table insertion is now the larger share of
-   the run rather than a tail on it. Sharding it by hash was measured and lost
-   — the routing costs more than the serial insert it replaces — so what is
-   left is to pipeline it against the sweep, inserting a chunk's rows while the
-   next chunk is still being read. Total CPU over wall says the whole remaining
-   prize is about 1.25x.
-3. **Reconciling the two Zig Parquet readers.** This tree and
-   `claude/data-comparison-rust-zig-jam00m` each wrote one; `git merge` reports
-   them as an add/add conflict.
-4. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
+1. **The byte proof reaches ndjson in one port out of four.** Settling a matched
+   row from its raw bytes is not C's alone — all four do it for CSV, each with
+   the same guard that two headers ordering the same columns differently would
+   break it, and Zig's `sharedTail` says so in as many words. What is C-only is
+   the JSON form, because a name repeated in one object takes its last value and
+   a prefix cannot see that; C rules it out with a bounded scan of the mate's
+   tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
+   the largest thing left here.
+2. **`--ignore` accepts a name that matches nothing, in silence** — in all four
+   ports, where `--key` with a name that matches nothing is an error. A missing
+   key makes the answer impossible; a missing ignore quietly makes it wider. It
+   cost a benchmark run here that reported every row as changed. Whether to
+   warn or to refuse is a contract decision across four ports.
+3. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-5. **Wide files.** Everything here is 20 columns. 200 would change the ratio of
-   key work to cell work, and probably the ranking — and would re-open the SIMD
-   question, since longer rows mean longer scans.
+4. **Compression.** Parquet here is generated uncompressed by choice, so no
+   table has ever measured a codec. Three ports could: Rust and Zig read snappy,
+   gzip, zstd, lz4 and brotli, C++ reads snappy alone, and C carries no codec at
+   all — the same choice its reader makes. What decompression costs against what
+   it saves in bytes read is unmeasured on one host.
+
+Three things that used to be on this list have been measured off it, and the
+numbers are in [BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
+the serial insert (blocked by allocation rather than ordering, and 1.4% of a
+200-column run), ndjson's cost per byte (the format, not a defect — name lookups
+are 12% of a 46% gap), and wide files (throughput flat from 20 columns to 200,
+and the SIMD question does not re-open there).
