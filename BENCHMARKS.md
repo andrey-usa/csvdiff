@@ -52,6 +52,15 @@ half straddles 1.00x, there is no result to report.
 So: a difference under about 10% is invisible to a ratio of bests here, and
 about 3% is the floor for the paired one. Ratios below those are the machine.
 
+**Every cross-port table above 2026-09-09 10:00 was built unfairly**, and is
+kept rather than deleted because the numbers within each port are still that
+port's. C and C++ carry `-march=native`; Rust and Zig were given a generic
+baseline, which compiles their wide scanners out entirely — the Rust one is
+selected by `cfg!(target_feature = "avx2")` and the Zig one by the cpu it is
+handed. So the C-versus-Rust and C-versus-Zig ratios in those tables are
+partly build flags. The workflow now builds every port for the runner it is
+measured on. It was the other branch's agent that pointed this out.
+
 ---
 
 ## 2026-09-09 (joint run, second) — the byte proof at ten million rows

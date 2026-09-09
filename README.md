@@ -67,6 +67,15 @@ raw bytes without either side being parsed.
 > The ndjson row is measured over five builds rather than seven: that branch's
 > Rust and Zig read ndjson and this tree's do not, so this tree's two were
 > dropped by the harness rather than given a slow number.
+>
+> **This table overstates the C lead, and is being re-measured.** C and C++
+> carry `-march=native` in their makefiles; Rust and Zig were built for a
+> generic baseline. That is not a codegen detail — the Rust scanner selects
+> itself on `cfg!(target_feature = "avx2")` and the Zig one on the cpu it is
+> given, so a baseline build compiles the wide scanner out of both. Some part
+> of the ratios above is a lead in build flags rather than in design. The
+> workflow now gives every port the machine it is measured on; this table
+> stands until the run under those flags replaces it.
 ---
 
 ## Using it

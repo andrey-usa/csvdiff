@@ -105,13 +105,29 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Every port compiled for the machine it is about to be measured on.
+      #
+      # C and C++ have carried `-march=native` in their makefiles since the
+      # first table, and Rust and Zig were built for a generic baseline -- so
+      # two of the four columns were tuned to the runner and two were not, in
+      # favour of the two this project publishes as winners. Worse than a few
+      # percent of codegen: the Rust scanner selects itself on
+      # `cfg!(target_feature = "avx2")` and the Zig one on the cpu it is given,
+      # so a baseline build compiles the wide scanner out of both of them
+      # entirely. A lead measured that way is partly a lead in build flags.
+      #
+      # Each tree keeps its *own* defaults for anything else -- the alt tree's
+      # `-Dscan=` width among them, which is that branch's tuning question and
+      # not this workflow's to guess at.
       - name: Build
+        env:
+          RUSTFLAGS: -C target-cpu=native
         run: |
           make -C c
           make -C cpp
           if [ "${ALL_PORTS:-}" = 1 ]; then
             cargo build --release --manifest-path rust/Cargo.toml
-            (cd zig && zig build --release=fast)
+            (cd zig && zig build --release=fast -Dcpu=native)
           fi
 
       # The alt tree's builds are allowed to fail without ending the run: it is
@@ -122,6 +138,8 @@ jobs:
       - name: Build the alt ref's Rust and Zig
         if: env.ALL_PORTS == '1' && github.event.inputs.alt_ref != ''
         continue-on-error: true
+        env:
+          RUSTFLAGS: -C target-cpu=native
         run: |
           set -x
           make -C alt/cpp || true
@@ -131,7 +149,11 @@ jobs:
           # a ref where the flag does not apply -- this tree, for one.
           cargo build --release --no-default-features --manifest-path alt/rust/Cargo.toml \
               || cargo build --release --manifest-path alt/rust/Cargo.toml || true
-          (cd alt/zig && zig build --release=fast) || true
+          # `-Dcpu=native` first, then without: a ref whose build.zig predates
+          # standardTargetOptions would reject the flag, and a missing column is
+          # worse than an untuned one.
+          (cd alt/zig && zig build --release=fast -Dcpu=native) \
+              || (cd alt/zig && zig build --release=fast) || true
           ls -l alt/cpp/build/csvdiff alt/rust/target/release/csvdiff \
                 alt/zig/zig-out/bin/csvdiff || true
 
