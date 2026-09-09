@@ -202,6 +202,32 @@ two that are known to work.
 > Windows editor, `\\wsl$\Ubuntu\home\you\csvdiff` reaches it from the
 > Windows side.
 
+It is not only slow there. The Zig build is the first thing to break on a
+Windows drive, and it does not break in a way that names the cause:
+
+```
+error: failed to rename compilation results ('.zig-cache/tmp/14aaf8cf27fc0150')
+  into local cache ('.zig-cache/o/7691fdba880312cb541a0fac7ef59a22'): AccessDenied
+```
+
+Zig commits a build by renaming it into `.zig-cache/o/` and hardlinking, and
+the Windows drive mount supports neither properly. Two commands say which of
+the two causes you have:
+
+```bash
+pwd                          # under /mnt/c ?
+ls -ld .zig-cache .zig-cache/o
+```
+
+| What you see | Fix |
+|---|---|
+| `pwd` is under `/mnt/c` | Clone into `~/` and build there. No flag works around it. |
+| `.zig-cache` is owned by `root` | A `sudo zig build` left it that way: `sudo rm -rf .zig-cache zig-out`, then build **without** sudo. |
+
+The Zig install above needs `sudo` only to write into `/opt`. Nothing in this
+repository should be built with it — and if `/opt` is not yours to write to,
+the PyPI route needs no root at all.
+
 ### Getting a pair to compare
 
 **Already have two files?** Skip this section, and substitute your paths and your
