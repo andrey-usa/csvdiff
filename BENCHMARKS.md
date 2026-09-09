@@ -64,6 +64,57 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-09 (later) — what a row parse costs, and a change that did not pay
+
+One 4-core / 16 GB container, 1,000,000 rows, thirteen interleaved rounds,
+`--max-rows 1` so the capped report does not sit in the denominator.
+
+| Build | Median | Best |
+|---|---:|---:|
+| Rust, as merged | 0.2585s | 0.2521s |
+| Rust, scanning A's run instead of parsing it | 0.2530s | 0.2389s |
+| | **-2.1%** | -5.2% |
+
+**Not kept.** Two per cent of the engine is about 1.7% of the Rust row at ten
+million, which is inside what that benchmark can resolve, and the change costs a
+const-generic split of the hottest loop in the port plus a second probe walk for
+every pair the bytes do not settle.
+
+The reasoning that led there was sound and the measurement is the useful part.
+With the byte shortcut in place, a matched pair whose bytes agree needs one thing
+from A's row — where the run of bytes ends — and the parse packs nineteen `Field`
+words to find it that nobody then reads. That is 94% of pairs on this payload. A
+scan that finds the same end and stores nothing should have been most of a parse
+cheaper.
+
+It is not, and that is the finding: **the scanning is what a row parse costs,
+not the packing.** Isolating them says the same thing — a build that parses A and
+stops runs the join phase in 0.072s against 0.059s for one that scans and stops,
+so packing nineteen fields is 0.013s of a 0.137s phase. Against that, the 6% of
+pairs the bytes do not settle now scan twice and probe twice, and the remainder
+is small enough to argue with.
+
+Where the join's time goes at one million rows, after the `added` pass was
+removed, is now:
+
+| Phase | | |
+|---|---:|---:|
+| row values (parallel) | 0.126s | 21% |
+| join chunks (parallel) | 0.115s | 19% |
+| assemble | 0.110s | 18% |
+| sweep, A and B at once | 0.070s | 12% |
+| index insert | 0.065s | 11% |
+| sorts (serial) | 0.065s | 11% |
+| changed cells (parallel) | 0.024s | 4% |
+
+The join is no longer the largest thing in the run; building the report is. That
+is a statement about one million rows and not about ten: the row sections are
+capped at fifty thousand, so everything under "report" here is roughly constant
+while the rest grows with the file. At ten million the same split reads 1.81s of
+engine against 0.40s of report.
+
+---
+
 ## 2026-09-09 (joint run, fourth) — one tree, four ports
 
 One GitHub Actions runner (4 vCPU / 16 GB), 10,000,000 rows × 20 columns, keyed
