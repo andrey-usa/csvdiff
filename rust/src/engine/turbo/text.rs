@@ -289,6 +289,44 @@ fn name_hash(s: &[u8]) -> u64 {
     h ^ (h >> 32)
 }
 
+/// Where the wanted part of a row ends, when two files agree closely enough for
+/// one to be measured against the other in bytes.
+///
+/// The join's expensive question is whether a matched pair differs, and it
+/// answers it by parsing both rows into fields. It does not have to. If the two
+/// rows are byte-identical up to the end of the last column either file wants,
+/// then every column in between is byte-identical too, and no parse can say
+/// otherwise -- so the pair is unchanged and the mate never needs reading.
+///
+/// That holds only when both sides really are the same shape: the same
+/// delimiter and the same column-to-slot mapping. Two files whose headers are
+/// ordered differently can carry identical bytes and mean different things,
+/// which is what comparing `slots_for` rules out -- the whole mapping, not the
+/// one-slot shortcut derived from it, because two columns that each feed several
+/// slots can agree on how many without agreeing on which. JSON has no such
+/// prefix -- its keys may come in any order -- so it never qualifies.
+///
+/// Returns the slot holding the last wanted column, and the delimiter that ends
+/// it.
+pub(super) fn shared_tail(a: &RowParser, b: &RowParser) -> Option<(usize, u8)> {
+    match (a, b) {
+        (
+            RowParser::Csv {
+                delimiter: da,
+                last_needed: la,
+                slots_for: fa,
+                ..
+            },
+            RowParser::Csv {
+                delimiter: db,
+                slots_for: fb,
+                ..
+            },
+        ) if da == db && fa == fb => fa[*la].first().map(|slot| (*slot as usize, *da)),
+        _ => None,
+    }
+}
+
 impl RowParser {
     pub(super) fn csv(delimiter: u8, source: Vec<Option<usize>>) -> Self {
         let last_needed = source.iter().flatten().copied().max().unwrap_or(0);

@@ -47,7 +47,7 @@ use std::time::Instant;
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of};
-use text::{RowParser, csv_header, detect_delimiter, json_header, sniff_dialect};
+use text::{RowParser, csv_header, detect_delimiter, json_header, shared_tail, sniff_dialect};
 
 use crate::columns::{compare_keys, differs, empty_to_null, normalise, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
@@ -136,6 +136,14 @@ impl Side {
                 let from = at as usize * self.width;
                 out.copy_from_slice(&fields[from..from + self.width]);
             }
+        }
+    }
+
+    /// The row parser, when rows are text and there is one.
+    fn parser(&self) -> Option<&RowParser> {
+        match &self.rows {
+            Rows::Text { parser, .. } => Some(parser),
+            Rows::Columnar { .. } => None,
         }
     }
 
@@ -631,8 +639,9 @@ impl RowIndex {
         key_size: usize,
         opt: &Options,
         want: Want,
+        span: Option<(&[u8], u8)>,
         probe: &mut [Field],
-    ) -> Option<i32> {
+    ) -> Option<(i32, bool)> {
         let mut slot = self.slot(hash);
         loop {
             let word = self.table[slot];
@@ -642,17 +651,48 @@ impl RowIndex {
             if tag_is(word, hash) {
                 let candidate = self.first_row[pos_of(word)];
                 if self.row_hash[candidate as usize] == hash {
+                    // The bytes first, where the caller offered them. A candidate
+                    // whose row opens with the same bytes as far as either file
+                    // reads has the same keys and the same columns, and neither
+                    // row needs parsing to say so. A candidate the tag let
+                    // through with a different key fails this on its first few
+                    // bytes, so the cost of being wrong is a handful of them.
+                    if let Some((bytes, delimiter)) = span
+                        && self.row_matches(side, candidate, bytes, delimiter)
+                    {
+                        return Some((candidate, true));
+                    }
                     match want {
                         Want::Whole => self.fields_of(side, candidate, probe),
                         Want::Keys => self.keys_of(side, candidate, key_size, probe),
                     }
                     if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
-                        return Some(candidate);
+                        return Some((candidate, false));
                     }
                 }
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+
+    /// Whether `candidate`'s row opens with exactly `bytes` and ends that run on
+    /// a field boundary.
+    ///
+    /// The boundary is what makes the run a whole number of columns rather than
+    /// a truncation of one: without it `12,3` would match a row opening `12,34`.
+    fn row_matches(&self, side: &Side, candidate: i32, bytes: &[u8], delimiter: u8) -> bool {
+        let data = side.slab.data();
+        let from = self.row_at[candidate as usize] as usize;
+        let Some(to) = from.checked_add(bytes.len()) else {
+            return false;
+        };
+        if to > data.len() {
+            return false;
+        }
+        if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
+            return false;
+        }
+        data[from..to] == *bytes
     }
 
     fn unique_keys(&self) -> i64 {
@@ -1015,6 +1055,13 @@ fn join(
     // with three cores idle. A key costs B about two thirds of what it costs A,
     // and B has just as many of them; nothing about that ratio makes a thread the
     // right unit. Chunks do not care which side they came from.
+    // Where a byte comparison may stand in for a parse, when the two files are
+    // the same shape; see `shared_tail`. `None` compares every pair column by
+    // column, which is what a mixed pair, a columnar side or JSON gets.
+    let span_tail = match (a.parser(), b.parser()) {
+        (Some(pa), Some(pb)) => shared_tail(pa, pb),
+        _ => None,
+    };
     let a_keys = ai.first_row.len();
     let b_keys = bi.first_row.len();
     let a_ways = ways_for(a_keys);
@@ -1046,7 +1093,27 @@ fn join(
             let hash = ai.row_hash[row as usize];
             // `fb` is the lookup's scratch, and on a hit it already holds the
             // mate's fields: that is what the key columns were matched against.
-            let Some(mate) = bi.lookup(b, &a.slab, &fa, hash, key_size, opt, Want::Whole, &mut fb)
+            // A's row up to the end of the last column either file wants. The
+            // end has to be a boundary in A as well: a quoted field ends on its
+            // closing quote, and what follows is not part of the run.
+            let span = span_tail.and_then(|(slot, delimiter)| {
+                let f = fa[slot];
+                if !field::is_real(f) {
+                    return None;
+                }
+                let data = a.slab.data();
+                let from = ai.row_at[row as usize] as usize;
+                let to = field::offset_of(f) + field::len_of(f);
+                if to < from || to > data.len() {
+                    return None;
+                }
+                if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
+                    return None;
+                }
+                Some((&data[from..to], delimiter))
+            });
+            let Some((mate, same_bytes)) =
+                bi.lookup(b, &a.slab, &fa, hash, key_size, opt, Want::Whole, span, &mut fb)
             else {
                 out.removed_total += 1;
                 if exporting || out.removed.len() <= cap {
@@ -1055,6 +1122,11 @@ fn join(
                 continue;
             };
             out.matched += 1;
+            // The two rows carry the same bytes across every column either file
+            // wants, so no column differs and the mate was never read.
+            if same_bytes {
+                continue;
+            }
 
             let mut any = false;
             // Two loops rather than one with a flag inside it: `plain` cannot
@@ -1116,7 +1188,7 @@ fn join(
             bi.keys_of(b, row, key_size, &mut fb);
             let hash = bi.row_hash[row as usize];
             if ai
-                .lookup(a, &b.slab, &fb, hash, key_size, opt, Want::Keys, &mut probe)
+                .lookup(a, &b.slab, &fb, hash, key_size, opt, Want::Keys, None, &mut probe)
                 .is_none()
             {
                 added.push(Pick { row, mate: -1 });
