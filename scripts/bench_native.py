@@ -61,8 +61,12 @@ def builds(tmp: Path) -> list[tuple[str, list[str], list[str]]]:
     return out
 
 
-def run(argv: list[str], out: Path, timeout: float) -> tuple[float, float, int]:
-    """Times one child and returns seconds, peak RSS in MB, and its exit code.
+def run(argv: list[str], out: Path, timeout: float) -> tuple[float, float, float, int]:
+    """Times one child: seconds, peak RSS in MB, CPU seconds, and its exit code.
+
+    CPU is user plus system for that exact child, from the same rusage the RSS
+    comes from. Divided by wall time it says how many cores were busy, which is
+    what separates an engine that is slow from one that is idle.
 
     The output file is removed first: a compare exits 1 when it finds
     differences, so its status cannot say whether it ran, and a crash would
@@ -86,11 +90,13 @@ def run(argv: list[str], out: Path, timeout: float) -> tuple[float, float, int]:
     while True:
         done, status, usage = os.wait4(pid, os.WNOHANG)
         if done:
-            return time.monotonic() - started, usage.ru_maxrss / 1024, os.waitstatus_to_exitcode(status)
+            return (time.monotonic() - started, usage.ru_maxrss / 1024,
+                    usage.ru_utime + usage.ru_stime, os.waitstatus_to_exitcode(status))
         if time.monotonic() > deadline:
             os.kill(pid, 9)
             _, _, usage = os.wait4(pid, 0)
-            return time.monotonic() - started, usage.ru_maxrss / 1024, -1
+            return (time.monotonic() - started, usage.ru_maxrss / 1024,
+                    usage.ru_utime + usage.ru_stime, -1)
         time.sleep(0.05)
 
 
@@ -124,7 +130,8 @@ def main() -> int:
     mapped = (a.stat().st_size + b.stat().st_size) / 1024**2
     warm(a, b)
     print(f"{args.rows}: inputs map {mapped:,.0f} MB, best of {args.repeats}\n")
-    print(f"{'build':32} {'seconds':>9} {'peak RSS':>10} {'above':>9}  counts")
+    print(f"{'build':32} {'seconds':>9} {'cpu':>8} {'cores':>7} "
+          f"{'peak RSS':>10} {'above':>9}  counts")
 
     truth = None
     for label, base, extra in plan:
@@ -134,7 +141,7 @@ def main() -> int:
         out = Path("/tmp") / ("bn_" + "".join(c if c.isalnum() else "_" for c in label) + ".json")
         best, counts = None, None
         for _ in range(args.repeats):
-            secs, rss, code = run(base + ["compare", str(a), str(b)] + KEY
+            secs, rss, cpu, code = run(base + ["compare", str(a), str(b)] + KEY
                                   + ["--json", str(out)] + extra, out, args.timeout)
             if code == -1:
                 print(f"{label:32} {'✗':>9}  did not finish in {args.timeout:.0f}s")
@@ -146,7 +153,7 @@ def main() -> int:
                 break
             counts = json.loads(out.read_text())["counts"]
             if best is None or secs < best[0]:
-                best = (secs, rss)
+                best = (secs, rss, cpu)
         if not best or counts is None:
             continue
         key = (counts["changed"], counts["added"], counts["removed"])
@@ -154,7 +161,9 @@ def main() -> int:
             truth, verdict = key, "reference"
         else:
             verdict = "agrees" if key == truth else f"DIFFERS {key}"
-        print(f"{label:32} {best[0]:9.2f} {best[1]:9,.0f} {best[1] - mapped:9,.0f}  {verdict}")
+        print(f"{label:32} {best[0]:9.2f} {best[2]:7.1f}s "
+              f"{best[2] / best[0] if best[0] else 0:6.2f}x "
+              f"{best[1]:9,.0f} {best[1] - mapped:9,.0f}  {verdict}")
 
     if truth:
         print(f"\nchanged {truth[0]:,} · added {truth[1]:,} · removed {truth[2]:,}")

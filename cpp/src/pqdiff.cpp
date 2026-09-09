@@ -14,6 +14,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#if defined(CSVDIFF_SCAN_AVX2) || defined(CSVDIFF_SCAN_AVX512)
+#include <immintrin.h>
+#endif
 #include <exception>
 #include <string_view>
 #include <thread>
@@ -163,8 +167,37 @@ bool cell_differs(Cell x, Cell y, const Options& o) {
 constexpr std::uint64_t kPrime = 0x100000001b3ULL;
 constexpr std::uint64_t kSeed = 0xcbf29ce484222325ULL;
 
+// FNV-1a, eight bytes at a time.
+//
+// A hash here is internal in exactly the sense the CSV engine's is: nothing
+// outside this file sees one, so the only property it owes anyone is that the
+// two places that compute it agree. That is what lets it read a word at a time
+// -- see `hash_bytes` in csvdiff.cpp, which is the same function for the same
+// reason.
+//
+// It matters more here than the call sites suggest. Interning a dictionary
+// costs one call per *distinct* value and is nothing; but a key column that is
+// not dictionary-encoded -- which a high-cardinality key column usually is not,
+// since a writer gives up on a dictionary that never repeats -- is hashed once
+// per row, on both sides, indexed and probed. At ten million rows a
+// twenty-six-byte key is four multiplies instead of twenty-six.
 std::uint64_t fold_bytes(std::uint64_t h, std::string_view v) {
-    for (unsigned char b : v) h = (h ^ b) * kPrime;
+    const char* p = v.data();
+    std::size_t n = v.size();
+    while (n >= 8) {
+        std::uint64_t word;
+        std::memcpy(&word, p, sizeof word);
+        h = (h ^ word) * kPrime;
+        h ^= h >> 29;  // the xor-shift is what spreads a whole word into the low bits
+        p += 8;
+        n -= 8;
+    }
+    if (n > 0) {
+        std::uint64_t tail = 0;
+        std::memcpy(&tail, p, n);
+        h = (h ^ tail) * kPrime;
+        h ^= h >> 29;
+    }
     return (h ^ v.size()) * kPrime;
 }
 std::uint64_t fold_absent(std::uint64_t h) { return (h ^ 0x9e3779b97f4a7c15ULL) * kPrime; }
@@ -470,12 +503,44 @@ constexpr std::size_t kBlock = 4096;
 
 // The vectorised core. `xa` and `xb` hold one block of shared ids, gathered
 // through each side's dictionary; the compiler turns the comparison below into
-// packed int32 compares, and the mismatch mask is then read eight bytes at a
-// time -- the same SWAR idiom the CSV scanner uses to find a delimiter, applied
-// to finding a changed cell.
+// packed int32 compares, and the mismatch mask is then read a register at a
+// time -- the same scanner the CSV path uses to find a delimiter, applied to
+// finding a changed cell, and built the same three ways so the same question
+// can be asked of it.
+//
+// The arithmetic that makes this worth doing: about 0.7% of cells differ per
+// column, so an eight-byte word is all-zero 94.6% of the time, a 32-byte vector
+// 80%, a 64-byte one 64%. Every one of those is a correctly predicted
+// not-taken branch and eight, thirty-two or sixty-four cells retired. The work
+// on a *hit* is identical in all three -- one `ctz` per changed cell -- so the
+// only thing a wider register buys is fewer trips round the skip path, which is
+// where nearly all the loop is. That is the opposite trade from the CSV
+// scanner, where a wider register also means fewer loads, and it is why both
+// are measured rather than assumed.
 template <typename Fn>
 void scan_mask(const std::uint8_t* neq, std::size_t m, std::size_t base, Fn&& hit) {
     std::size_t i = 0;
+#if defined(CSVDIFF_SCAN_AVX512)
+    for (; i + 64 <= m; i += 64) {
+        const __m512i v = _mm512_loadu_si512(neq + i);
+        std::uint64_t bits = _mm512_test_epi8_mask(v, v);
+        while (bits) {
+            hit(base + i + static_cast<unsigned>(__builtin_ctzll(bits)));
+            bits &= bits - 1;
+        }
+    }
+#elif defined(CSVDIFF_SCAN_AVX2)
+    const __m256i zero = _mm256_setzero_si256();
+    for (; i + 32 <= m; i += 32) {
+        const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(neq + i));
+        std::uint32_t bits = static_cast<std::uint32_t>(
+            ~_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
+        while (bits) {
+            hit(base + i + static_cast<unsigned>(__builtin_ctz(bits)));
+            bits &= bits - 1;
+        }
+    }
+#endif
     for (; i + 8 <= m; i += 8) {
         std::uint64_t w;
         std::memcpy(&w, neq + i, 8);

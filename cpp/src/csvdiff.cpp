@@ -6,6 +6,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(CSVDIFF_SCAN_AVX2) || defined(CSVDIFF_SCAN_AVX512)
+#include <immintrin.h>
+#endif
+
 #include <algorithm>
 #include <bit>
 #include <optional>
@@ -84,10 +88,37 @@ std::uint64_t load64(const char* p) {
     return w;
 }
 
+// The three scanners, chosen at build time rather than dispatched at run time:
+// a benchmark of an instruction set should not be measuring a function pointer,
+// and each binary is what you would actually ship for that target. SWAR is the
+// default because it is the only one that needs no CPU feature at all; the
+// vector builds start where they can and hand the tail to SWAR.
 std::size_t next_of2(std::string_view d, std::size_t from, std::size_t end, char a, char b) {
+    std::size_t at = from;
+#if defined(CSVDIFF_SCAN_AVX512)
+    {
+        const __m512i va = _mm512_set1_epi8(a), vb = _mm512_set1_epi8(b);
+        for (; at + 64 <= end; at += 64) {
+            const __m512i chunk = _mm512_loadu_si512(d.data() + at);
+            const __mmask64 hits =
+                _mm512_cmpeq_epi8_mask(chunk, va) | _mm512_cmpeq_epi8_mask(chunk, vb);
+            if (hits) return at + static_cast<std::size_t>(__builtin_ctzll(hits));
+        }
+    }
+#elif defined(CSVDIFF_SCAN_AVX2)
+    {
+        const __m256i va = _mm256_set1_epi8(a), vb = _mm256_set1_epi8(b);
+        for (; at + 32 <= end; at += 32) {
+            const __m256i chunk =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
+            const unsigned hits = static_cast<unsigned>(_mm256_movemask_epi8(
+                _mm256_or_si256(_mm256_cmpeq_epi8(chunk, va), _mm256_cmpeq_epi8(chunk, vb))));
+            if (hits) return at + static_cast<std::size_t>(__builtin_ctz(hits));
+        }
+    }
+#endif
     const std::uint64_t ba = broadcast(static_cast<unsigned char>(a));
     const std::uint64_t bb = broadcast(static_cast<unsigned char>(b));
-    std::size_t at = from;
     for (; at + 8 <= end; at += 8) {
         const std::uint64_t w = load64(d.data() + at);
         const std::uint64_t hits = match_bits(w, ba) | match_bits(w, bb);
@@ -99,8 +130,29 @@ std::size_t next_of2(std::string_view d, std::size_t from, std::size_t end, char
 }
 
 std::size_t next_of1(std::string_view d, std::size_t from, std::size_t end, char target) {
-    const std::uint64_t bt = broadcast(static_cast<unsigned char>(target));
     std::size_t at = from;
+#if defined(CSVDIFF_SCAN_AVX512)
+    {
+        const __m512i vt = _mm512_set1_epi8(target);
+        for (; at + 64 <= end; at += 64) {
+            const __m512i chunk = _mm512_loadu_si512(d.data() + at);
+            const __mmask64 hits = _mm512_cmpeq_epi8_mask(chunk, vt);
+            if (hits) return at + static_cast<std::size_t>(__builtin_ctzll(hits));
+        }
+    }
+#elif defined(CSVDIFF_SCAN_AVX2)
+    {
+        const __m256i vt = _mm256_set1_epi8(target);
+        for (; at + 32 <= end; at += 32) {
+            const __m256i chunk =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
+            const unsigned hits =
+                static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vt)));
+            if (hits) return at + static_cast<std::size_t>(__builtin_ctz(hits));
+        }
+    }
+#endif
+    const std::uint64_t bt = broadcast(static_cast<unsigned char>(target));
     for (; at + 8 <= end; at += 8) {
         const std::uint64_t w = load64(d.data() + at);
         const std::uint64_t hits = match_bits(w, bt);
@@ -397,12 +449,47 @@ bool cell_differs(const Slab& a, Field x, const Slab& b, Field y, const Options&
 }
 
 // FNV-1a over exactly the bytes equality compares, by the same route.
+//
+// A hash is internal -- nothing outside this file can see one -- so the only
+// property it owes anyone is that the index build and the join probe compute the
+// same number for the same bytes. That is what lets the common path read eight
+// bytes at a time: a key of twenty-six bytes costs four multiplies instead of
+// twenty-six, and at ten million rows the key hash is computed four times over
+// (both files, indexed then probed), which made byte-at-a-time FNV about a
+// billion dependent multiply-xor steps of the run.
+//
+// The escaped and normalised paths stay byte-at-a-time, because there the bytes
+// are produced one at a time anyway.
+std::uint64_t hash_bytes(const unsigned char* p, std::size_t n, std::uint64_t seed) {
+    constexpr std::uint64_t kPrime = 0x100000001b3ULL;
+    std::uint64_t h = seed;
+    while (n >= 8) {
+        std::uint64_t word;
+        std::memcpy(&word, p, sizeof word);
+        h = (h ^ word) * kPrime;
+        h ^= h >> 29;  // the xor-shift is what spreads a whole word into the low bits
+        p += 8;
+        n -= 8;
+    }
+    if (n > 0) {
+        std::uint64_t tail = 0;
+        std::memcpy(&tail, p, n);
+        h = (h ^ tail) * kPrime;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
 std::uint64_t hash_field(const Slab& s, Field f, const Options& o, std::uint64_t seed) {
     constexpr std::uint64_t kPrime = 0x100000001b3ULL;
     std::uint64_t h = seed;
     if (is_absent(s, f, o)) return (h ^ 0x9e3779b97f4a7c15ULL) * kPrime;
     std::uint64_t len = 0;
-    if (needs_normalising(o)) {
+    if (!needs_normalising(o) && !is_escaped(f)) {
+        const std::string_view raw = s.raw(f);
+        h = hash_bytes(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(), h);
+        len = raw.size();
+    } else if (needs_normalising(o)) {
         const std::string v = value_of(s, f, o).value_or(std::string());
         for (unsigned char b : v) {
             h = (h ^ b) * kPrime;
@@ -477,6 +564,26 @@ class RowParser {
     RowParser(char delimiter, std::vector<int> source)
         : delimiter_(delimiter), source_(std::move(source)) {
         for (int c : source_) last_needed_ = std::max(last_needed_, c);
+        // Inverted once, so storing a field is a lookup rather than a walk of
+        // every wanted column: twenty columns against twenty slots is four
+        // hundred comparisons a row otherwise. A column can feed more than one
+        // slot -- `--compare` may name a key column -- so it is a run rather
+        // than a single entry, laid out flat with a start per column.
+        csv_slot_starts_.assign(static_cast<std::size_t>(last_needed_) + 2, 0);
+        for (int c : source_)
+            if (c >= 0) ++csv_slot_starts_[static_cast<std::size_t>(c) + 1];
+        for (std::size_t i = 1; i < csv_slot_starts_.size(); ++i)
+            csv_slot_starts_[i] += csv_slot_starts_[i - 1];
+        csv_slots_.assign(static_cast<std::size_t>(csv_slot_starts_.back()), 0);
+        std::vector<int> filled(static_cast<std::size_t>(last_needed_) + 1, 0);
+        for (std::size_t slot = 0; slot < source_.size(); ++slot) {
+            const int c = source_[slot];
+            if (c < 0) continue;
+            csv_slots_[static_cast<std::size_t>(csv_slot_starts_[static_cast<std::size_t>(c)] +
+                                                filled[static_cast<std::size_t>(c)])] =
+                static_cast<int>(slot);
+            ++filled[static_cast<std::size_t>(c)];
+        }
     }
 
     // The JSON form. A CSV row is addressed by column number; a JSON object is
@@ -667,8 +774,9 @@ class RowParser {
 
     void store(int column, Field f, Field* out) const {
         if (column > last_needed_) return;
-        for (std::size_t i = 0; i < source_.size(); ++i)
-            if (source_[i] == column) out[i] = f;
+        const std::size_t at = static_cast<std::size_t>(column);
+        for (int i = csv_slot_starts_[at]; i < csv_slot_starts_[at + 1]; ++i)
+            out[csv_slots_[static_cast<std::size_t>(i)]] = f;
     }
 
     static std::size_t end_of_row(std::string_view d, std::size_t pos, std::size_t end) {
@@ -688,6 +796,8 @@ class RowParser {
     char delimiter_ = ',';
     std::vector<int> source_;
     int last_needed_ = 0;
+    // The inverse of `source_`: which slots each column of the file feeds.
+    std::vector<int> csv_slot_starts_, csv_slots_;
     Dialect dialect_ = Dialect::Csv;
     std::vector<std::string> wanted_;   // JSON: the key whose value goes in each slot
     std::vector<int> slots_;            // JSON: open-addressed name -> slot
@@ -789,6 +899,9 @@ class RowIndex {
             slot = (slot + 1) & mask_;
         }
     }
+
+    /// The key hash the sweep computed for this row.
+    std::uint64_t hash_of(int row) const { return row_hash_[static_cast<std::size_t>(row)]; }
 
     const std::vector<int>& first_rows() const { return first_row_; }
     const std::vector<std::uint32_t>& occurrences() const { return occurrences_; }
@@ -1290,8 +1403,10 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
             ai.fields_of(row, fa.data());
-            const int mate =
-                bi.lookup(a, fa.data(), key_hash(a, fa.data(), key_size, opt), probe.data());
+            // The hash is the one the sweep computed for this row: the same
+            // bytes through the same function, so computing it again here would
+            // be a second pass over every key in the file for the same number.
+            const int mate = bi.lookup(a, fa.data(), ai.hash_of(row), probe.data());
             if (mate < 0) {
                 ++out.removed_total;
                 if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
@@ -1358,8 +1473,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         std::vector<Field> fb(width), probe(width);
         for (int row : bi.first_rows()) {
             bi.fields_of(row, fb.data());
-            if (ai.lookup(b, fb.data(), key_hash(b, fb.data(), key_size, opt), probe.data()) < 0)
-                added.push(row, -1);
+            if (ai.lookup(b, fb.data(), bi.hash_of(row), probe.data()) < 0) added.push(row, -1);
         }
     };
     {

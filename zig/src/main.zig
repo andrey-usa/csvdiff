@@ -13,7 +13,7 @@ const csvdiff = @import("csvdiff.zig");
 const pqdiff = @import("pqdiff.zig");
 
 const usage =
-    \\csvdiff - composite-key CSV comparison, byte-level, with a memory budget
+    \\csvdiff - composite-key comparison of CSV, JSON and Parquet, with a memory budget
     \\
     \\usage:
     \\  csvdiff compare A B -k COLS [options]
@@ -28,6 +28,7 @@ const usage =
     \\      --tolerance N     absolute numeric tolerance
     \\      --max-rows N      rows embedded per section (default 50000)
     \\      --delimiter D     force the delimiter (default: sniff it)
+    \\      --threads N       how many threads to use (default: as many as cores)
     \\      --max-memory MB   fail rather than exceed this much memory
     \\      --json PATH       write the JSON summary here
     \\
@@ -52,6 +53,9 @@ pub fn main(init: std.process.Init) !u8 {
     // the runtime already cleans up rather than being freed by hand.
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+    // The other two ports take this from the environment too, and print the same
+    // shape of phase breakdown on stderr.
+    csvdiff.phases_on = init.minimal.environ.getPosix("CSVDIFF_PHASES") != null;
 
     const io = init.io;
     var stdout_buf: [4096]u8 = undefined;
@@ -105,6 +109,9 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, f, "--max-rows")) {
             opt.max_rows = std.fmt.parseInt(usize, need(args, &i) orelse "", 10) catch
                 return fail(&stderr, "--max-rows needs a number");
+        } else if (std.mem.eql(u8, f, "--threads")) {
+            opt.threads = std.fmt.parseInt(usize, need(args, &i) orelse "", 10) catch
+                return fail(&stderr, "--threads needs a number");
         } else if (std.mem.eql(u8, f, "--max-memory")) {
             max_memory_mb = std.fmt.parseInt(usize, need(args, &i) orelse "", 10) catch
                 return fail(&stderr, "--max-memory needs a number of megabytes");
@@ -145,49 +152,32 @@ pub fn main(init: std.process.Init) !u8 {
         gpa = fixed.threadSafeAllocator();
     }
 
-    // Parquet is not a text format and is not read as one: it goes to the
-    // columnar path, which never reconstructs a row. Both sides have to be
-    // Parquet -- comparing a column store against a byte stream would mean
-    // building rows out of one of them, and that is the cost the columnar path
-    // exists to avoid.
-    const a_parquet = pqdiff.isParquetFile(io, files.items[0]);
-    const b_parquet = pqdiff.isParquetFile(io, files.items[1]);
-    if (a_parquet != b_parquet) {
-        return fail(&stderr, "one file is parquet and the other is not; convert one of them first");
-    }
+    // Parquet on both sides goes to the columnar path, which never reconstructs
+    // a row: it joins on the key columns and then compares whole columns as
+    // integers. Where only one side is Parquet that is not available -- there is
+    // no column to compare a byte stream against -- so the text engine reads it
+    // into rows instead, which is slower and still answers the question rather
+    // than refusing it.
+    const both_parquet = pqdiff.isParquetFile(io, files.items[0]) and
+        pqdiff.isParquetFile(io, files.items[1]);
 
-    var result = (if (a_parquet)
+    var result = (if (both_parquet)
         pqdiff.compare(io, gpa, files.items[0], files.items[1], opt)
     else
         csvdiff.compare(io, gpa, files.items[0], files.items[1], opt)) catch |err| {
-        const message = switch (err) {
-            error.OutOfMemory => blk: {
-                if (max_memory_mb) |mb| {
-                    try stderr.interface.print(
-                        "error: the comparison needs more than the {d} MB it was given\n",
-                        .{mb},
-                    );
-                    try stderr.interface.flush();
-                    return 2;
-                }
-                break :blk "out of memory";
-            },
-            csvdiff.Error.KeyColumnMissing => "key column(s) missing from one of the files",
-            csvdiff.Error.ComparedColumnMissing => "compared column missing from one of the files",
-            csvdiff.Error.NoHeaderRow => "file has no header row",
-            csvdiff.Error.FieldTooLong => "a field is larger than this engine packs",
-            csvdiff.Error.CannotReadFile => "cannot read one of the files",
-            csvdiff.Error.NonAsciiCaseFold => "--ignore-case outside ASCII needs Unicode case " ++
-                "folding, which this port does not carry; use another implementation for that data",
-            pqdiff.Error.ParquetKeyColumnMissing => "key column(s) missing from one of the files",
-            pqdiff.Error.ParquetComparedColumnMissing => "compared column missing from one of the files",
-            pqdiff.Error.ParquetRowCountMismatch => "parquet columns disagree about how many rows the file has",
-            pqdiff.Error.ParquetMixedWithText => "one file is parquet and the other is not",
-            // The reader refuses what it does not implement by name rather than
-            // guessing, and the name is the message.
-            else => @errorName(err),
-        };
-        try stderr.interface.print("error: {s}\n", .{message});
+        // A budget that was not enough is the one failure worth naming in full:
+        // it is the answer to the question --max-memory was asked.
+        if (err == error.OutOfMemory) {
+            if (max_memory_mb) |mb| {
+                try stderr.interface.print(
+                    "error: the comparison needs more than the {d} MB it was given\n",
+                    .{mb},
+                );
+                try stderr.interface.flush();
+                return 2;
+            }
+        }
+        try stderr.interface.print("error: {s}\n", .{csvdiff.message(err)});
         try stderr.interface.flush();
         return 2;
     };
@@ -225,7 +215,7 @@ pub fn main(init: std.process.Init) !u8 {
         .{
             c.a_rows,       c.b_rows,   c.matched,       c.changed,
             c.added,        c.removed,  c.a_dup_keys,    c.b_dup_keys,
-            if (a_parquet) @as([]const u8, "parquet") else "turbo",
+            if (both_parquet) @as([]const u8, "parquet") else "turbo",
         },
     );
     try stdout.interface.flush();
