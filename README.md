@@ -122,8 +122,85 @@ cargo build --release --manifest-path rust\Cargo.toml
 ```
 
 For the other three on Windows, install WSL (`wsl --install`) and use the bash
-commands above inside it. A Windows path is reachable from WSL as
-`/mnt/c/Users/you/data.csv`.
+commands above inside it. A fresh WSL has neither a current Rust nor any Zig at
+all, and the reasons are not obvious from inside it, so read the next section
+before you start.
+
+### If you are on WSL
+
+**WSL is a second machine.** It has its own filesystem, its own package manager
+and its own toolchains, and it shares none of them with Windows. A rustup
+install on the Windows side puts `rustc.exe` in your Windows profile; those are
+Windows binaries that build Windows executables, and a Linux `cargo build`
+cannot use them. So "Rust is new on Windows but old in WSL" is not a
+misconfiguration — they are two separate installations, and only one of them
+has been kept current.
+
+What makes it confusing is that WSL appends the Windows `PATH` to its own, so
+`cargo.exe` and `rustc.exe` **are** found from inside WSL. The toolchain looks
+present. It just is not a Linux one.
+
+Two specific symptoms, and what causes each:
+
+| Symptom | Cause |
+|---|---|
+| `error: rustc 1.86.0 is not supported by the following packages: csvdiff@1.0.0 requires rustc 1.90` | Rust came from `apt install rustc cargo`. Distro packages are frozen at whatever the release shipped and never follow stable. |
+| `zig: command not found` | Zig is not in Ubuntu's default repositories in a usable version. It is normally installed by unpacking a tarball, so a fresh WSL has none. |
+
+Fix both from inside WSL. **Rust**, via rustup rather than apt:
+
+```bash
+# inside WSL -- where is the old one coming from?
+which -a rustc                           # /usr/bin/rustc means apt installed it
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+. "$HOME/.cargo/env"
+rustc --version                          # 1.90 or newer
+```
+
+rustup installs to `~/.cargo/bin` and puts it at the front of `PATH`, which is
+usually enough on its own. If `rustc --version` still reports the old one, open
+a new shell; if that does not do it, `/usr/bin` is still winning:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"     # add to ~/.bashrc to keep it
+```
+
+Removing apt's copy with `sudo apt remove rustc cargo` also works, but check
+what else goes with it first — `apt` takes reverse-dependencies too, and
+shadowing it by `PATH` is the smaller change.
+
+**Zig 0.16.0**, the version CI builds with:
+
+```bash
+# inside WSL
+curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
+  | sudo tar -xJ -C /opt
+echo 'export PATH="/opt/zig-x86_64-linux-0.16.0:$PATH"' >> ~/.bashrc
+exec bash
+zig version                              # 0.16.0
+```
+
+Without `sudo`, or on a machine where `/opt` is not yours to write to, the same
+release is on PyPI and needs no root:
+
+```bash
+pip install ziglang==0.16.0
+mkdir -p ~/.local/bin
+printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' > ~/.local/bin/zig
+chmod +x ~/.local/bin/zig
+```
+
+Both routes are what the `parity` and `formats` workflows use, so they are the
+two that are known to work.
+
+> **Clone into the WSL home directory, not `/mnt/c/`.** A Windows drive is
+> reachable from WSL as `/mnt/c/Users/you/...`, but it is a network filesystem
+> underneath, and it is slow enough to change what you measure — which for a
+> repository whose whole subject is throughput makes every number here
+> meaningless. `git clone` into `~/` and work there. To open the result in a
+> Windows editor, `\\wsl$\Ubuntu\home\you\csvdiff` reaches it from the
+> Windows side.
 
 ### Getting a pair to compare
 

@@ -207,6 +207,12 @@ before timing anything.
   exist. Their values go through the engine's own parsers, and a test asserts CSV, ndjson and
   Parquet preview identically -- a preview that disagreed with the comparison would be worse than
   none.
+- **The WSL setup section pins toolchain versions -- keep them level with CI.** The README tells a
+  WSL reader to install Zig `0.16.0` and a Rust that satisfies `rust-version` in `rust/Cargo.toml`.
+  Both numbers are copied from `.github/workflows/`, and both install routes (the ziglang.org
+  tarball and `pip install ziglang`) are the ones `parity` and `formats` use, so they are known to
+  work rather than assumed to. Bump the workflows and the README together, or the instructions
+  quietly start installing a toolchain CI no longer builds with.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
