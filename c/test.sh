@@ -514,6 +514,15 @@ pcase "the same values under a different name order" "0 0 0" jo_a.ndjson jo_b.nd
 printf '{"id":"k1","a":"p","ts":"T1"}\n' > "$pdir/jc_a.ndjson"
 printf '{"id":"k1","a":"X","ts":"T2"}\n' > "$pdir/jc_b.ndjson"
 pcase "a change in the compared value"          "1 0 0" jc_a.ndjson jc_b.ndjson -k id -i ts
+
+# A repeated *key* name. First occurrence wins, so this row's key is `k1` and it
+# matches. Under last-wins the key would be `OTHER`, and the row would come out
+# as one added and one removed instead -- which is what the C++ port did until
+# its key-only parse landed, on an input no fixture covered. Both ports are
+# pinned to it now.
+printf '{"id":"k1","a":"p"}\n'              > "$pdir/jk_a.ndjson"
+printf '{"id":"k1","id":"OTHER","a":"p"}\n' > "$pdir/jk_b.ndjson"
+pcase "a repeated key name keeps the first"     "0 0 0" jk_a.ndjson jk_b.ndjson -k id
 rm -rf "$pdir"
 
 if [ "$with_ports" = 1 ]; then

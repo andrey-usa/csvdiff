@@ -40,6 +40,7 @@ constexpr unsigned kLengthShift = 40;
 constexpr std::uint64_t kLengthMask = (1ULL << 23) - 1;
 constexpr std::uint64_t kEscaped = 1ULL << 63;
 constexpr std::uint64_t kMaxFieldLen = kLengthMask;
+constexpr unsigned kProofBackoff = 64;  // a power of two: the loop tests against it
 
 Field pack(std::size_t offset, std::size_t len, bool escaped) {
     if (len > kMaxFieldLen) return kTooLong;
@@ -81,11 +82,31 @@ std::uint64_t match_bits(std::uint64_t word, std::uint64_t target) {
 
 // Reads eight bytes as one little-endian word. The SWAR tricks below all assume
 // the first byte of the file is the lowest byte of the word.
+// How far two byte ranges agree, a word at a time.
+//
+// The join's expensive half is not the lookup -- it is what happens after one:
+// the mate's row is parsed a second time and every compared column is compared
+// byte by byte. But rows that match usually match because they are the same row
+// with one column moved, so comparing the two rows' raw bytes from the front
+// finds where they first diverge, and every compared column that closes before
+// that point is proven equal without the mate being parsed at all.
+inline std::size_t common_prefix(const char* x, const char* y, std::size_t n);
+
 std::uint64_t load64(const char* p) {
     std::uint64_t w;
     std::memcpy(&w, p, sizeof w);
     if constexpr (std::endian::native == std::endian::big) w = bswap64(w);
     return w;
+}
+
+inline std::size_t common_prefix(const char* x, const char* y, std::size_t n) {
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const std::uint64_t a = load64(x + i), b = load64(y + i);
+        if (a != b) return i + (static_cast<std::size_t>(__builtin_ctzll(a ^ b)) >> 3);
+    }
+    for (; i < n && x[i] == y[i]; ++i) {}
+    return i;
 }
 
 // The three scanners, chosen at build time rather than dispatched at run time:
@@ -564,6 +585,7 @@ class RowParser {
     RowParser(char delimiter, std::vector<int> source)
         : delimiter_(delimiter), source_(std::move(source)) {
         for (int c : source_) last_needed_ = std::max(last_needed_, c);
+        key_last_ = last_needed_;  // until set_key_size says otherwise
         // Inverted once, so storing a field is a lookup rather than a walk of
         // every wanted column: twenty columns against twenty slots is four
         // hundred comparisons a row otherwise. A column can feed more than one
@@ -611,8 +633,13 @@ class RowParser {
     // shorter than the header leaves the missing fields absent, which is a
     // difference to report rather than a file to refuse.
     std::size_t parse(std::string_view d, std::size_t start, std::size_t end, Field* out) const {
-        if (dialect_ == Dialect::Json) return parse_json(d, start, end, out);
-        std::fill(out, out + source_.size(), kAbsent);
+        if (dialect_ == Dialect::Json) return parse_json(d, start, end, out, wanted_.size());
+        return parse_csv(d, start, end, out, last_needed_, source_.size());
+    }
+
+    std::size_t parse_csv(std::string_view d, std::size_t start, std::size_t end, Field* out,
+                          int last, std::size_t slots) const {
+        std::fill(out, out + slots, kAbsent);
         std::size_t pos = start;
         int column = 0;
 
@@ -631,13 +658,13 @@ class RowParser {
                 if (stop > pos && d[stop - 1] == '\r') --stop;  // CRLF behaves like LF
                 field = pack(pos, stop - pos, false);
             }
-            store(column, field, out);
+            store(column, field, out, last, slots);
             ++column;
 
             if (next >= end) return end;
             if (d[next] == '\n') return next + 1;
             pos = next + 1;
-            if (column > last_needed_) {
+            if (column > last) {
                 const std::size_t eol = end_of_row(d, pos, end);
                 return eol >= end ? end : eol + 1;
             }
@@ -647,6 +674,31 @@ class RowParser {
 
     std::size_t width() const {
         return dialect_ == Dialect::Json ? wanted_.size() : source_.size();
+    }
+
+    /// Slot -> the column it reads. The join needs it to decide whether the two
+    /// files lay their compared columns out the same way.
+    const std::vector<int>& source() const { return source_; }
+
+    /// Key slots come first, so this is how far a key-only parse has to go.
+    void set_key_size(std::size_t n) {
+        key_size_ = n;
+        key_last_ = -1;
+        for (std::size_t slot = 0; slot < n && slot < source_.size(); ++slot)
+            key_last_ = std::max(key_last_, source_[slot]);
+        if (key_last_ < 0) key_last_ = last_needed_;
+    }
+
+    /// The keys, and nothing else.
+    ///
+    /// The sweep hashes keys and stores where the row starts; it never looks at
+    /// a compared column. Parsing all twenty to use two was most of what it
+    /// cost -- and the gain grows with the file, because past cache the parses
+    /// removed are memory traffic and not only instructions.
+    std::size_t parse_keys(std::string_view d, std::size_t start, std::size_t end,
+                           Field* out) const {
+        return dialect_ == Dialect::Json ? parse_json(d, start, end, out, key_size_)
+                                         : parse_csv(d, start, end, out, key_last_, key_size_);
     }
 
   private:
@@ -659,9 +711,10 @@ class RowParser {
     // Walks one JSON object, storing the values of the keys we want. One pass
     // over the object, one hash per key -- not a search per wanted column, which
     // at twenty columns would be four hundred comparisons a row.
-    std::size_t parse_json(std::string_view d, std::size_t start, std::size_t end,
-                           Field* out) const {
-        std::fill(out, out + wanted_.size(), kAbsent);
+    std::size_t parse_json(std::string_view d, std::size_t start, std::size_t end, Field* out,
+                           std::size_t slots) const {
+        std::fill(out, out + slots, kAbsent);
+        std::size_t found = 0;  // key slots filled, for the early exit below
         std::size_t pos = start;
         while (pos < end && json_space(d[pos])) ++pos;
         if (pos >= end) return end;
@@ -715,7 +768,23 @@ class RowParser {
             }
             if (!v.absent) {
                 const int slot = slot_for(key);
-                if (slot >= 0) out[slot] = pack(v.from, v.to - v.from, v.escaped);
+                if (slot >= 0 && static_cast<std::size_t>(slot) < slots) {
+                    // First occurrence wins for a key column, and only for a key
+                    // column -- the C port's rule, adopted here so the two agree
+                    // on a name a JSON object repeats. It is not a nicety: the
+                    // key-only parse below stops as soon as it has the keys, and
+                    // under last-wins it could stop on a different value than the
+                    // full parse ends with, which is a lookup that misses its own
+                    // row. Compared columns keep last-wins.
+                    if (static_cast<std::size_t>(slot) < key_size_) {
+                        if (out[slot] == kAbsent) {
+                            out[slot] = pack(v.from, v.to - v.from, v.escaped);
+                            if (++found == slots) break;
+                        }
+                    } else {
+                        out[slot] = pack(v.from, v.to - v.from, v.escaped);
+                    }
+                }
             }
         }
         return end_of_json_row(d, pos, end);
@@ -772,11 +841,13 @@ class RowParser {
         return end;
     }
 
-    void store(int column, Field f, Field* out) const {
-        if (column > last_needed_) return;
+    void store(int column, Field f, Field* out, int last, std::size_t slots) const {
+        if (column > last) return;
         const std::size_t at = static_cast<std::size_t>(column);
-        for (int i = csv_slot_starts_[at]; i < csv_slot_starts_[at + 1]; ++i)
-            out[csv_slots_[static_cast<std::size_t>(i)]] = f;
+        for (int i = csv_slot_starts_[at]; i < csv_slot_starts_[at + 1]; ++i) {
+            const std::size_t slot = static_cast<std::size_t>(csv_slots_[static_cast<std::size_t>(i)]);
+            if (slot < slots) out[slot] = f;
+        }
     }
 
     static std::size_t end_of_row(std::string_view d, std::size_t pos, std::size_t end) {
@@ -796,6 +867,8 @@ class RowParser {
     char delimiter_ = ',';
     std::vector<int> source_;
     int last_needed_ = 0;
+    int key_last_ = 0;
+    std::size_t key_size_ = 0;
     // The inverse of `source_`: which slots each column of the file feeds.
     std::vector<int> csv_slot_starts_, csv_slots_;
     Dialect dialect_ = Dialect::Csv;
@@ -824,6 +897,8 @@ class RowIndex {
     RowIndex(const Slab& slab, const RowParser& parser, std::size_t from, std::size_t key_size,
              const Options& opt, unsigned threads = 1)
         : slab_(slab), parser_(parser), key_size_(key_size), opt_(opt) {
+        // A placeholder until the sweep says how many rows there are; an empty
+        // file returns before that and needs a valid mask.
         table_.assign(1 << 12, kEmpty);
         mask_ = table_.size() - 1;
         scratch_.assign(parser.width() * 2, kAbsent);  // probe, then this row's key
@@ -862,6 +937,17 @@ class RowIndex {
         for (const auto& c : chunks) total += c.starts.size();
         row_start_.reserve(total);
         row_hash_.reserve(total);
+        // Sized once, from a row count the sweep has already produced. Growing
+        // into it instead costs a rehash per doubling -- thirteen of them at ten
+        // million rows, each one a full pass of random probes over a table far
+        // too big to cache, to arrive at the size that was known before the
+        // first insert. Under a half load, so nothing ever rehashes.
+        std::size_t cap = 1u << 12;
+        while (cap < total * 2 + 16) cap <<= 1;
+        table_.assign(cap, kEmpty);
+        mask_ = cap - 1;
+        first_row_.reserve(total);
+        occurrences_.reserve(total);
         // Each chunk is released as soon as it has been inserted. Holding all of
         // them until the end would keep two copies of every row's start and hash
         // alive at once -- the chunks and the arrays being filled from them --
@@ -879,6 +965,18 @@ class RowIndex {
         parser_.parse(slab_.bytes(), row_start_[row], slab_.bytes().size(), out);
     }
 
+    /// Where this row's bytes stop: the next row's start, or the end of the file.
+    std::size_t row_end(int row) const {
+        const std::size_t next = static_cast<std::size_t>(row) + 1;
+        return next < row_start_.size() ? row_start_[next] : slab_.bytes().size();
+    }
+    std::size_t row_begin(int row) const { return row_start_[static_cast<std::size_t>(row)]; }
+
+    /// This row's key fields, for a caller that compares nothing else.
+    void keys_of(int row, Field* out) const {
+        parser_.parse_keys(slab_.bytes(), row_start_[row], slab_.bytes().size(), out);
+    }
+
     // The row carrying `fields`' key, or -1. `other` is the slab those fields
     // live in, which is the opposite file when this is a join probe. `probe` is
     // scratch the caller owns: the join runs both directions at once, and a
@@ -890,7 +988,7 @@ class RowIndex {
             if (at == kEmpty) return -1;
             const int candidate = first_row_[at];
             if (row_hash_[candidate] == hash) {
-                fields_of(candidate, probe);
+                keys_of(candidate, probe);
                 bool ok = true;
                 for (std::size_t i = 0; i < key_size_ && ok; ++i)
                     ok = same(slab_, probe[i], other, fields[i], opt_);
@@ -1004,9 +1102,12 @@ class RowIndex {
                 pos += 2;
                 continue;
             }
-            const std::size_t next = parser.parse(d, pos, end, fields.data());
-            for (Field f : fields)
-                if (f == kTooLong)
+            // Keys only. This loop hashes the key and remembers where the row
+            // starts; it never looks at a compared column, and parsing all
+            // twenty to use two was most of what the sweep cost.
+            const std::size_t next = parser.parse_keys(d, pos, end, fields.data());
+            for (std::size_t i = 0; i < key_size_; ++i)
+                if (fields[i] == kTooLong)
                     throw Error("a field larger than " + std::to_string(kMaxFieldLen) +
                                 " bytes is more than this engine packs");
             out.starts.push_back(pos);
@@ -1042,10 +1143,13 @@ class RowIndex {
             const int candidate = first_row_[at];
             if (row_hash_[candidate] == hash) {
                 if (!mine_parsed) {
-                    parser_.parse(slab_.bytes(), start, slab_.bytes().size(), mine);
+                    // Keys only, like the candidate it is about to be compared
+                    // with: this branch decides whether two rows carry the same
+                    // key, and looks at nothing else.
+                    parser_.parse_keys(slab_.bytes(), start, slab_.bytes().size(), mine);
                     mine_parsed = true;
                 }
-                fields_of(candidate, probe);
+                keys_of(candidate, probe);
                 bool ok = true;
                 for (std::size_t i = 0; i < key_size_ && ok; ++i)
                     ok = same(slab_, probe[i], slab_, mine[i], opt_);
@@ -1322,10 +1426,35 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             out.push_back(std::find(header.begin(), header.end(), n) == header.end() ? "" : n);
         return out;
     };
-    const RowParser ap = a.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(a_header))
-                                                     : RowParser(a_delim, positions(a_header));
-    const RowParser bp = b.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(b_header))
-                                                     : RowParser(b_delim, positions(b_header));
+    RowParser ap = a.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(a_header))
+                                                : RowParser(a_delim, positions(a_header));
+    RowParser bp = b.dialect() == Dialect::Json ? RowParser(Dialect::Json, names_for(b_header))
+                                                : RowParser(b_delim, positions(b_header));
+    // Key slots come first in both, so this is all a key-only parse needs to
+    // know: where to stop, and how many slots to fill.
+    ap.set_key_size(key_size);
+    bp.set_key_size(key_size);
+
+    // Can a prefix prove a row equal? Only where both files are CSV read with
+    // the same delimiter and every compared column sits at the same column
+    // number on both sides, ascending -- then equal bytes mean equal columns,
+    // and the last compared column is the one that closes last. Two headers
+    // that order the same columns differently would put the same bytes under
+    // different names, which is exactly what this refuses.
+    //
+    // JSON is excluded here. A value there is found by name, and a name
+    // repeated in one object takes its last value for a compared column, so a
+    // duplicate past the diverging byte could carry a value the prefix never
+    // saw. The C port rules that out with a bounded scan of the mate's tail;
+    // this one has not caught up yet.
+    const std::vector<int>& a_src = ap.source();
+    const std::vector<int>& b_src = bp.source();
+    bool aligned = a.dialect() != Dialect::Json && b.dialect() != Dialect::Json &&
+                   a_delim == b_delim && nc > 0 && a_src.size() == width &&
+                   b_src.size() == width;
+    for (std::size_t i = key_size; aligned && i < width; ++i)
+        aligned = a_src[i] >= 0 && a_src[i] == b_src[i] &&
+                  (i == key_size || a_src[i] > a_src[i - 1]);
 
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
@@ -1400,6 +1529,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         const std::size_t lo = a_keys.size() * p / join_ways;
         const std::size_t hi = a_keys.size() * (p + 1) / join_ways;
         std::vector<Field> fa(width), fb(width), probe(width);
+        unsigned refused = 0;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
             ai.fields_of(row, fa.data());
@@ -1413,6 +1543,35 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
                 continue;
             }
             ++out.matched;
+            // A proof that keeps failing is a scan for nothing -- two files
+            // where every row really has changed pay for it on every row -- so
+            // after kProofBackoff failures in a row it is only attempted every
+            // kProofBackoff rows, until one succeeds and it is on again.
+            if (aligned && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+                const Field g = fa[width - 1];
+                if (is_real(g)) {
+                    const char* d = a.bytes().data();
+                    const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+                    const std::size_t b_lo = bi.row_begin(mate);
+                    const std::size_t b_n = bi.row_end(mate) - b_lo;
+                    // Through the byte that closes the last compared column,
+                    // not up to it. Agreeing as far as the field's last byte
+                    // says only that the mate's field starts the same way: `cc`
+                    // is a prefix of `cccccccc`, and a quoted field the mate
+                    // carries on with a doubled quote reads the same that far
+                    // too. It is the delimiter or the line ending after it that
+                    // says the mate's field stopped where this one did.
+                    std::size_t t = offset_of(g) + len_of(g);
+                    while (t < a_end && d[t] != a_delim && d[t] != '\n' && d[t] != '\r') ++t;
+                    const std::size_t need = t + 1 - a_lo;
+                    if (t < a_end && need <= b_n &&
+                        common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need) {
+                        refused = 0;
+                        continue;
+                    }
+                    if (refused < kProofBackoff) ++refused;
+                }
+            }
             bi.fields_of(mate, fb.data());
             bool any = false;
             for (std::size_t i = 0; i < nc; ++i) {
@@ -1469,14 +1628,88 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             removed.total += part.removed_total - static_cast<std::int64_t>(part.removed.size());
         }
     };
-    auto b_side = [&] {
+    // B's keys, over every core rather than one.
+    //
+    // This pass was the wall clock. The A side already ran on `join_ways`
+    // threads while this one walked all of B on a single thread beside it, and
+    // a throwaway build that skipped it entirely measured 1.29x of wall -- so it
+    // was not a tail on the run, it was most of it. Every key here is
+    // independent of every other, exactly as on the A side.
+    //
+    // Each part keeps its own added rows, and the parts are concatenated in
+    // order afterwards. That matters: the report keeps the first `max_rows` of
+    // them, and pushing from several threads into one list would make *which*
+    // rows a truncated report shows depend on thread scheduling. `first_rows()`
+    // is in first-occurrence order, each part takes a contiguous range of it,
+    // so the concatenation is the order the single thread produced.
+    const std::vector<int>& b_keys = bi.first_rows();
+    const unsigned b_ways = b_keys.size() < (1u << 14) ? 1u : join_ways;
+    std::vector<std::vector<std::pair<int, int>>> b_parts(b_ways);
+    std::vector<std::int64_t> b_totals(b_ways, 0);
+    auto b_range = [&](unsigned p) {
         std::vector<Field> fb(width), probe(width);
-        for (int row : bi.first_rows()) {
-            bi.fields_of(row, fb.data());
-            if (ai.lookup(b, fb.data(), bi.hash_of(row), probe.data()) < 0) added.push(row, -1);
+        const std::size_t lo = b_keys.size() * p / b_ways;
+        const std::size_t hi = b_keys.size() * (p + 1) / b_ways;
+        for (std::size_t at = lo; at < hi; ++at) {
+            const int row = b_keys[at];
+            // Keys only: this pass asks whether B's key exists in A, and the
+            // lookup compares key fields. The row's other nineteen columns are
+            // parsed later, and only for the rows the report actually keeps.
+            bi.keys_of(row, fb.data());
+            if (ai.lookup(b, fb.data(), bi.hash_of(row), probe.data()) < 0) {
+                ++b_totals[p];
+                if (b_parts[p].size() <= opt.max_rows) b_parts[p].emplace_back(row, -1);
+            }
         }
     };
-    {
+    auto b_side = [&] {
+        std::vector<std::thread> workers;
+        std::vector<std::exception_ptr> failures(b_ways);
+        workers.reserve(b_ways - 1);
+        auto guarded = [&](unsigned p) {
+            try {
+                b_range(p);
+            } catch (...) {
+                failures[p] = std::current_exception();
+            }
+        };
+        for (unsigned p = 1; p < b_ways; ++p) {
+            try {
+                workers.emplace_back(guarded, p);
+            } catch (const std::system_error&) {
+                guarded(p);  // no thread to be had: the same work, here
+            }
+        }
+        guarded(0);
+        for (auto& w : workers) w.join();
+        for (const auto& f : failures)
+            if (f) std::rethrow_exception(f);
+        for (unsigned p = 0; p < b_ways; ++p) {
+            added.total += b_totals[p];
+            for (const auto& e : b_parts[p])
+                if (added.held.size() <= added.cap) added.held.push_back(e);
+        }
+    };
+    // `added` does not need a pass of its own to be *counted*.
+    //
+    // Every distinct key of A finds at most one distinct key of B, distinct
+    // keys of A cannot find the same key of B, and the comparison behind the
+    // lookup is symmetric -- so the number of B's keys with an A counterpart is
+    // exactly the `matched` the A pass already produced, and `added` is B's
+    // distinct keys minus it.
+    //
+    // What the pass is still for is the *sample*: this port has a report, and
+    // its added section names rows. So it runs when something will print them
+    // and not otherwise. Skipping it is worth 1.29x of wall -- it is a full
+    // random-probed pass over a second table, and threading it changed nothing
+    // because the machine was already busy with the A side. That is the whole
+    // difference between work moved and work removed.
+    if (!opt.row_lists) {
+        a_side();
+        std::int64_t seen = 0;
+        for (const Part& part : parts) seen += part.matched;
+        added.total = bi.unique_keys() - seen;
+    } else {
         std::exception_ptr failure;
         std::thread worker([&] {
             try {

@@ -33,6 +33,10 @@ struct Options {
     // each is split into this many chunks, so the work is spread this wide in
     // total rather than per file.
     unsigned threads = 0;
+    // Whether anything will print the row lists. The counts are always exact
+    // either way; this only decides whether the *sample* of added rows is worth
+    // a pass over B to collect. See the note on `b_side` in csvdiff.cpp.
+    bool row_lists = true;
 };
 
 // Row counts. Always exact, even when the embedded row lists are capped.
