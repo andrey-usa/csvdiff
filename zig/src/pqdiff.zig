@@ -40,6 +40,7 @@ const Counts = csvdiff.Counts;
 const ColumnStat = csvdiff.ColumnStat;
 const Result = csvdiff.Result;
 const Phases = csvdiff.Phases;
+const PREFETCH_AHEAD = csvdiff.PREFETCH_AHEAD;
 
 pub const Error = error{
     ParquetKeyColumnMissing,
@@ -446,6 +447,14 @@ fn buildIndex(
     try ix.hashes.ensureTotalCapacity(gpa, s.rows);
 
     for (hs, 0..) |h, r| {
+        // Every insert is a random access into a table of tens of megabytes, and
+        // the next one wants a different line: without this the loop is a serial
+        // chain of misses, each waiting on an address known long before the load
+        // was issued. The hashes are all in hand, so the line can be asked for
+        // early. See `PREFETCH_AHEAD`.
+        if (r + PREFETCH_AHEAD < hs.len) {
+            @prefetch(&ix.slots[hs[r + PREFETCH_AHEAD] & ix.mask], .{ .rw = .read, .locality = 3, .cache = .data });
+        }
         var at: usize = @intCast(h & ix.mask);
         while (true) {
             const slot = ix.slots[at];
@@ -580,7 +589,13 @@ const MatchSweep = struct {
             try out.pair_a.ensureTotalCapacity(self.gpa, hi - lo);
             try out.pair_b.ensureTotalCapacity(self.gpa, hi - lo);
         }
-        for (firsts[lo..hi], hashes[lo..hi]) |row, h| {
+        const mine = hashes[lo..hi];
+        for (firsts[lo..hi], mine, 0..) |row, h, i| {
+            // As in the index build: the probe's address is known well before
+            // the load, so it is started early.
+            if (i + PREFETCH_AHEAD < mine.len) {
+                @prefetch(&self.into.slots[mine[i + PREFETCH_AHEAD] & self.into.mask], .{ .rw = .read, .locality = 3, .cache = .data });
+            }
             const mate = try lookup(
                 self.gpa,
                 self.as_id,

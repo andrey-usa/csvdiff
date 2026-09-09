@@ -103,7 +103,7 @@ pub const Phases = struct {
 /// How many rows ahead a table probe is started. Enough misses in flight to
 /// cover the latency of one, and not so many that the lines are evicted before
 /// the loop reaches them.
-const PREFETCH_AHEAD: usize = 32;
+pub const PREFETCH_AHEAD: usize = 32;
 
 /// Keys per join chunk. Sized in rows rather than in threads so that a chunk is
 /// small enough that no single one of them is the last thing four cores are
