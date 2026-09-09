@@ -236,6 +236,58 @@ previous case's report when a run refused its flags, and reported the previous
 case's answer as this one's; it deletes the file first now and treats a missing
 one as a failure.
 
+## What ndjson was paying for
+
+The ten-million-row run put this port third on ndjson, 20.13s against a Zig
+build's 15.58s, and its own CSV row at 4.16s on 2.42x fewer bytes. Phase timings
+-- which the text path did not have until this change, though the Parquet path
+has printed them for weeks -- said where it went. Two million rows:
+
+| Phase | CSV | ndjson | ndjson / CSV |
+|---|---:|---:|---:|
+| sweep rows (per side) | 0.23s | 0.83s | **3.2x** |
+| insert in order | 0.27s | 0.27s | 1.0x |
+| join and compare | 0.82s | 2.03s | 2.5x |
+
+ndjson is 2.42x the bytes, so the join is in proportion and the insert -- which
+hashes and probes and never looks at a byte of the file -- is identical, exactly
+as it should be. The sweep is the outlier at 3.2x.
+
+**The row scanner was the cost, and it was unnecessary.** Finding where a row
+ends used to alternate a SWAR scan for `\n` or `"` with a walk over each string
+it landed on, so that a newline inside a quoted value could not be mistaken for
+the end of the row. That cannot happen: RFC 8259 forbids the raw control
+characters U+0000 to U+001F inside a string, and a newline is U+000A. A valid
+JSON string cannot contain one -- it must be written `\n` -- and the framing of
+ndjson depends on precisely that. It is one scan for one byte now, and on a
+twenty-field row that removes about twenty string walks.
+
+**And the key-only parse stops when it has the keys.** The sweep and the probes
+want two columns of twenty; they used to walk the whole object anyway, because
+stopping early was unsafe while a repeated name took its *last* value -- the
+key-only parse would stop on one value and the full parse end with another,
+which is a lookup that misses its own row. A key column takes its **first**
+value now, in both parses, so they cannot disagree. Compared columns keep
+last-wins, which is what the C++ port does and what `test.sh` cross-checks.
+
+Two million rows, five interleaved rounds:
+
+| Build | Best | Median | CPU |
+|---|---:|---:|---:|
+| **after** | **2.18s** | **2.20s** | **6.9s** |
+| before | 3.45s | 3.58s | 11.9s |
+
+**1.58x on wall and 1.72x on CPU**, counts unchanged and still agreeing with the
+C++ port. CSV is untouched at 1.19s against 1.27s, which is noise -- neither
+change is on that path.
+
+Both rules the fast path now rests on are pinned by checks the generated fixture
+cannot produce: an escaped newline inside a string must not end a row, and a
+repeated key column must keep its first value. The second discriminates -- the
+previous binary answers it `added 1 removed 1` where this one answers
+`changed 1`. The first does not, and is a regression guard rather than a
+discriminator, which is worth saying rather than implying.
+
 ## The generator, on every core
 
 Every row is a pure function of its index, and whether a row is emitted at all

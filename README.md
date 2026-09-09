@@ -113,8 +113,8 @@ instead, silently. See [ARCHIVE.md](ARCHIVE.md#the-field-measured-once-2026-surv
 ## Working on it
 
 ```bash
-(cd c && bash test.sh)                # 18 checks, a few seconds, no other toolchain
-(cd c && bash test.sh --with-ports)   # adds the cross-port oracles: 36
+(cd c && bash test.sh)                # 20 checks, a few seconds, no other toolchain
+(cd c && bash test.sh --with-ports)   # adds the cross-port oracles: 38
 
 # the data, in any of the three formats, on every core
 c/gen-data --rows 10m --out-dir /tmp/d --prefix p [--format json|parquet] [--threads N]
@@ -166,11 +166,9 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **ndjson, now that CSV has left it behind.** Stopping the object walk once
-   the keys are found is the obvious move, but it needs the full and key-only
-   parses to agree on which value of a repeated JSON key wins — the full parse
-   takes the last, an early exit takes the first, and a row whose key differs
-   between them is a row whose lookups miss.
+1. **ndjson, again.** 1.58x came from framing rows on the newline byte and
+   letting the key-only parse stop once it has the keys. What is left is the
+   join, which still parses a matched row in full on both sides.
 2. **Where the C CSV path stops scaling.** 14.5 CPU-seconds over 4.06s of wall
    is 3.57 of four cores, and what is left sequential is the table insertion.
 3. **Reconciling the two Zig Parquet readers.** This tree and

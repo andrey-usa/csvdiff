@@ -72,6 +72,8 @@ counts keys rather than rows, and reports duplicates as their own section.
 | **Sizing the hash table once** | thirteen rehashes at 10M, each a full pass of random probes, gone |
 | **Software prefetch at distance 24** | every insert is a cache miss on a table too big to hold, and the hash is already in hand |
 | **Threading the generator** | 2.3x to 2.8x on wall for no more CPU -- flat on CSV, 12% *down* on ndjson. This was in the "not worth it" table above on the strength of a comparison that turned out to be unsound; it was a scope decision recorded as a measurement |
+| **Framing ndjson rows on the newline byte alone** | valid JSON cannot hold a raw control character in a string, so the quote-tracking scan the row end used was guarding against something the format forbids: 1.58x wall and 1.72x CPU on ndjson, with about twenty string walks a row removed |
+| **Stopping the key-only JSON parse once the keys are found** | needs the key columns to be first-wins in both parses, or the two disagree about a row's key and the lookup misses its own row |
 | **Reading only the key columns where only keys are read** | C's CSV path: 2.66x at two million rows, **3.65x at ten million** — the gain grows with the size, because past cache the parses removed were memory traffic and not only instructions |
 | **Huge pages for rare, long-lived, randomly-probed allocations** | a 128 MB slot table is 32,768 4 KB pages against ~1,500 TLB entries |
 | **Writing the generator's two sides at once** | 2.0x on Parquet by itself, where splitting a row group's twenty columns — the split the design points at — is 1.28x |

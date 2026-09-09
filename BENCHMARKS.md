@@ -34,6 +34,35 @@ a different question.
 
 ---
 
+## 2026-09-09 (later) — the C ndjson path
+
+One 4-core / 16 GB container, 2,000,000 rows, five interleaved rounds, both
+binaries from the same tree minutes apart.
+
+| Format | Build | Best | Median | CPU |
+|---|---|---:|---:|---:|
+| ndjson, 1,697 MB | **after** | **2.18s** | 2.20s | **6.9s** |
+| ndjson | before | 3.45s | 3.58s | 11.9s |
+| CSV, 702 MB | after | 1.19s | 1.31s | 3.7s |
+| CSV | before | 1.27s | 1.36s | 3.9s |
+
+**1.58x wall and 1.72x CPU on ndjson; CSV unchanged**, which is the control —
+neither change is on that path.
+
+Phase timings, added to the text path in this change, are what found it:
+
+| Phase | CSV | ndjson | ndjson / CSV |
+|---|---:|---:|---:|
+| sweep rows (per side) | 0.23s | 0.83s | **3.2x** |
+| insert in order | 0.27s | 0.27s | 1.0x |
+| join and compare | 0.82s | 2.03s | 2.5x |
+
+ndjson is 2.42x the bytes. The insert never touches the file and is identical;
+the join is in proportion; the sweep was the outlier, and it was the row scanner
+rather than the field parsing.
+
+---
+
 ## 2026-09-09 — seven builds against the other branch's rewritten ports
 
 GitHub Actions `ubuntu-latest`, 4 vCPU / 16 GB.

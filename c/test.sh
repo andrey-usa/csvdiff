@@ -185,6 +185,43 @@ else
   echo "  skip  ndjson against csv needs $GEN"; fail=1
 fi
 
+# Two rules the key-only JSON parse rests on, neither of which the generated
+# fixture can exercise because it never produces either shape.
+echo "the ndjson rules the fast path depends on:"
+jd=$(mktemp -d)
+BS=$(printf '\\')
+# A row ends at the next newline byte, full stop -- valid JSON cannot carry a
+# raw one inside a string, so an *escaped* newline must not split the row.
+printf '{"k":"1","v":"a%snb"}\n{"k":"2","v":"plain"}\n' "$BS" > "$jd/a.ndjson"
+printf '{"k":"1","v":"a%snb"}\n{"k":"2","v":"other"}\n' "$BS" > "$jd/b.ndjson"
+jrun() { # file pair, expected "rows changed"
+  rm -f "$jd/o.json"
+  ./csvdiff compare "$jd/$1" "$jd/$2" -k k --json "$jd/o.json" >/dev/null 2>&1 || true
+  python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["counts"]; print(c["a_rows"], c["changed"])' "$jd/o.json" 2>/dev/null || echo "(no report)"
+}
+got=$(jrun a.ndjson b.ndjson)
+if [ "$got" = "2 1" ]; then
+  echo "  ok    an escaped newline inside a string does not end the row"
+else
+  echo "  FAIL  an escaped newline inside a string does not end the row"
+  echo "    want: 2 1"; echo "    got : $got"; fail=1
+fi
+
+# A repeated key column takes its *first* value, so that the key-only parse --
+# which stops as soon as it has the keys -- and the full parse agree on what a
+# row's key is. Both rows below key on 1 under that rule and on 2 under the
+# other, so the counts say which rule ran.
+printf '{"k":"1","k":"2","v":"x"}\n' > "$jd/dup_a.ndjson"
+printf '{"k":"1","v":"y"}\n'         > "$jd/dup_b.ndjson"
+got=$(jrun dup_a.ndjson dup_b.ndjson)
+if [ "$got" = "1 1" ]; then
+  echo "  ok    a repeated key column keeps its first value"
+else
+  echo "  FAIL  a repeated key column keeps its first value"
+  echo "    want: 1 1 (matched on k=1, v differs)"; echo "    got : $got"; fail=1
+fi
+rm -rf "$jd"
+
 # A JSON writer may escape a character or write it literally, and the two spell
 # the same value -- so they have to compare equal. This is the one place the two
 # dialects genuinely differ: CSV doubles a quote, JSON puts a backslash in front,

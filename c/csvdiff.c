@@ -30,6 +30,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "parallel.h"
 #include "parquet.h"
@@ -211,17 +212,26 @@ static size_t skip_json_nested(const char *d, size_t pos, size_t end) {
 
 /* Past the end of this object's line. Records are newline-delimited, so a
  * newline outside a string ends the row. */
+/*
+ * The end of a row, which for newline-delimited JSON is the next newline byte
+ * and nothing subtler.
+ *
+ * This used to alternate a scan for `\n` or `"` with a walk over each string it
+ * landed on, to avoid mistaking a newline inside a quoted value for the end of
+ * the row. That cannot happen: RFC 8259 forbids the raw control characters
+ * U+0000 to U+001F inside a string, and a newline is U+000A, so a valid JSON
+ * string cannot contain one -- it must be written `\n`. The framing of ndjson
+ * depends on exactly that.
+ *
+ * So it is one SWAR scan for one byte, and on a twenty-field row that replaces
+ * about twenty string walks. Input that does put a raw newline inside a string
+ * is not JSON, and this reader will split the row there -- which is what every
+ * ndjson reader does, because the format has no other way to say where a row
+ * ends.
+ */
 static size_t end_of_json_row(const char *d, size_t pos, size_t end) {
-    while (pos < end) {
-        size_t stop = next_of2(d, pos, end, '\n', '"');
-        if (stop >= end) return end;
-        if (d[stop] == '\n') return stop + 1;
-        bool ignored = false;
-        size_t next = skip_json_string(d, stop, end, &ignored);
-        if (next <= stop) return end;
-        pos = next;
-    }
-    return end;
+    const size_t stop = next_of1(d, pos, end, '\n');
+    return stop >= end ? end : stop + 1;
 }
 
 static size_t utf8_put(unsigned cp, char *buf, size_t cap, size_t at) {
@@ -551,6 +561,7 @@ static size_t end_of_row(const char *d, size_t pos, size_t end) {
 static size_t parse_json_row(const RowParser *p, const char *d, size_t start, size_t end,
                              Field *out, size_t slots) {
     for (size_t i = 0; i < slots; i++) out[i] = ABSENT;
+    size_t found = 0;   /* key slots filled, for the early exit below */
     size_t pos = start;
     while (pos < end && json_space(d[pos])) pos++;
     if (pos >= end) return end;
@@ -597,7 +608,30 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
         }
         if (!absent) {
             int slot = parser_slot_for(p, d + key_from, key_len);
-            if (slot >= 0 && (size_t)slot < slots) out[slot] = pack(from, to - from, escaped);
+            if (slot >= 0 && (size_t)slot < slots) {
+                /*
+                 * First occurrence wins for a key column, and only for a key
+                 * column. A JSON object is not supposed to repeat a name and
+                 * this generator never does, but the rule has to be *stated*
+                 * rather than incidental, because two parses of the same row
+                 * have to agree on what its key is: the key-only parse below
+                 * stops as soon as it has the keys, and a last-wins rule would
+                 * let it stop on a different value than the full parse ends
+                 * with, which is a lookup that misses its own row. Compared
+                 * columns keep last-wins, which is what the C++ port does and
+                 * what test.sh cross-checks against.
+                 */
+                if ((size_t)slot < p->key_size) {
+                    if (out[slot] == ABSENT) {
+                        out[slot] = pack(from, to - from, escaped);
+                        /* Every key found and nothing else wanted: the rest of
+                         * the object is bytes to skip, not fields to parse. */
+                        if (++found == slots) break;
+                    }
+                } else {
+                    out[slot] = pack(from, to - from, escaped);
+                }
+            }
         }
     }
     return end_of_json_row(d, pos, end);
@@ -654,6 +688,32 @@ static size_t parse_keys(const RowParser *p, const char *d, size_t start, size_t
                          Field *out) {
     if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out, p->key_size);
     return parse_csv_row(p, d, start, end, out, p->key_last, p->key_size);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Phase timings                                                               */
+/*                                                                             */
+/* On stderr when CSVDIFF_PHASES is set, the same shape pqdiff.c prints. The    */
+/* text path has three costs that move independently -- finding and hashing the */
+/* rows, inserting them in order, and the join that re-reads both sides -- and  */
+/* until this existed the only way to tell which had grown was to guess.        */
+/* ------------------------------------------------------------------------- */
+
+typedef struct { int on; struct timespec last; } Phases;
+
+static void phases_init(Phases *p) {
+    p->on = getenv("CSVDIFF_PHASES") != NULL;
+    clock_gettime(CLOCK_MONOTONIC, &p->last);
+}
+
+static void phase_mark(Phases *p, const char *what) {
+    if (!p->on) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const double secs = (double)(now.tv_sec - p->last.tv_sec) +
+                        (double)(now.tv_nsec - p->last.tv_nsec) / 1e9;
+    fprintf(stderr, "  %-22s %6.3fs\n", what, secs);
+    p->last = now;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -854,9 +914,12 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     if (!bounds || !chunks) { free(bounds); free(chunks); return false; }
     const unsigned ways = chunk_bounds(slab, from, threads, bounds);
 
+    Phases ph;
+    phases_init(&ph);
     SweepCtx sc = { slab, parser, key_size, bounds, chunks };
     run_parts(sweep_part, &sc, ways);
     free(bounds);
+    phase_mark(&ph, "sweep rows");
 
     bool ok = true;
     for (unsigned p = 0; p < ways; p++) {
@@ -941,6 +1004,7 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
             slot = (slot + 1) & ix->mask;
         }
     }
+    phase_mark(&ph, "insert in order");
     return true;
 }
 
@@ -1384,6 +1448,8 @@ int main(int argc, char **argv) {
     int64_t *col_blanked = NULL;
     int64_t *col_filled = NULL;
 
+    Phases whole;
+    phases_init(&whole);
     if (!slab_open(&a, a_path) || !slab_open(&b, b_path)) { fail("cannot read one of the files"); goto done; }
 
     a.dialect = detect_dialect(&a);
@@ -1476,6 +1542,7 @@ int main(int argc, char **argv) {
         BuildCtx bc = { { &ai, &bi }, { &a, &b }, { &ap, &bp }, { a_start, b_start },
                         key_size, budget > 1 ? budget / 2 : 1, { false, false } };
         run_parts(build_part, &bc, 2);
+        phase_mark(&whole, "both indexes");
         if (!bc.ok[0] || !bc.ok[1]) {
             fail(ai.failed || bi.failed ? "a field is larger than this engine packs"
                                         : "out of memory");
@@ -1492,6 +1559,7 @@ int main(int argc, char **argv) {
         if (!parts) { fail("out of memory"); goto done; }
         CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts };
         run_parts(compare_part, &cc, ways + b_ways);
+        phase_mark(&whole, "join and compare");
 
         bool oom = false;
         for (unsigned p = 0; p < ways + b_ways; p++) {
