@@ -355,7 +355,13 @@ fn a_row_short_of_the_last_column_still_compares() {
 #[test]
 fn an_empty_last_column_is_a_boundary_like_any_other() {
     agrees("k,v\nK1,\nK2,y\n", "k,v\nK1,\nK2,z\n", &["k"], false, false);
-    agrees("k,v\nK1,\nK2,y\n", "k,v\nK1,q\nK2,y\n", &["k"], false, false);
+    agrees(
+        "k,v\nK1,\nK2,y\n",
+        "k,v\nK1,q\nK2,y\n",
+        &["k"],
+        false,
+        false,
+    );
 }
 
 /// The last row of a file ends at the end of the file rather than at a newline,
@@ -371,8 +377,20 @@ fn a_final_row_without_a_newline_takes_the_run_to_the_end() {
 /// runs for the pairs whose bytes differ.
 #[test]
 fn trimming_and_folding_still_decide_the_pairs_the_bytes_did_not() {
-    agrees("k,v\nK1, x \nK2,y\n", "k,v\nK1,x\nK2,y\n", &["k"], true, false);
-    agrees("k,v\nK1,X\nK2,y\n", "k,v\nK1,x\nK2,y\n", &["k"], false, true);
+    agrees(
+        "k,v\nK1, x \nK2,y\n",
+        "k,v\nK1,x\nK2,y\n",
+        &["k"],
+        true,
+        false,
+    );
+    agrees(
+        "k,v\nK1,X\nK2,y\n",
+        "k,v\nK1,x\nK2,y\n",
+        &["k"],
+        false,
+        true,
+    );
 }
 
 /// The case the run's own end has to be checked for, which a boundary in the
@@ -397,5 +415,8 @@ fn a_run_ending_inside_a_quoted_field_is_not_a_run() {
         counts.push(serde_json::json!(r.counts).to_string());
     }
     assert_eq!(counts[1], counts[0], "turbo diverges from native");
-    assert!(counts[0].contains("\"changed\":1"), "expected a changed pair");
+    assert!(
+        counts[0].contains("\"changed\":1"),
+        "expected a changed pair"
+    );
 }

@@ -67,6 +67,24 @@ gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 - Prefer editing the existing virtualised grid over adding a table library; the grid renders only
   the visible rows and that is the reason large reports open instantly.
 
+## Working on this repository
+
+Several agents work here at once, split by topic rather than by branch: one takes the C and C++
+ports, another the Rust and Zig ones. Everything lands on `main`, so the split is in what you
+touch, not where you push.
+
+- **Branch, then pull request.** Work on a topic branch and open a PR against `main`; do not
+  commit to `main` directly. Keep commits small enough to read and say in the message what was
+  measured, not only what changed.
+- **Wait for the Codex review before considering a PR done.** Every PR gets an automated code
+  review. Read it: where a finding is legitimate, fix it and push to the same branch; where it is
+  wrong or does not apply, say so on the PR and why. Do not merge past an unanswered review, and
+  do not silently ignore one — a finding you disagree with still needs a reply.
+- **Someone else may have already done your change in their port.** Before starting a round,
+  read what landed on `main` recently. The same finding often applies to all four ports, and the
+  right answer can differ per port: `added` is derived arithmetically in C++ and Zig, from a
+  bitmap in Rust, because only Rust has to name the rows.
+
 ## Gotchas
 
 - `resource.ru_maxrss` is KB on Linux, bytes on macOS — the harnesses in `scripts/` handle both.
