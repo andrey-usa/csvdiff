@@ -889,15 +889,35 @@ fn chunk_bounds(data: &[u8], from: usize, threads: usize, dialect: Dialect) -> V
         .map(|i| from + (end - from) * i / threads)
         .collect();
 
+    // Quotes before each split point, counted once per byte rather than once per
+    // byte per split point.
+    //
+    // Asking each task for the count from `from` to its own split reads the
+    // first slice of the file in every task, the second in all but one, and so
+    // on: `(threads - 1) / 2` passes over the file in total, and the last task
+    // alone reads nearly all of it, so the step costs about a whole pass however
+    // many threads run it. That grows with the thread count while the work it
+    // parallelises shrinks -- at four threads it was a fifth of the sweep, and at
+    // sixteen it would dominate it.
+    //
+    // Counting each slice on its own and running a prefix sum over the results
+    // gives the same numbers for one pass split evenly.
     let quotes: Vec<usize> = if dialect == Dialect::Json {
         vec![0; nominal.len()]
     } else {
-        in_parallel(nominal.len(), |i| {
-            Ok(count_byte(data, from, nominal[i], b'"'))
-        })
-        .into_iter()
-        .map(|r| r.unwrap_or(0))
-        .collect()
+        let mut edges = Vec::with_capacity(nominal.len() + 1);
+        edges.push(from);
+        edges.extend_from_slice(&nominal);
+        let each = in_parallel(nominal.len(), |i| {
+            Ok(count_byte(data, edges[i], edges[i + 1], b'"'))
+        });
+        let mut running = 0usize;
+        each.into_iter()
+            .map(|r| {
+                running += r.unwrap_or(0);
+                running
+            })
+            .collect()
     };
 
     let mut bounds = vec![from];

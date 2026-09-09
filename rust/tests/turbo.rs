@@ -420,3 +420,61 @@ fn a_run_ending_inside_a_quoted_field_is_not_a_run() {
         "expected a changed pair"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Chunk boundaries. Nothing above reaches them: the sweep only splits a file
+// past `CHUNKING_THRESHOLD`, which is 4 MB, and every fixture above is bytes.
+// ---------------------------------------------------------------------------
+
+/// Builds a file big enough for the sweep to split, whose rows are mostly
+/// quoted field — so a split point has a good chance of landing inside one.
+///
+/// A newline inside a quoted field is not a row boundary, and a thread starting
+/// mid-file cannot tell whether it is inside one except by what came before it.
+/// Get that wrong and a row is cut in half: the counts move, which is what these
+/// tests read.
+fn quoted_bulk(rows: usize, marker: &str) -> String {
+    let mut s = String::from("k,note,v\n");
+    for i in 0..rows {
+        // 200-odd bytes of quoted field, holding both a newline and a delimiter.
+        s.push_str(&format!(
+            "K{i},\"line one of {i}\nline two, with a comma\n{}\",{}\n",
+            "padding, and more padding\n".repeat(6),
+            if i == rows / 2 { marker } else { "same" }
+        ));
+    }
+    s
+}
+
+/// The sweep's split points must land on real row boundaries in a file where
+/// most bytes are inside quotes, and the answer must not depend on how many
+/// threads looked for them.
+#[test]
+fn chunk_boundaries_land_between_rows_in_a_quoted_file() {
+    let a = quoted_bulk(40_000, "same");
+    let b = quoted_bulk(40_000, "different");
+    assert!(
+        a.len() > 8 << 20,
+        "fixture must exceed the chunking threshold, got {} bytes",
+        a.len()
+    );
+    let f = Fixture::new(&a, &b);
+
+    let mut reference = None;
+    for threads in [1usize, 2, 3, 4, 8] {
+        let mut opt = Options::with_key(["k"]);
+        opt.engine = Engine::Turbo.label().to_string();
+        opt.threads = Some(threads);
+        let r = compare(&f.a, &f.b, &mut opt).expect("compare");
+        let got = serde_json::json!({"counts": r.counts, "columns": r.columns}).to_string();
+        // One row differs, and every row must survive as one row.
+        assert!(
+            got.contains("\"changed\":1") && got.contains("\"a_rows\":40000"),
+            "threads {threads}: rows were cut apart -- {got}"
+        );
+        match &reference {
+            None => reference = Some(got),
+            Some(first) => assert_eq!(&got, first, "threads {threads} disagrees"),
+        }
+    }
+}
