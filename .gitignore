@@ -15,6 +15,10 @@ __pycache__/
 /rust/bench/
 /rust/out/
 /rust/target/
+# The scanner variants build into their own target directories, because a
+# different -C target-feature invalidates everything cargo has cached.
+/rust/target-*/
+/zig/zig-out-*/
 csvdiff.toml
 *.html
 !examples/report.html

@@ -25,13 +25,22 @@
 //! bounds this path exactly as it bounds the CSV one.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const csvdiff = @import("csvdiff.zig");
 const parquet = @import("parquet.zig");
+
+/// Bytes per step of the mismatch scan, from the same `-Dscan` build option the
+/// CSV scanner uses: 8 is SWAR, 32 and 64 are a vector register.
+const mask_width = build_options.scan_width;
+const MaskVector = @Vector(mask_width, u8);
+const MaskBits = std.meta.Int(.unsigned, mask_width);
 
 const Options = csvdiff.Options;
 const Counts = csvdiff.Counts;
 const ColumnStat = csvdiff.ColumnStat;
 const Result = csvdiff.Result;
+const Phases = csvdiff.Phases;
+const PREFETCH_AHEAD = csvdiff.PREFETCH_AHEAD;
 
 pub const Error = error{
     ParquetKeyColumnMissing,
@@ -167,9 +176,31 @@ fn cellDiffers(gpa: std.mem.Allocator, x: Look, y: Look, o: Options, s: *Scratch
 const PRIME: u64 = 0x100_0000_01b3;
 const SEED: u64 = 0xcbf2_9ce4_8422_2325;
 
+/// FNV-1a, eight bytes at a time.
+///
+/// A hash here is internal in exactly the sense the CSV engine's is: nothing
+/// outside this file sees one, so the only property it owes anyone is that the
+/// two places that compute it agree. That is what lets it read a word at a time
+/// -- see `csvdiff.hashBytes`, which is the same function for the same reason.
+///
+/// It matters more than the call sites suggest. Interning a dictionary costs
+/// one call per *distinct* value and is nothing; a key column that is not
+/// dictionary-encoded -- which a high-cardinality key column usually is not,
+/// since a writer gives up on a dictionary that never repeats -- is hashed once
+/// per row, on both sides, indexed and probed.
 fn foldBytes(seed: u64, v: []const u8) u64 {
     var h = seed;
-    for (v) |b| h = (h ^ b) *% PRIME;
+    var at: usize = 0;
+    while (at + 8 <= v.len) : (at += 8) {
+        h = (h ^ std.mem.readInt(u64, v[at..][0..8], .little)) *% PRIME;
+        h ^= h >> 29; // the xor-shift is what spreads a whole word into the low bits
+    }
+    if (at < v.len) {
+        var tail: [8]u8 = @splat(0);
+        @memcpy(tail[0 .. v.len - at], v[at..]);
+        h = (h ^ std.mem.readInt(u64, &tail, .little)) *% PRIME;
+        h ^= h >> 29;
+    }
     return (h ^ v.len) *% PRIME;
 }
 fn foldAbsent(h: u64) u64 {
@@ -392,6 +423,7 @@ fn buildIndex(
     as_id: []const bool,
     s: KeySide,
     o: Options,
+    ways: usize,
 ) !Index {
     var ix = Index{ .rows = @intCast(s.rows) };
     errdefer ix.deinit(gpa);
@@ -401,7 +433,22 @@ fn buildIndex(
 
     const hs = try gpa.alloc(u64, s.rows);
     defer gpa.free(hs);
-    for (hs, 0..) |*h, r| h.* = try rowHash(gpa, as_id, s, r, o, &sc);
+    {
+        const chunks = @max(1, std.math.divCeil(usize, s.rows, HashRows.rows_per_chunk) catch 1);
+        const errs = try gpa.alloc(?anyerror, chunks);
+        defer gpa.free(errs);
+        @memset(errs, null);
+        var work = HashRows{
+            .gpa = gpa,
+            .as_id = as_id,
+            .side = s,
+            .opt = o,
+            .hs = hs,
+            .errs = errs,
+        };
+        try csvdiff.runOnThreads(&work, HashRows.run, ways);
+        for (errs) |e| if (e) |err| return err;
+    }
 
     // Sized to about a two-thirds load: linear probing is still short there, and
     // a smaller table is a smaller working set, which is what this phase is
@@ -416,6 +463,14 @@ fn buildIndex(
     try ix.hashes.ensureTotalCapacity(gpa, s.rows);
 
     for (hs, 0..) |h, r| {
+        // Every insert is a random access into a table of tens of megabytes, and
+        // the next one wants a different line: without this the loop is a serial
+        // chain of misses, each waiting on an address known long before the load
+        // was issued. The hashes are all in hand, so the line can be asked for
+        // early. See `PREFETCH_AHEAD`.
+        if (r + PREFETCH_AHEAD < hs.len) {
+            @prefetch(&ix.slots[hs[r + PREFETCH_AHEAD] & ix.mask], .{ .rw = .read, .locality = 3, .cache = .data });
+        }
         var at: usize = @intCast(h & ix.mask);
         while (true) {
             const slot = ix.slots[at];
@@ -443,6 +498,206 @@ fn buildIndex(
     }
     return ix;
 }
+
+/// One key column of one file, decoded on its own thread.
+///
+/// Reading a column is the expensive half of the key phase -- pages decoded,
+/// dictionaries built, levels expanded -- and the two sides' columns have
+/// nothing in common, so there is no reason to do them in turn. What follows
+/// them, interning the two dictionaries into one id space, does have to be
+/// serial per column: it is one shared id space by construction, and it is a
+/// few thousand string comparisons rather than ten million.
+const KeyRead = struct {
+    /// A ceiling so the jobs and their thread handles live on the stack. A key
+    /// of more than sixteen columns reads in place instead.
+    const max_jobs = 32;
+
+    gpa: std.mem.Allocator,
+    map: []const u8,
+    at: usize,
+    out: *Col,
+    err: ?anyerror = null,
+
+    fn run(self: *KeyRead) void {
+        const c = parquet.readColumn(self.gpa, self.map, self.at) catch |e| {
+            self.err = e;
+            return;
+        };
+        self.out.* = .{ .c = c, .map = self.map };
+    }
+};
+
+/// One side's index, built on its own thread. The two sides share nothing --
+/// not the mapping, not the key columns, not the table -- so the only reason
+/// this is a struct rather than a call is that a thread cannot return an error.
+const IndexBuild = struct {
+    gpa: std.mem.Allocator,
+    as_id: []const bool,
+    side: KeySide,
+    opt: Options,
+    /// How many threads this side's hash pass may use. The two sides build at
+    /// once, so this is half the machine each.
+    ways: usize = 1,
+    index: Index = .{},
+    err: ?anyerror = null,
+
+    fn run(self: *IndexBuild) void {
+        self.index = buildIndex(self.gpa, self.as_id, self.side, self.opt, self.ways) catch |e| {
+            self.err = e;
+            return;
+        };
+    }
+};
+
+/// The hash half of the index build, chunked.
+///
+/// A row's hash depends on nothing but that row, which is the whole reason the
+/// build is written as hash-then-insert -- and this half was still walking ten
+/// million rows on one thread while the insert it feeds is the part that has to
+/// be serial. The Rust port has threaded this since it was written; this one had
+/// not.
+const HashRows = struct {
+    const rows_per_chunk: usize = 1 << 16;
+
+    gpa: std.mem.Allocator,
+    as_id: []const bool,
+    side: KeySide,
+    opt: Options,
+    hs: []u64,
+    /// One slot per chunk, so a failing chunk writes only its own.
+    errs: []?anyerror,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn run(self: *HashRows) void {
+        var sc = Scratch{};
+        defer sc.deinit(self.gpa);
+        while (true) {
+            const c = self.next.fetchAdd(1, .monotonic);
+            if (c >= self.errs.len) return;
+            const lo = c * rows_per_chunk;
+            const hi = @min(lo + rows_per_chunk, self.hs.len);
+            for (lo..hi) |r| {
+                self.hs[r] = rowHash(self.gpa, self.as_id, self.side, r, self.opt, &sc) catch |e| {
+                    self.errs[c] = e;
+                    return;
+                };
+            }
+        }
+    }
+};
+
+/// One direction of the join: every distinct key on `from`'s side looked up in
+/// `into`'s table. The A direction keeps the pairs it finds; the B direction
+/// only counts the keys that find nothing, which is why `keep_pairs` exists and
+/// why the two can run at once without sharing an output.
+/// Keys per chunk of the match sweep. Sized in rows rather than in threads, so a
+/// chunk is small enough that no single one of them is the last thing four cores
+/// are waiting on.
+const SWEEP_CHUNK: usize = 1 << 16;
+
+/// How many chunks `keys` divides into. One below the threshold, where finding
+/// the boundaries would cost more than the sweep it splits.
+fn sweepWays(keys: usize) usize {
+    if (keys < (1 << 14)) return 1;
+    return @max(1, std.math.divCeil(usize, keys, SWEEP_CHUNK) catch 1);
+}
+
+/// What one chunk of one direction found.
+const SweepPart = struct {
+    pair_a: std.ArrayList(i32) = .empty,
+    pair_b: std.ArrayList(i32) = .empty,
+    missing: i64 = 0,
+    err: ?anyerror = null,
+
+    fn deinit(self: *SweepPart, gpa: std.mem.Allocator) void {
+        self.pair_a.deinit(gpa);
+        self.pair_b.deinit(gpa);
+    }
+};
+
+const MatchSweep = struct {
+    gpa: std.mem.Allocator,
+    as_id: []const bool,
+    into: *const Index,
+    into_keys: KeySide,
+    from: *const Index,
+    from_keys: KeySide,
+    opt: Options,
+    keep_pairs: bool,
+    parts: []SweepPart = &.{},
+
+    /// One chunk of this direction's keys, looked up in the other side's table.
+    fn one(self: *MatchSweep, p: usize) void {
+        self.chunk(p) catch |e| {
+            self.parts[p].err = e;
+        };
+    }
+
+    fn chunk(self: *MatchSweep, p: usize) !void {
+        var sc = Scratch{};
+        defer sc.deinit(self.gpa);
+        const firsts = self.from.firsts.items;
+        const hashes = self.from.hashes.items;
+        const lo = firsts.len * p / self.parts.len;
+        const hi = firsts.len * (p + 1) / self.parts.len;
+        var out = &self.parts[p];
+        if (self.keep_pairs) {
+            try out.pair_a.ensureTotalCapacity(self.gpa, hi - lo);
+            try out.pair_b.ensureTotalCapacity(self.gpa, hi - lo);
+        }
+        const mine = hashes[lo..hi];
+        for (firsts[lo..hi], mine, 0..) |row, h, i| {
+            // As in the index build: the probe's address is known well before
+            // the load, so it is started early.
+            if (i + PREFETCH_AHEAD < mine.len) {
+                @prefetch(&self.into.slots[mine[i + PREFETCH_AHEAD] & self.into.mask], .{ .rw = .read, .locality = 3, .cache = .data });
+            }
+            const mate = try lookup(
+                self.gpa,
+                self.as_id,
+                self.into.*,
+                self.into_keys,
+                self.from_keys,
+                @intCast(row),
+                h,
+                self.opt,
+                &sc,
+            );
+            if (mate < 0) {
+                out.missing += 1;
+                continue;
+            }
+            if (self.keep_pairs) {
+                out.pair_a.appendAssumeCapacity(row);
+                out.pair_b.appendAssumeCapacity(mate);
+            }
+        }
+    }
+};
+
+/// Both directions of the join, chunked into one queue that every thread pulls
+/// from.
+///
+/// A thread per direction looked right -- the two share nothing and write to
+/// different places -- and it is what the CSV engine used to do too. Measuring
+/// says a direction is the wrong unit: the two are not the same size, so one
+/// finishes early and half the machine waits. Chunks do not care which direction
+/// they came from.
+const Sweeps = struct {
+    pairs: *MatchSweep,
+    counts: *MatchSweep,
+    next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn run(self: *Sweeps) void {
+        const first = self.pairs.parts.len;
+        const total = first + self.counts.parts.len;
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= total) return;
+            if (i < first) self.pairs.one(i) else self.counts.one(i - first);
+        }
+    }
+};
 
 /// Looks one side's row up in the other side's table.
 fn lookup(
@@ -480,6 +735,31 @@ const block = 4096;
 /// wholesale is most of the loop.
 fn scanMask(neq: []const u8, base: usize, hits: *std.ArrayList(usize), gpa: std.mem.Allocator) !void {
     var i: usize = 0;
+    // The same `-Dscan` switch the CSV scanner is built under, asked of the same
+    // question in a different shape: there it is "which byte is a delimiter",
+    // here "which cell changed".
+    //
+    // The arithmetic that makes it worth doing: about 0.7% of cells differ per
+    // column, so an eight-byte word is all-zero 94.6% of the time, a 32-byte
+    // vector 80%, a 64-byte one 64%. Every one of those is a correctly
+    // predicted not-taken branch and eight, thirty-two or sixty-four cells
+    // retired. The work on a *hit* is identical in all three -- one `@ctz` per
+    // changed cell -- so the only thing a wider register buys is fewer trips
+    // round the skip path, which is where nearly all the loop is. That is the
+    // opposite trade from the CSV scanner, where a wider register also means
+    // fewer loads, and it is why both are measured rather than assumed.
+    if (mask_width > 8) {
+        const zero: MaskVector = @splat(0);
+        while (i + mask_width <= neq.len) : (i += mask_width) {
+            const chunk: MaskVector = @bitCast(neq[i..][0..mask_width].*);
+            const nonzero: @Vector(mask_width, bool) = chunk != zero;
+            var bits: MaskBits = @bitCast(nonzero);
+            while (bits != 0) {
+                try hits.append(gpa, base + i + @ctz(bits));
+                bits &= bits - 1;
+            }
+        }
+    }
     while (i + 8 <= neq.len) : (i += 8) {
         var w = std.mem.readInt(u64, neq[i..][0..8], .little);
         while (w != 0) {
@@ -663,9 +943,10 @@ pub fn compare(
     b_path: []const u8,
     opt: Options,
 ) !Result {
-    var a_slab = try csvdiff.Slab.open(io, a_path);
+    var phases = Phases.start("");
+    var a_slab = try csvdiff.Slab.map(io, a_path);
     defer a_slab.close();
-    var b_slab = try csvdiff.Slab.open(io, b_path);
+    var b_slab = try csvdiff.Slab.map(io, b_path);
     defer b_slab.close();
     const a_map = a_slab.data;
     const b_map = b_slab.data;
@@ -710,16 +991,35 @@ pub fn compare(
     defer a_keys.deinit(gpa);
     defer b_keys.deinit(gpa);
 
-    for (opt.key, 0..) |k, j| {
-        a_keys.col[j] = .{
-            .c = try parquet.readColumn(gpa, a_map, indexOf(a_meta.names, k)),
-            .map = a_map,
-        };
-        b_keys.col[j] = .{
-            .c = try parquet.readColumn(gpa, b_map, indexOf(b_meta.names, k)),
-            .map = b_map,
-        };
+    // Every key column, both sides, at once. These reads are the phase that
+    // decodes pages for ten million rows and they share nothing -- different
+    // files, different columns, separate outputs -- but they used to run one
+    // after another, which is where this path's cores-busy ratio went. There
+    // are `2 * key_size` of them and usually four.
+    {
+        var jobs: [KeyRead.max_jobs]KeyRead = undefined;
+        var n: usize = 0;
+        for (opt.key, 0..) |k, j| {
+            if (n + 2 > KeyRead.max_jobs) break;
+            jobs[n] = .{ .gpa = gpa, .map = a_map, .at = indexOf(a_meta.names, k), .out = &a_keys.col[j] };
+            jobs[n + 1] = .{ .gpa = gpa, .map = b_map, .at = indexOf(b_meta.names, k), .out = &b_keys.col[j] };
+            n += 2;
+        }
+        // A key wider than the job table falls back to reading in place, which
+        // is the old behaviour and still right.
+        for (opt.key[n / 2 ..], n / 2..) |k, j| {
+            a_keys.col[j] = .{ .c = try parquet.readColumn(gpa, a_map, indexOf(a_meta.names, k)), .map = a_map };
+            b_keys.col[j] = .{ .c = try parquet.readColumn(gpa, b_map, indexOf(b_meta.names, k)), .map = b_map };
+        }
+
+        var threads: [KeyRead.max_jobs]?std.Thread = @splat(null);
+        // The last job runs on this thread rather than waiting for one.
+        for (1..n) |i| threads[i] = std.Thread.spawn(.{}, KeyRead.run, .{&jobs[i]}) catch null;
+        if (n > 0) jobs[0].run();
+        for (1..n) |i| if (threads[i]) |t| t.join() else jobs[i].run();
+        for (jobs[0..n]) |job| if (job.err) |e| return e;
     }
+    phases.mark("key columns (par)");
     a_keys.rows = if (key_size > 0) a_keys.col[0].rows() else 0;
     b_keys.rows = if (key_size > 0) b_keys.col[0].rows() else 0;
     for (0..key_size) |j| {
@@ -750,12 +1050,80 @@ pub fn compare(
         }
     }
 
+    phases.mark("intern dicts (serial)");
     // --- the join ---------------------------------------------------------
-    var ai = try buildIndex(gpa, as_id, a_keys, opt);
-    defer ai.deinit(gpa);
-    var bi = try buildIndex(gpa, as_id, b_keys, opt);
-    defer bi.deinit(gpa);
+    //
+    // Two phases, and each is two independent halves, so each runs on two
+    // threads: the indexes share nothing, and once both exist the two
+    // directions of the join read them and write to different places. This is
+    // the same structure the CSV engine has had since it was threaded at all --
+    // one thread per file, one per direction -- and it is what this path was
+    // missing: it was building both indexes and walking both directions on one
+    // thread while the column pass below it used every core.
+    // The same budget the sweep and the column pass take, halved: the two sides
+    // build at the same time, so each gets half the machine for its hash pass.
+    const machine = @max(1, if (opt.threads != 0) opt.threads else (std.Thread.getCpuCount() catch 1));
+    const per_side = @max(1, machine / 2);
+    var build_a = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = a_keys, .opt = opt, .ways = per_side };
+    var build_b = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = b_keys, .opt = opt, .ways = per_side };
+    // A thread that cannot be spawned is not a reason to fail: the work runs
+    // here instead, which is slower and still right.
+    const build_thread = std.Thread.spawn(.{}, IndexBuild.run, .{&build_b}) catch null;
+    build_a.run();
+    if (build_thread) |t| t.join() else build_b.run();
 
+    phases.mark("index build (2 ways)");
+    var ai = build_a.index;
+    defer ai.deinit(gpa);
+    var bi = build_b.index;
+    defer bi.deinit(gpa);
+    if (build_a.err) |e| return e;
+    if (build_b.err) |e| return e;
+
+    const a_ways = sweepWays(ai.firsts.items.len);
+    const b_ways = sweepWays(bi.firsts.items.len);
+    const parts = try gpa.alloc(SweepPart, a_ways + b_ways);
+    defer {
+        for (parts) |*part| part.deinit(gpa);
+        gpa.free(parts);
+    }
+    for (parts) |*part| part.* = .{};
+
+    var pairs = MatchSweep{
+        .gpa = gpa,
+        .as_id = as_id,
+        .into = &bi,
+        .into_keys = b_keys,
+        .from = &ai,
+        .from_keys = a_keys,
+        .opt = opt,
+        .keep_pairs = true,
+        .parts = parts[0..a_ways],
+    };
+    // The other direction only has to count the keys that find no mate, so it
+    // shares nothing with the first -- not even an output array.
+    var unmatched_b = MatchSweep{
+        .gpa = gpa,
+        .as_id = as_id,
+        .into = &ai,
+        .into_keys = a_keys,
+        .from = &bi,
+        .from_keys = b_keys,
+        .opt = opt,
+        .keep_pairs = false,
+        .parts = parts[a_ways..],
+    };
+    var sweeps = Sweeps{ .pairs = &pairs, .counts = &unmatched_b };
+    // The same budget the column pass below uses: this path takes the machine
+    // rather than `--threads`, which bounds the CSV engine's chunking instead.
+    try csvdiff.runOnThreads(&sweeps, Sweeps.run, machine);
+    for (parts) |part| {
+        if (part.err) |e| return e;
+    }
+
+    phases.mark("match sweep (par)");
+    // Merged in chunk order, so the pairing does not depend on which thread took
+    // which chunk.
     var pair_a: std.ArrayList(i32) = .empty;
     defer pair_a.deinit(gpa);
     var pair_b: std.ArrayList(i32) = .empty;
@@ -763,24 +1131,24 @@ pub fn compare(
     var removed_total: i64 = 0;
     var added_total: i64 = 0;
     {
-        var sc = Scratch{};
-        defer sc.deinit(gpa);
-        try pair_a.ensureTotalCapacity(gpa, ai.firsts.items.len);
-        try pair_b.ensureTotalCapacity(gpa, ai.firsts.items.len);
-        for (ai.firsts.items, ai.hashes.items) |row, h| {
-            const mate = try lookup(gpa, as_id, bi, b_keys, a_keys, @intCast(row), h, opt, &sc);
-            if (mate < 0) {
-                removed_total += 1;
-                continue;
-            }
-            try pair_a.append(gpa, row);
-            try pair_b.append(gpa, mate);
+        var kept: usize = 0;
+        for (parts[0..a_ways]) |part| kept += part.pair_a.items.len;
+        try pair_a.ensureTotalCapacity(gpa, kept);
+        try pair_b.ensureTotalCapacity(gpa, kept);
+        for (parts[0..a_ways]) |*part| {
+            pair_a.appendSliceAssumeCapacity(part.pair_a.items);
+            pair_b.appendSliceAssumeCapacity(part.pair_b.items);
+            removed_total += part.missing;
+            // Released as it is copied rather than at the end of the function:
+            // holding both the chunks and the merged lists is eighty megabytes
+            // of the same pairs, live across the column pass that follows.
+            // Emptied as well as freed, because the deferred cleanup runs too.
+            part.pair_a.deinit(gpa);
+            part.pair_b.deinit(gpa);
+            part.pair_a = .empty;
+            part.pair_b = .empty;
         }
-        for (bi.firsts.items, bi.hashes.items) |row, h| {
-            if ((try lookup(gpa, as_id, ai, a_keys, b_keys, @intCast(row), h, opt, &sc)) < 0) {
-                added_total += 1;
-            }
-        }
+        for (parts[a_ways..]) |part| added_total += part.missing;
     }
 
     const npairs = pair_a.items.len;
@@ -847,6 +1215,7 @@ pub fn compare(
     for (any) |w| changed_total += @popCount(w);
 
     const matched: i64 = @intCast(npairs);
+    phases.mark("compared columns (par)");
     return Result{
         .counts = .{
             .a_rows = ai.rows,

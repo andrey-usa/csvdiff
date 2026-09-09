@@ -146,9 +146,30 @@ fn cell_differs(x: Look<'_>, y: Look<'_>, opt: &Options) -> bool {
 const PRIME: u64 = 0x100000001b3;
 const SEED: u64 = 0xcbf29ce484222325;
 
+/// FNV-1a, eight bytes at a time.
+///
+/// A hash here is internal in exactly the sense the CSV engine's is: nothing
+/// outside this module sees one, so the only property it owes anyone is that
+/// the two places that compute it agree. That is what lets it read a word at a
+/// time -- see `turbo::hash_bytes`, which is the same function for the same
+/// reason.
+///
+/// It matters more than the call sites suggest. Interning a dictionary costs
+/// one call per *distinct* value and is nothing; a key column that is not
+/// dictionary-encoded -- which a high-cardinality key column usually is not,
+/// since a writer gives up on a dictionary that never repeats -- is hashed once
+/// per row, on both sides, indexed and probed.
 fn fold_bytes(mut h: u64, v: &[u8]) -> u64 {
-    for &b in v {
-        h = (h ^ b as u64).wrapping_mul(PRIME);
+    let (words, tail) = v.as_chunks::<8>();
+    for chunk in words {
+        h = (h ^ u64::from_le_bytes(*chunk)).wrapping_mul(PRIME);
+        h ^= h >> 29; // the xor-shift is what spreads a whole word into the low bits
+    }
+    if !tail.is_empty() {
+        let mut buf = [0u8; 8];
+        buf[..tail.len()].copy_from_slice(tail);
+        h = (h ^ u64::from_le_bytes(buf)).wrapping_mul(PRIME);
+        h ^= h >> 29;
     }
     (h ^ v.len() as u64).wrapping_mul(PRIME)
 }
@@ -352,6 +373,30 @@ impl Index {
 /// that row; insertion is serial because first-occurrence-wins depends on the
 /// order rows arrive, and threading it would make the answer depend on the
 /// scheduler. Same split as the CSV path.
+/// How many rows ahead a slot probe is started. The same distance the CSV engine
+/// uses, and as there it is not delicate.
+const PREFETCH_AHEAD: usize = 32;
+
+/// Starts the fetch of the slot `h` will land in, without waiting for it.
+///
+/// The build loop walks an array of hashes it already holds and the sweep walks
+/// another, and both then probe a slot table of tens of megabytes: a serial chain
+/// of misses, each waiting on an address known long before the load was issued.
+#[inline]
+fn prefetch_slot(slots: &[u64], mask: u64, h: u64) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: the index is masked into the table's length, so the pointer is in
+    // bounds, and a prefetch has no architectural effect in any case.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(slots.as_ptr().add((h & mask) as usize) as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (slots, mask, h);
+    }
+}
+
 fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -> Index {
     let n = s.rows;
     let mut hs = vec![0u64; n];
@@ -385,13 +430,21 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
     while cap * 2 < n * 3 + 16 {
         cap <<= 1;
     }
-    ix.slots = vec![0u64; cap];
+    // Written rather than calloc'd, for the reason the CSV engine's `empty_table`
+    // gives: a fresh mapping is one shared page of zeroes until something writes
+    // to it, and nothing reads this table before the inserts start, so every one
+    // of its pages would be first touched by a random probe.
+    ix.slots = Vec::with_capacity(cap);
+    ix.slots.resize(cap, 0u64);
     ix.mask = cap as u64 - 1;
     ix.firsts.reserve(n);
     ix.counts.reserve(n);
     ix.hashes.reserve(n);
 
     for (r, &h) in hs.iter().enumerate() {
+        if let Some(&soon) = hs.get(r + PREFETCH_AHEAD) {
+            prefetch_slot(&ix.slots, ix.mask, soon);
+        }
         let mut at = (h & ix.mask) as usize;
         loop {
             let slot = ix.slots[at];
@@ -488,13 +541,69 @@ struct ColOut {
 
 const BLOCK: usize = 4096;
 
-/// The mismatch mask, read eight bytes at a time -- the same SWAR idiom the CSV
-/// scanner uses to find a delimiter, applied to finding a changed cell. About
-/// 0.7% of cells differ per column, so seven bytes in eight are zero and
-/// skipping them wholesale is most of the loop.
+/// The bytes of the thirty-two-or-sixty-four at `at` that are not zero, one bit
+/// each. Compiled only where the build targets a vector unit, exactly as
+/// [`turbo::field`] does it, so neither binary pays for a runtime check.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(target_feature = "avx2", target_feature = "avx512bw")
+))]
+#[inline(always)]
+fn vector_nonzero(neq: &[u8], at: usize) -> u64 {
+    #[cfg(target_feature = "avx512bw")]
+    // Safety: the caller has checked `at + 64 <= neq.len()`, and the build
+    // targets a CPU with AVX-512BW or this function is not compiled at all.
+    unsafe {
+        use std::arch::x86_64::*;
+        let chunk = _mm512_loadu_si512(neq.as_ptr().add(at) as *const _);
+        _mm512_test_epi8_mask(chunk, chunk)
+    }
+    #[cfg(not(target_feature = "avx512bw"))]
+    // Safety: as above, with AVX2 and thirty-two bytes.
+    unsafe {
+        use std::arch::x86_64::*;
+        let chunk = _mm256_loadu_si256(neq.as_ptr().add(at) as *const _);
+        let zero = _mm256_cmpeq_epi8(chunk, _mm256_setzero_si256());
+        !(_mm256_movemask_epi8(zero) as u32) as u64
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+const MASK_WIDTH: usize = 64;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    not(target_feature = "avx512bw")
+))]
+const MASK_WIDTH: usize = 32;
+
+/// The mismatch mask, read a register at a time -- the same scanner the CSV
+/// path uses to find a delimiter, applied to finding a changed cell.
+///
+/// The arithmetic that makes this worth doing: about 0.7% of cells differ per
+/// column, so an eight-byte word is all-zero 94.6% of the time, a 32-byte
+/// vector 80%, a 64-byte one 64%. Every one of those is a correctly predicted
+/// not-taken branch and eight, thirty-two or sixty-four cells retired. The work
+/// on a *hit* is identical in all three -- one `trailing_zeros` per changed
+/// cell -- so the only thing a wider register buys is fewer trips round the
+/// skip path, which is where nearly all the loop is. That is the opposite trade
+/// from the CSV scanner, where a wider register also means fewer loads, and it
+/// is why both are measured rather than assumed.
 fn scan_mask(neq: &[u8], base: usize, mut hit: impl FnMut(usize)) {
     let m = neq.len();
     let mut i = 0;
+    #[cfg(all(
+        target_arch = "x86_64",
+        any(target_feature = "avx2", target_feature = "avx512bw")
+    ))]
+    while i + MASK_WIDTH <= m {
+        let mut bits = vector_nonzero(neq, i);
+        while bits != 0 {
+            hit(base + i + bits.trailing_zeros() as usize);
+            bits &= bits - 1;
+        }
+        i += MASK_WIDTH;
+    }
     while i + 8 <= m {
         let mut w = u64::from_le_bytes(neq[i..i + 8].try_into().unwrap());
         while w != 0 {
@@ -650,6 +759,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         out.pa.reserve(hi - lo);
         out.pb.reserve(hi - lo);
         for at in lo..hi {
+            if let Some(&soon) = ai.hashes.get(at + PREFETCH_AHEAD) {
+                prefetch_slot(&bi.slots, bi.mask, soon);
+            }
             let row = ai.firsts[at];
             let mate = lookup(
                 &as_id,
@@ -677,6 +789,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let lo = bi.firsts.len() * p / b_ways;
         let hi = bi.firsts.len() * (p + 1) / b_ways;
         for at in lo..hi {
+            if let Some(&soon) = bi.hashes.get(at + PREFETCH_AHEAD) {
+                prefetch_slot(&ai.slots, ai.mask, soon);
+            }
             let row = bi.firsts[at];
             if lookup(
                 &as_id,

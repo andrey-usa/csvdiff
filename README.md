@@ -67,9 +67,10 @@ the four cores better, not doing less.
 > own defaults for anything else, including that branch's `-Dscan=` width, which
 > is its tuning question rather than this workflow's to guess at.
 >
-> The ndjson row is measured over five builds rather than seven: that branch's
-> Rust and Zig read ndjson and this tree's do not, so this tree's two were
-> dropped by the harness rather than given a slow number.
+> The ndjson row was measured over five builds rather than seven: at the time,
+> only that branch's Rust and Zig read ndjson, so this tree's two were dropped by
+> the harness rather than given a slow number. After the merge all four ports
+> read all three formats, and the next run will have seven columns everywhere.
 ---
 
 ## Using it
@@ -103,8 +104,8 @@ another Parquet file; CSV and ndjson compare against each other.
 |---|---|---|---|
 | **[`c/`](c/)** | CSV, ndjson, uncompressed Parquet | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` / `--compare` |
 | **[`cpp/`](cpp/)** | CSV, ndjson, Parquet **including Snappy** | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report |
-| **[`rust/`](rust/)** | CSV, Parquet | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | ndjson |
-| **[`zig/`](zig/)** | CSV, Parquet | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report, no ndjson |
+| **[`rust/`](rust/)** | CSV, ndjson, Parquet | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | — |
+| **[`zig/`](zig/)** | CSV, ndjson, Parquet | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report |
 
 Every port builds from its own toolchain alone, in seconds, and carries no
 runtime dependency with a comparison engine in it. What was removed to get

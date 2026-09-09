@@ -45,6 +45,22 @@ Two limitations, both stated rather than papered over:
   snappy, data page v1. Nested columns, other types, other codecs and page v2 are
   errors that say which. Both sides of a comparison must be Parquet.
 
+## The scanner is a build option
+
+`make` builds the SWAR scanner, which needs no CPU feature at all. `make
+scanners` builds three binaries — SWAR, AVX2 and AVX-512 — so the instruction set
+can be measured without a runtime switch in the way:
+
+```bash
+make scanners
+build/csvdiff-avx2 compare a.csv b.csv -k id --threads 4
+```
+
+At ten million rows on a hosted runner with AVX2, the vector scanner is about 7%
+ahead of SWAR. That reverses what this repository used to say, and the reason is
+in the root README: the key hash used to dominate the run, and it does not any
+more.
+
 ## The compiler is worth more than the language
 
 On a million rows, best of three, one 4-core container:

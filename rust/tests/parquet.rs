@@ -254,9 +254,48 @@ fn with_a_small_cap() {
     });
 }
 
-/// One side Parquet and one side text is refused rather than half-answered.
+/// One side Parquet and one side text cannot take the columnar path -- there is
+/// no column to compare a byte stream against -- so `turbo` decodes the Parquet
+/// side into rows instead. Slower than the columnar path, and the same answer:
+/// that is what this checks, against csv against csv on the same rows.
 #[test]
-fn a_mixed_parquet_and_text_pair_is_refused() {
+fn a_mixed_parquet_and_text_pair_is_read_as_rows() {
+    let Some(tool) = generator() else {
+        eprintln!("skipping: ../cpp/build/gen-data is not built");
+        return;
+    };
+    let Some(f) = Fixture::new(&tool, "1k", SNAPPY) else {
+        return;
+    };
+    let key = &["account_id", "txn_id"];
+    let from_text = run(
+        &f.path("a", ".csv"),
+        &f.path("b", ".csv"),
+        options(key, |_| {}),
+        Engine::Turbo,
+    );
+    let mixed = run(
+        &f.path("a", ".parquet"),
+        &f.path("b", ".csv"),
+        options(key, |_| {}),
+        Engine::Turbo,
+    );
+    assert_eq!(
+        from_text, mixed,
+        "the mixed pair differs from csv against csv"
+    );
+
+    // And it is honest about the path it took: `turbo`, not `parquet`.
+    let mut opt = options(key, |_| {});
+    let result = compare(&f.path("a", ".parquet"), &f.path("b", ".csv"), &mut opt)
+        .expect("a mixed pair is answered");
+    assert_eq!(result.meta.engine, "turbo");
+}
+
+/// An engine that cannot read Parquet says so by name rather than handing the
+/// footer to a CSV parser and reporting the parse error it makes of it.
+#[test]
+fn an_engine_that_cannot_read_parquet_says_so() {
     let Some(tool) = generator() else {
         eprintln!("skipping: ../cpp/build/gen-data is not built");
         return;
@@ -265,10 +304,11 @@ fn a_mixed_parquet_and_text_pair_is_refused() {
         return;
     };
     let mut opt = options(&["account_id", "txn_id"], |_| {});
+    opt.engine = "sortmerge".to_string();
     let err = compare(&f.path("a", ".parquet"), &f.path("b", ".csv"), &mut opt)
-        .expect_err("a mixed pair is an error");
+        .expect_err("sortmerge cannot read parquet");
     assert!(
-        err.to_string().contains("one file is parquet"),
+        err.to_string().contains("cannot read parquet"),
         "the error should say which: {err}"
     );
 }

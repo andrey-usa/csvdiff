@@ -16,8 +16,16 @@
 //! | duplicate keys | 0.01% per file |
 //!
 //! The recipe and the hash are the same as the Python, TypeScript, Java and Go
-//! generators — the files come out byte for byte identical — so a benchmark
+//! generators — the CSV files come out byte for byte identical — so a benchmark
 //! number from any of them is directly comparable.
+//!
+//! The same rows are written as newline-delimited JSON and as Parquet on demand,
+//! by [`Format`]. That matters for benchmarking the three readers against each
+//! other: the payloads have to hold the same values, spelled the same way, or a
+//! format comparison is measuring the converter. Writing all three here means no
+//! part of the benchmark depends on DuckDB, pyarrow or a Python install.
+
+pub mod parquet;
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -25,6 +33,38 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
+
+pub use parquet::Compression;
+
+/// Which format the payload is written in. The values are identical in all
+/// three; only the container changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Csv,
+    Ndjson,
+    Parquet,
+}
+
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::Csv => "csv",
+            Format::Ndjson => "ndjson",
+            Format::Parquet => "parquet",
+        }
+    }
+
+    pub fn parse(name: &str) -> Result<Format> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "csv" => Ok(Format::Csv),
+            "ndjson" | "json" => Ok(Format::Ndjson),
+            "parquet" => Ok(Format::Parquet),
+            other => Err(Error::new(format!(
+                "unknown format: {other}. Choose one of csv, ndjson, parquet"
+            ))),
+        }
+    }
+}
 
 /// The 20-column schema, in order.
 pub const COLUMNS: [&str; 20] = [
@@ -95,13 +135,120 @@ fn days() -> Vec<String> {
     out
 }
 
-/// Builds one row of one side, appending it to `out` with a trailing newline.
+/// One row's twenty values, laid end to end in one buffer with where each stops.
+///
+/// The values are built once and written out in whichever format was asked for,
+/// so the three payloads cannot drift apart: a format that held different bytes
+/// would make the format comparison measure the generator instead of the reader.
+pub struct Row {
+    buf: String,
+    ends: Vec<u32>,
+}
+
+impl Row {
+    fn new() -> Row {
+        Row {
+            buf: String::with_capacity(256),
+            ends: Vec::with_capacity(COLUMNS.len()),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.ends.clear();
+    }
+
+    /// Ends the value being built. What a CSV writer spells as a comma.
+    fn end(&mut self) {
+        self.ends.push(self.buf.len() as u32);
+    }
+
+    fn push(&mut self, text: &str) {
+        self.buf.push_str(text);
+    }
+
+    fn pad(&mut self, v: i64, width: usize) {
+        let _ = write!(self.buf, "{v:0width$}");
+    }
+
+    fn number(&mut self, v: u64) {
+        let _ = write!(self.buf, "{v}");
+    }
+
+    /// An amount held in cents, as a two-decimal number.
+    fn money(&mut self, cents: i64) {
+        if cents < 0 {
+            self.buf.push('-');
+        }
+        let a = cents.unsigned_abs();
+        let _ = write!(self.buf, "{}.{:02}", a / 100, a % 100);
+    }
+
+    pub fn cell(&self, i: usize) -> &str {
+        let from = if i == 0 { 0 } else { self.ends[i - 1] as usize };
+        &self.buf[from..self.ends[i] as usize]
+    }
+
+    pub fn cells(&self) -> impl Iterator<Item = &str> {
+        (0..self.ends.len()).map(|i| self.cell(i))
+    }
+
+    fn write_csv(&self, out: &mut Vec<u8>) {
+        for i in 0..self.ends.len() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(self.cell(i).as_bytes());
+        }
+        out.push(b'\n');
+    }
+
+    /// One JSON object per line, keys in schema order.
+    fn write_json(&self, out: &mut Vec<u8>) {
+        out.push(b'{');
+        for (i, name) in COLUMNS.iter().enumerate().take(self.ends.len()) {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.push(b'"');
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b"\":\"");
+            write_json_string(self.cell(i), out);
+            out.push(b'"');
+        }
+        out.extend_from_slice(b"}\n");
+    }
+}
+
+/// Escapes what JSON requires escaping. These values never need it, so the
+/// common case is one copy; the branch is here because a generator that writes
+/// invalid JSON for an unusual value would be found much later.
+fn write_json_string(value: &str, out: &mut Vec<u8>) {
+    let plain = value.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\');
+    if plain {
+        out.extend_from_slice(value.as_bytes());
+        return;
+    }
+    for b in value.bytes() {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0x00..=0x1f => out.extend_from_slice(format!("\\u{b:04x}").as_bytes()),
+            other => out.push(other),
+        }
+    }
+}
+
+/// Builds one row of one side.
 ///
 /// Money is carried in integer cents and the drift is applied to those integers,
 /// never to a float. Every implementation of this generator then produces the
 /// same digits without depending on its language's rounding rule — which is
 /// what makes the five sets of files byte-identical.
-fn row(out: &mut String, i: i64, b_side: bool, seed: i64, days: &[String]) {
+fn row(out: &mut Row, i: i64, b_side: bool, seed: i64, days: &[String]) {
     let bucket = modulo(i, 0, seed, 10_000);
     let mut amount_cents = modulo(i, 21, seed, 900_000_000) as i64 - 100_000_000;
     let mut balance_cents = modulo(i, 31, seed, 2_000_000_000) as i64;
@@ -123,110 +270,175 @@ fn row(out: &mut String, i: i64, b_side: bool, seed: i64, days: &[String]) {
         }
     }
 
-    out.push_str("ACC-");
-    pad(out, (i * 7919) % 250_000, 8);
-    out.push_str(",TXN-");
-    pad(out, i, 11);
-    out.push(',');
-    out.push_str(&days[modulo(i, 1, seed, 240) as usize]);
-    out.push(',');
-    out.push_str(value_date);
-    out.push(',');
-    out.push_str(CURRENCY[modulo(i, 51, seed, 4) as usize]);
-    out.push(',');
-    money(out, amount_cents);
-    out.push(',');
-    money(out, modulo(i, 61, seed, 5000) as i64);
-    out.push(',');
-    money(out, balance_cents);
-    out.push(',');
-    out.push_str(status);
-    out.push(',');
-    out.push_str(CHANNEL[modulo(i, 71, seed, 5) as usize]);
-    out.push(',');
-    out.push_str(REGION[modulo(i, 81, seed, 4) as usize]);
-    out.push_str(",BR");
-    pad(out, modulo(i, 91, seed, 900) as i64 + 100, 4);
-    out.push_str(",P");
-    pad(out, modulo(i, 101, seed, 5000) as i64, 5);
-    out.push_str(",CP-");
-    pad(out, modulo(i, 111, seed, 90_000) as i64, 6);
-    out.push(',');
-    let _ = write!(out, "{}", modulo(i, 121, seed, 500) + 1);
-    out.push_str(",0.");
-    pad(out, modulo(i, 131, seed, 1200) as i64, 4);
-    out.push(',');
-    out.push_str(CATEGORY[modulo(i, 141, seed, 5) as usize]);
-    out.push(',');
+    out.clear();
+    out.push("ACC-");
+    out.pad((i * 7919) % 250_000, 8);
+    out.end();
+    out.push("TXN-");
+    out.pad(i, 11);
+    out.end();
+    out.push(&days[modulo(i, 1, seed, 240) as usize]);
+    out.end();
+    out.push(value_date);
+    out.end();
+    out.push(CURRENCY[modulo(i, 51, seed, 4) as usize]);
+    out.end();
+    out.money(amount_cents);
+    out.end();
+    out.money(modulo(i, 61, seed, 5000) as i64);
+    out.end();
+    out.money(balance_cents);
+    out.end();
+    out.push(status);
+    out.end();
+    out.push(CHANNEL[modulo(i, 71, seed, 5) as usize]);
+    out.end();
+    out.push(REGION[modulo(i, 81, seed, 4) as usize]);
+    out.end();
+    out.push("BR");
+    out.pad(modulo(i, 91, seed, 900) as i64 + 100, 4);
+    out.end();
+    out.push("P");
+    out.pad(modulo(i, 101, seed, 5000) as i64, 5);
+    out.end();
+    out.push("CP-");
+    out.pad(modulo(i, 111, seed, 90_000) as i64, 6);
+    out.end();
+    out.number(modulo(i, 121, seed, 500) + 1);
+    out.end();
+    out.push("0.");
+    out.pad(modulo(i, 131, seed, 1200) as i64, 4);
+    out.end();
+    out.push(CATEGORY[modulo(i, 141, seed, 5) as usize]);
+    out.end();
     out.push(if modulo(i, 151, seed, 20) == 0 {
-        'Y'
+        "Y"
     } else {
-        'N'
+        "N"
     });
-    let _ = write!(out, ",batch {} line {},", i % 997 + 1, i % 53 + 1);
-    out.push_str(if b_side {
+    out.end();
+    let _ = write!(out.buf, "batch {} line {}", i % 997 + 1, i % 53 + 1);
+    out.end();
+    out.push(if b_side {
         "2026-09-01 02:15:00"
     } else {
         "2026-08-01 02:15:00"
     });
-    out.push('\n');
+    out.end();
 }
 
-/// Writes an amount held in cents as a two-decimal number.
-fn money(out: &mut String, cents: i64) {
-    if cents < 0 {
-        out.push('-');
+/// Where one side's rows are written, in whichever format was asked for.
+enum Sink {
+    /// CSV or newline-delimited JSON: text, buffered a megabyte at a time.
+    Text {
+        file: BufWriter<File>,
+        buf: Vec<u8>,
+        json: bool,
+    },
+    Parquet(parquet::Writer),
+}
+
+impl Sink {
+    fn create(path: &Path, format: Format, compression: Compression) -> Result<Sink> {
+        Ok(match format {
+            Format::Parquet => Sink::Parquet(parquet::Writer::create(
+                path,
+                &COLUMNS,
+                compression,
+                // A million rows a group: large enough that the dictionaries are
+                // worth having and the footer stays small, small enough that the
+                // writer holds a bounded amount of the file at once.
+                1_000_000,
+            )?),
+            Format::Csv | Format::Ndjson => {
+                let mut file = BufWriter::with_capacity(1 << 20, File::create(path)?);
+                // JSON carries its names on every record, so it has no header.
+                if format == Format::Csv {
+                    writeln!(file, "{}", COLUMNS.join(","))?;
+                }
+                Sink::Text {
+                    file,
+                    buf: Vec::with_capacity(1 << 20),
+                    json: format == Format::Ndjson,
+                }
+            }
+        })
     }
-    let a = cents.unsigned_abs();
-    let _ = write!(out, "{}.{:02}", a / 100, a % 100);
+
+    fn row(&mut self, row: &Row) -> Result<()> {
+        match self {
+            Sink::Text { file, buf, json } => {
+                buf.clear();
+                if *json {
+                    row.write_json(buf);
+                } else {
+                    row.write_csv(buf);
+                }
+                file.write_all(buf)?;
+                Ok(())
+            }
+            Sink::Parquet(writer) => writer.write_row(row.cells()),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            Sink::Text { mut file, .. } => {
+                file.flush()?;
+                Ok(())
+            }
+            Sink::Parquet(writer) => writer.finish(),
+        }
+    }
 }
 
-fn pad(out: &mut String, v: i64, width: usize) {
-    let _ = write!(out, "{v:0width$}");
-}
-
-/// Writes both files in one pass.
-pub fn generate(rows: i64, a_path: &Path, b_path: &Path, seed: i64) -> Result<()> {
+/// Writes both files in one pass, in the given format.
+pub fn generate_as(
+    rows: i64,
+    a_path: &Path,
+    b_path: &Path,
+    seed: i64,
+    format: Format,
+    compression: Compression,
+) -> Result<()> {
     let days = days();
-    let header = COLUMNS.join(",");
-    let mut fa = BufWriter::with_capacity(1 << 20, File::create(a_path)?);
-    let mut fb = BufWriter::with_capacity(1 << 20, File::create(b_path)?);
-    writeln!(fa, "{header}")?;
-    writeln!(fb, "{header}")?;
+    let mut fa = Sink::create(a_path, format, compression)?;
+    let mut fb = Sink::create(b_path, format, compression)?;
 
     let dup_extra = (rows / DUP_MOD).max(1);
     let added = (rows / ADDED_RATIO).max(1);
 
-    let mut line = String::with_capacity(256);
+    let mut line = Row::new();
     for i in 0..rows {
-        line.clear();
         row(&mut line, i, false, seed, &days);
-        fa.write_all(line.as_bytes())?;
+        fa.row(&line)?;
 
         if i % REMOVED_MOD != 7 {
-            line.clear();
             row(&mut line, i, true, seed, &days);
-            fb.write_all(line.as_bytes())?;
+            fb.row(&line)?;
         }
         if i % DUP_MOD == 3 && i < rows / 2 {
-            line.clear();
             row(&mut line, i, true, seed, &days);
-            fb.write_all(line.as_bytes())?;
+            fb.row(&line)?;
         }
     }
     for i in 0..dup_extra {
-        line.clear();
         row(&mut line, i, false, seed, &days);
-        fa.write_all(line.as_bytes())?;
+        fa.row(&line)?;
     }
     for i in rows..rows + added {
-        line.clear();
         row(&mut line, i, true, seed, &days);
-        fb.write_all(line.as_bytes())?;
+        fb.row(&line)?;
     }
-    fa.flush()?;
-    fb.flush()?;
+    fa.finish()?;
+    fb.finish()?;
     Ok(())
+}
+
+/// Writes both files as CSV, which is what every other generator here emits and
+/// what the parity check compares byte for byte.
+pub fn generate(rows: i64, a_path: &Path, b_path: &Path, seed: i64) -> Result<()> {
+    generate_as(rows, a_path, b_path, seed, Format::Csv, Compression::None)
 }
 
 /// Parses `10000`, `10k`, `1m`, `2.5M`.

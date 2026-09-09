@@ -1,5 +1,5 @@
-//! A composite-key CSV comparison, byte-level, with the memory it may use
-//! passed in rather than assumed.
+//! A composite-key comparison, byte-level, with the memory it may use passed in
+//! rather than assumed.
 //!
 //! The design is the one the Java, Rust and C++ ports share: the file is mapped,
 //! a field is an offset and a length packed into one word, delimiters are found
@@ -12,10 +12,29 @@
 //! than it was given. A comparison that would exceed the budget fails with
 //! `error.OutOfMemory` at the allocation that would have crossed it, rather than
 //! growing until the kernel intervenes. "Bounded memory" stops being a
-//! measurement and becomes a property the type system enforces.
+//! measurement and becomes a property the type system enforces. That still holds
+//! for the two things added since: reading Parquet allocates its arena from the
+//! same allocator, and every thread takes its chunk from it too.
+//!
+//! Three input formats — CSV, newline-delimited JSON and Parquet — all reduce to
+//! the same field word, so the two sides of a comparison need not be in the same
+//! format. See `text.zig` and `parquet.zig`.
 
 const std = @import("std");
 const scan = @import("scan.zig");
+const fld = @import("field.zig");
+const slab_mod = @import("slab.zig");
+const text = @import("text.zig");
+const parquet = @import("pqread.zig");
+const codec = @import("codec.zig");
+const encoding = @import("encoding.zig");
+
+const Field = fld.Field;
+const ABSENT = fld.ABSENT;
+const TOO_LONG = fld.TOO_LONG;
+// Re-exported: `pqdiff.zig` maps its two files the same way this engine does.
+pub const Slab = slab_mod.Slab;
+const Dialect = slab_mod.Dialect;
 
 pub const Error = error{
     KeyColumnMissing,
@@ -25,6 +44,79 @@ pub const Error = error{
     CannotReadFile,
     NonAsciiCaseFold,
 };
+
+/// Below this there is nothing to divide: finding the chunk boundaries would cost
+/// more than the parsing it splits.
+const CHUNKING_THRESHOLD: usize = 4 << 20;
+
+/// How many keys make the join worth splitting.
+const JOIN_THRESHOLD: usize = 1 << 14;
+
+/// Phase timings, on stderr, when `CSVDIFF_PHASES` is set — the same switch and
+/// the same output shape the other two ports use.
+///
+/// A comparison has costs that move independently: sweeping and hashing every
+/// row, inserting them into the index, and joining. Knowing which one grew is
+/// the difference between tuning and guessing, and the cores-busy column says
+/// only *that* something is serial, never which thing.
+/// Set once from `CSVDIFF_PHASES` before the comparison starts; read by every
+/// thread and written by none of them. `main.zig` owns the environment, so it
+/// does the reading.
+pub var phases_on: bool = false;
+
+pub const Phases = struct {
+    on: bool,
+    tag: []const u8,
+    last: i128,
+
+    /// `tag` prefixes every line, because the two files are read on two threads
+    /// and their phases would otherwise interleave unattributed.
+    /// The monotonic clock straight from the kernel: std's timing now wants an
+    /// `Io`, and threading one through the engine for a diagnostic that is off by
+    /// default would be a worse trade than this one call.
+    fn now() i128 {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+
+    pub fn start(tag: []const u8) Phases {
+        return .{
+            .on = phases_on,
+            .tag = tag,
+            .last = now(),
+        };
+    }
+
+    pub fn mark(self: *Phases, what: []const u8) void {
+        const at = now();
+        if (self.on) {
+            const seconds = @as(f64, @floatFromInt(at - self.last)) / 1e9;
+            var buf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&buf, "{s}{s}", .{ self.tag, what }) catch what;
+            std.debug.print("  {s: <26} {d: >7.3}s\n", .{ name, seconds });
+        }
+        self.last = at;
+    }
+};
+
+/// How many rows ahead a table probe is started. Enough misses in flight to
+/// cover the latency of one, and not so many that the lines are evicted before
+/// the loop reaches them.
+pub const PREFETCH_AHEAD: usize = 32;
+
+/// Keys per join chunk. Sized in rows rather than in threads so that a chunk is
+/// small enough that no single one of them is the last thing four cores are
+/// waiting on: at ten million keys this is a couple of hundred chunks of a few
+/// hundredths of a second each.
+const JOIN_CHUNK: usize = 1 << 16;
+
+/// How many chunks `keys` divides into. One below the threshold, where finding
+/// the boundaries would cost more than the join it splits.
+fn waysFor(keys: usize) usize {
+    if (keys < JOIN_THRESHOLD) return 1;
+    return @max(1, std.math.divCeil(usize, keys, JOIN_CHUNK) catch 1);
+}
 
 pub const Options = struct {
     key: []const []const u8,
@@ -36,6 +128,10 @@ pub const Options = struct {
     tolerance: f64 = 0,
     max_rows: usize = 50_000,
     delimiter: ?u8 = null,
+    /// How many threads the whole comparison may use. Zero means as many as the
+    /// machine has. Both files are read at once and each is split further, so
+    /// this is the width of the run rather than of one file.
+    threads: usize = 0,
 };
 
 pub const Counts = struct {
@@ -61,118 +157,59 @@ pub const ColumnStat = struct {
     filled: i64 = 0,
 };
 
-// ---------------------------------------------------------------------------
-// A field packed into one word: offset, length, and whether it needs unescaping.
-//
-// 40 bits of offset addresses a terabyte and 23 bits of length a field of eight
-// megabytes. An over-long field is reported rather than truncated through the
-// mask.
-// ---------------------------------------------------------------------------
-
-const Field = u64;
-const ABSENT: Field = std.math.maxInt(u64);
-const TOO_LONG: Field = std.math.maxInt(u64) - 1;
-const OFFSET_MASK: u64 = (1 << 40) - 1;
-const LENGTH_SHIFT: u6 = 40;
-const LENGTH_MASK: u64 = (1 << 23) - 1;
-const ESCAPED: u64 = 1 << 63;
-const MAX_FIELD_LEN: u64 = LENGTH_MASK;
-
-fn pack(offset: usize, len: usize, escaped: bool) Field {
-    if (len > MAX_FIELD_LEN) return TOO_LONG;
-    return (@as(u64, offset) & OFFSET_MASK) |
-        ((@as(u64, len) & LENGTH_MASK) << LENGTH_SHIFT) |
-        (if (escaped) ESCAPED else 0);
+/// What went wrong, in words, for any error this engine or its readers can
+/// return. A switch here rather than in the command line, because the readers
+/// each have their own error set and the caller should not have to know them.
+pub fn message(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        Error.KeyColumnMissing => "key column(s) missing from one of the files",
+        Error.ComparedColumnMissing => "compared column missing from one of the files",
+        Error.NoHeaderRow => "file has no header row",
+        Error.FieldTooLong => "a field is larger than this engine packs",
+        Error.CannotReadFile => "cannot read one of the files",
+        Error.NonAsciiCaseFold => "--ignore-case outside ASCII needs Unicode case folding, which " ++
+            "this port does not carry; use another implementation for that data",
+        text.Error.NoJsonObject => "the JSON file has no object to read the column names from",
+        parquet.Error.NotParquet => "that file does not begin and end with a Parquet magic number",
+        parquet.Error.BadFooter => "the Parquet footer is longer than the file",
+        parquet.Error.TruncatedParquetFile => "that file begins with a Parquet magic number but " ++
+            "does not end with one: it is truncated",
+        parquet.Error.NestedSchema => "this Parquet file nests a group; a comparison needs a flat " ++
+            "table of cells",
+        parquet.Error.RepeatedColumn => "this Parquet file repeats a column; a comparison needs " ++
+            "one value per row",
+        parquet.Error.NoColumns => "this Parquet file has no columns",
+        parquet.Error.RowCountMismatch => "this Parquet file's row groups do not hold the number " ++
+            "of rows its footer claims",
+        parquet.Error.UnsupportedEncoding => "this Parquet file uses an encoding this reader does " ++
+            "not decode; rewrite it with PLAIN or dictionary encoding",
+        parquet.Error.UnsupportedType => "this Parquet file has a column of a type this reader " ++
+            "does not know",
+        parquet.Error.ExternalColumn => "this Parquet file keeps a column in another file, which " ++
+            "this reader does not follow",
+        parquet.Error.TruncatedPage => "a Parquet page ends mid-value",
+        parquet.Error.DictionaryMissing => "a Parquet page is dictionary-encoded but its column " ++
+            "chunk has no dictionary",
+        parquet.Error.DictionaryIndexOutOfRange => "a Parquet page indexes past the end of its " ++
+            "dictionary",
+        codec.Error.UnsupportedCodec => "this Parquet file is compressed with a codec this reader " ++
+            "does not decode",
+        codec.Error.CorruptPage => "a compressed Parquet page will not decode",
+        codec.Error.PageSizeMismatch => "a Parquet page decompressed to a different size from the " ++
+            "one its header states",
+        encoding.Error.TruncatedValues => "a Parquet page holds fewer values than its levels promise",
+        encoding.Error.BadBlockSize => "a delta-encoded Parquet page has a block size its " ++
+            "miniblocks do not divide",
+        encoding.Error.VarintTooLong => "a Parquet varint is longer than 64 bits",
+        thrift_error.TruncatedMetadata => "the Parquet metadata ends mid-value",
+        thrift_error.UnknownThriftType => "the Parquet metadata holds a Thrift type this reader " ++
+            "does not know",
+        else => "the comparison failed",
+    };
 }
 
-fn offsetOf(f: Field) usize {
-    return @intCast(f & OFFSET_MASK);
-}
-
-fn lenOf(f: Field) usize {
-    return @intCast((f >> LENGTH_SHIFT) & LENGTH_MASK);
-}
-
-fn isEscaped(f: Field) bool {
-    return (f & ESCAPED) != 0;
-}
-
-fn isReal(f: Field) bool {
-    return f != ABSENT and f != TOO_LONG;
-}
-
-// ---------------------------------------------------------------------------
-// The mapped file
-// ---------------------------------------------------------------------------
-
-pub const Slab = struct {
-    data: []align(std.heap.page_size_min) const u8,
-
-    pub fn open(io: std.Io, path: []const u8) !Slab {
-        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return Error.CannotReadFile;
-        defer file.close(io);
-        const size = (file.stat(io) catch return Error.CannotReadFile).size;
-        if (size == 0) return Slab{ .data = &[_]u8{} };
-        const mapped = std.posix.mmap(
-            null,
-            size,
-            .{ .READ = true },
-            .{ .TYPE = .PRIVATE },
-            file.handle,
-            0,
-        ) catch return Error.CannotReadFile;
-        return Slab{ .data = mapped };
-    }
-
-    pub fn close(self: *Slab) void {
-        if (self.data.len > 0) std.posix.munmap(self.data);
-    }
-
-    /// The field's raw span, still holding any doubled quotes.
-    fn raw(self: Slab, f: Field) []const u8 {
-        if (!isReal(f)) return &[_]u8{};
-        return self.data[offsetOf(f)..][0..lenOf(f)];
-    }
-};
-
-/// A field's logical bytes: the raw span with the second quote of each doubled
-/// pair dropped. Equality, hashing and decoding all read a field through this
-/// one route, so they cannot disagree about its value — the property whose
-/// absence produced two silently wrong answers in the Java port.
-const Logical = struct {
-    raw: []const u8,
-    escaped: bool,
-    at: usize = 0,
-
-    fn next(self: *Logical) ?u8 {
-        if (self.at >= self.raw.len) return null;
-        const b = self.raw[self.at];
-        self.at += 1;
-        if (self.escaped and b == '"' and self.at < self.raw.len and self.raw[self.at] == '"') {
-            self.at += 1;
-        }
-        return b;
-    }
-};
-
-fn logical(slab: Slab, f: Field) Logical {
-    return .{ .raw = slab.raw(f), .escaped = isReal(f) and isEscaped(f) };
-}
-
-fn sameBytes(a: Slab, x: Field, b: Slab, y: Field) bool {
-    const ex = isReal(x) and isEscaped(x);
-    const ey = isReal(y) and isEscaped(y);
-    if (!ex and !ey) return std.mem.eql(u8, a.raw(x), b.raw(y));
-    var lx = logical(a, x);
-    var ly = logical(b, y);
-    while (true) {
-        const cx = lx.next();
-        const cy = ly.next();
-        if (cx == null and cy == null) return true;
-        if (cx == null or cy == null) return false;
-        if (cx.? != cy.?) return false;
-    }
-}
+const thrift_error = @import("thrift.zig").Error;
 
 // ---------------------------------------------------------------------------
 // Values
@@ -187,12 +224,12 @@ fn isSpace(c: u8) bool {
 }
 
 /// The field's normalised bytes written into `buf`, or null when it is absent.
-/// Only the normalising paths and the report call this; the default path never
-/// builds anything for a cell at all.
+/// Only the normalising paths call this; the default path never builds anything
+/// for a cell at all.
 fn normalised(slab: Slab, f: Field, o: Options, buf: []u8) Error!?[]const u8 {
-    if (!isReal(f)) return null;
+    if (!fld.isReal(f)) return null;
     var n: usize = 0;
-    var it = logical(slab, f);
+    var it = slab.logical(f);
     while (it.next()) |b| {
         if (n >= buf.len) return Error.FieldTooLong;
         buf[n] = b;
@@ -227,7 +264,7 @@ const Scratch = struct {
 };
 
 fn isAbsent(slab: Slab, f: Field, o: Options, buf: []u8) Error!bool {
-    if (!isReal(f) or lenOf(f) == 0) return true;
+    if (!fld.isReal(f) or fld.lenOf(f) == 0) return true;
     if (!needsNormalising(o)) return false;
     return (try normalised(slab, f, o, buf)) == null;
 }
@@ -236,7 +273,7 @@ fn same(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Error!boo
     const xa = try isAbsent(a, x, o, &s.a);
     const yb = try isAbsent(b, y, o, &s.b);
     if (xa or yb) return xa and yb;
-    if (!needsNormalising(o)) return sameBytes(a, x, b, y);
+    if (!needsNormalising(o)) return slab_mod.sameBytes(a, x, b, y);
     const nx = (try normalised(a, x, o, &s.a)) orelse "";
     const ny = (try normalised(b, y, o, &s.b)) orelse "";
     return std.mem.eql(u8, nx, ny);
@@ -245,8 +282,8 @@ fn same(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Error!boo
 /// Deliberately stricter than a plain float parse: "inf" and "nan" are ordinary
 /// text in a CSV, and treating them as numbers would make two unequal strings
 /// compare equal under a tolerance.
-fn asNumber(text: []const u8) ?f64 {
-    var s = text;
+fn asNumber(value: []const u8) ?f64 {
+    var s = value;
     while (s.len > 0 and isSpace(s[0])) s = s[1..];
     while (s.len > 0 and isSpace(s[s.len - 1])) s = s[0 .. s.len - 1];
     if (s.len == 0) return null;
@@ -260,6 +297,26 @@ fn asNumber(text: []const u8) ?f64 {
     }
     const v = std.fmt.parseFloat(f64, s) catch return null;
     return if (std.math.isFinite(v)) v else null;
+}
+
+/// Whether a field is absent, when nothing has to be normalised first.
+///
+/// The general `isAbsent` returns `Error!bool` because a normalising build can
+/// refuse a non-ASCII byte under `--ignore-case`. With no normalising there is
+/// no error to have, and the difference matters: the join asks this four times
+/// per compared cell -- twice in `cellDiffers` and twice more inside the `same`
+/// it calls -- so ten million rows over seventeen columns propagate an error
+/// union nearly seven hundred million times for a question that is two bit
+/// tests.
+inline fn plainAbsent(f: Field) bool {
+    return !fld.isReal(f) or fld.lenOf(f) == 0;
+}
+
+/// `cellDiffers` for the common case, computing each side's absence once and
+/// returning a plain `bool`. Both absent is not a difference; exactly one is.
+inline fn plainDiffers(a: Slab, x: Field, xa: bool, b: Slab, y: Field, yb: bool) bool {
+    if (xa or yb) return xa != yb;
+    return !slab_mod.sameBytes(a, x, b, y);
 }
 
 fn cellDiffers(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Error!bool {
@@ -276,6 +333,34 @@ fn cellDiffers(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Er
     return !(try same(a, x, b, y, o, s));
 }
 
+/// FNV-1a over eight bytes at a time.
+///
+/// A hash is internal — nothing outside this engine can see one — so the only
+/// property it owes anyone is that the index build and the join probe compute
+/// the same number for the same bytes. That is what lets the common path read a
+/// word at a time: a key of twenty-six bytes costs four multiplies instead of
+/// twenty-six, and the key hash is computed four times over at every row (both
+/// files, indexed then probed), which made byte-at-a-time FNV about a billion
+/// dependent multiply-xor steps of a ten-million-row run.
+fn hashBytes(bytes: []const u8, seed: u64) u64 {
+    const PRIME: u64 = 0x100_0000_01b3;
+    var h = seed;
+    var at: usize = 0;
+    while (at + 8 <= bytes.len) : (at += 8) {
+        h = (h ^ std.mem.readInt(u64, bytes[at..][0..8], .little)) *% PRIME;
+        // The xor-shift is what spreads a whole word into the low bits, which is
+        // where the table's slot comes from.
+        h ^= h >> 29;
+    }
+    if (at < bytes.len) {
+        var tail: [8]u8 = @splat(0);
+        @memcpy(tail[0 .. bytes.len - at], bytes[at..]);
+        h = (h ^ std.mem.readInt(u64, &tail, .little)) *% PRIME;
+        h ^= h >> 29;
+    }
+    return h;
+}
+
 /// FNV-1a over exactly the bytes equality compares, by the same route.
 fn hashField(slab: Slab, f: Field, o: Options, seed: u64, buf: []u8) Error!u64 {
     const PRIME: u64 = 0x100_0000_01b3;
@@ -289,10 +374,23 @@ fn hashField(slab: Slab, f: Field, o: Options, seed: u64, buf: []u8) Error!u64 {
             len += 1;
         }
     } else {
-        var it = logical(slab, f);
-        while (it.next()) |b| {
-            h = (h ^ b) *% PRIME;
-            len += 1;
+        if (!fld.isEscaped(f)) {
+            // Nothing to unescape, so the bytes are the value and eight of them
+            // can be taken at a time. See `hashBytes`.
+            //
+            // The field word is asked directly rather than through `logical()`,
+            // which answers the same question by building an iterator over the
+            // slab -- the cost `sameBytes` used to pay, in the one function that
+            // runs for every key column of every row of both files.
+            const raw = slab.raw(f);
+            h = hashBytes(raw, h);
+            len = raw.len;
+        } else {
+            var it = slab.logical(f);
+            while (it.next()) |b| {
+                h = (h ^ b) *% PRIME;
+                len += 1;
+            }
         }
     }
     return (h ^ len) *% PRIME;
@@ -305,221 +403,438 @@ fn keyHash(slab: Slab, fields: []const Field, key_size: usize, o: Options, buf: 
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// One file, read into the representation the join works on
 // ---------------------------------------------------------------------------
 
-/// Splits rows into fields, projecting straight to the columns asked for. Once
-/// the last needed column has been read the rest of the row is skipped to its
-/// newline without its fields ever being delimited: on twenty columns keyed on
-/// the first two, most of a row is never looked at.
-const RowParser = struct {
-    delimiter: u8,
-    /// Where each projected column sits in the file, or null when absent.
-    source: []const ?usize,
-    last_needed: usize,
+/// How a file's rows are addressed.
+const Rows = union(enum) {
+    /// Text: a row is an offset into the mapping, re-parsed on demand. The index
+    /// stores where a row starts rather than its fields, because an offset is
+    /// eight bytes where the fields would be twenty times that, and re-parsing is
+    /// cheap because the parser stops at the last needed column.
+    text: struct {
+        parser: text.RowParser,
+        /// The same parser configured with the key columns alone, for the sweep.
+        ///
+        /// The sweep reads every row of the file and wants two things from each:
+        /// its hash, which comes from the key columns, and where the next row
+        /// starts. It has never wanted the other seventeen, and packing them was
+        /// most of what it cost -- a parser stops at the last column it was asked
+        /// for, so asking for less makes the rest of the row a plain scan for the
+        /// newline rather than a field-by-field walk.
+        keys: text.RowParser,
+        from: usize,
+    },
+    /// Parquet: there is no row to re-read, so the fields are materialised once,
+    /// row-major, and a row is an index into them.
+    columnar: struct { fields: []Field, rows: usize },
+};
 
-    fn init(delimiter: u8, source: []const ?usize) RowParser {
-        var last: usize = 0;
-        for (source) |s| if (s) |c| {
-            if (c > last) last = c;
+/// How much of a candidate row a lookup has to parse.
+///
+/// The two directions of the join want different things from the row they land
+/// on. A's direction compares every column against its mate, so it needs the
+/// whole row and keeps it. B's direction is asking one question -- is this key in
+/// A? -- and discards the row it matched against; parsing the eighteen columns it
+/// will not look at is the largest thing that side was doing.
+const Want = enum { whole, keys };
+
+/// A run of one row's bytes, and the delimiter that has to end it in the other
+/// file for that run to be a whole number of columns.
+const Span = struct { bytes: []const u8, delimiter: u8 };
+
+/// What a probe found: the row, and whether the bytes settled it outright.
+const Hit = struct { row: i32, same_bytes: bool };
+
+const Side = struct {
+    gpa: std.mem.Allocator,
+    slab: Slab,
+    rows: Rows,
+    width: usize,
+    /// Held so the JSON parser's key names outlive it.
+    wanted_names: ?[]?[]const u8 = null,
+    wanted_source: ?[]?usize = null,
+
+    /// The fields of the row addressed by `at` — a byte offset for a text file,
+    /// a row number for a columnar one.
+    fn fieldsAt(self: Side, at: u64, out: []Field) void {
+        switch (self.rows) {
+            .text => |t| _ = t.parser.parse(self.slab.data, @intCast(at), self.slab.data.len, out),
+            .columnar => |c| {
+                const from = @as(usize, @intCast(at)) * self.width;
+                @memcpy(out, c.fields[from..][0..self.width]);
+            },
+        }
+    }
+
+    /// The row parser, when rows are text and there is one.
+    fn parser(self: Side) ?text.RowParser {
+        return switch (self.rows) {
+            .text => |t| t.parser,
+            .columnar => null,
         };
-        return .{ .delimiter = delimiter, .source = source, .last_needed = last };
     }
 
-    /// Parses one row into `out`, returning the offset of the next row. A row
-    /// shorter than the header leaves the missing fields absent, which is a
-    /// difference to report rather than a file to refuse.
-    fn parse(self: RowParser, d: []const u8, start: usize, end: usize, out: []Field) usize {
-        @memset(out, ABSENT);
-        var pos = start;
-        var column: usize = 0;
-
-        while (pos <= end) {
-            var field: Field = undefined;
-            var next: usize = undefined;
-            if (pos < end and d[pos] == '"') {
-                const close = scan.skipQuoted(d, pos + 1, end);
-                const body_end = if (close > pos + 1) close - 1 else pos + 1;
-                next = scan.nextOf2(d, close, end, self.delimiter, '\n');
-                const escaped = scan.nextOf1(d, pos + 1, body_end, '"') < body_end;
-                field = pack(pos + 1, body_end - (pos + 1), escaped);
-            } else {
-                next = scan.nextOf2(d, pos, end, self.delimiter, '\n');
-                var stop = next;
-                if (stop > pos and d[stop - 1] == '\r') stop -= 1; // CRLF behaves like LF
-                field = pack(pos, stop - pos, false);
-            }
-            self.store(column, field, out);
-            column += 1;
-
-            if (next >= end) return end;
-            if (d[next] == '\n') return next + 1;
-            pos = next + 1;
-            if (column > self.last_needed) {
-                const eol = endOfRow(d, pos, end);
-                return if (eol >= end) end else eol + 1;
-            }
+    /// The key columns of that row, and nothing else.
+    ///
+    /// The whole row is eighteen more fields than a key comparison reads, and a
+    /// parser stops at the last column it was asked for -- so asking for the two
+    /// key columns turns the rest of the row into one scan for the newline
+    /// instead of eighteen field boundaries packed into words nobody looks at.
+    /// This is the saving the sweep already takes, in the half of the engine
+    /// that only ever wanted a key.
+    ///
+    /// Fills `out[0..key_size]` and leaves the rest of the buffer as it was:
+    /// every caller reads the key columns alone.
+    fn keysAt(self: Side, at: u64, key_size: usize, out: []Field) void {
+        switch (self.rows) {
+            .text => |t| _ = t.keys.parse(self.slab.data, @intCast(at), self.slab.data.len, out),
+            .columnar => |c| {
+                const from = @as(usize, @intCast(at)) * self.width;
+                @memcpy(out[0..key_size], c.fields[from..][0..key_size]);
+            },
         }
-        return end;
     }
 
-    fn store(self: RowParser, column: usize, f: Field, out: []Field) void {
-        if (column > self.last_needed) return;
-        for (self.source, 0..) |s, i| {
-            if (s != null and s.? == column) out[i] = f;
+    fn deinit(self: *Side) void {
+        switch (self.rows) {
+            .text => |t| {
+                t.parser.deinit(self.gpa);
+                t.keys.deinit(self.gpa);
+            },
+            .columnar => |c| self.gpa.free(c.fields),
         }
+        if (self.wanted_names) |n| self.gpa.free(n);
+        if (self.wanted_source) |s| self.gpa.free(s);
+        self.slab.close();
     }
 };
 
-fn endOfRow(d: []const u8, pos: usize, end: usize) usize {
-    var at = pos;
-    while (at < end) {
-        const next = scan.nextOf2(d, at, end, '\n', '"');
-        if (next >= end) return end;
-        if (d[next] == '"') {
-            at = scan.skipQuoted(d, next + 1, end);
-            continue;
+/// A file after its header has been read but before the comparison knows which
+/// columns it wants. The two phases are separate because a Parquet file should
+/// decode the columns being compared and no others, and that list is not known
+/// until both headers have been resolved against each other.
+const Input = union(enum) {
+    text: struct { slab: Slab, delimiter: u8, from: usize, names: [][]const u8 },
+    parquet: struct { reader: parquet.Reader, names: [][]const u8 },
+
+    fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8, opt: Options) !Input {
+        // The format is decided by what is in the file, not by its name: a file
+        // called `.parquet` that is really a CSV is read as a CSV.
+        var slab = try Slab.map(io, path);
+        errdefer slab.close();
+        if (parquet.looksLikeParquet(slab.data)) {
+            slab.close();
+            var reader = try parquet.Reader.open(gpa, io, path);
+            errdefer reader.deinit();
+            return .{ .parquet = .{ .reader = reader, .names = try reader.columnNames(gpa) } };
         }
-        return next;
+        // A file that begins with the magic and does not end with it is a
+        // truncated Parquet file. Reading it as a CSV would report a missing key
+        // column, which sends the reader looking in the wrong place entirely.
+        if (slab.data.len >= 4 and std.mem.eql(u8, slab.data[0..4], "PAR1"))
+            return parquet.Error.TruncatedParquetFile;
+        slab.dialect = text.sniffDialect(slab.data);
+        if (slab.dialect == .json) {
+            const head = try text.readJsonHeader(gpa, slab);
+            return .{ .text = .{ .slab = slab, .delimiter = ',', .from = 0, .names = head.names } };
+        }
+        const delimiter = opt.delimiter orelse
+            text.detectDelimiter(slab.data[0..scan.nextOf1(slab.data, 0, slab.data.len, '\n')]);
+        const head = try text.readCsvHeader(gpa, slab, delimiter);
+        return .{ .text = .{
+            .slab = slab,
+            .delimiter = delimiter,
+            .from = head.start,
+            .names = head.names,
+        } };
     }
-    return end;
-}
+
+    fn names(self: Input) [][]const u8 {
+        return switch (self) {
+            .text => |t| t.names,
+            .parquet => |p| p.names,
+        };
+    }
+
+    fn freeNames(self: Input, gpa: std.mem.Allocator) void {
+        for (self.names()) |n| gpa.free(n);
+        gpa.free(self.names());
+    }
+
+    /// Reads the file into the join's representation, keeping only `wanted`.
+    /// Takes ownership: on return the input is spent either way.
+    fn project(
+        self: Input,
+        gpa: std.mem.Allocator,
+        wanted: []const []const u8,
+        key_size: usize,
+        threads: usize,
+    ) !Side {
+        const width = wanted.len;
+        switch (self) {
+            .text => |t| {
+                var side = Side{ .gpa = gpa, .slab = t.slab, .width = width, .rows = undefined };
+                errdefer side.slab.close();
+                if (t.slab.dialect == .json) {
+                    const keys = try gpa.alloc(?[]const u8, width);
+                    errdefer gpa.free(keys);
+                    for (wanted, 0..) |n, i| keys[i] = if (has(t.names, n)) n else null;
+                    side.wanted_names = keys;
+                    side.rows = .{ .text = .{
+                        .parser = try text.RowParser.initJson(gpa, keys),
+                        .keys = try text.RowParser.initJson(gpa, keys[0..@min(key_size, width)]),
+                        .from = t.from,
+                    } };
+                } else {
+                    const source = try gpa.alloc(?usize, width);
+                    errdefer gpa.free(source);
+                    for (wanted, 0..) |n, i| source[i] = indexOf(t.names, n);
+                    side.wanted_source = source;
+                    side.rows = .{ .text = .{
+                        .parser = try text.RowParser.initCsv(gpa, t.delimiter, source),
+                        .keys = try text.RowParser.initCsv(
+                            gpa,
+                            t.delimiter,
+                            source[0..@min(key_size, width)],
+                        ),
+                        .from = t.from,
+                    } };
+                }
+                return side;
+            },
+            .parquet => |p| {
+                var reader = p.reader;
+                defer reader.deinit(); // the mapping is finished with once decoded
+                const keys = try gpa.alloc(?[]const u8, width);
+                defer gpa.free(keys);
+                for (wanted, 0..) |n, i| keys[i] = if (has(p.names, n)) n else null;
+                const rows = reader.rows;
+                const projected = try reader.project(gpa, keys, threads);
+                return .{
+                    .gpa = gpa,
+                    .slab = Slab.owned(gpa, projected.arena, .raw),
+                    .rows = .{ .columnar = .{ .fields = projected.fields, .rows = rows } },
+                    .width = width,
+                };
+            },
+        }
+    }
+};
 
 // ---------------------------------------------------------------------------
 // The index
 // ---------------------------------------------------------------------------
 
-const EMPTY: i32 = -1;
+/// A slot holds the top bits of its key's hash and the position in `first_row`
+/// plus one, so zero means empty.
+///
+/// Carrying the tag is what makes a failed probe cheap: the word already loaded
+/// settles it. A table of bare positions has to follow each one into `first_row`
+/// and then into `row_hash` — two dependent random loads, over arrays far too big
+/// to cache at ten million keys — only to reject it.
+const POS_MASK: u64 = (1 << 40) - 1;
+const TAG_MASK: u64 = ~POS_MASK;
+const EMPTY_SLOT: u64 = 0;
+
+fn slotFor(hash: u64, pos: usize) u64 {
+    return (hash & TAG_MASK) | (@as(u64, pos) + 1);
+}
+
+fn tagIs(slot: u64, hash: u64) bool {
+    return (slot ^ hash) & TAG_MASK == 0;
+}
+
+fn posOf(slot: u64) usize {
+    return @intCast((slot & POS_MASK) - 1);
+}
+
+/// One chunk's rows, in the order they appear in it.
+const Chunk = struct {
+    at: std.ArrayList(u64) = .empty,
+    hash: std.ArrayList(u64) = .empty,
+    /// Written only by the thread that owns this chunk, read only once every
+    /// thread has been joined -- which is why no lock is needed for it.
+    failure: ?anyerror = null,
+
+    fn deinit(self: *Chunk, gpa: std.mem.Allocator) void {
+        self.at.deinit(gpa);
+        self.hash.deinit(gpa);
+    }
+};
 
 /// Open addressing over one file's rows. Everything is a primitive array taken
 /// from the caller's allocator, so an index that would not fit in the budget
 /// fails here rather than growing until the kernel intervenes.
 const RowIndex = struct {
     gpa: std.mem.Allocator,
-    slab: Slab,
-    parser: RowParser,
+    side: *const Side,
     key_size: usize,
     opt: Options,
-    row_start: std.ArrayList(u64),
+    row_at: std.ArrayList(u64),
     row_hash: std.ArrayList(u64),
-    table: []i32,
+    table: []u64,
     mask: usize,
     first_row: std.ArrayList(i32),
     occurrences: std.ArrayList(u32),
     probe: []Field,
+    mine: []Field,
     rows: i64 = 0,
     dup_keys: i64 = 0,
     dup_rows: i64 = 0,
 
+    /// Finds and hashes every row in parallel, then inserts them on one thread in
+    /// file order.
+    ///
+    /// The split is safe because the two halves need different things: parsing a
+    /// row depends on nothing but where it starts, while the table depends on the
+    /// order rows arrive — first occurrence of a key wins, and the duplicate
+    /// counts follow from that. Doing the second half in parallel would make the
+    /// answer depend on thread scheduling.
     fn build(
         gpa: std.mem.Allocator,
-        slab: Slab,
-        parser: RowParser,
-        from: usize,
-        width: usize,
+        side: *const Side,
         key_size: usize,
         opt: Options,
+        threads: usize,
+        tag: []const u8,
     ) !RowIndex {
-        const table = try gpa.alloc(i32, 1 << 12);
-        @memset(table, EMPTY);
+        var phases = Phases.start(tag);
+        const chunks = try sweep(gpa, side, key_size, opt, threads);
+        phases.mark("sweep (parallel)");
+        defer {
+            for (chunks) |*c| c.deinit(gpa);
+            gpa.free(chunks);
+        }
+
+        var total: usize = 0;
+        for (chunks) |c| total += c.at.items.len;
+        // Sized once for the rows about to be inserted, at about a two-thirds
+        // load. Starting at four thousand and doubling meant twelve rehashes at
+        // ten million rows, each one a full random-access pass over a table
+        // already too big to cache — work that grows with the file and is
+        // entirely avoidable, since the row count is known before the first
+        // insert.
+        //
+        // Two thirds and not a half: sizing for a half load also removes the
+        // rehash, but the table it leaves is twice as big, and at ten million
+        // keys the misses that costs are worth more than the probes it saves.
+        var cap: usize = 1 << 12;
+        while (cap * 2 < total * 3 + 16) cap <<= 1;
+        const table = try gpa.alloc(u64, cap);
+        @memset(table, EMPTY_SLOT);
         var self = RowIndex{
             .gpa = gpa,
-            .slab = slab,
-            .parser = parser,
+            .side = side,
             .key_size = key_size,
             .opt = opt,
-            .row_start = .empty,
+            .row_at = .empty,
             .row_hash = .empty,
             .table = table,
             .mask = table.len - 1,
             .first_row = .empty,
             .occurrences = .empty,
-            .probe = try gpa.alloc(Field, width),
+            .probe = try gpa.alloc(Field, side.width),
+            .mine = try gpa.alloc(Field, side.width),
         };
         errdefer self.deinit();
 
-        const d = slab.data;
-        const end = d.len;
-        const fields = try gpa.alloc(Field, width);
-        defer gpa.free(fields);
-        var s = Scratch{};
+        try self.row_at.ensureTotalCapacity(gpa, total);
+        try self.row_hash.ensureTotalCapacity(gpa, total);
+        // One entry per distinct key, and every key is distinct until proven
+        // otherwise.
+        try self.first_row.ensureTotalCapacity(gpa, total);
+        try self.occurrences.ensureTotalCapacity(gpa, total);
 
-        var pos = from;
-        while (pos < end) {
-            // A line with nothing on it is not a row.
-            if (d[pos] == '\n') {
-                pos += 1;
-                continue;
+        var s = Scratch{};
+        // Each chunk is released as soon as it has been inserted. Holding all of
+        // them to the end would keep two copies of every row's address and hash
+        // alive at once, which is sixteen bytes a row of pure duplication.
+        for (chunks) |*chunk| {
+            const hashes = chunk.hash.items;
+            for (chunk.at.items, hashes, 0..) |at, hash, i| {
+                if (i + PREFETCH_AHEAD < hashes.len) self.prefetch(hashes[i + PREFETCH_AHEAD]);
+                try self.insert(at, hash, &s);
             }
-            if (d[pos] == '\r' and pos + 1 < end and d[pos + 1] == '\n') {
-                pos += 2;
-                continue;
-            }
-            const next = parser.parse(d, pos, end, fields);
-            for (fields) |f| if (f == TOO_LONG) return Error.FieldTooLong;
-            try self.add(pos, fields, &s);
-            if (next <= pos) break; // no progress: a malformed tail, not an endless loop
-            pos = next;
+            // Emptied rather than only released, because the caller frees the
+            // chunks too and a list deinitialised twice frees a pointer it no
+            // longer owns.
+            chunk.deinit(gpa);
+            chunk.* = .{};
         }
+        phases.mark("index insert (serial)");
         return self;
     }
 
     fn deinit(self: *RowIndex) void {
-        self.row_start.deinit(self.gpa);
+        self.row_at.deinit(self.gpa);
         self.row_hash.deinit(self.gpa);
         self.first_row.deinit(self.gpa);
         self.occurrences.deinit(self.gpa);
         self.gpa.free(self.table);
         self.gpa.free(self.probe);
+        self.gpa.free(self.mine);
     }
 
-    fn add(self: *RowIndex, start: usize, fields: []const Field, s: *Scratch) !void {
+    fn insert(self: *RowIndex, at: u64, hash: u64, s: *Scratch) !void {
         self.rows += 1;
-        const row: i32 = @intCast(self.row_start.items.len);
-        const hash = try keyHash(self.slab, fields, self.key_size, self.opt, &s.a);
-        try self.row_start.append(self.gpa, start);
+        const row: i32 = @intCast(self.row_at.items.len);
+        try self.row_at.append(self.gpa, at);
         try self.row_hash.append(self.gpa, hash);
 
         var slot = self.slotOf(hash);
+        var mine_parsed = false;
         while (true) {
-            const at = self.table[slot];
-            if (at == EMPTY) {
-                self.table[slot] = @intCast(self.first_row.items.len);
+            const word = self.table[slot];
+            if (word == EMPTY_SLOT) {
+                self.table[slot] = slotFor(hash, self.first_row.items.len);
                 try self.first_row.append(self.gpa, row);
                 try self.occurrences.append(self.gpa, 1);
-                if (self.first_row.items.len * 2 > self.table.len) try self.rehash();
+                // Two thirds, which is what `build` sizes the table for.
+                if (self.first_row.items.len * 3 > self.table.len * 2) try self.rehash();
                 return;
             }
-            const candidate = self.first_row.items[@intCast(at)];
-            if (self.row_hash.items[@intCast(candidate)] == hash and
-                try self.sameKey(candidate, fields, s))
-            {
-                self.occurrences.items[@intCast(at)] += 1;
-                if (self.occurrences.items[@intCast(at)] == 2) {
-                    self.dup_keys += 1;
-                    self.dup_rows += 1; // the first occurrence counts once the key repeats
+            // The tag rejects almost every collision without leaving this word.
+            if (tagIs(word, hash)) {
+                const key = posOf(word);
+                const candidate = self.first_row.items[key];
+                if (self.row_hash.items[@intCast(candidate)] == hash) {
+                    // This row's fields are re-read rather than carried over from
+                    // the sweep because the sweep produced ten million of them and
+                    // this branch wants one.
+                    if (!mine_parsed) {
+                        self.side.keysAt(at, self.key_size, self.mine);
+                        mine_parsed = true;
+                    }
+                    self.keysOf(candidate, self.probe);
+                    var ok = true;
+                    for (0..self.key_size) |i| {
+                        if (!(try same(self.side.slab, self.probe[i], self.side.slab, self.mine[i], self.opt, s))) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) {
+                        self.occurrences.items[key] += 1;
+                        if (self.occurrences.items[key] == 2) {
+                            self.dup_keys += 1;
+                            self.dup_rows += 1; // the first occurrence counts once the key repeats
+                        }
+                        self.dup_rows += 1;
+                        return;
+                    }
                 }
-                self.dup_rows += 1;
-                return;
             }
             slot = (slot + 1) & self.mask;
         }
     }
 
-    fn sameKey(self: *RowIndex, candidate: i32, fields: []const Field, s: *Scratch) !bool {
-        self.fieldsOf(candidate, self.probe);
-        for (0..self.key_size) |i| {
-            if (!(try same(self.slab, self.probe[i], self.slab, fields[i], self.opt, s))) return false;
-        }
-        return true;
+    fn fieldsOf(self: RowIndex, row: i32, out: []Field) void {
+        self.side.fieldsAt(self.row_at.items[@intCast(row)], out);
     }
 
-    /// Re-parses a row. The index stores where a row starts rather than its
-    /// fields, because an offset is eight bytes where the fields would be twenty
-    /// times that; re-parsing is cheap because the parser stops early.
-    fn fieldsOf(self: RowIndex, row: i32, out: []Field) void {
-        const start: usize = @intCast(self.row_start.items[@intCast(row)]);
-        _ = self.parser.parse(self.slab.data, start, self.slab.data.len, out);
+    fn keysOf(self: RowIndex, row: i32, out: []Field) void {
+        self.side.keysAt(self.row_at.items[@intCast(row)], self.key_size, out);
     }
 
     /// The high bits of an FNV hash are the well-mixed ones; fold them down.
@@ -527,49 +842,109 @@ const RowIndex = struct {
         return @as(usize, @intCast((hash ^ (hash >> 32)) & 0xffff_ffff)) & self.mask;
     }
 
+    /// Starts the fetch of the slot `hash` will land in, without waiting for it.
+    ///
+    /// Every probe of this table is a random access into tens of megabytes, so it
+    /// misses to memory, and the row after it needs a different line: the loop
+    /// spends most of its time waiting on a load whose address was known long
+    /// before it was issued. Asking for the line `PREFETCH_AHEAD` rows early turns
+    /// that serial chain of misses into overlapping ones.
+    fn prefetch(self: *const RowIndex, hash: u64) void {
+        @prefetch(&self.table[self.slotOf(hash)], .{ .rw = .read, .locality = 3, .cache = .data });
+    }
+
+    /// Only reached if the row count was underestimated: `build` sizes the table
+    /// for the rows it is about to insert, so the common path never grows it.
     fn rehash(self: *RowIndex) !void {
-        const table = try self.gpa.alloc(i32, self.table.len * 2);
-        @memset(table, EMPTY);
+        const table = try self.gpa.alloc(u64, self.table.len * 2);
+        @memset(table, EMPTY_SLOT);
         self.gpa.free(self.table);
         self.table = table;
         self.mask = table.len - 1;
         for (self.first_row.items, 0..) |row, key| {
-            var slot = self.slotOf(self.row_hash.items[@intCast(row)]);
-            while (self.table[slot] != EMPTY) slot = (slot + 1) & self.mask;
-            self.table[slot] = @intCast(key);
+            const hash = self.row_hash.items[@intCast(row)];
+            var slot = self.slotOf(hash);
+            while (self.table[slot] != EMPTY_SLOT) slot = (slot + 1) & self.mask;
+            self.table[slot] = slotFor(hash, key);
         }
     }
 
     /// The row carrying `fields`' key, or null. `other` is the slab those fields
-    /// live in, which is the opposite file when this is a join probe.
-    // `probe` is scratch the caller owns. The join runs both directions at once,
-    // and a buffer hanging off the index would be shared between those threads.
+    /// live in, which is the opposite file when this is a join probe. `probe` is
+    /// scratch the caller owns: the join runs several chunks at once, and a buffer
+    /// hanging off the index would be shared between them.
+    ///
+    /// On a hit, `probe` holds as much of that row as `want` asked for — it is
+    /// what the key columns were compared against. The join used to read the row
+    /// again on the line after this one returned, which is a second parse of
+    /// every matched row in the file.
+    ///
+    /// `want` is `.whole` for the side that goes on to compare the columns, and
+    /// `.keys` for the side that only asks whether the key exists at all and
+    /// throws the answer away.
     fn lookup(
         self: *const RowIndex,
         other: Slab,
         fields: []const Field,
         hash: u64,
+        want: Want,
+        span: ?Span,
         s: *Scratch,
         probe: []Field,
-    ) !?i32 {
+    ) !?Hit {
         var slot = self.slotOf(hash);
         while (true) {
-            const at = self.table[slot];
-            if (at == EMPTY) return null;
-            const candidate = self.first_row.items[@intCast(at)];
-            if (self.row_hash.items[@intCast(candidate)] == hash) {
-                self.fieldsOf(candidate, probe);
-                var ok = true;
-                for (0..self.key_size) |i| {
-                    if (!(try same(self.slab, probe[i], other, fields[i], self.opt, s))) {
-                        ok = false;
-                        break;
+            const word = self.table[slot];
+            if (word == EMPTY_SLOT) return null;
+            // The tag rejects almost every collision without leaving this word.
+            if (tagIs(word, hash)) {
+                const candidate = self.first_row.items[posOf(word)];
+                if (self.row_hash.items[@intCast(candidate)] == hash) {
+                    // The bytes first, where the caller offered them. A candidate
+                    // whose row opens with the same bytes as far as either file
+                    // reads has the same keys and the same columns, and neither
+                    // row needs parsing to say so. A candidate the tag let
+                    // through with a different key fails this on its first few
+                    // bytes, so the cost of being wrong is a handful of them.
+                    if (span) |sp| {
+                        if (self.rowMatches(candidate, sp)) {
+                            return .{ .row = candidate, .same_bytes = true };
+                        }
                     }
+                    switch (want) {
+                        .whole => self.fieldsOf(candidate, probe),
+                        .keys => self.keysOf(candidate, probe),
+                    }
+                    var ok = true;
+                    for (0..self.key_size) |i| {
+                        if (!(try same(self.side.slab, probe[i], other, fields[i], self.opt, s))) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (ok) return .{ .row = candidate, .same_bytes = false };
                 }
-                if (ok) return candidate;
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+
+    /// Whether `candidate`'s row opens with exactly `sp.bytes` and ends that run
+    /// on a field boundary.
+    ///
+    /// The boundary is what makes the run a whole number of columns rather than
+    /// a truncation of one: without it `12,3` would match a row opening `12,34`.
+    fn rowMatches(self: *const RowIndex, candidate: i32, sp: Span) bool {
+        const data = self.side.slab.data;
+        const from: usize = @intCast(self.row_at.items[@intCast(candidate)]);
+        // Both tests, and in this order: `data.len - sp.bytes.len` underflows for
+        // a run longer than this whole file, which a release build would wrap
+        // rather than trap. A's rows and B's bytes come from different files and
+        // nothing bounds one by the other.
+        if (sp.bytes.len > data.len or from > data.len - sp.bytes.len) return false;
+        const to = from + sp.bytes.len;
+        if (to < data.len and data[to] != sp.delimiter and data[to] != '\n') return false;
+        return std.mem.eql(u8, data[from..to], sp.bytes);
     }
 
     fn uniqueKeys(self: RowIndex) i64 {
@@ -578,26 +953,214 @@ const RowIndex = struct {
 };
 
 // ---------------------------------------------------------------------------
+// The sweep: finding and hashing every row, in parallel
+// ---------------------------------------------------------------------------
+
+/// Where each chunk begins, as offsets of real row starts.
+///
+/// The nominal split is `size / threads`, walked forward to the next row. Walking
+/// forward is the whole difficulty for CSV: a newline inside a quoted field is not
+/// a row boundary, and a thread starting mid-file cannot tell whether it is inside
+/// one. Parity settles it — every `"` toggles in-quote state, including both halves
+/// of a doubled quote, which toggles twice and so correctly leaves the state alone,
+/// so the count of quotes before a position says whether that position is inside a
+/// field. Counting them is a scan for one byte, far cheaper than parsing.
+///
+/// JSON needs none of that: a raw newline inside a string is not valid JSON, so
+/// every newline ends a record.
+fn chunkBounds(
+    gpa: std.mem.Allocator,
+    data: []const u8,
+    from: usize,
+    threads: usize,
+    dialect: Dialect,
+) ![]usize {
+    var bounds: std.ArrayList(usize) = .empty;
+    errdefer bounds.deinit(gpa);
+    const end = data.len;
+    if (threads <= 1 or end - from < CHUNKING_THRESHOLD) {
+        try bounds.appendSlice(gpa, &.{ from, end });
+        return bounds.toOwnedSlice(gpa);
+    }
+
+    try bounds.append(gpa, from);
+    for (1..threads) |i| {
+        const nominal = from + (end - from) * i / threads;
+        var in_quotes = dialect == .csv and
+            scan.countByte(data, from, nominal, '"') % 2 == 1;
+        var at = nominal;
+        while (at < end) : (at += 1) {
+            const c = data[at];
+            if (c == '"' and dialect == .csv) {
+                in_quotes = !in_quotes;
+            } else if (c == '\n' and !in_quotes) {
+                at += 1;
+                break;
+            }
+        }
+        if (at > bounds.items[bounds.items.len - 1] and at < end) try bounds.append(gpa, at);
+    }
+    try bounds.append(gpa, end);
+    return bounds.toOwnedSlice(gpa);
+}
+
+/// The shared state of a parallel sweep: a range each, and the first failure.
+const Sweep = struct {
+    gpa: std.mem.Allocator,
+    side: *const Side,
+    key_size: usize,
+    opt: Options,
+    bounds: []const usize,
+    /// Set for a columnar file, where a chunk is a range of row numbers rather
+    /// than a range of bytes.
+    columnar_rows: usize,
+    chunks: []Chunk,
+    next: std.atomic.Value(usize),
+
+    fn run(self: *Sweep) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.chunks.len) return;
+            self.one(i) catch |e| {
+                self.chunks[i].failure = e;
+                return;
+            };
+        }
+    }
+
+    fn one(self: *Sweep, i: usize) !void {
+        const gpa = self.gpa;
+        const fields = try gpa.alloc(Field, self.side.width);
+        defer gpa.free(fields);
+        // The sweep parses with the key-only parser, so it needs room for the
+        // key columns; the full-width buffer above is what a row over the field
+        // cap is re-read into, and what the columnar branch fills.
+        const keys = try gpa.alloc(Field, @max(1, self.key_size));
+        defer gpa.free(keys);
+        var s = Scratch{};
+        var chunk = &self.chunks[i];
+
+        switch (self.side.rows) {
+            .columnar => {
+                const lo = self.columnar_rows * i / self.chunks.len;
+                const hi = self.columnar_rows * (i + 1) / self.chunks.len;
+                try chunk.at.ensureTotalCapacity(gpa, hi - lo);
+                try chunk.hash.ensureTotalCapacity(gpa, hi - lo);
+                for (lo..hi) |row| {
+                    self.side.fieldsAt(row, fields);
+                    chunk.at.appendAssumeCapacity(row);
+                    chunk.hash.appendAssumeCapacity(
+                        try keyHash(self.side.slab, fields, self.key_size, self.opt, &s.a),
+                    );
+                }
+            },
+            .text => |t| {
+                const data = self.side.slab.data;
+                var pos = self.bounds[i];
+                const stop = self.bounds[i + 1];
+                // Rows that *start* in this chunk belong to it; the last one is
+                // finished past the boundary rather than cut in half.
+                while (pos < stop) {
+                    // A line with nothing on it is not a row.
+                    if (data[pos] == '\n') {
+                        pos += 1;
+                        continue;
+                    }
+                    if (data[pos] == '\r' and pos + 1 < data.len and data[pos + 1] == '\n') {
+                        pos += 2;
+                        continue;
+                    }
+                    const next = t.keys.parse(data, pos, data.len, keys);
+                    // A field cannot be longer than the row that holds it, so
+                    // only a row over the cap can hide an over-long column the
+                    // key parser never looked at. That row, and only that row, is
+                    // re-read in full to find it. At a hundred and eighty bytes a
+                    // row this is one comparison and never taken; the check it
+                    // replaces walked twenty fields of every row of the file.
+                    for (keys) |field| if (field == TOO_LONG) return Error.FieldTooLong;
+                    if (next -| pos > fld.MAX_FIELD_LEN) {
+                        _ = t.parser.parse(data, pos, data.len, fields);
+                        for (fields) |field| if (field == TOO_LONG) return Error.FieldTooLong;
+                    }
+                    try chunk.at.append(gpa, pos);
+                    try chunk.hash.append(
+                        gpa,
+                        try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a),
+                    );
+                    if (next <= pos) break; // no progress: a malformed tail, not a loop
+                    pos = next;
+                }
+            },
+        }
+    }
+};
+
+fn sweep(
+    gpa: std.mem.Allocator,
+    side: *const Side,
+    key_size: usize,
+    opt: Options,
+    threads: usize,
+) ![]Chunk {
+    var bounds: []usize = &.{};
+    var parts: usize = 1;
+    switch (side.rows) {
+        .text => |t| {
+            const data = side.slab.data;
+            if (t.from >= data.len) return gpa.alloc(Chunk, 0);
+            bounds = try chunkBounds(gpa, data, t.from, threads, side.slab.dialect);
+            parts = bounds.len - 1;
+        },
+        .columnar => |c| {
+            parts = @max(1, @min(threads, (c.rows + (1 << 14) - 1) / (1 << 14)));
+        },
+    }
+    defer if (bounds.len > 0) gpa.free(bounds);
+
+    const chunks = try gpa.alloc(Chunk, parts);
+    errdefer {
+        for (chunks) |*c| c.deinit(gpa);
+        gpa.free(chunks);
+    }
+    for (chunks) |*c| c.* = .{};
+
+    var work = Sweep{
+        .gpa = gpa,
+        .side = side,
+        .key_size = key_size,
+        .opt = opt,
+        .bounds = bounds,
+        .columnar_rows = switch (side.rows) {
+            .columnar => |c| c.rows,
+            .text => 0,
+        },
+        .chunks = chunks,
+        .next = std.atomic.Value(usize).init(0),
+    };
+    try runOnThreads(&work, Sweep.run, parts);
+    for (chunks) |c| {
+        if (c.failure) |e| return e;
+    }
+    return chunks;
+}
+
+/// Runs `entry` on `ways` threads, or on this one where a thread cannot be had:
+/// a thread that will not spawn is not a reason to fail, it is the same work.
+pub fn runOnThreads(state: anytype, comptime entry: anytype, ways: usize) !void {
+    var workers: [64]?std.Thread = undefined;
+    const spawned = @min(if (ways > 0) ways - 1 else 0, workers.len);
+    for (0..spawned) |i| workers[i] = std.Thread.spawn(.{}, entry, .{state}) catch null;
+    entry(state);
+    for (0..spawned) |i| {
+        if (workers[i]) |w| w.join() else entry(state);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Columns
 // ---------------------------------------------------------------------------
 
-fn detectDelimiter(header: []const u8) u8 {
-    var best: u8 = ',';
-    var best_count: isize = -1;
-    for ([_]u8{ ',', ';', '\t', '|' }) |c| {
-        var n: isize = 0;
-        for (header) |b| {
-            if (b == c) n += 1;
-        }
-        if (n > best_count) {
-            best = c;
-            best_count = n;
-        }
-    }
-    return best;
-}
-
-fn contains(haystack: []const []const u8, needle: []const u8) bool {
+fn has(haystack: []const []const u8, needle: []const u8) bool {
     for (haystack) |h| {
         if (std.mem.eql(u8, h, needle)) return true;
     }
@@ -609,40 +1172,6 @@ fn indexOf(haystack: []const []const u8, needle: []const u8) ?usize {
         if (std.mem.eql(u8, h, needle)) return i;
     }
     return null;
-}
-
-/// The header row's names, and where the first data row starts.
-fn readHeader(gpa: std.mem.Allocator, slab: Slab, delimiter: u8) !struct { names: [][]const u8, start: usize } {
-    const d = slab.data;
-    if (d.len == 0) return Error.NoHeaderRow;
-    var names: std.ArrayList([]const u8) = .empty;
-    errdefer names.deinit(gpa);
-    var pos: usize = 0;
-    while (true) {
-        var field: Field = undefined;
-        var next: usize = undefined;
-        if (pos < d.len and d[pos] == '"') {
-            const close = scan.skipQuoted(d, pos + 1, d.len);
-            const body_end = if (close > pos + 1) close - 1 else pos + 1;
-            next = scan.nextOf2(d, close, d.len, delimiter, '\n');
-            field = pack(pos + 1, body_end - (pos + 1), scan.nextOf1(d, pos + 1, body_end, '"') < body_end);
-        } else {
-            next = scan.nextOf2(d, pos, d.len, delimiter, '\n');
-            var stop = next;
-            if (stop > pos and d[stop - 1] == '\r') stop -= 1;
-            field = pack(pos, stop - pos, false);
-        }
-        // A header name is one of the few strings this engine does own; there is
-        // one per column, not one per cell.
-        var buf: std.ArrayList(u8) = .empty;
-        var it = logical(slab, field);
-        while (it.next()) |b| try buf.append(gpa, b);
-        try names.append(gpa, try buf.toOwnedSlice(gpa));
-
-        if (next >= d.len) return .{ .names = try names.toOwnedSlice(gpa), .start = d.len };
-        if (d[next] == '\n') return .{ .names = try names.toOwnedSlice(gpa), .start = next + 1 };
-        pos = next + 1;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -657,25 +1186,230 @@ pub const Result = struct {
         return self.counts.changed == 0 and self.counts.added == 0 and self.counts.removed == 0;
     }
 
-    /// The column names are owned copies, so the header they were read from can
-    /// be released as soon as the comparison is done with it.
+    /// The column names are owned copies, so the header they were read from can be
+    /// released as soon as the comparison is done with it.
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         for (self.columns) |c| gpa.free(c.name);
         gpa.free(self.columns);
     }
 };
 
-/// Releases a header read by `readHeader`.
-fn freeHeader(gpa: std.mem.Allocator, names: [][]const u8) void {
-    for (names) |n| gpa.free(n);
-    gpa.free(names);
-}
+/// One chunk of the join queue. A chunk of A's keys fills the matched, changed
+/// and removed counts and the column stats; a chunk of B's fills `added`. The
+/// merge is a sum, so the answer does not depend on how many chunks there are or
+/// on which thread took which.
+const Part = struct {
+    matched: i64 = 0,
+    changed: i64 = 0,
+    removed: i64 = 0,
+    added: i64 = 0,
+    columns: []ColumnStat,
+    /// Written only by the thread that owns this range, read only once every
+    /// thread has been joined.
+    failure: ?anyerror = null,
+};
+
+const Join = struct {
+    a: *const Side,
+    b: *const Side,
+    ai: *const RowIndex,
+    bi: *const RowIndex,
+    opt: Options,
+    key_size: usize,
+    nc: usize,
+    width: usize,
+    parts: []Part,
+    /// Chunk `i` is A's chunk `i` below this and B's above it.
+    a_ways: usize,
+    /// Where a byte comparison may stand in for a parse, when the two files are
+    /// the same shape; see `text.sharedTail`. Null compares every pair column by
+    /// column, which is what a mixed pair, a columnar side or JSON gets.
+    span_tail: ?text.Tail,
+    next: std.atomic.Value(usize),
+
+    fn run(self: *Join) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.parts.len) return;
+            const work = if (i < self.a_ways) self.range(i) else self.added(i);
+            work catch |e| {
+                self.parts[i].failure = e;
+                return;
+            };
+        }
+    }
+
+    fn range(self: *Join, p: usize) !void {
+        const gpa = self.a.gpa;
+        const fa = try gpa.alloc(Field, self.width);
+        defer gpa.free(fa);
+        // The lookup's scratch, and on a hit it already holds the mate's fields:
+        // that is what the key columns were matched against.
+        const fb = try gpa.alloc(Field, self.width);
+        defer gpa.free(fb);
+        var s = Scratch{};
+        var out = &self.parts[p];
+
+        const keys = self.ai.first_row.items;
+        const lo = keys.len * p / self.a_ways;
+        const hi = keys.len * (p + 1) / self.a_ways;
+        // Nothing to normalise and no tolerance: the cell comparison cannot
+        // fail, so it need not be asked through an error union.
+        const plain = !needsNormalising(self.opt);
+        const mine = keys[lo..hi];
+        for (mine, 0..) |row, at| {
+            if (at + PREFETCH_AHEAD < mine.len) {
+                self.bi.prefetch(self.ai.row_hash.items[@intCast(mine[at + PREFETCH_AHEAD])]);
+            }
+            self.ai.fieldsOf(row, fa);
+            // The hash is the one the sweep computed for this row: the same
+            // bytes through the same function, so computing it again here would
+            // be a second pass over every key in the file for the same number.
+            const hash = self.ai.row_hash.items[@intCast(row)];
+            // A's row up to the end of the last column either file wants. The
+            // end has to be a boundary in A as well: a quoted field ends on its
+            // closing quote, and what follows is not part of the run.
+            const span: ?Span = blk: {
+                const tail = self.span_tail orelse break :blk null;
+                const f = fa[tail.slot];
+                if (!fld.isReal(f)) break :blk null;
+                const data = self.a.slab.data;
+                const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
+                const to = fld.offsetOf(f) + fld.lenOf(f);
+                if (to < from or to > data.len) break :blk null;
+                if (to < data.len and data[to] != tail.delimiter and data[to] != '\n') {
+                    break :blk null;
+                }
+                break :blk .{ .bytes = data[from..to], .delimiter = tail.delimiter };
+            };
+            const hit = (try self.bi.lookup(self.a.slab, fa, hash, .whole, span, &s, fb)) orelse {
+                out.removed += 1;
+                continue;
+            };
+            out.matched += 1;
+            // The two rows carry the same bytes across every column either file
+            // wants, so no column differs and the mate was never read.
+            if (hit.same_bytes) continue;
+            var any = false;
+            // Two loops rather than one with a flag inside it: `plain` cannot
+            // change between columns or between rows, and this is the innermost
+            // loop of the whole comparison -- seventeen columns of ten million
+            // matched rows.
+            if (plain) {
+                for (0..self.nc) |i| {
+                    const x = fa[self.key_size + i];
+                    const y = fb[self.key_size + i];
+                    const xa = plainAbsent(x);
+                    const yb = plainAbsent(y);
+                    if (plainDiffers(self.a.slab, x, xa, self.b.slab, y, yb)) {
+                        any = true;
+                        out.columns[i].changed += 1;
+                        // Absence is already known: the general path asks for it
+                        // twice more, having thrown away the answer.
+                        if (yb) out.columns[i].blanked += 1;
+                        if (xa) out.columns[i].filled += 1;
+                    }
+                }
+            } else {
+                for (0..self.nc) |i| {
+                    const x = fa[self.key_size + i];
+                    const y = fb[self.key_size + i];
+                    if (try cellDiffers(self.a.slab, x, self.b.slab, y, self.opt, &s)) {
+                        any = true;
+                        out.columns[i].changed += 1;
+                        if (try isAbsent(self.b.slab, y, self.opt, &s.b)) out.columns[i].blanked += 1;
+                        if (try isAbsent(self.a.slab, x, self.opt, &s.a)) out.columns[i].filled += 1;
+                    }
+                }
+            }
+            if (any) out.changed += 1;
+        }
+    }
+
+    /// B's side of the join: which of B's keys are not in A at all.
+    ///
+    /// It looked like the cheap half -- it asks one question per key where A's
+    /// side reads both rows and every compared column -- and so it was given one
+    /// thread while A got the rest. Timing each task says otherwise: at four
+    /// million rows B's single thread took 3.1s where A's three ranges took 1.6s
+    /// each, and the join sat waiting on B with three cores idle. A key does cost
+    /// B less than it costs A, about two thirds, but B has just as many of them,
+    /// and no ratio like that makes "one thread" the right unit for either side.
+    /// So B is chunked into the same queue, and chunks do not care which side
+    /// they came from.
+    fn added(self: *Join, i: usize) !void {
+        const p = i - self.a_ways;
+        const gpa = self.b.gpa;
+        const fb = try gpa.alloc(Field, self.width);
+        defer gpa.free(fb);
+        const probe = try gpa.alloc(Field, self.width);
+        defer gpa.free(probe);
+        var s = Scratch{};
+        var out = &self.parts[i];
+
+        const keys = self.bi.first_row.items;
+        const b_ways = self.parts.len - self.a_ways;
+        const lo = keys.len * p / b_ways;
+        const hi = keys.len * (p + 1) / b_ways;
+        const mine = keys[lo..hi];
+        for (mine, 0..) |row, j| {
+            if (j + PREFETCH_AHEAD < mine.len) {
+                self.ai.prefetch(self.bi.row_hash.items[@intCast(mine[j + PREFETCH_AHEAD])]);
+            }
+            // Only the key columns: this side compares nothing else, and the row
+            // it is about to probe against is discarded either way.
+            self.bi.keysOf(row, fb);
+            const hash = self.bi.row_hash.items[@intCast(row)];
+            if ((try self.ai.lookup(self.b.slab, fb, hash, .keys, null, &s, probe)) == null) {
+                out.added += 1;
+            }
+        }
+    }
+};
+
+/// One file's whole preparation — decode or map it, then index it — so that both
+/// files can be done at once.
+const Prepare = struct {
+    gpa: std.mem.Allocator,
+    input: Input,
+    wanted: []const []const u8,
+    key_size: usize,
+    opt: Options,
+    threads: usize,
+    tag: []const u8,
+    side: ?Side = null,
+    index: ?RowIndex = null,
+    failure: ?anyerror = null,
+
+    fn run(self: *Prepare) void {
+        self.go() catch |e| {
+            self.failure = e;
+        };
+    }
+
+    fn go(self: *Prepare) !void {
+        self.side = try self.input.project(self.gpa, self.wanted, self.key_size, self.threads);
+        self.index = try RowIndex.build(
+            self.gpa,
+            &self.side.?,
+            self.key_size,
+            self.opt,
+            self.threads,
+            self.tag,
+        );
+    }
+
+    fn deinit(self: *Prepare) void {
+        if (self.index) |*i| i.deinit();
+        if (self.side) |*s| s.deinit();
+    }
+};
 
 /// Compares two files, taking every byte it needs from `gpa`.
 ///
-/// Hand it a `FixedBufferAllocator` and the comparison cannot exceed that
-/// buffer: it returns `error.OutOfMemory` at the allocation that would have
-/// crossed the line. That is the whole reason this port is in Zig.
+/// Hand it a `FixedBufferAllocator` and the comparison cannot exceed that buffer:
+/// it returns `error.OutOfMemory` at the allocation that would have crossed the
+/// line. That is the whole reason this port is in Zig.
 pub fn compare(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -683,33 +1417,29 @@ pub fn compare(
     b_path: []const u8,
     opt: Options,
 ) !Result {
-    var a = try Slab.open(io, a_path);
-    defer a.close();
-    var b = try Slab.open(io, b_path);
-    defer b.close();
+    const total = if (opt.threads > 0) opt.threads else @max(1, std.Thread.getCpuCount() catch 1);
 
-    const a_delim = opt.delimiter orelse detectDelimiter(a.data[0..scan.nextOf1(a.data, 0, a.data.len, '\n')]);
-    const b_delim = opt.delimiter orelse detectDelimiter(b.data[0..scan.nextOf1(b.data, 0, b.data.len, '\n')]);
-
-    const a_head = try readHeader(gpa, a, a_delim);
-    defer freeHeader(gpa, a_head.names);
-    const b_head = try readHeader(gpa, b, b_delim);
-    defer freeHeader(gpa, b_head.names);
+    const a_input = try Input.open(gpa, io, a_path, opt);
+    defer a_input.freeNames(gpa);
+    const b_input = try Input.open(gpa, io, b_path, opt);
+    defer b_input.freeNames(gpa);
+    const a_names = a_input.names();
+    const b_names = b_input.names();
 
     for (opt.key) |k| {
-        if (!contains(a_head.names, k) or !contains(b_head.names, k)) return Error.KeyColumnMissing;
+        if (!has(a_names, k) or !has(b_names, k)) return Error.KeyColumnMissing;
     }
 
     var compared: std.ArrayList([]const u8) = .empty;
     defer compared.deinit(gpa);
     if (opt.compare.len > 0) {
         for (opt.compare) |c| {
-            if (!contains(a_head.names, c) or !contains(b_head.names, c)) return Error.ComparedColumnMissing;
+            if (!has(a_names, c) or !has(b_names, c)) return Error.ComparedColumnMissing;
             try compared.append(gpa, c);
         }
     } else {
-        for (a_head.names) |c| {
-            if (contains(b_head.names, c) and !contains(opt.key, c) and !contains(opt.ignore, c))
+        for (a_names) |c| {
+            if (has(b_names, c) and !has(opt.key, c) and !has(opt.ignore, c))
                 try compared.append(gpa, c);
         }
     }
@@ -723,73 +1453,46 @@ pub fn compare(
     for (opt.key) |k| try wanted.append(gpa, k);
     for (compared.items) |c| try wanted.append(gpa, c);
 
-    const a_src = try gpa.alloc(?usize, width);
-    defer gpa.free(a_src);
-    const b_src = try gpa.alloc(?usize, width);
-    defer gpa.free(b_src);
-    for (wanted.items, 0..) |n, i| {
-        a_src[i] = indexOf(a_head.names, n);
-        b_src[i] = indexOf(b_head.names, n);
-    }
-
-    const ap = RowParser.init(a_delim, a_src);
-    const bp = RowParser.init(b_delim, b_src);
-
-    // The two indexes share nothing, so they are built at the same time. This is
-    // most of the run: parsing and hashing every row of both files.
+    // The two files share nothing until the join, so they are read at the same
+    // time, and each is split further: two files across four cores is two chunks
+    // each, so the whole machine is busy rather than half of it.
     //
     // `gpa` has to be thread-safe for this. Under --max-memory it is a
-    // FixedBufferAllocator -- a bump pointer with no lock, which would hand both
+    // FixedBufferAllocator -- a bump pointer with no lock, which would hand two
     // threads the same bytes -- so main.zig passes its lock-taking variant. The
     // budget it enforces is unchanged.
-    //
-    // The error type is spelled out rather than inferred: storing a failure as
-    // `anyerror` would widen this function's error set and cost main.zig its
-    // exhaustive switch.
-    const Fault = Error || std.mem.Allocator.Error;
-    const Build = struct {
-        fn run(
-            out: *?RowIndex,
-            err: *?Fault,
-            al: std.mem.Allocator,
-            slab: Slab,
-            parser: RowParser,
-            start: usize,
-            w: usize,
-            ks: usize,
-            o: Options,
-        ) void {
-            out.* = RowIndex.build(al, slab, parser, start, w, ks, o) catch |e| {
-                err.* = e;
-                return;
-            };
-        }
+    const per_file = @max(1, total / 2);
+    var prepare_a = Prepare{
+        .gpa = gpa,
+        .input = a_input,
+        .wanted = wanted.items,
+        .key_size = key_size,
+        .opt = opt,
+        .threads = per_file,
+        .tag = "A ",
     };
+    var prepare_b = Prepare{
+        .gpa = gpa,
+        .input = b_input,
+        .wanted = wanted.items,
+        .key_size = key_size,
+        .opt = opt,
+        .threads = per_file,
+        .tag = "B ",
+    };
+    const reader: ?std.Thread = std.Thread.spawn(.{}, Prepare.run, .{&prepare_b}) catch null;
+    if (reader == null) prepare_b.run();
+    prepare_a.run();
+    if (reader) |w| w.join();
+    defer prepare_a.deinit();
+    defer prepare_b.deinit();
+    if (prepare_a.failure) |e| return e;
+    if (prepare_b.failure) |e| return e;
 
-    var ai_slot: ?RowIndex = null;
-    var ai_err: ?Fault = null;
-    var bi_slot: ?RowIndex = null;
-    var bi_err: ?Fault = null;
-
-    // A thread that cannot be spawned is not a reason to fail: it is the same
-    // work, so it falls back to doing both indexes here in turn.
-    const build_worker: ?std.Thread = std.Thread.spawn(.{}, Build.run, .{
-        &bi_slot, &bi_err, gpa, b, bp, b_head.start, width, key_size, opt,
-    }) catch null;
-    if (build_worker == null)
-        Build.run(&bi_slot, &bi_err, gpa, b, bp, b_head.start, width, key_size, opt);
-    Build.run(&ai_slot, &ai_err, gpa, a, ap, a_head.start, width, key_size, opt);
-    if (build_worker) |w| w.join();
-
-    if (ai_err != null or bi_err != null) {
-        if (ai_slot) |*x| x.deinit();
-        if (bi_slot) |*x| x.deinit();
-        return ai_err orelse bi_err.?;
-    }
-    var ai = ai_slot.?;
-    defer ai.deinit();
-    var bi = bi_slot.?;
-    defer bi.deinit();
+    const a = &prepare_a.side.?;
+    const b = &prepare_b.side.?;
+    const ai = &prepare_a.index.?;
+    const bi = &prepare_b.index.?;
 
     // Owned copies: the names point into the header, which is released when this
     // function returns, and the result outlives it.
@@ -804,140 +1507,57 @@ pub fn compare(
         made += 1;
     }
 
-    // The two directions of the join read both indexes and write different
-    // outputs -- one fills changed, removed and the per-column counts, the other
-    // only added -- so they run at the same time. Each side allocates its own
-    // field buffers and its own Scratch; all they share is the two finished
-    // indexes and the two mappings, which are read-only from here on.
-    const Sides = struct {
-        // A's distinct keys, in first-appearance order, so a run is reproducible.
-        fn aSide(
-            err: *?Fault,
-            al: std.mem.Allocator,
-            sa: Slab,
-            sb: Slab,
-            ia: *const RowIndex,
-            ib: *const RowIndex,
-            cs: *Counts,
-            cols: []ColumnStat,
-            w: usize,
-            ks: usize,
-            n: usize,
-            o: Options,
-        ) void {
-            const fa = al.alloc(Field, w) catch |e| {
-                err.* = e;
-                return;
-            };
-            defer al.free(fa);
-            const fb = al.alloc(Field, w) catch |e| {
-                err.* = e;
-                return;
-            };
-            defer al.free(fb);
-            const probe = al.alloc(Field, w) catch |e| {
-                err.* = e;
-                return;
-            };
-            defer al.free(probe);
-            var s = Scratch{};
-            for (ia.first_row.items) |row| {
-                ia.fieldsOf(row, fa);
-                const hash = keyHash(sa, fa, ks, o, &s.a) catch |e| {
-                    err.* = e;
-                    return;
-                };
-                const mate = (ib.lookup(sa, fa, hash, &s, probe) catch |e| {
-                    err.* = e;
-                    return;
-                }) orelse {
-                    cs.removed += 1;
-                    continue;
-                };
-                cs.matched += 1;
-                ib.fieldsOf(mate, fb);
-                var any = false;
-                for (0..n) |i| {
-                    const x = fa[ks + i];
-                    const y = fb[ks + i];
-                    const differs = cellDiffers(sa, x, sb, y, o, &s) catch |e| {
-                        err.* = e;
-                        return;
-                    };
-                    if (differs) {
-                        any = true;
-                        cols[i].changed += 1;
-                        const blank = isAbsent(sb, y, o, &s.b) catch |e| {
-                            err.* = e;
-                            return;
-                        };
-                        if (blank) cols[i].blanked += 1;
-                        const fill = isAbsent(sa, x, o, &s.a) catch |e| {
-                            err.* = e;
-                            return;
-                        };
-                        if (fill) cols[i].filled += 1;
-                    }
-                }
-                if (any) cs.changed += 1;
-            }
-        }
+    // Both sides are chunked into one queue and every thread pulls from it; see
+    // `Join.added` for why B is not worth a thread of its own.
+    const a_ways = waysFor(ai.first_row.items.len);
+    const b_ways = waysFor(bi.first_row.items.len);
+    const parts = try gpa.alloc(Part, a_ways + b_ways);
+    defer {
+        for (parts) |p| gpa.free(p.columns);
+        gpa.free(parts);
+    }
+    var built: usize = 0;
+    errdefer for (parts[0..built]) |p| gpa.free(p.columns);
+    for (parts) |*p| {
+        const stats = try gpa.alloc(ColumnStat, nc);
+        for (stats, compared.items) |*stat, name| stat.* = .{ .name = name };
+        p.* = .{ .columns = stats };
+        built += 1;
+    }
 
-        fn bSide(
-            out: *i64,
-            err: *?Fault,
-            al: std.mem.Allocator,
-            sb: Slab,
-            ia: *const RowIndex,
-            ib: *const RowIndex,
-            w: usize,
-            ks: usize,
-            o: Options,
-        ) void {
-            const fb = al.alloc(Field, w) catch |e| {
-                err.* = e;
-                return;
-            };
-            defer al.free(fb);
-            const probe = al.alloc(Field, w) catch |e| {
-                err.* = e;
-                return;
-            };
-            defer al.free(probe);
-            var s = Scratch{};
-            var n: i64 = 0;
-            for (ib.first_row.items) |row| {
-                ib.fieldsOf(row, fb);
-                const hash = keyHash(sb, fb, ks, o, &s.b) catch |e| {
-                    err.* = e;
-                    return;
-                };
-                const hit = ia.lookup(sb, fb, hash, &s, probe) catch |e| {
-                    err.* = e;
-                    return;
-                };
-                if (hit == null) n += 1;
-            }
-            out.* = n;
-        }
+    var join = Join{
+        .a = a,
+        .b = b,
+        .ai = ai,
+        .bi = bi,
+        .opt = opt,
+        .key_size = key_size,
+        .nc = nc,
+        .width = width,
+        .parts = parts,
+        .a_ways = a_ways,
+        .span_tail = if (a.parser()) |pa| (if (b.parser()) |pb| text.sharedTail(pa, pb) else null) else null,
+        .next = std.atomic.Value(usize).init(0),
     };
+    var phases = Phases.start("");
+    try runOnThreads(&join, Join.run, total);
+    phases.mark("join chunks (par)");
+    for (parts) |part| {
+        if (part.failure) |e| return e;
+    }
 
     var counts = Counts{};
-    var added_count: i64 = 0;
-    var a_err: ?Fault = null;
-    var b_err: ?Fault = null;
-
-    const join_worker: ?std.Thread = std.Thread.spawn(.{}, Sides.bSide, .{
-        &added_count, &b_err, gpa, b, &ai, &bi, width, key_size, opt,
-    }) catch null;
-    if (join_worker == null)
-        Sides.bSide(&added_count, &b_err, gpa, b, &ai, &bi, width, key_size, opt);
-    Sides.aSide(&a_err, gpa, a, b, &ai, &bi, &counts, columns, width, key_size, nc, opt);
-    if (join_worker) |w| w.join();
-
-    if (a_err) |e| return e;
-    if (b_err) |e| return e;
-    counts.added = added_count;
+    for (parts) |part| {
+        counts.matched += part.matched;
+        counts.changed += part.changed;
+        counts.removed += part.removed;
+        counts.added += part.added;
+        for (columns, part.columns) |*into, from| {
+            into.changed += from.changed;
+            into.blanked += from.blanked;
+            into.filled += from.filled;
+        }
+    }
 
     counts.a_rows = ai.rows;
     counts.b_rows = bi.rows;

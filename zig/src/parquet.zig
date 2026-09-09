@@ -644,21 +644,39 @@ const RleReader = struct {
             } else if (self.width == 0) {
                 @memset(out[done..][0..take], 0);
             } else {
+                // The eight-byte read needs eight bytes to read, and asking that
+                // per value is a branch on every one of ten million. Where the
+                // last value of a run starts is arithmetic, so the count that
+                // cannot run off the end is solved for once and those values are
+                // taken without a check -- the same reason the CSV scanner cuts
+                // its slice before looping rather than testing inside it. Only a
+                // run ending within eight bytes of the page reaches the general
+                // path below.
+                var bit = self.bit;
+                const width = self.width;
+                const mask = self.mask;
                 var i: usize = 0;
-                while (i < take) : (i += 1) {
-                    const byte = self.bit >> 3;
-                    var w: u64 = 0;
-                    if (byte + 8 <= self.d.len) {
-                        w = std.mem.readInt(u64, self.d[byte..][0..8], .little);
-                    } else {
-                        var k: usize = 0;
-                        while (k < 8 and byte + k < self.d.len) : (k += 1) {
-                            w |= @as(u64, self.d[byte + k]) << @intCast(8 * k);
-                        }
+                if (self.d.len >= 8) {
+                    const last = (self.d.len - 8) * 8 + 7;
+                    const safe = if (bit > last) 0 else (last - bit) / width + 1;
+                    const n = @min(take, safe);
+                    while (i < n) : (i += 1) {
+                        const w = std.mem.readInt(u64, self.d[bit >> 3 ..][0..8], .little);
+                        out[done + i] = @intCast((w >> @intCast(bit & 7)) & mask);
+                        bit += width;
                     }
-                    out[done + i] = @intCast((w >> @intCast(self.bit & 7)) & self.mask);
-                    self.bit += self.width;
                 }
+                while (i < take) : (i += 1) {
+                    const byte = bit >> 3;
+                    var w: u64 = 0;
+                    var k: usize = 0;
+                    while (k < 8 and byte + k < self.d.len) : (k += 1) {
+                        w |= @as(u64, self.d[byte + k]) << @intCast(8 * k);
+                    }
+                    out[done + i] = @intCast((w >> @intCast(bit & 7)) & mask);
+                    bit += width;
+                }
+                self.bit = bit;
             }
             self.left -= take;
             done += take;
