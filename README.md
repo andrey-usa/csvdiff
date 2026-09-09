@@ -618,64 +618,66 @@ numbers come from the same `wait4` rusage as the peak RSS beside them.
 
 | Build | Input | Compare | Rows/s | CPU | Cores | Peak RSS | Above the input |
 |---|---|---:|---:|---:|---:|---:|---:|
-| **Zig** | **CSV, 3,509 MB** | **3.61s** | **2,768,572** | **13.3s** | 3.68x | 4,392 MB | 883 MB |
-| Zig AVX-512 | CSV | 3.61s | 2,767,824 | 13.5s | **3.74x** | 4,376 MB | **867 MB** |
-| Zig AVX2 | CSV | 3.72s | 2,689,714 | 13.7s | 3.69x | 4,381 MB | 873 MB |
-| Rust, engine only | CSV | 3.97s | 2,520,885 | 14.6s | 3.69x | 4,382 MB | 873 MB |
-| Rust AVX2 | CSV | 4.42s | 2,263,331 | 15.3s | 3.46x | 4,408 MB | 899 MB |
-| Rust | CSV | 4.47s | 2,239,127 | 15.4s | 3.44x | 4,408 MB | 899 MB |
-| C++ AVX2 | CSV | 6.87s | 1,455,051 | 19.9s | 2.89x | 4,388 MB | 879 MB |
-| C++ | CSV | 7.27s | 1,374,885 | 21.3s | 2.93x | 4,412 MB | 903 MB |
-| C++ AVX-512 | CSV | 7.27s | 1,375,427 | 21.3s | 2.92x | 4,385 MB | 876 MB |
-| C++ SWAR | CSV | 7.32s | 1,365,551 | 21.2s | 2.90x | 4,413 MB | 905 MB |
-| **Zig** | **Parquet, 1,535 MB** | **2.31s** | **4,336,190** | 8.2s | 3.57x | **2,748 MB** | **1,213 MB** |
-| Zig AVX-512 | Parquet | 2.31s | 4,331,702 | 8.4s | **3.63x** | 2,744 MB | 1,209 MB |
-| Zig AVX2 | Parquet | 2.31s | 4,328,658 | 8.3s | 3.60x | 2,753 MB | 1,218 MB |
-| Rust, engine only | Parquet | 2.36s | 4,232,614 | 8.2s | 3.46x | 2,879 MB | 1,345 MB |
-| C++ | Parquet | 2.46s | 4,059,162 | **8.0s** | 3.25x | 2,851 MB | 1,316 MB |
-| Rust AVX2 | Parquet | 2.72s | 3,683,378 | 8.4s | 3.09x | 2,855 MB | 1,320 MB |
-| Rust | Parquet | 2.77s | 3,613,133 | 8.6s | 3.11x | 2,916 MB | 1,382 MB |
+| **Zig AVX2** | **CSV, 3,509 MB** | **2.21s** | **4,528,575** | **7.7s** | 3.47x | 4,387 MB | **878 MB** |
+| Rust AVX2 | CSV | 2.52s | 3,974,645 | 8.4s | 3.33x | 4,408 MB | 899 MB |
+| Rust, engine only | CSV | 2.56s | 3,905,901 | 9.1s | **3.56x** | 4,385 MB | 877 MB |
+| Zig | CSV | 2.67s | 3,751,410 | 9.3s | 3.48x | 4,395 MB | 887 MB |
+| Rust | CSV | 3.06s | 3,263,576 | 10.3s | 3.37x | 4,408 MB | 899 MB |
+| C++ AVX2 | CSV | 9.18s | 1,089,673 | 26.9s | 2.93x | 4,389 MB | 880 MB |
+| C++ SWAR | CSV | 9.73s | 1,027,635 | 28.8s | 2.96x | 4,390 MB | 881 MB |
+| C++ | CSV | 9.83s | 1,017,661 | 29.1s | 2.96x | 4,388 MB | 879 MB |
+| **Rust, engine only** | **Parquet, 1,535 MB** | **2.36s** | **4,236,483** | **8.1s** | 3.41x | 2,863 MB | 1,329 MB |
+| Zig | Parquet | 2.66s | 3,758,951 | 9.4s | **3.54x** | 2,756 MB | **1,221 MB** |
+| Zig AVX2 | Parquet | 2.67s | 3,747,959 | 9.4s | 3.51x | **2,755 MB** | 1,221 MB |
+| Rust | Parquet | 2.77s | 3,616,121 | 8.9s | 3.22x | 2,908 MB | 1,373 MB |
+| Rust AVX2 | Parquet | 2.77s | 3,611,854 | 8.8s | 3.18x | 2,882 MB | 1,347 MB |
+| C++ | Parquet | 3.02s | 3,311,269 | 9.6s | 3.18x | 2,852 MB | 1,317 MB |
 
 Every row returns `matched 9,990,000 · changed 599,320 · added 10,000 ·
 removed 10,000`, and the harness refuses to print the table if any row disagrees.
-[The run.](https://github.com/andrey-usa/csvdiff/actions/runs/34307421180) This
-one carried `avx512bw`, so the 64-byte builds ran rather than skipping
-themselves — only the second runner in this project's history to do so.
+[The run.](https://github.com/andrey-usa/csvdiff/actions/runs/34347601844) This
+runner reported `vector units: avx2` and no `avx512bw`, so the 64-byte builds
+skipped themselves and there is no AVX-512 row to read. The rows are sorted by
+time rather than by port, because the fastest build in each format is no longer
+the port's default one.
 
 **The C++ rows are the control.** Nothing in `cpp/` or the workflow has changed
 across any of these runs, so its numbers measure the machine rather than the
 code, and every runner is a different machine. **Compare rows within a table, and
 compare across tables only as a ratio to the C++ row.**
 
-**Zig now finishes CSV in half the time the C++ port takes and Parquet in less
-than the C++ port takes**, which is not what this branch set out to find: it set
-out to see whether Rust and Zig could *match* a C++ port that started three times
-ahead. As a ratio to the C++ row, which is the only fair way to read across
-machines:
+**Zig now finishes CSV in a bit over a quarter of the time the C++ port takes**,
+which is not what this branch set out to find: it set out to see whether Rust and
+Zig could *match* a C++ port that started three times ahead. As a ratio to the
+C++ row, which is the only fair way to read across machines:
 
-| CPU, as a fraction of the C++ port's | Set D, three rounds ago | Set D now |
-|---|---:|---:|
-| Zig on CSV | 0.90 | **0.62** |
-| Rust on CSV | 0.94 | **0.69** |
-| Zig on Parquet | 1.05 | **1.03** |
-| Rust on Parquet | 1.15 | **1.03** |
+| CPU, as a fraction of the C++ port's | Four rounds ago | Last round | Now |
+|---|---:|---:|---:|
+| Zig on CSV | 0.90 | 0.62 | **0.32** |
+| Rust on CSV | 0.94 | 0.69 | **0.35** |
+| Zig on Parquet | 1.05 | 1.03 | **0.98** |
+| Rust on Parquet | 1.15 | 1.03 | **0.93** |
 
-Parquet is the round that moved most: both ports were behind the C++ path and
-both now finish ahead of it on the clock, on the same CPU. [What the columnar
-path was waiting on](#what-the-columnar-path-was-waiting-on) is the round that
-did it.
+The CSV column halved again in one round, and the round that did it is [what the
+join was still parsing](#what-the-join-was-still-parsing). Parquet barely moved,
+which is the control working: neither change in that round touches the columnar
+path, and its rows drifted only as far as the machine did.
 
 **Two rows are not comparing like with like, and say so.** The Rust port renders
 the HTML report; the C++ and Zig ports produce counts and JSON only. `Rust,
 engine only` is the same comparison with `--max-rows 1`, which is the row to read
 against the other two ports. The difference between its rows — 0.50s on CSV and
 0.41s on Parquet — is the report: fifty thousand changed rows decoded into
-strings, sorted, gzipped and embedded. It was 0.76s and 0.60s until [the gzip
-went parallel](#gzip-was-not-the-serial-tail-it-was-described-as), which landed
-after this run.
+strings, sorted, gzipped and embedded. Those two numbers have not moved in two
+runs, and should not: the row sections are capped at fifty thousand, so the
+report is the one part of the run whose cost does not grow with the file, and
+nothing in the last round went near it. As the engine gets quicker the report
+becomes a larger share of the Rust row -- a sixth of it now, where it was an
+eighth. [The gzip going parallel](#gzip-was-not-the-serial-tail-it-was-described-as)
+is what took it to 0.50s from 0.76s.
 
-**Parquet is 3.0x quicker than CSV in the same port and holds 1.5 GB less**
-(the C++ port: 7.27s and 4,412 MB against 2.46s and 2,851 MB), where the first
+**Parquet is 3.3x quicker than CSV in the same port and holds 1.5 GB less**
+(the C++ port: 9.83s and 4,388 MB against 3.02s and 2,852 MB), where the first
 version of this table had it slower and 4 GB *heavier*. That reversal is the
 whole of [the columnar path](#the-design-never-reconstruct-a-row): the earlier
 reader decoded the pages into rows and handed them to the same byte-level engine
@@ -687,31 +689,47 @@ row-materialising reader survives only
 as the fallback for `a.parquet` against `b.csv`, which has no column to compare
 a byte stream against.
 
-**The cores column is where the rounds show.** Three rounds ago every CSV row in
-this table sat between 2.80x and 3.01x; Rust and Zig now run at 3.69x and 3.74x
-of four, while the untouched C++ rows sit where they always did, a little under
-three. That is the whole difference between an engine that is slow and an engine
-that is idle, and it is why every row here carries CPU as well as wall.
+**The cores column went down this round, and that is the point.** Four rounds ago
+every CSV row sat between 2.80x and 3.01x, and the rounds that followed pushed
+Rust and Zig to 3.69x and 3.74x by finding work that was sitting on one thread.
+They now read 3.37x and 3.48x. Nothing regressed: [the last
+round](#what-the-join-was-still-parsing) deleted parallel work rather than
+spreading it, and deleting work a thread was doing lowers the ratio while the
+clock improves. Cores-busy is a diagnosis, not a target -- it says whether a slow
+row is idle or merely working too hard, and the answer for these two is now
+neither. The untouched C++ rows sit where they always did, a little under three.
 
-* **Rust holds 873 MB above the input where it used to hold 1,193 MB**, and is
-  the lightest CSV row here bar Zig's widest build. That is the rehash fix: the
-  index was sized for a two-thirds load and then doubled itself at one half, so
-  it spent the run in a table twice the size it was designed for.
+* **Rust holds 877 MB above the input where it used to hold 1,193 MB.** That is
+  the rehash fix: the index was sized for a two-thirds load and then doubled
+  itself at one half, so it spent the run in a table twice the size it was
+  designed for.
 * **Zig on Parquet was the least parallel row in this table and is now the most**
-  — 2.66x became 3.57x, and last place became first. The cause this file used to
-  name, serial dictionary interning, was never measured and is not real: [what
-  actually capped it](#what-the-columnar-path-was-waiting-on).
+  — 2.66x became 3.54x. The cause this file used to name, serial dictionary
+  interning, was never measured and is not real: [what actually capped
+  it](#what-the-columnar-path-was-waiting-on). Which of the two ports leads that
+  format on the clock has now changed hands three runs running, by margins of a
+  tenth of a second; neither of the last two rounds went near the columnar path,
+  so that is the machine talking and not a result.
 
-**The 64-byte scanner is level with the 32-byte one here, on both formats** —
-Zig 3.61s against 3.72s on CSV and 2.31s against 2.31s on Parquet, and the C++
-port's AVX-512 build loses to its own AVX2, 7.27s against 6.87s. That is a third
-machine and a third answer: an earlier runner put Zig's AVX-512 clearly first,
-and a development container puts it 15% behind SWAR. All of them are true, and
-[what varies is the CPU generation and whether anything downstream uses the bytes
-the width forced you to read](#avx-512-measured-on-two-machines-that-disagree).
+**The 32-byte scanner now wins CSV outright in both ports** — Zig 2.21s against
+2.67s and Rust 2.52s against 3.06s, both against their own SWAR default, and the
+C++ port's AVX2 build beats its own SWAR by 6%. That is a reversal of the last
+run, where the widths finished level, and the reason is the round in between: the
+join stopped parsing rows it did not need, so scanning is a larger share of what
+is left and the width that scans faster wins by more. A saving that looks like
+nothing beside expensive work becomes visible once the expensive work is gone,
+which is the general form of this and not a fact about AVX2.
+
+There is no AVX-512 row to compare against: this runner has none, and the 64-byte
+builds skipped themselves. Three machines have now given three answers about that
+width — one put Zig's AVX-512 clearly first, one put it level with AVX2, and a
+development container puts it 15% behind SWAR — and [what varies is the CPU
+generation and whether anything downstream uses the bytes the width forced you to
+read](#avx-512-measured-on-two-machines-that-disagree).
 
 **AVX2 buys nothing on the Parquet path, in either port that has it** — Zig
-2.31s against 2.31s, Rust 2.72s against 2.77s, both inside the noise. The
+2.66s against 2.67s, Rust 2.77s against 2.77s, both inside the noise, and the
+same verdict this table has returned three runs running. The
 prediction [above](#swar-and-how-it-compares-to-real-simd) was that a wider
 register should win by *more* there, since the mismatch mask is read whether or
 not it is scanned wide. It does not, and two independent implementations
@@ -1013,6 +1031,63 @@ That last one is the argument for the column in miniature. Wall time said
 "slower engine". CPU time said "same work, fewer cores", and cores-busy on the
 `engine only` row said "not the engine". Three different fixes, and only the
 third was the right one.
+
+### What the join was still parsing
+
+The phase timer said the join was 43% of a one-million-row run and every other
+phase was small. The obvious reading is that comparing eighteen columns of ten
+million matched rows is expensive. It is not, and the way to find that out is to
+stop doing it: a build that parses both rows and then skips the comparison
+entirely runs the phase in **0.245s**, against **0.245s** for the build that
+compares. Not close — the same number, three runs each.
+
+So the join never was comparing. It was *parsing the rows it compared*, and two
+rounds came out of that.
+
+**The direction that only asks whether a key exists was reading twenty columns.**
+The join runs both ways: A's direction reads its row, finds the mate and compares
+every column against it, while B's asks one question — is this key in A? — and
+throws away the row it matched against. `RowParser` already stops at the last
+column it was asked for, and both ports already carried a parser built from the
+key columns alone, because [the sweep](#what-the-join-was-waiting-on) took that
+saving a round earlier. The join simply never used it. Giving `lookup` a `Want`,
+so the discarding side parses two fields for its own row and two for the
+candidate rather than forty, is **-8.5% in Rust and -6.5% in Zig** on the clock,
+and moves the join phase by a fifth in both — which is what removing the same
+work from the same place in two ports should look like.
+
+**Then stop parsing the mate at all.** If A's row and B's row carry the same
+bytes as far as the last column either file wants, then every column in between
+is the same bytes too, and no parse can find a difference that byte equality has
+already ruled out. The pair is unchanged and the mate is never read. On this
+payload 94% of matched pairs are unchanged, so 94% of them collapse to one
+comparison of about a hundred and fifty bytes: **-11.9% in Rust and -20.6% in
+Zig**, on top of the round above.
+
+That shortcut is only sound between files of the same shape — the same delimiter
+and the same column-to-slot mapping — because two headers in different orders can
+carry identical bytes and mean entirely different things. It is settled once, per
+comparison, before the join starts. JSON never qualifies, having no such prefix,
+and neither does a pair with a columnar side, which has no row bytes to compare.
+
+Two guards make a run of bytes a whole number of columns rather than a truncation
+of one, and there is a test for each that fails when the guard is removed:
+
+- **The run must end on a field boundary in B**, or `12,3` matches a row that
+  merely opens `12,34`. Deleting this check fails five tests.
+- **And on a boundary in A**, or a run ending inside a quoted field — whose end
+  is its closing quote, not a delimiter — matches a row that never closed one.
+  This one only bites on malformed input, which is why its test holds the counts
+  to the reference engine rather than the rendered values: the two already
+  disagree about the trailing newline of an unterminated field, which is older
+  than this and a separate question.
+
+At ten million rows the pair of rounds is worth more than at one million, because
+the join is a larger share of the run there while the report stays capped: Rust's
+CSV row went **4.62s to 3.06s** and Zig's **4.36s to 2.67s** across them, on two
+runners of the same class. The C++ rows moved +10% on unchanged source over the
+same interval and every Parquet row moved with them, which is how much of that is
+the machine and how much is the code.
 
 ## Set C — against the field
 
