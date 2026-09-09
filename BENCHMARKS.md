@@ -64,6 +64,72 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-09 (codecs) — what compression costs, and what the fall-through costs
+
+One 4-core / 16 GB container, idle, page cache warm, median of five runs.
+5,000,500 against 5,000,250 rows of 20 columns, keyed on `(account_id, txn_id)`,
+`-i updated_at`. Every file was written by the same pyarrow call with the same
+row-group size and dictionary setting, so within this set the codec is the only
+thing that differs.
+
+**What a default run costs**, which is what a reader actually meets:
+
+| Port | none | snappy | gzip | zstd | lz4 |
+|---|---:|---:|---:|---:|---:|
+| C | 1.11s | refused | refused | refused | refused |
+| C++ | 1.54s | 2.35s | refused | refused | refused |
+| Rust | **1.48s** | 2.29s | 6.49s | 5.20s | 5.37s |
+| Zig | 1.32s | **1.96s** | 7.38s | **13.96s** | 6.11s |
+
+Read that as four numbers and a trap. Rust and Zig take the columnar path for
+uncompressed and snappy and fall through to the row reader for the other three,
+so the 3.5-4x jump at gzip is **not** what gzip costs. It is the fall-through,
+already measured at 3.7x in the entry below.
+
+**What the codec costs**, with the reader held still — `--engine turbo` on all
+five, so nothing routes:
+
+| Codec | Wall | vs uncompressed | Bytes read | Smaller by |
+|---|---:|---:|---:|---:|
+| none | 5.17s | 1.00x | 1,073.1 MB | 1.00x |
+| snappy | 5.67s | 1.10x | 530.3 MB | 2.02x |
+| gzip | 6.17s | 1.19x | 344.2 MB | 3.12x |
+| **zstd** | **5.15s** | **1.00x** | **281.0 MB** | **3.82x** |
+| lz4 | 5.38s | 1.04x | 528.2 MB | 2.03x |
+
+Decompression costs between nothing and 19% of wall time. **zstd costs nothing
+measurable and reads 3.82x fewer bytes** — it was 1.00x on both runs of this,
+taken an hour apart on a restarted container. On a host where bytes read cost
+anything at all, that is not a trade-off, it is free.
+
+So the practical answer to "what should I write?" is zstd, and the reason a zstd
+pair looks expensive today is the router, not the codec.
+
+**Zig's zstd is the exception, and it is a real one.** Its three fall-through
+codecs are 7.38s (gzip), 6.11s (lz4) and 13.96s (zstd): zstd is **2.3x its own
+lz4**, where Rust's zstd is its *cheapest* codec at 0.96x its lz4. Same files,
+same machine. That is Zig's zstd decoder, not the format, and it is on the open
+list now.
+
+### What this run cannot tell you
+
+The bytes-saved half is unmeasured, and the honest reason is that this host
+cannot measure it. `drop_caches` empties the guest's page cache but the
+hypervisor still holds the blocks, so "cold" runs came back within 25% of warm
+ones — measuring the host's cache, not a disk. The one genuine cold read
+available, the first touch after a container restart, took **2m17s for 2.5 GB**,
+about 18 MB/s, which is neither reproducible nor representative of anything.
+
+So: the CPU side of the question is answered and the I/O side is not. On storage
+where reading 1,073 MB rather than 281 MB costs real time, zstd's 3.82x wins by
+however much that is worth; on this container it wins by nothing and loses by
+nothing. Anyone with a characterisable disk can finish the other half.
+
+Taken because "compression is unmeasured" had been on the open list since the
+Parquet readers landed, and because timing it turned up a SIGSEGV in the Zig
+port on every compressed file, which had to be fixed before three of these
+twenty numbers existed at all.
+
 ## 2026-09-09 (parquet readers) — what the columnar path is worth
 
 One 4-core / 16 GB container, `scripts/bench_ab.sh`, seven interleaved rounds,

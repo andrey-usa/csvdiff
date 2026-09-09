@@ -224,6 +224,15 @@ before timing anything.
   each stripping the engine label and the separators), so compare through the helper rather than
   inlining a `sed`. The JSON is the contract and never had this problem -- `c/test.sh` compares
   that for its large fixture, which is the more robust pattern where a check can use it.
+- **A Parquet codec is nearly free; the fall-through is not.** Held to one reader, snappy costs
+  1.10x an uncompressed run, gzip 1.19x, lz4 1.04x and zstd 1.00x while reading 3.82x fewer bytes.
+  A default gzip/zstd/lz4 run looks 3.5-4x worse only because it routes to the row reader, which
+  is 3.7x the columnar path on its own. Never read a codec number without checking the engine
+  field first -- it is the difference between measuring zstd and measuring the router.
+- **`drop_caches` does not give you a cold disk here.** The hypervisor keeps the blocks, so
+  "cold" runs come back within 25% of warm ones. The only genuine cold read is the first touch
+  after a container restart, and it ran at about 18 MB/s -- not reproducible, not representative.
+  Any claim about bytes read costing time needs a host with a characterisable disk.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
