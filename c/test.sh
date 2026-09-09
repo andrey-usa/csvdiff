@@ -525,6 +525,35 @@ printf '{"id":"k1","id":"OTHER","a":"p"}\n' > "$pdir/jk_b.ndjson"
 pcase "a repeated key name keeps the first"     "0 0 0" jk_a.ndjson jk_b.ndjson -k id
 rm -rf "$pdir"
 
+# --- the generator's own front door -----------------------------------------
+#
+# `data/` is in .gitignore, so on a fresh clone the directory the README's first
+# command writes into does not exist. It used to fail there, with "write failed"
+# and nothing about which write or why -- the first thing a new reader pasted.
+echo "the generator's output directory:"
+gd=$(mktemp -d)
+if "$GEN" --rows 10k --out-dir "$gd/made" --prefix g >/dev/null 2>&1 \
+   && [ -s "$gd/made/g_a.csv" ] && [ -s "$gd/made/g_b.csv" ]; then
+  printf '  ok    a missing --out-dir is created\n'
+else
+  printf '  FAIL  a missing --out-dir is created\n'; fail=1
+fi
+if "$GEN" --rows 10k --out-dir "$gd/made" --prefix g >/dev/null 2>&1; then
+  printf '  ok    and writing into it again is fine\n'
+else
+  printf '  FAIL  and writing into it again is fine\n'; fail=1
+fi
+# One level only, on purpose: a missing parent is a typo, and saying so beats
+# quietly building a tree the reader did not ask for.
+gcode=0   # this script runs with -e, so the status has to be caught, not returned
+gerr=$("$GEN" --rows 10k --out-dir "$gd/no/such/parent" --prefix g 2>&1) || gcode=$?
+if [ "$gcode" != 0 ] && printf '%s' "$gerr" | grep -qi "no such file"; then
+  printf '  ok    a missing parent says which and why\n'
+else
+  printf '  FAIL  a missing parent says which and why (exit %s: %s)\n' "$gcode" "$gerr"; fail=1
+fi
+rm -rf "$gd"
+
 if [ "$with_ports" = 1 ]; then
   echo "generator bytes, c against c++:"
   gen_dir=$(mktemp -d)

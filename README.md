@@ -64,6 +64,13 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 
 ## Building and running
 
+> **Run every command in this section from the repository root** — the directory
+> holding `c/`, `rust/` and this file. Every path below is written relative to it,
+> in bash and in PowerShell alike, so that one rule covers the whole section. If
+> you are inside a port's directory, `cd ..` first: from `c/`, `c/gen-data` is
+> `No such file or directory`, and `./gen-data` would work but write its pair
+> into `c/data/` rather than the `data/` the commands below then read.
+
 ### What runs where
 
 Linux and Windows are tested. macOS is not, so that column is what the source
@@ -95,34 +102,72 @@ pulls in nothing that contains a comparison engine.
 # Linux, macOS, or WSL
 (cd c    && make)                    # cc or clang, C11. Also builds c/gen-data
 (cd cpp  && make)                    # g++ or clang++, C++20
-(cd rust && cargo build --release)   # edition 2024
+(cd rust && cargo build --release)   # edition 2024. Also builds a gen-data
 (cd zig  && zig build --release=fast)
 ```
 
 ```powershell
-# Windows, PowerShell — the Rust port is the one that builds without WSL
-cd rust
-cargo build --release
-.\target\release\csvdiff.exe compare july.csv august.csv -k id
+# Windows, PowerShell — the Rust port is the one that builds without WSL.
+# --manifest-path so this runs from the root like everything else; the
+# binaries still land in rust\target\release\.
+cargo build --release --manifest-path rust\Cargo.toml
 ```
 
 For the other three on Windows, install WSL (`wsl --install`) and use the bash
 commands above inside it. A Windows path is reachable from WSL as
 `/mnt/c/Users/you/data.csv`.
 
+### Getting a pair to compare
+
+**Already have two files?** Skip this section, and substitute your paths and your
+key columns everywhere below. Nothing here is required.
+
+Otherwise generate a pair. Both generators write the same bytes from the same
+`--seed`, so it only matters which toolchain you have:
+
+```bash
+# Linux, macOS, or WSL
+c/gen-data --rows 1m --out-dir data --prefix demo
+```
+
+```powershell
+# Windows, PowerShell — after the build above
+rust\target\release\gen-data.exe --rows 1m --out-dir data --prefix demo
+```
+
+Either writes `data/demo_a.csv` and `data/demo_b.csv`, 184 MB each: 1,000,100
+and 1,000,050 rows of 20 columns, keyed on `(account_id, txn_id)`, with 1,000
+keys only in A, 1,000 only in B, a scattering of changed values, and
+`updated_at` moved on **every** row — which is what the `-i` flag below is for.
+`--rows` also takes `10k`, `10m`, and so on; `--format json|parquet` writes the
+same rows in the other two formats.
+
+**The C generator is the faster of the two**, by 4.3x on wall time: 2m rows in
+1.05s against the Rust generator's 5.49s on this 4-vCPU runner (paired rounds,
+`scripts/bench_ab.sh`), because it renders rows in waves across all cores while
+the Rust one is single-threaded. Both write all three formats. Reach for the
+Rust generator when you are on Windows without WSL, or want a single toolchain.
+
 ### Running
 
 ```bash
 # the smallest useful invocation: two files and a key
-c/csvdiff compare july.csv august.csv -k order_id,line_no
+c/csvdiff compare data/demo_a.csv data/demo_b.csv -k account_id,txn_id
 
 # -i skips columns that always move; --json writes the counts and samples;
 # --threads caps the cores it takes
-c/csvdiff compare july.csv august.csv -k id -i updated_at --json summary.json --threads 4
+c/csvdiff compare data/demo_a.csv data/demo_b.csv -k account_id,txn_id \
+  -i updated_at --json summary.json --threads 4
 
-# the Rust port is the one with the self-contained HTML report
-rust/target/release/csvdiff compare july.csv august.csv -k id -o report.html
+# the Rust port is the one with the self-contained HTML report -- and the one
+# that runs on Windows, as `rust\target\release\csvdiff.exe` with the same flags
+rust/target/release/csvdiff compare data/demo_a.csv data/demo_b.csv \
+  -k account_id,txn_id -i updated_at -o report.html
 ```
+
+The second and third print `matched 999,000 (changed 60,049) | added 1,000 |
+removed 1,000`. Without `-i updated_at` the first one reports all 999,000
+matched rows as changed, correctly: that column really did move on every row.
 
 **Exit codes** make any of them a CI or pipeline gate directly:
 
@@ -164,8 +209,8 @@ instead, silently. See [ARCHIVE.md](ARCHIVE.md#the-field-measured-once-2026-surv
 ## Working on it
 
 ```bash
-(cd c && bash test.sh)                # 24 checks, a few seconds, no other toolchain
-(cd c && bash test.sh --with-ports)   # adds the cross-port oracles: 42
+(cd c && bash test.sh)                # 42 checks, a few seconds, no other toolchain
+(cd c && bash test.sh --with-ports)   # adds the cross-port oracles: 60
 
 # the data, in any of the three formats, on every core
 c/gen-data --rows 10m --out-dir /tmp/d --prefix p [--format json|parquet] [--threads N]
