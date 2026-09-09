@@ -1103,6 +1103,38 @@ static int32_t index_lookup(const RowIndex *ix, const Slab *other, const Field *
 /* change the answer.                                                          */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Two rows that agree byte for byte over a prefix agree, column for column,
+ * over every column that ends inside it.
+ *
+ * The join's expensive half is not the lookup -- it is what happens after one:
+ * the mate's row is parsed a second time and every compared column is compared
+ * byte by byte. But rows that match usually match because they are the same
+ * row, differing in one column that moved. Comparing the two rows' raw bytes
+ * from the front, a word at a time, finds where they first diverge; every
+ * compared column that ends before that point is proven equal without parsing
+ * the mate at all, and when that covers all of them the mate is never touched.
+ *
+ * The proof needs the two files to lay their columns out the same way, which
+ * `aligned` below decides once per run, and it is CSV only -- see there.
+ */
+static inline size_t row_end(const RowIndex *ix, int32_t row) {
+    const size_t next = (size_t)row + 1;
+    return next < ix->rows ? (size_t)ix->row_start[next] : ix->slab->size;
+}
+
+#define PROOF_BACKOFF 64u /* a power of two: the loop tests k against it */
+
+static inline size_t common_prefix(const char *x, const char *y, size_t n) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const uint64_t a = load64(x + i), b = load64(y + i);
+        if (a != b) return i + ((size_t)__builtin_ctzll(a ^ b) >> 3);
+    }
+    for (; i < n && x[i] == y[i]; i++) {}
+    return i;
+}
+
 typedef struct {
     int64_t  matched, changed, removed, added;
     int64_t *col_changed, *col_blanked, *col_filled;
@@ -1116,6 +1148,21 @@ typedef struct {
     size_t          key_size, nc, width;
     unsigned        ways, b_ways;
     CmpPart        *parts;
+    /*
+     * Set when both files are CSV, read with the same delimiter, and put every
+     * compared column at the same column number in ascending order. Then a
+     * column's bytes sit at the same offset in both rows, and the compared
+     * column that ends last is the one with the highest column number -- so one
+     * check settles the whole row.
+     *
+     * JSON is deliberately excluded. A value there is found by name, and a name
+     * repeated in one object takes its *last* value for a compared column, so a
+     * duplicate past the diverging byte in the mate could carry a value the
+     * prefix never saw.
+     */
+    bool            aligned;
+    size_t          guard;
+    char            delim;
 } CmpCtx;
 
 /*
@@ -1153,6 +1200,7 @@ static void compare_part(void *vctx, unsigned p) {
 
     if (p < c->ways) {
         const size_t lo = c->ai->keys * p / c->ways, hi = c->ai->keys * (p + 1) / c->ways;
+        unsigned refused = 0;
         for (size_t k = lo; k < hi; k++) {
             const int32_t row = c->ai->first_row[k];
             /* The sweep already hashed this row; re-deriving it here meant
@@ -1167,6 +1215,41 @@ static void compare_part(void *vctx, unsigned p) {
             const int32_t mate = index_lookup(c->bi, c->a, out->fa, hash, out->probe);
             if (mate < 0) { out->removed++; continue; }
             out->matched++;
+            const Field g = out->fa[c->guard];
+            /*
+             * A proof that keeps failing is a scan for nothing -- two files
+             * where every row really has changed pay for it on every row. So
+             * after PROOF_BACKOFF failures in a row it is only attempted every
+             * PROOF_BACKOFF rows, until one succeeds and it is on again.
+             */
+            if (c->aligned && field_real(g) &&
+                (refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0)) {
+                const size_t a_lo = (size_t)c->ai->row_start[row];
+                const size_t b_lo = (size_t)c->bi->row_start[mate];
+                /*
+                 * How far the two rows have to agree: through the byte that
+                 * closes the last compared column, and no further -- whatever
+                 * trails it is ignored, and reading it is work for nothing.
+                 *
+                 * Through the closing byte, not up to it. Agreeing as far as
+                 * the field's last byte says only that the mate's field starts
+                 * the same way: `cc` is a prefix of `cccccccc`, and a quoted
+                 * field the mate carries on with a doubled quote reads the same
+                 * that far too. It is the delimiter or the line ending after it
+                 * that says the mate's field stopped where this one did.
+                 */
+                const char *d = c->a->data;
+                const size_t a_end = row_end(c->ai, row);
+                size_t t = field_off(g) + field_len(g);
+                while (t < a_end && d[t] != c->delim && d[t] != '\n' && d[t] != '\r') t++;
+                const size_t need = t + 1 - a_lo;
+                if (t < a_end && need <= row_end(c->bi, mate) - b_lo &&
+                    common_prefix(d + a_lo, c->b->data + b_lo, need) == need) {
+                    refused = 0;
+                    continue;
+                }
+                if (refused < PROOF_BACKOFF) refused++;
+            }
             index_fields(c->bi, mate, out->fb);
             bool any = false;
             for (size_t i = 0; i < nc; i++) {
@@ -1617,7 +1700,19 @@ int main(int argc, char **argv) {
         unsigned b_ways = !verify ? 0u : (bi.keys < (1u << 14) ? 1u : budget);
         CmpPart *parts = calloc(ways + b_ways, sizeof *parts);
         if (!parts) { fail("out of memory"); goto done; }
-        CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts };
+        /*
+         * Can a prefix prove a row equal? Only where both files are CSV read
+         * with the same delimiter and every compared column sits at the same
+         * column number on both sides, ascending -- then equal bytes mean equal
+         * columns, and the last compared column is the one that ends last.
+         */
+        bool aligned = a.dialect == DIALECT_CSV && b.dialect == DIALECT_CSV &&
+                       a_delim == b_delim && nc > 0;
+        for (size_t i = key_size; aligned && i < width; i++)
+            aligned = a_src[i] >= 0 && a_src[i] == b_src[i] &&
+                      (i == key_size || a_src[i] > a_src[i - 1]);
+        CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts,
+                      aligned, width - 1, a_delim };
         run_parts(compare_part, &cc, ways + b_ways);
         phase_mark(&whole, "join and compare");
 

@@ -415,6 +415,75 @@ kcase "key in the last column"                "1 1 1" -k z2
 kcase "two key columns, first and last"       "1 1 1" -k x,z2
 rm -rf "$kdir"
 
+# The join proves a row unchanged from the two rows' raw bytes when they agree
+# far enough in, and only parses the mate when they do not. These are the shapes
+# where that proof has to hold or refuse: a change in the column it checks, a
+# change hidden behind an ignored one, and two files that spell the same columns
+# in a different order -- where equal bytes mean different columns.
+echo "proving a row unchanged from the bytes:"
+pdir=$(mktemp -d)
+pcase() { # label, expected "changed added removed", a-file, b-file, then flags
+  local label=$1 want=$2 af=$3 bf=$4; shift 4
+  rm -f "$pdir/o.json"
+  ./csvdiff compare "$pdir/$af" "$pdir/$bf" "$@" --json "$pdir/o.json" >/dev/null 2>&1 || true
+  local got
+  got=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["counts"]; print(c["changed"], c["added"], c["removed"])' "$pdir/o.json" 2>/dev/null) || got="(no report)"
+  if [ "$got" = "$want" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    printf '  FAIL  %s\n    want: %s\n    got : %s\n' "$label" "$want" "$got"; fail=1
+  fi
+}
+
+# One ignored column at the end that always differs -- the case the proof is
+# for -- and a change in the last compared column, which is the one it checks.
+{ echo 'id,a,b,ts'; echo 'k1,p,q,T1'; echo 'k2,p,q,T1'; } > "$pdir/tail_a.csv"
+{ echo 'id,a,b,ts'; echo 'k1,p,q,T2'; echo 'k2,p,zz,T2'; } > "$pdir/tail_b.csv"
+pcase "an ignored last column that always differs" "1 0 0" tail_a.csv tail_b.csv -k id -i ts
+pcase "and no proof to be had once it is compared" "2 0 0" tail_a.csv tail_b.csv -k id
+
+# A change in the first compared column, with everything after it identical.
+{ echo 'id,a,b,ts'; echo 'k1,p,q,T1'; } > "$pdir/head_a.csv"
+{ echo 'id,a,b,ts'; echo 'k1,X,q,T2'; } > "$pdir/head_b.csv"
+pcase "a change in the first compared column" "1 0 0" head_a.csv head_b.csv -k id -i ts
+
+# An ignored column in the middle that differs, and a real change after it: the
+# bytes diverge early, so the proof must refuse and the change must be found.
+{ echo 'id,skip,a,ts'; echo 'k1,S1,p,T1'; } > "$pdir/mid_a.csv"
+{ echo 'id,skip,a,ts'; echo 'k1,S2,X,T2'; } > "$pdir/mid_b.csv"
+pcase "a change behind an ignored middle column" "1 0 0" mid_a.csv mid_b.csv -k id -i skip,ts
+
+# Identical bytes, different columns. The proof reads bytes, so this is the
+# shape that breaks it if it is applied where the two headers disagree.
+{ echo 'id,p,q'; echo 'k1,X,Y'; } > "$pdir/ord_a.csv"
+{ echo 'id,q,p'; echo 'k1,X,Y'; } > "$pdir/ord_b.csv"
+pcase "the same bytes under a different column order" "1 0 0" ord_a.csv ord_b.csv -k id
+
+# Same value, spelled two ways: quoted on one side, bare on the other, and CRLF
+# against LF. The bytes diverge, the values do not.
+printf 'id,a,ts\nk1,"p",T1\n' > "$pdir/q_a.csv"
+printf 'id,a,ts\r\nk1,p,T2\r\n' > "$pdir/q_b.csv"
+pcase "quoted against bare, and CRLF against LF" "0 0 0" q_a.csv q_b.csv -k id -i ts
+
+# A row that stops before the column the proof checks.
+{ echo 'id,a,b,ts'; echo 'k1,p,q,T1'; } > "$pdir/rag_a.csv"
+{ echo 'id,a,b,ts'; echo 'k1,p'; } > "$pdir/rag_b.csv"
+pcase "a mate that stops before the checked column" "1 0 0" rag_a.csv rag_b.csv -k id -i ts
+
+# The mate's value carries on where this one stopped. `cc` is a prefix of
+# `cccccccc`, so a proof that reads only as far as this row's last byte calls
+# them equal; the cross-port oracle caught exactly this.
+{ echo 'a,k,c'; echo 'x,K1,c1'; echo 'y,K2,cc'; } > "$pdir/pre_a.csv"
+{ echo 'a,k,c'; echo 'x,K1,c1'; echo 'y,K2,cccccccc'; } > "$pdir/pre_b.csv"
+pcase "a mate whose last column carries on" "1 0 0" pre_a.csv pre_b.csv -k k
+
+# The same trap behind quotes: the mate closes its field two bytes later,
+# because what looks like the closing quote is a doubled one.
+printf 'id,a,ts\nk1,"ab",T1\n'      > "$pdir/dq_a.csv"
+printf 'id,a,ts\nk1,"ab""x",T2\n'   > "$pdir/dq_b.csv"
+pcase "a mate that reopens on a doubled quote" "1 0 0" dq_a.csv dq_b.csv -k id -i ts
+rm -rf "$pdir"
+
 if [ "$with_ports" = 1 ]; then
   echo "generator bytes, c against c++:"
   gen_dir=$(mktemp -d)
