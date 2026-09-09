@@ -125,3 +125,41 @@ jobs:
                       sys.exit(f"{e} {section} differ from {ref_name}: {n[section]} vs {ref[section]}")
           print(f"all {len(engines)} engines agree:", json.dumps(ref["counts"]))
           PY
+
+  windows:
+    name: build rust on windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # Build and test, not just `cargo check`: the point is to catch what a
+      # Linux job cannot see. `memmap2::Advice` is gated `#[cfg(unix)]` inside
+      # that crate, so this port did not compile on Windows at all -- and the
+      # README claimed it did, on the strength of a grep for `std::os::unix`
+      # that could not see inside a dependency. A claim about a platform is
+      # worth what the runner that proves it is worth.
+      - name: Build and test
+        run: |
+          cargo build --release
+          cargo test --release
+      # The Rust port is the only one that builds on Windows without WSL: the
+      # other three want mmap and pthreads, and Zig wants Linux specifically.
+      # So this is the whole of the repository's native Windows coverage.
+      - name: Compare two files end to end
+        shell: bash
+        run: |
+          printf 'id,a\nk1,p\nk2,q\n'       > a.csv
+          printf 'id,a\nk1,p\nk2,CHANGED\n' > b.csv
+          # A compare exits 1 when it finds differences, and this shell runs
+          # with -e, so the status has to be caught rather than allowed to end
+          # the step. The same trap is documented at the top of c/test.sh.
+          code=0
+          # --no-compress so the assertion below can read it: the report gzips
+          # its payload by default and the browser inflates it.
+          ./target/release/csvdiff.exe compare a.csv b.csv -k id \
+              --engine turbo -o report.html --no-compress || code=$?
+          [ "$code" = 1 ] || { echo "::error::expected exit 1 (differences found), got $code"; exit 1; }
+          grep -q "CHANGED" report.html || { echo "::error::the report does not name the changed value"; exit 1; }
