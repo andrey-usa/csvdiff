@@ -75,8 +75,16 @@ TIMEFORMAT='%R %U %S'
 # outside the shell is needed -- peak RSS is the one number it cannot give, and
 # the reason bench_ports.py reaches for wait4.
 one() {
-  local out
-  out=$( { time "$@" >/dev/null 2>&1; } 2>&1 ) || true
+  local out code
+  out=$( { time "$@" >/dev/null 2>&1; } 2>&1 ); code=$?
+  # A compare exits 1 when it finds differences, which is the expected outcome
+  # of nearly every measurement here. Anything else is a build that failed, and
+  # a failed build is not a fast one -- hyperfine's `-i` would time it and
+  # report the crash as a win.
+  if [ "$code" != 0 ] && [ "$code" != 1 ]; then
+    echo "bench_ab.sh: $1 exited $code -- not timing a failure" >&2
+    exit 1
+  fi
   awk '{printf "%.4f %.4f\n", $1, $2 + $3}' <<<"$out"
 }
 
