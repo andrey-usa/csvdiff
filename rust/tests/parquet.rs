@@ -313,9 +313,15 @@ fn an_engine_that_cannot_read_parquet_says_so() {
     );
 }
 
-/// The report says which path ran, not which engine was asked for.
+/// The report says which path ran -- which is not always the columnar one.
+///
+/// This used to assert that `--engine turbo` on a Parquet pair still reported
+/// `parquet`, because the router ignored the request and always took the
+/// columnar path. That was the bug rather than the contract: a zstd file was
+/// refused outright by a binary that could read it, and asking for the reader
+/// that could did nothing. Both halves are pinned here now.
 #[test]
-fn the_report_names_the_parquet_path() {
+fn the_report_names_the_path_that_ran() {
     let Some(tool) = generator() else {
         eprintln!("skipping: ../cpp/build/gen-data is not built");
         return;
@@ -323,8 +329,107 @@ fn the_report_names_the_parquet_path() {
     let Some(f) = Fixture::new(&tool, "1k", SNAPPY) else {
         return;
     };
+    let (a, b) = (f.path("a", ".parquet"), f.path("b", ".parquet"));
+
+    let mut opt = options(&["account_id", "txn_id"], |_| {});
+    let by_default = compare(&a, &b, &mut opt).unwrap();
+    assert_eq!(
+        by_default.meta.engine, "parquet",
+        "the fast path by default"
+    );
+
     let mut opt = options(&["account_id", "txn_id"], |_| {});
     opt.engine = "turbo".to_string();
-    let r = compare(&f.path("a", ".parquet"), &f.path("b", ".parquet"), &mut opt).unwrap();
-    assert_eq!(r.meta.engine, "parquet");
+    let asked_for = compare(&a, &b, &mut opt).unwrap();
+    assert_eq!(
+        asked_for.meta.engine, "turbo",
+        "an explicit request is honoured"
+    );
+
+    // Same rows, two readers: the counts have to agree, or one of them is wrong.
+    assert_eq!(by_default.counts, asked_for.counts);
+}
+
+/// A codec the columnar path does not read is not a refusal: this binary has a
+/// second Parquet reader, and the router falls through to it.
+///
+/// Reported from the field -- an NYC TLC trip-data file, zstd, was turned away
+/// with "only uncompressed and snappy parquet are read here" by a build that
+/// reads zstd perfectly well through `turbo`, and `--engine turbo` did not help
+/// because the Parquet-pair branch ran before the engine was consulted.
+///
+/// The generator here is this crate's own, not `cpp/build/gen-data`, because the
+/// C++ one writes snappy and plain only -- and a test that skips is no use for a
+/// bug a reader hit.
+#[test]
+fn a_zstd_pair_falls_through_to_the_reader_that_handles_it() {
+    use csvdiff::gendata::{Compression, Format, generate_as};
+
+    let dir = std::env::temp_dir().join(format!(
+        "csvdiff-zstd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("a temp directory");
+
+    let plain = |side: &str| dir.join(format!("plain_{side}.parquet"));
+    let zstd = |side: &str| dir.join(format!("zstd_{side}.parquet"));
+    generate_as(
+        2_000,
+        &plain("a"),
+        &plain("b"),
+        7,
+        Format::Parquet,
+        Compression::None,
+    )
+    .expect("the plain pair");
+    generate_as(
+        2_000,
+        &zstd("a"),
+        &zstd("b"),
+        7,
+        Format::Parquet,
+        Compression::Zstd,
+    )
+    .expect("the zstd pair");
+
+    let mut opt = options(&["account_id", "txn_id"], |_| {});
+    let compressed = compare(&zstd("a"), &zstd("b"), &mut opt).expect("zstd is read, not refused");
+    assert_eq!(compressed.meta.engine, "turbo", "the fall-through path");
+
+    // The same rows written twice, once each way. Reading them has to give the
+    // same answer, or the fall-through is reading something else.
+    let mut opt = options(&["account_id", "txn_id"], |_| {});
+    let uncompressed = compare(&plain("a"), &plain("b"), &mut opt).expect("plain is read");
+    assert_eq!(
+        uncompressed.meta.engine, "parquet",
+        "the columnar path, unchanged"
+    );
+    assert_eq!(compressed.counts, uncompressed.counts);
+    assert_eq!(compressed.columns, uncompressed.columns);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file that is simply wrong still fails, rather than being handed to the
+/// other reader and reported as its problem.
+#[test]
+fn a_real_error_is_not_dressed_up_as_an_unsupported_codec() {
+    let Some(tool) = generator() else {
+        eprintln!("skipping: ../cpp/build/gen-data is not built");
+        return;
+    };
+    let Some(f) = Fixture::new(&tool, "1k", SNAPPY) else {
+        return;
+    };
+    let mut opt = options(&["no_such_column"], |_| {});
+    let err = compare(&f.path("a", ".parquet"), &f.path("b", ".parquet"), &mut opt)
+        .expect_err("a key column that is in neither file");
+    assert!(
+        err.to_string().contains("the parquet engine failed"),
+        "the columnar path owns this failure: {err}"
+    );
 }

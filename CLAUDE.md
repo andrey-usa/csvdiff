@@ -166,6 +166,17 @@ before timing anything.
   column name, a binary name or a working directory, and run the README's commands before claiming
   the change is done; the `windows-latest` job in `ci-rust.yml` runs the PowerShell ones from the
   root for this reason.
+- **The Rust port has two Parquet readers.** The columnar path (`engine/pqdiff.rs` on
+  `src/parquet.rs`) reads uncompressed and snappy, `BYTE_ARRAY`, v1 pages, and is 3.7x faster on
+  wall; `turbo` (`engine/turbo/parquet.rs` on `turbo/codec.rs`) reads gzip, zstd and lz4 too. A
+  capability refusal from the first falls through to the second — `Error::unsupported`, read by
+  `engine.rs`. Two traps live there: route on the **requested** engine, not the resolved one
+  (`auto` is already `Turbo` for any Parquet input, so testing the resolved value retires the fast
+  path for everyone), and mark only capability refusals, never a corrupt file or a missing column,
+  or a real error comes back wearing the other reader's name.
+- **Neither Rust nor Zig reads brotli or LZO.** Both codec tables refuse them by name. The README
+  claimed brotli for two ports for weeks, and it took a reader's zstd file to find out that nobody
+  had run a codec through either port.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a

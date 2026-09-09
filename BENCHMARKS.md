@@ -64,6 +64,39 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-09 (parquet readers) — what the columnar path is worth
+
+One 4-core / 16 GB container, `scripts/bench_ab.sh`, seven interleaved rounds,
+2,000,000 rows of 20-column uncompressed Parquet, 154 MB a side. Two flag sets
+of one binary: the default (the columnar path) against `--engine turbo`.
+
+| Path | Wall best | Wall median | CPU best | CPU median |
+|---|---:|---:|---:|---:|
+| columnar (`parquet`) | **0.636s** | **0.665s** | **1.69s** | **1.74s** |
+| `turbo` | 1.964s | 2.429s | 4.80s | 5.53s |
+
+Paired per-round ratio 0.27x wall (middle half 0.26-0.29) and 0.31x CPU
+(0.31-0.33). The columnar path is **3.7x** on wall and takes a third of the CPU,
+which is the whole argument for keeping it: it joins on the key columns and
+compares whole columns as integers without ever building a row, and `turbo`
+decodes pages into rows to answer the same question.
+
+Taken because the two readers had just stopped being interchangeable. A Parquet
+pair used to go to the columnar path unconditionally — `--engine turbo` was
+accepted and ignored — so a file it does not read (zstd, from a reader in the
+field) was refused by a binary that reads zstd through `turbo`. The router now
+falls through on a capability refusal. This is the number that says the
+fall-through has to stay a fall-through: routing everything to `turbo` would
+have cost 3.7x on every Parquet pair, and an earlier draft of that change did
+exactly that by testing the *resolved* engine, where `auto` is already `Turbo`.
+
+Counts agree between the two paths on the same pair, and between an
+uncompressed pair and a zstd pair of the same rows — 199,800 matched, 12,123
+changed, 200 added, 200 removed at 200k. That equality is what the routing is
+allowed to lean on.
+
+---
+
 ## 2026-09-09 (verification) — the same two changes, through `bench_ab.sh`
 
 The `added` changes in both ports were measured with a hand-rolled interleaved
