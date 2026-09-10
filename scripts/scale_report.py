@@ -50,8 +50,9 @@ def ceiling_tables(rows: list[dict]) -> str:
 
     by = {(r["port"], r["size"]): r for r in rows}
     out = ["### How far each port got\n",
-           "Wall time in seconds. **failed** is where the port stopped, and the",
-           "reason is under the table.\n",
+           "Wall time in seconds. Every rung is its own run on its own runner, so",
+           "**failed** is that size failing and says nothing about the ones above",
+           "it -- those were measured too. The reason is under the table.\n",
            "| Rows | " + " | ".join(ports) + " |",
            "|---|" + "|".join(["---:"] * len(ports)) + "|"]
     for s in sizes:
@@ -77,7 +78,19 @@ def ceiling_tables(rows: list[dict]) -> str:
             out.append(f"| **{p}** | none | – | – | – | {bad[0]['why'] if bad else 'no result'} |")
             continue
         best = max(ok, key=lambda r: r["rows"])
-        stopped = bad[0]["why"] + f" at {bad[0]['size']}" if bad else "ladder ran out, not the port"
+        # Which failure is the ceiling depends on where it sits. Rungs are run
+        # independently, so a port can fail at 30m and still finish 60m -- and
+        # then 30m is not what stopped it, it is a hole. Only a failure above
+        # the largest completed size is a ceiling; one below it is an anomaly,
+        # and worth saying out loud rather than quietly reporting as the limit.
+        # The sequential ladder this replaced could not produce that state,
+        # which is why this column used to be `bad[0]` and nothing more.
+        above = sorted((r for r in bad if r["rows"] > best["rows"]), key=lambda r: r["rows"])
+        below = sorted((r for r in bad if r["rows"] < best["rows"]), key=lambda r: r["rows"])
+        stopped = f"{above[0]['why']} at {above[0]['size']}" if above else "ladder ran out, not the port"
+        if below:
+            stopped += " — but also failed at " + ", ".join(r["size"] for r in below) + \
+                       ", under a size that passed"
         out.append(f"| **{p}** | **{best['size']}** | {best['input_mb']:,.0f} MB | "
                    f"{best['wall_s']:.2f}s | {best['rss_mb']:,.0f} MB | {stopped} |")
     return "\n".join(out) + "\n"

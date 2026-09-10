@@ -9,12 +9,30 @@ name: Scale ceiling
 # killed. A port can lead on one and trail on the other, which is the reason
 # both tables are here rather than one.
 #
-# One port per runner, on purpose. The ladder is larger than any single runner's
-# disk -- fifty million rows of CSV is 18.4 GB of input for one pair -- so the
-# sizes are done one at a time and each pair is deleted after its runs. Putting
-# four ports on one runner would mean four ports sharing that disk and one of
-# them running out because of another's leftovers. Separate jobs also mean a
-# port that dies at 40m does not take the rest of the table with it.
+# One runner per rung: every (port, size) pair is its own job. The first version
+# of this file put one port on a runner and had it climb the whole ladder, which
+# made the ladder -- the thing this workflow is named after -- entirely
+# sequential. Four jobs ran at once and each of them did six sizes back to back,
+# so the run took as long as the tallest ladder and no size reported until the
+# ones below it had finished. Splitting the ladder into steps, which this file
+# also tried, does not change that: steps inside a job are sequential by
+# definition. Only separate jobs run at the same time.
+#
+# The disk argument that produced the old shape still holds and is better served
+# here: sixty million rows of CSV is 22 GB of input for one pair, and one rung
+# on its own runner has that runner's whole disk rather than sharing it with the
+# five rungs before it.
+#
+# There is a second reason, and it is about the answer rather than the clock.
+# Climbing in order means stopping at the first failure, so a rung that dies for
+# a passing reason hides every rung above it and the ceiling reads lower than it
+# is. Independent rungs measure every size, and the report already takes the
+# largest one that passed rather than the last one before a failure.
+#
+# The cost is runner slots: four ports by six sizes is 24 jobs, plus four for
+# the floor, against a limit of 20 concurrent jobs on the Free plan. The excess
+# queues and drains. This repository is public, so standard runners cost no
+# minutes -- the only price is that the last wave starts late.
 #
 # Peak RSS is reported but is not the memory answer. An engine that maps its
 # input has reclaimable pages, so its RSS is whatever the kernel let it keep
@@ -25,7 +43,7 @@ on:
   workflow_dispatch:
     inputs:
       sizes:
-        description: "Ladder, climbed until one fails (comma separated)"
+        description: "Ladder: one job per size, all at once (comma separated)"
         default: "10m,20m,30m,40m,50m,60m"
       floor_size:
         description: "Size the memory floor is searched at"
@@ -49,14 +67,35 @@ permissions:
   contents: read
 
 jobs:
-  ceiling:
-    name: "ceiling: ${{ matrix.port }}"
+  # A matrix cannot be built from a comma-separated string, and the ladder is an
+  # input rather than a constant, so one small job turns "10m,20m" into ["10m",
+  # "20m"] for the matrix below to fan out over.
+  plan:
+    name: the ladder
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    outputs:
+      sizes: ${{ steps.split.outputs.sizes }}
+    steps:
+      - id: split
+        env:
+          SIZES: ${{ inputs.sizes }}
+        run: |
+          python3 -c "import json,os;print('sizes='+json.dumps([s.strip() for s in os.environ['SIZES'].split(',') if s.strip()]))" \
+              | tee -a "$GITHUB_OUTPUT"
+
+  ceiling:
+    name: "ceiling: ${{ matrix.port }} at ${{ matrix.size }}"
+    needs: plan
+    runs-on: ubuntu-latest
+    # One rung, not six. The old number was 330 because it covered a whole
+    # ladder; a single size that needs three hours is a result worth having, and
+    # anything past that is the runner rather than the port.
+    timeout-minutes: 180
     strategy:
-      fail-fast: false          # a port that dies at 40m is a result, not a reason to stop
+      fail-fast: false          # a rung that dies is a result, not a reason to stop
       matrix:
         port: [c, cpp, rust, zig]
+        size: ${{ fromJSON(needs.plan.outputs.sizes) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +112,7 @@ jobs:
       - name: What this runner is
         run: |
           {
-            echo "### ${{ matrix.port }}"
+            echo "### ${{ matrix.port }} at ${{ matrix.size }}"
             echo
             echo '```'
             grep -m1 "model name" /proc/cpuinfo
@@ -111,7 +150,7 @@ jobs:
             zig)  (cd zig && zig build --release=fast) ;;
           esac
 
-      - name: Climb the ladder
+      - name: This rung
         run: |
           case "${{ matrix.port }}" in
             c)    BIN=c/csvdiff ;;
@@ -120,24 +159,24 @@ jobs:
             zig)  BIN=zig/zig-out/bin/csvdiff ;;
           esac
           mkdir -p out
+          # One size. No --stop-on-fail: there is nothing after this to stop.
           python3 scripts/bench_scale.py \
               --binary "$BIN" --label "${{ matrix.port }}" \
-              --sizes "${{ inputs.sizes }}" \
+              --sizes "${{ matrix.size }}" \
               --repeats "${{ inputs.repeats }}" \
               --threads "$(nproc)" \
-              --stop-on-fail \
               --data-dir "$RUNNER_TEMP/scale" \
-              --json-out "out/ceiling-${{ matrix.port }}.json" \
-              2>&1 | tee "out/ceiling-${{ matrix.port }}.txt"
+              --json-out "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.json" \
+              2>&1 | tee "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt"
 
-      - name: This port's ladder, in the summary
+      - name: This rung, in the summary
         if: always()
         run: |
           {
-            echo "<details><summary>${{ matrix.port }} — full ladder output</summary>"
+            echo "<details><summary>${{ matrix.port }} at ${{ matrix.size }}</summary>"
             echo
             echo '```'
-            cat "out/ceiling-${{ matrix.port }}.txt" 2>/dev/null || echo "(no output)"
+            cat "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt" 2>/dev/null || echo "(no output)"
             echo '```'
             echo
             echo "</details>"
@@ -146,7 +185,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ceiling-${{ matrix.port }}
+          name: ceiling-${{ matrix.port }}-${{ matrix.size }}
           path: out/
 
   floor:
@@ -224,7 +263,7 @@ jobs:
 
   collect:
     name: the two tables
-    needs: [ceiling, floor]
+    needs: [plan, ceiling, floor]
     if: always()
     runs-on: ubuntu-latest
     steps:
