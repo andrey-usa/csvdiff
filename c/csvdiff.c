@@ -974,8 +974,14 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     if (ix->failed) ok = false;
 
     if (ok) {
-        ix->row_start = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->row_start);
-        ix->row_hash = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->row_hash);
+        const size_t n = ix->rows ? ix->rows : 1;
+        if (budget_take(n * (sizeof *ix->row_start + sizeof *ix->row_hash)) != 0) {
+            for (unsigned p = 0; p < ways; p++) { free(chunks[p].start); free(chunks[p].hash); }
+            free(chunks);
+            return false;
+        }
+        ix->row_start = malloc(n * sizeof *ix->row_start);
+        ix->row_hash = malloc(n * sizeof *ix->row_hash);
         ok = ix->row_start && ix->row_hash;
     }
     if (ok) {
@@ -1005,6 +1011,12 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     ix->pos_bits = 1;
     while (ix->pos_bits < 32 && ((size_t)1 << ix->pos_bits) < ix->rows + 2) ix->pos_bits++;
     ix->pos_mask = ix->pos_bits >= 32 ? 0xFFFFFFFFu : (uint32_t)(((uint64_t)1 << ix->pos_bits) - 1);
+    {
+        const size_t n = ix->rows ? ix->rows : 1;
+        if (budget_take(cap * sizeof *ix->table +
+                        n * (sizeof *ix->first_row + sizeof *ix->occurrences)) != 0)
+            return false;
+    }
     ix->table = alloc_huge(cap * sizeof *ix->table);
     ix->first_row = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->first_row);
     ix->occurrences = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->occurrences);
@@ -1519,6 +1531,15 @@ static int fail(const char *message) {
     return 2;
 }
 
+/* The one refusal worth naming in full: it is the answer to the question
+ * --max-memory asked. */
+static int fail_budget(void) {
+    fprintf(stderr,
+            "error: the comparison needs more than the %zu MB it was given\n",
+            budget_limit() / (1024 * 1024));
+    return 2;
+}
+
 /* ------------------------------------------------------------------------- */
 /* The report                                                                  */
 /*                                                                             */
@@ -1579,7 +1600,7 @@ static int compare_parquet(const char *a_path, const char *b_path, const Names *
     PqResult r;
     if (pq_compare(a_path, b_path, key->items, key->len, ignore->items, ignore->len,
                    compare->items, compare->len, threads, &r) != 0)
-        return fail(pq_error());
+        return budget_exceeded() ? fail_budget() : fail(pq_error());
 
     OutCol *cols = calloc(r.ncols ? r.ncols : 1, sizeof *cols);
     if (!cols) { pq_result_free(&r); return fail("out of memory"); }
@@ -1612,6 +1633,7 @@ int main(int argc, char **argv) {
     Names key = {0}, ignore = {0}, compare = {0};
     const char *a_path = NULL, *b_path = NULL, *json_path = NULL;
     unsigned threads = 0;   /* 0 means one per core, on the Parquet path */
+    size_t   max_memory_mb = 0;   /* 0 means no ceiling */
     /* Three lists to release now, and a fourth would be a fourth place to
      * forget one: every exit from the scan goes through here. */
 #define ARGS_FAIL(msg) \
@@ -1628,6 +1650,7 @@ int main(int argc, char **argv) {
             !strcmp(f, "-c") || !strcmp(f, "--compare") ||
             !strcmp(f, "--json") ||
             !strcmp(f, "-t") || !strcmp(f, "--threads") ||
+            !strcmp(f, "--max-memory") ||
             !strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine");
         if (wants_value && i + 1 >= argc) {
             if (!strcmp(f, "-k") || !strcmp(f, "--key")) ARGS_FAIL("--key needs a value");
@@ -1635,6 +1658,7 @@ int main(int argc, char **argv) {
             if (!strcmp(f, "-c") || !strcmp(f, "--compare")) ARGS_FAIL("--compare needs a value");
             if (!strcmp(f, "--json")) ARGS_FAIL("--json needs a value");
             if (!strcmp(f, "-t") || !strcmp(f, "--threads")) ARGS_FAIL("--threads needs a value");
+            if (!strcmp(f, "--max-memory")) ARGS_FAIL("--max-memory needs a value");
             ARGS_FAIL("that option needs a value");
         }
         if (!strcmp(f, "-k") || !strcmp(f, "--key")) key = split_commas(argv[++i]);
@@ -1643,6 +1667,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(f, "--json")) json_path = argv[++i];
         else if (!strcmp(f, "-t") || !strcmp(f, "--threads"))
             threads = (unsigned)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(f, "--max-memory")) max_memory_mb = strtoul(argv[++i], NULL, 10);
         else if (!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) i++;
         else if (f[0] == '-') ARGS_FAIL("unknown option");
         else if (!a_path) a_path = f;
@@ -1651,6 +1676,7 @@ int main(int argc, char **argv) {
     if (!a_path || !b_path) ARGS_FAIL("compare needs two files");
     if (key.len == 0) ARGS_FAIL("--key is required");
 #undef ARGS_FAIL
+    budget_set(max_memory_mb);
 
     /* A column store and a byte stream have no common ground to be compared on:
      * one of them would have to be turned into the other, which is the cost the
@@ -1814,8 +1840,9 @@ int main(int argc, char **argv) {
         run_parts(build_part, &bc, 2);
         phase_mark(&whole, "both indexes");
         if (!bc.ok[0] || !bc.ok[1]) {
-            fail(ai.failed || bi.failed ? "a field is larger than this engine packs"
-                                        : "out of memory");
+            if (budget_exceeded()) fail_budget();
+            else fail(ai.failed || bi.failed ? "a field is larger than this engine packs"
+                                             : "out of memory");
             goto done;
         }
     }

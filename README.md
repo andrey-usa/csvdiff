@@ -403,7 +403,7 @@ compared against another Parquet file; CSV and ndjson compare against each other
 
 | | Reads | Notable | Not there |
 |---|---|---|---|
-| **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed, snappy, lz4) | fastest on all three formats, and on every codec it reads; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance`; gzip and zstd |
+| **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed, snappy, lz4) | fastest on all three formats, and on every codec it reads; lowest peak memory of the four; `--max-memory MB` bounds what grows with the input; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance`; gzip and zstd |
 | **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report; no codec but snappy |
 | **[`rust/`](rust/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | brotli, and LZO |
 | **[`zig/`](zig/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report; brotli, and LZO |
@@ -413,6 +413,21 @@ Rust's rejects brotli by name. C reads snappy and LZ4 and refuses gzip and zstd:
 the first two are byte-copy loops written out in `c/parquet.c`, and the other
 two are real decoders that would mean a dependency this port does not take. The codec lists above said otherwise until a
 reader's zstd file was refused — see **Parquet codecs** below.
+
+**Two ports take a memory ceiling, and they mean different things by it.** Zig's
+`--max-memory` is enforced by a fixed buffer: nothing outside it is allocated at
+all. C's is a declaration made before the allocations that scale with the input
+-- the per-row index arrays and the Parquet column buffers -- so it bounds the
+part that grows rather than the whole process, and the mapped files are not in
+it. Both turn "the machine ran out" into an error naming the ceiling. Neither is
+on by default.
+
+That distinction is worth the sentence because checking what `malloc` returns is
+necessary and not sufficient. Under Linux's default heuristic overcommit there
+is a band -- on a 15 GB machine, around 14 GB -- where `malloc` hands back a
+pointer and the kernel kills the process when the pages are touched: exit 137,
+no message, nothing to catch. A ceiling declared up front is the only thing that
+turns that into a diagnosis.
 
 Every port builds from its own toolchain alone, in seconds, and carries no
 runtime dependency with a comparison engine in it. What was removed to get

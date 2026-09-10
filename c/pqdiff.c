@@ -365,6 +365,15 @@ static int build_index(const Keys *k, const KeySide *s, unsigned threads, Index 
      * actually limited by. */
     size_t cap = 1u << 12;
     while (cap * 2 < s->rows * 3 + 16) cap <<= 1;
+    {
+        const size_t n = s->rows ? s->rows : 1;
+        if (budget_take(cap * sizeof *ix->slots +
+                        n * (sizeof *ix->firsts + sizeof *ix->counts + sizeof *ix->hashes)) != 0) {
+            free(hs);
+            index_free(ix);
+            return pq_set_error("over the --max-memory ceiling");
+        }
+    }
     ix->slots = alloc_slots(cap);
     ix->firsts = malloc((s->rows ? s->rows : 1) * sizeof *ix->firsts);
     ix->counts = malloc((s->rows ? s->rows : 1) * sizeof *ix->counts);

@@ -246,6 +246,17 @@ before timing anything.
 - **C carries snappy and LZ4 and refuses gzip and zstd**, and that line is where it stays: the
   first two are byte-copy loops of about eighty lines, the other two are real decoders and would
   be the dependency this port exists without. `c/parquet.h` says so at the top.
+- **A checked `malloc` is not OOM resilience.** Under Linux's default overcommit there is a band
+  where `malloc` returns a pointer and the kernel kills the process on touch -- exit 137, no
+  message. Measured on a 15 GB box: 8 GB allocates and touches fine, 14 GB allocates and is
+  killed, 20 GB is refused up front. That band is why C has `--max-memory`, and why the sizes
+  that scale with row count go through `budget_take` *before* they are allocated. Adding a new
+  allocation that grows with the input means adding it to the budget, or the ceiling quietly
+  stops meaning what it says.
+- **C's budget bounds what grows, not the process.** The per-row index arrays and the Parquet
+  column buffers are in it; the mapped files and a few kilobytes of bookkeeping are not. Say
+  "bounds what scales with the input", never "enforced" -- that word belongs to Zig's fixed
+  buffer, which is a stronger guarantee.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a

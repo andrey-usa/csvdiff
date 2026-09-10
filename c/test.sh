@@ -688,4 +688,50 @@ for flag in --key --ignore --compare --json --threads; do
   esac
 done
 
+# --max-memory: a ceiling declared before the allocations that scale with the
+# input, rather than discovered when one fails. Checking what malloc returns is
+# necessary and not sufficient -- under Linux's default overcommit there is a
+# band where malloc succeeds and the kernel kills the process on touch, with no
+# message and exit 137. This is the flag that turns that into an error.
+echo "--max-memory:"
+mdir=$(mktemp -d)
+"$GEN" --rows 60k --out-dir "$mdir" --prefix m >/dev/null 2>&1
+
+out=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" -k account_id,txn_id \
+        -i updated_at --max-memory 1 2>&1 | head -1); rc=$?
+case "$out" in
+  *"needs more than the 1 MB"*) echo "  ok    a ceiling too small is refused, naming the ceiling" ;;
+  *) echo "  FAIL  expected a refusal naming the ceiling, got: $out"; fail=1 ;;
+esac
+
+# The same run with room finishes, and finishes with the same answer it gives
+# with no ceiling at all -- a budget that changed the counts would be worse
+# than no budget.
+free=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" -k account_id,txn_id -i updated_at 2>&1 | summary)
+capped=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" -k account_id,txn_id -i updated_at \
+             --max-memory 512 2>&1 | summary)
+if [ "$free" = "$capped" ] && [ -n "$free" ]; then
+  echo "  ok    a ceiling with room changes nothing: $capped"
+else
+  echo "  FAIL  a ceiling changed the answer"; echo "    without: $free"; echo "    with   : $capped"; fail=1
+fi
+
+# And on the columnar path, which allocates in a different file.
+if [ -x "$GEN" ]; then
+  "$GEN" --rows 5k --out-dir "$mdir" --prefix q --format parquet >/dev/null 2>&1
+  out=$(./csvdiff compare "$mdir/q_a.unc.parquet" "$mdir/q_b.unc.parquet" \
+          -k account_id,txn_id -i updated_at --max-memory 1 2>&1 | head -1)
+  case "$out" in
+    *"needs more than the 1 MB"*) echo "  ok    the parquet path honours the ceiling too" ;;
+    *) echo "  FAIL  parquet ignored the ceiling: $out"; fail=1 ;;
+  esac
+fi
+
+out=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" --max-memory 2>&1) || true
+case "$out" in
+  *"--max-memory needs a value"*) echo "  ok    --max-memory with no value says so" ;;
+  *) echo "  FAIL  $out"; fail=1 ;;
+esac
+rm -rf "$mdir"
+
 exit $fail
