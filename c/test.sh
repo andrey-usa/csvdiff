@@ -751,6 +751,18 @@ if [ -x "$GEN" ]; then
     *"more than the"*) echo "  FAIL  a ceiling that fits one column refused: $one$many"; fail=1 ;;
     *) echo "  ok    the ceiling counts what is held, not every column read" ;;
   esac
+
+  # And it counts every buffer a column keeps, not just the row index. A PLAIN
+  # column's values array is eight bytes a row where the index is four, so a
+  # ceiling that saw only the index read low on exactly the columns that cost
+  # most. Ask for a ceiling between the two and the run must be refused: it
+  # would have been allowed when only the index was counted.
+  out=$(./csvdiff compare "$mdir/q_a.unc.parquet" "$mdir/q_b.unc.parquet" \
+          -k account_id,txn_id -i updated_at --threads 1 --max-memory 1 2>&1 | head -1)
+  case "$out" in
+    *"more than the"*) echo "  ok    the ceiling counts the values array, not just the index" ;;
+    *) echo "  FAIL  a 1 MB ceiling admitted a 20k-row parquet run: $out"; fail=1 ;;
+  esac
 fi
 
 out=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" --max-memory 2>&1) || true
