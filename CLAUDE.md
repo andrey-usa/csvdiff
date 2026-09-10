@@ -237,6 +237,15 @@ before timing anything.
   `pqdiff.c` for the columnar path, because they resolve columns against different structures.
   A change to one that skips the other is a flag that works on CSV and is ignored on Parquet.
   The same is true of `--key` and `--ignore`; only Rust has a single `resolve`.
+- **A compressed Parquet column in C means `owned`, and `pq_base()` is how you read it.** A
+  column is wholly compressed or wholly not -- one whose chunks disagree is refused -- so
+  `PqColumn.owned` being non-NULL settles what every slice in that column counts from. Never take
+  `mapping->data` as the base directly; `pq_base(&col.c, mapping->data)` is the only correct form,
+  and an uncompressed file still resolves to the mapping exactly as before. `owned` moves as it
+  grows, which is why a slice is an offset and not a pointer.
+- **C carries snappy and LZ4 and refuses gzip and zstd**, and that line is where it stays: the
+  first two are byte-copy loops of about eighty lines, the other two are real decoders and would
+  be the dependency this port exists without. `c/parquet.h` says so at the top.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a

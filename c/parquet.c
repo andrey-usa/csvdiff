@@ -185,7 +185,143 @@ enum { P_BOOLEAN = 0, P_INT32 = 1, P_INT64 = 2, P_INT96 = 3, P_FLOAT = 4, P_DOUB
 /* parquet.thrift Encoding */
 enum { E_PLAIN = 0, E_PLAIN_DICTIONARY = 2, E_RLE = 3, E_RLE_DICTIONARY = 8 };
 /* parquet.thrift CompressionCodec */
-enum { C_UNCOMPRESSED = 0 };
+enum { C_UNCOMPRESSED = 0, C_SNAPPY = 1, C_GZIP = 2, C_LZ4_RAW = 7 };
+
+/* ------------------------------------------------------------------------- */
+/* Page decompression: snappy and LZ4, written out rather than linked          */
+/*                                                                             */
+/* Both are byte-copy loops with no tables and no allocation of their own: the */
+/* output buffer is sized from the page header before either is called, so a   */
+/* corrupt length is a refusal rather than an allocation the size of whatever  */
+/* number was in the file. Gzip and zstd are deliberately absent -- their      */
+/* decoders are real programs, and this port carries no dependency.            */
+/* ------------------------------------------------------------------------- */
+
+/* A cursor that fills `out` and refuses to run past it, which is what turns a
+ * corrupt length into an error rather than a wild write. */
+typedef struct { char *out; size_t cap, at; } Sink;
+
+static int sink_literal(Sink *s, const char *from, size_t n) {
+    if (n > s->cap - s->at) return fail("a compressed parquet page overruns its declared size");
+    memcpy(s->out + s->at, from, n);
+    s->at += n;
+    return 0;
+}
+
+/* Copies `n` bytes from `distance` back, which may overlap what it is writing:
+ * a run of one byte is encoded as a one-byte match repeated, so this cannot be
+ * memcpy or memmove. */
+static int sink_copy(Sink *s, size_t distance, size_t n) {
+    if (distance == 0 || distance > s->at) return fail("a compressed parquet page copies from outside itself");
+    if (n > s->cap - s->at) return fail("a compressed parquet page overruns its declared size");
+    char *dst = s->out + s->at;
+    const char *src = dst - distance;
+    /* Eight bytes at a time where the source is at least eight behind, which
+     * is most matches: each chunk reads only bytes already written, so the
+     * byte-by-byte meaning is preserved. A closer match is a repeating run --
+     * a one-byte distance is how a run of one byte is encoded -- and has to
+     * stay a byte loop. */
+    size_t i = 0;
+    if (distance >= 8) {
+        for (; i + 8 <= n; i += 8) memcpy(dst + i, src + i, 8);
+    }
+    for (; i < n; i++) dst[i] = src[i];
+    s->at += n;
+    return 0;
+}
+
+static int snappy_decode(const char *in, size_t in_len, char *out, size_t out_len) {
+    size_t at = 0, declared = 0;
+    unsigned shift = 0;
+    for (;;) {
+        if (at >= in_len) return fail("a snappy parquet page ends inside its length");
+        const uint8_t b = (uint8_t)in[at++];
+        declared |= (size_t)(b & 0x7f) << shift;
+        if (!(b & 0x80)) break;
+        if (shift >= 28) return fail("a snappy parquet page has a corrupt length");
+        shift += 7;
+    }
+    if (declared != out_len) return fail("a snappy parquet page is not the size its header claims");
+
+    Sink s = { out, out_len, 0 };
+    while (at < in_len) {
+        const uint8_t tag = (uint8_t)in[at++];
+        if ((tag & 0x03) == 0) {
+            /* A literal: a short length in the tag, or one to four bytes of it. */
+            size_t n = tag >> 2;
+            if (n >= 60) {
+                const size_t extra = n - 59;
+                if (in_len - at < extra) return fail("a snappy parquet page ends inside a literal length");
+                n = 0;
+                for (size_t i = 0; i < extra; i++) n |= (size_t)(uint8_t)in[at + i] << (8 * i);
+                at += extra;
+            }
+            n += 1;
+            if (in_len - at < n) return fail("a snappy parquet page ends inside a literal");
+            if (sink_literal(&s, in + at, n) != 0) return -1;
+            at += n;
+            continue;
+        }
+        size_t n = 0, distance = 0;
+        if ((tag & 0x03) == 1) {
+            if (at >= in_len) return fail("a snappy parquet page ends inside a copy");
+            n = 4 + ((tag >> 2) & 0x07);
+            distance = ((size_t)(tag >> 5) << 8) | (uint8_t)in[at];
+            at += 1;
+        } else if ((tag & 0x03) == 2) {
+            if (in_len - at < 2) return fail("a snappy parquet page ends inside a copy");
+            n = (size_t)(tag >> 2) + 1;
+            distance = (size_t)(uint8_t)in[at] | ((size_t)(uint8_t)in[at + 1] << 8);
+            at += 2;
+        } else {
+            if (in_len - at < 4) return fail("a snappy parquet page ends inside a copy");
+            n = (size_t)(tag >> 2) + 1;
+            distance = (size_t)(uint8_t)in[at] | ((size_t)(uint8_t)in[at + 1] << 8) |
+                       ((size_t)(uint8_t)in[at + 2] << 16) | ((size_t)(uint8_t)in[at + 3] << 24);
+            at += 4;
+        }
+        if (sink_copy(&s, distance, n) != 0) return -1;
+    }
+    if (s.at != out_len) return fail("a snappy parquet page is shorter than its header claims");
+    return 0;
+}
+
+static int lz4_decode(const char *in, size_t in_len, char *out, size_t out_len) {
+    Sink s = { out, out_len, 0 };
+    size_t at = 0;
+    while (at < in_len) {
+        const uint8_t token = (uint8_t)in[at++];
+        size_t literals = token >> 4;
+        if (literals == 15) {
+            for (;;) {
+                if (at >= in_len) return fail("an lz4 parquet page ends inside a literal length");
+                const uint8_t b = (uint8_t)in[at++];
+                literals += b;
+                if (b != 255) break;
+            }
+        }
+        if (in_len - at < literals) return fail("an lz4 parquet page ends inside a literal");
+        if (sink_literal(&s, in + at, literals) != 0) return -1;
+        at += literals;
+        /* The last sequence of a block is literals only, with no match after. */
+        if (at >= in_len) break;
+        if (in_len - at < 2) return fail("an lz4 parquet page ends inside a match offset");
+        const size_t distance = (size_t)(uint8_t)in[at] | ((size_t)(uint8_t)in[at + 1] << 8);
+        at += 2;
+        size_t n = token & 0x0f;
+        if (n == 15) {
+            for (;;) {
+                if (at >= in_len) return fail("an lz4 parquet page ends inside a match length");
+                const uint8_t b = (uint8_t)in[at++];
+                n += b;
+                if (b != 255) break;
+            }
+        }
+        if (sink_copy(&s, distance, n + 4) != 0) return -1;
+    }
+    if (s.at != out_len) return fail("an lz4 parquet page is shorter than its header claims");
+    return 0;
+}
 /* parquet.thrift PageType */
 enum { PG_DATA = 0, PG_INDEX = 1, PG_DICTIONARY = 2, PG_DATA_V2 = 3 };
 
@@ -584,6 +720,7 @@ void pq_column_free(PqColumn *c) {
     free(c->dict);
     free(c->index);
     free(c->values);
+    free(c->owned);
     memset(c, 0, sizeof *c);
 }
 
@@ -623,6 +760,11 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
     int      dictionary = 1;
     size_t   dict_cap = 0, index_cap = 0, values_cap = 0;
     int32_t *defs = NULL;  size_t defs_cap = 0;
+    /* Where decompressed pages land, when there are any. A column is wholly
+     * compressed or wholly not, so this being non-NULL is what tells every
+     * slice in the column what its offset counts from. */
+    size_t owned_cap = 0;
+    int    col_codec = -1;
     int32_t *idx = NULL;   size_t idx_cap = 0;
     PqSlice *got = NULL;   size_t got_len = 0, got_cap = 0;
 
@@ -636,8 +778,17 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
         if (which >= fm.groups[g].columns_len) { fail("a row group is missing a column"); goto done; }
         const ChunkMeta *c = &fm.groups[g].columns[which];
         if (c->type != P_BYTE_ARRAY) { fail("only BYTE_ARRAY parquet columns are read here"); goto done; }
-        if (c->codec != C_UNCOMPRESSED) {
-            fail("this port reads uncompressed parquet only; the column is compressed");
+        if (c->codec != C_UNCOMPRESSED && c->codec != C_SNAPPY && c->codec != C_LZ4_RAW) {
+            fail(c->codec == C_GZIP
+                     ? "gzip parquet is not read here; this port carries snappy and lz4 only"
+                     : "that parquet codec is not read here; this port carries snappy and lz4 only");
+            goto done;
+        }
+        /* Every chunk has to agree, because a slice is an offset with no room
+         * to say what it is an offset *into*. */
+        if (col_codec < 0) col_codec = c->codec;
+        else if (col_codec != c->codec) {
+            fail("a parquet column compresses some chunks and not others");
             goto done;
         }
 
@@ -653,11 +804,31 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
             const size_t body = (size_t)h.compressed;
             if (h.after + body > size) { fail("a parquet page runs past the file"); goto done; }
 
-            /* Uncompressed only, so a page is read where it lies and every
-             * offset is into the mapping. */
-            const char  *page = data + h.after;
-            const size_t page_len = body;
-            const uint64_t page_base = h.after;
+            /* Uncompressed pages are read where they lie, so every offset is
+             * into the mapping and nothing is copied. A compressed one is
+             * decompressed onto the end of `owned`, and its offsets count from
+             * there instead -- `owned` may move as it grows, which is exactly
+             * why a slice is an offset and not a pointer. */
+            const char  *page;
+            size_t       page_len;
+            uint64_t     page_base;
+            if (col_codec == C_UNCOMPRESSED) {
+                page = data + h.after;
+                page_len = body;
+                page_base = h.after;
+            } else {
+                if (h.uncompressed < 0) { fail("a compressed parquet page declares no size"); goto done; }
+                const size_t want = (size_t)h.uncompressed;
+                if (grow((void **)&out->owned, &owned_cap, out->owned_len + want, 1) != 0) goto done;
+                char *dst = out->owned + out->owned_len;
+                if ((col_codec == C_SNAPPY ? snappy_decode : lz4_decode)(
+                        data + h.after, body, dst, want) != 0)
+                    goto done;
+                page_base = out->owned_len;
+                out->owned_len += want;
+                page = dst;
+                page_len = want;
+            }
 
             if (h.type == PG_DICTIONARY) {
                 if (h.encoding != E_PLAIN && h.encoding != E_PLAIN_DICTIONARY) {

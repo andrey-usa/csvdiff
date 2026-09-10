@@ -403,13 +403,15 @@ compared against another Parquet file; CSV and ndjson compare against each other
 
 | | Reads | Notable | Not there |
 |---|---|---|---|
-| **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed only) | fastest on all three formats; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance` |
+| **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed, snappy, lz4) | fastest on all three formats, and on every codec it reads; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance`; gzip and zstd |
 | **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report; no codec but snappy |
 | **[`rust/`](rust/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | brotli, and LZO |
 | **[`zig/`](zig/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report; brotli, and LZO |
 
 No port reads brotli or LZO; Zig's codec table names both as unsupported and
-Rust's rejects brotli by name. The codec lists above said otherwise until a
+Rust's rejects brotli by name. C reads snappy and LZ4 and refuses gzip and zstd:
+the first two are byte-copy loops written out in `c/parquet.c`, and the other
+two are real decoders that would mean a dependency this port does not take. The codec lists above said otherwise until a
 reader's zstd file was refused — see **Parquet codecs** below.
 
 Every port builds from its own toolchain alone, in seconds, and carries no

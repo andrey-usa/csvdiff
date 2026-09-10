@@ -64,6 +64,54 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (C codecs) — the columnar path, on compressed files
+
+Same container, same 5m-row pair, same method as the codec entry below: median
+of five warm runs, every file written by one pyarrow call so the codec is the
+only variable.
+
+C read no codec at all when that entry was taken. It reads snappy and LZ4 now,
+both written out in `c/parquet.c` rather than linked, and it reads them on the
+columnar path -- which is the whole result:
+
+| Port | none | snappy | lz4 |
+|---|---:|---:|---:|
+| **C** | **0.98s** | **1.61s** | **1.65s** |
+| C++ | 1.64s | 2.08s | refused |
+| Rust | 1.52s | 2.12s | 5.41s |
+| Zig | 1.26s | 1.79s | 5.98s |
+
+C is fastest on every codec it reads. The LZ4 column is the interesting one:
+**3.3x Rust and 3.6x Zig**, and not because the decoder is better. Rust and Zig
+have no LZ4 in their columnar readers, so an LZ4 file falls through to the row
+reader and pays the 3.7x that costs. C decompresses into a buffer the columnar
+path reads from, so the codec is the only thing it adds.
+
+Decompression costs C about 0.63s on this pair, 64% over uncompressed, which is
+more than the 10-19% the row readers pay for the same codecs. That is the same
+arithmetic from the other side: the columnar path is fast enough that a codec is
+a larger share of a smaller number.
+
+Gzip and zstd are refused by name. Their decoders are real programs rather than
+eighty-line loops, and this port carries no dependency.
+
+### The copy loop, paired
+
+Nine interleaved rounds of the same binary with one change -- the match copy
+doing eight bytes at a time where the source is at least eight behind, instead
+of one:
+
+| Codec | Byte loop | Eight at a time | Paired ratio |
+|---|---:|---:|---:|
+| snappy | 1.62s | 1.52s | **0.936** (middle half 0.920-0.950) |
+| lz4 | 1.61s | 1.53s | **0.951** (0.929-0.958) |
+
+6.4% and 4.9%, with the middle half clear of 1.0 in both. Small, and the reason
+it is worth the five lines is that it is free: a match whose distance is at
+least eight reads only bytes already written, so the chunked copy means exactly
+what the byte loop meant. A closer match is a repeating run and stays a byte
+loop.
+
 ## 2026-09-09 (codecs) — what compression costs, and what the fall-through costs
 
 One 4-core / 16 GB container, idle, page cache warm, median of five runs.
@@ -81,7 +129,8 @@ thing that differs.
 | Rust | **1.48s** | 2.29s | 6.49s | 5.20s | 5.37s |
 | Zig | 1.32s | **1.96s** | 7.38s | **13.96s** | 6.11s |
 
-Read that as four numbers and a trap. Rust and Zig take the columnar path for
+C's four refusals are of their time: it reads snappy and LZ4 now, and the entry
+above has those numbers. Read the rest as four numbers and a trap. Rust and Zig take the columnar path for
 uncompressed and snappy and fall through to the row reader for the other three,
 so the 3.5-4x jump at gzip is **not** what gzip costs. It is the fall-through,
 already measured at 3.7x in the entry below.
