@@ -1,0 +1,209 @@
+name: Do parallel benchmark jobs contend?
+
+# An A/A test at the CI level, to settle a question the repository has been
+# answering two different ways.
+#
+# CLAUDE.md's benchmark rule used to say two timing jobs "share a host and
+# measure each other's contention". `scale-ceiling.yml`'s header says "these are
+# separate hosted runners so they do not contend with each other". Both cannot
+# be right, and the answer decides real things: `bench-2m.yml` runs three timing
+# jobs at once on purpose, and the `benchmark-host` group costs a pull request
+# the wait for any benchmark already going. Neither statement had a measurement
+# behind it.
+#
+# So: run the identical benchmark alone, then run it again as one of N identical
+# jobs started together, and compare. `crowd` needs `alone`, so the lone run is
+# genuinely lone. If the crowd's numbers match the lone one, separate hosted
+# runners do not contend and the group is costing latency for nothing. If the
+# crowd is systematically slower, the rule is right and `bench-2m.yml`'s three
+# parallel jobs need rethinking.
+#
+# Read the ratio, not the verdict line: this compares two sittings, which
+# CLAUDE.md warns about, and one runner in the crowd landing on a slow machine
+# is not the same finding as all of them landing slow. The spread across the
+# crowd is printed for that reason.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "Row count for every job"
+        default: "2m"
+      format:
+        description: "One format: csv, ndjson or parquet"
+        default: "csv"
+      repeats:
+        description: "Runs per build inside each job"
+        default: "3"
+      crowd:
+        description: "How many identical jobs to start together"
+        default: "4"
+
+# It has to hold the benchmark lock: a run of this measuring contention while
+# another benchmark contends with it would be measuring the thing it is trying
+# to isolate.
+concurrency:
+  group: benchmark-host
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      crowd: ${{ steps.n.outputs.crowd }}
+    steps:
+      - id: n
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          n = os.environ["CROWD"]
+          if not n.isdigit() or not 2 <= int(n) <= 20:
+              sys.exit(f"crowd must be a number from 2 to 20, got {n!r}")
+          print("crowd=" + json.dumps(list(range(1, int(n) + 1))))
+          PY
+        env:
+          CROWD: ${{ github.event.inputs.crowd }}
+
+  alone:
+    name: alone
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: contention-alone
+      - name: Install Zig
+        run: |
+          pip install ziglang==0.16.0
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+      - run: CXX=clang++ scripts/build_ports.sh c rust zig cpp cpp-gen
+      - name: Measure, with nothing else running
+        run: |
+          echo "runner: $RUNNER_NAME  $(grep -m1 'model name' /proc/cpuinfo)"
+          python3 scripts/bench_formats_ports.py \
+            --rows "${{ github.event.inputs.rows || '2m' }}" \
+            --formats "${{ github.event.inputs.format || 'csv' }}" \
+            --repeats "${{ github.event.inputs.repeats || '3' }}" \
+            --json-out /tmp/alone.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aa-alone-${{ github.run_id }}
+          path: /tmp/alone.json
+
+  crowd:
+    name: "crowd ${{ matrix.n }}"
+    # The lone run must finish before the crowd starts, or it is not lone.
+    needs: [plan, alone]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        n: ${{ fromJSON(needs.plan.outputs.crowd) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: contention-crowd-${{ matrix.n }}
+      - name: Install Zig
+        run: |
+          pip install ziglang==0.16.0
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+      - run: CXX=clang++ scripts/build_ports.sh c rust zig cpp cpp-gen
+      - name: Measure, with the rest of the crowd running
+        run: |
+          echo "runner: $RUNNER_NAME  $(grep -m1 'model name' /proc/cpuinfo)"
+          python3 scripts/bench_formats_ports.py \
+            --rows "${{ github.event.inputs.rows || '2m' }}" \
+            --formats "${{ github.event.inputs.format || 'csv' }}" \
+            --repeats "${{ github.event.inputs.repeats || '3' }}" \
+            --json-out /tmp/crowd.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aa-crowd-${{ matrix.n }}-${{ github.run_id }}
+          path: /tmp/crowd.json
+
+  verdict:
+    name: the answer
+    needs: [alone, crowd]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: aa-*-${{ github.run_id }}
+          path: aa
+      - name: Compare the lone run against the crowd
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, pathlib, statistics
+
+          root = pathlib.Path("aa")
+          lone = list(root.glob("aa-alone-*/alone.json"))
+          crowd = sorted(root.glob("aa-crowd-*/crowd.json"))
+          if not lone or not crowd:
+              print("## Inconclusive\n")
+              print(f"{len(lone)} lone result and {len(crowd)} crowd results: "
+                    "a job failed, so there is nothing to compare.")
+              raise SystemExit(0)
+
+          def by_port(path):
+              d = json.loads(path.read_text())
+              return {(r["port"], r["format"]): r["seconds"]
+                      for r in d["results"] if r.get("seconds")}
+
+          a = by_port(lone[0])
+          runs = [by_port(p) for p in crowd]
+
+          print("## Alone against the crowd\n")
+          print(f"One job by itself, then {len(runs)} identical jobs started together.\n")
+          print("| Build | Alone | Crowd median | Ratio | Crowd spread |")
+          print("|---|---:|---:|---:|---:|")
+          ratios = []
+          for key in sorted(a):
+              got = [r[key] for r in runs if key in r]
+              if not got:
+                  continue
+              med = statistics.median(got)
+              ratio = med / a[key]
+              ratios.append(ratio)
+              spread = f"{min(got):.3f}-{max(got):.3f}s"
+              print(f"| {key[0]} {key[1]} | {a[key]:.3f}s | {med:.3f}s "
+                    f"| {ratio:.2f}x | {spread} |")
+
+          if not ratios:
+              print("\nNo build appears in both, so there is nothing to compare.")
+              raise SystemExit(0)
+
+          overall = statistics.median(ratios)
+          print(f"\n**Median ratio across builds: {overall:.2f}x** "
+                f"(1.00x means the crowd ran no slower than the lone job).\n")
+          # Deliberately not a pass/fail: this compares two sittings, which is
+          # exactly what CLAUDE.md says not to trust blindly. The number is the
+          # finding; what it means is a judgement.
+          if overall >= 1.10:
+              print("The crowd is more than 10% slower. That is what contention "
+                    "looks like, and `benchmark-host` is earning its keep -- "
+                    "`bench-2m.yml`'s three parallel jobs need rethinking.")
+          elif overall <= 1.03:
+              print("The crowd is within 3% of the lone run, which is inside what "
+                    "`bench_ab.sh --self-test` reports for a build against itself "
+                    "on this class of runner. On this evidence separate hosted "
+                    "runners do not contend, and the repository-wide group is "
+                    "costing pull requests latency for nothing.")
+          else:
+              print("Between 3% and 10%: not clean either way. Raise the crowd "
+                    "size or the row count and run it again before concluding.")
+          print("\nCheck the per-job runner lines in the logs before trusting "
+                "this: one crowd job landing on a slow machine is a different "
+                "finding from all of them landing slow, and the spread column "
+                "is there to show which happened.")
+          PY

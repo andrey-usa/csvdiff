@@ -165,6 +165,9 @@ def main(argv: list[str]) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rows", default="1m")
     parser.add_argument("--formats", default="csv,ndjson,parquet")
+    parser.add_argument("--json-out", type=Path, default=None,
+                        help="also write the rows here, unrounded, for a harness "
+                             "that has to compare two runs of this script")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--threads", type=int, default=None,
                         help="threads per run; the default is whatever each port picks")
@@ -257,6 +260,16 @@ def main(argv: list[str]) -> int:
         print(f"| {row['port']} | {row['format']} | {row['seconds']:.2f}s | {rate:,.0f} | "
               f"{row['cpu']:.1f}s | {row['cores']:.2f}x | "
               f"{row['rss']:,.0f} MB | {row['above']:,.0f} MB |")
+
+    # The table rounds seconds to two decimals, which is a couple of per cent at
+    # the sizes this runs at -- fine to read, too coarse to compare two runs
+    # with. The JSON keeps what was measured.
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(
+            {"rows_arg": args.rows, "cores": cores, "results": results},
+            indent=2, sort_keys=True))
+        print(f"\nwrote {args.json_out}")
     return 0
 
 

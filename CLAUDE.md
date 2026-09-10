@@ -29,7 +29,8 @@ python scripts/bench_ports.py data/p_a.csv data/p_b.csv --repeats 5    # every p
 scripts/bench_ab.sh old/csvdiff new/csvdiff -- compare A.csv B.csv -k id   # two builds
 scripts/bench_ab.sh --self-test c/csvdiff -- compare A.csv B.csv -k id    # the harness itself
 scripts/build_ports.sh c cpp rust zig          # the ports at once, not in a row
-gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
+gh workflow run "Benchmark ladder (10M and up)" -f sizes=10m,20m,40m
+gh workflow run "Do parallel benchmark jobs contend?" -f crowd=4   # settles the rule below
 ```
 
 Linux is the only platform anything is *run* on. C, C++ and Zig need POSIX or
@@ -302,7 +303,8 @@ before timing anything.
   to `nproc` at a time and exits non-zero naming each one that failed. **It is worth a lot where
   the work is spread over many independent builds and little where one build dominates**, because
   parallelism cannot shorten the longest single build -- it only stops the others queueing behind
-  it. On the runner, Benchmark 10M's seven builds plus the disk cleanup went 4m56s to 2m13s and
+  it. On the runner, the ten-million-row job's seven builds plus the disk cleanup went 4m56s to
+  2m13s and
   the whole job 7m34s to 4m48s, while `parity`'s four went 48s to 43s: that set is bounded by
   `cargo build --release`, which is most of its time. Size a change here by the *second* longest
   build, not the sum. A local figure taken with a warm cargo cache will overstate it -- that is how
@@ -325,8 +327,9 @@ before timing anything.
   hosted runners so they do not contend with each other". Both cannot be right, and the answer
   decides real things: `bench-2m.yml` runs three timing jobs at once on purpose, and the group
   costs a pull request the wait for any benchmark already going. What would settle it is an A/A
-  test at the CI level — the same benchmark job run alone, then run as one of four identical jobs
-  started together, and the two tables compared. Until somebody runs it, the group stays because
+  test at the CI level, and `bench-contention.yml` is that test: it runs the same benchmark job
+  alone, then as one of N identical jobs started together, and prints the ratio with the crowd's
+  spread beside it. Nobody has dispatched it yet. Until somebody does, the group stays because
   the conservative arrangement is the cheap mistake. Within one workflow, jobs are split so that
   every port-against-port comparison stays inside a single job, which is the part that is true
   either way.
