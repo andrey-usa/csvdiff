@@ -19,6 +19,8 @@ import argparse
 import json
 from pathlib import Path
 
+from mdtable import table
+
 ORDER = ["c", "cpp", "rust", "zig"]
 
 
@@ -52,30 +54,30 @@ def ceiling_tables(rows: list[dict]) -> str:
     out = ["### How far each port got\n",
            "Wall time in seconds. Every rung is its own run on its own runner, so",
            "**failed** is that size failing and says nothing about the ones above",
-           "it -- those were measured too. The reason is under the table.\n",
-           "| Rows | " + " | ".join(ports) + " |",
-           "|---|" + "|".join(["---:"] * len(ports)) + "|"]
+           "it -- those were measured too. The reason is under the table.\n"]
+    grid = []
     for s in sizes:
-        cells = []
+        cells = [s]
         for p in ports:
             r = by.get((p, s))
             if r is None:
-                cells.append("–")
+                cells.append("-")
             elif r.get("ok"):
                 cells.append(f"{r['wall_s']:.2f}s")
             else:
                 cells.append("**failed**")
-        out.append(f"| {s} | " + " | ".join(cells) + " |")
+        grid.append(cells)
+    out += table(["Rows"] + ports, ["l"] + ["r"] * len(ports), grid)
 
-    out += ["", "### The ceiling\n",
-            "| Port | Largest completed | Input at that size | Wall | Peak RSS | Stopped by |",
-            "|---|---:|---:|---:|---:|---|"]
+    out += ["", "### The ceiling\n"]
+    grid = []
     for p in ports:
         mine = [r for r in rows if r["port"] == p]
         ok = [r for r in mine if r.get("ok")]
         bad = [r for r in mine if not r.get("ok")]
         if not ok:
-            out.append(f"| **{p}** | none | – | – | – | {bad[0]['why'] if bad else 'no result'} |")
+            grid.append([f"**{p}**", "none", "-", "-", "-",
+                         bad[0]["why"] if bad else "no result"])
             continue
         best = max(ok, key=lambda r: r["rows"])
         # Which failure is the ceiling depends on where it sits. Rungs are run
@@ -91,8 +93,10 @@ def ceiling_tables(rows: list[dict]) -> str:
         if below:
             stopped += " — but also failed at " + ", ".join(r["size"] for r in below) + \
                        ", under a size that passed"
-        out.append(f"| **{p}** | **{best['size']}** | {best['input_mb']:,.0f} MB | "
-                   f"{best['wall_s']:.2f}s | {best['rss_mb']:,.0f} MB | {stopped} |")
+        grid.append([f"**{p}**", f"**{best['size']}**", f"{best['input_mb']:,.0f} MB",
+                     f"{best['wall_s']:.2f}s", f"{best['rss_mb']:,.0f} MB", stopped])
+    out += table(["Port", "Largest completed", "Input at that size", "Wall", "Peak RSS",
+                  "Stopped by"], ["l", "r", "r", "r", "r", "l"], grid)
     return "\n".join(out) + "\n"
 
 
@@ -104,13 +108,14 @@ def floor_table(rows: list[dict]) -> str:
            "The smallest cgroup limit the same comparison finishes inside. Lower is",
            "better, and it is not the same ordering as speed. Peak RSS would not",
            "answer this: mapped pages are reclaimable, so that figure is whatever the",
-           "kernel allowed, not what the engine needed.\n",
-           "| Port | Size compared | Smallest limit that finishes |",
-           "|---|---|---:|"]
+           "kernel allowed, not what the engine needed.\n"]
+    grid = []
     for r in rows:
         mb = r.get("floor_mb")
-        out.append(f"| **{r.get('port','?')}** | {r.get('size','?')} | "
-                   + (f"**{mb:,} MB** |" if mb else "did not finish |"))
+        grid.append([f"**{r.get('port','?')}**", str(r.get("size", "?")),
+                     f"**{mb:,} MB**" if mb else "did not finish"])
+    out += table(["Port", "Size compared", "Smallest limit that finishes"],
+                 ["l", "l", "r"], grid)
     return "\n".join(out) + "\n"
 
 

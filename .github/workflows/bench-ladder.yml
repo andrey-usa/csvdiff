@@ -176,24 +176,45 @@ jobs:
           fi
           python3 scripts/bench_formats_ports.py \
             --rows "${{ matrix.size }}" --formats "$FORMATS" --repeats "$REPEATS" $scanners \
+            --md-out /tmp/bench.md \
             | tee /tmp/bench.txt
 
+      # The table outside the code fence and the log inside it. They used to go
+      # in together, which meant the markdown table this script prints was
+      # sealed in a ``` block and shown as its own source -- a row of pipes,
+      # never a table. Everything else the script prints is narrative and does
+      # belong in a fence, so the two are published separately rather than the
+      # fence being dropped.
       - name: Publish this rung
         if: always()
         run: |
           {
             echo "## ${{ matrix.size }} rows — $FORMATS"
             echo
+            if [ -s /tmp/bench.md ]; then
+              cat /tmp/bench.md
+            else
+              echo "_This rung produced no table. Its log is below._"
+            fi
+            echo
+            echo "<details><summary>${{ matrix.size }} — full log for this rung</summary>"
+            echo
             echo '```'
-            cat /tmp/bench.txt 2>/dev/null || echo "this rung produced no table"
+            cat /tmp/bench.txt 2>/dev/null || echo "(no output)"
             echo '```'
+            echo
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ladder-${{ matrix.size }}-${{ github.run_id }}
-          path: /tmp/bench.txt
+          # Both: the log for what happened, the table on its own for reading
+          # and for pasting into BENCHMARKS.md.
+          path: |
+            /tmp/bench.txt
+            /tmp/bench.md
           retention-days: 30
 
   collect:
@@ -202,6 +223,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # Before the download, not after: checkout cleans the workspace, so the
+      # other order would delete the rungs it is here to read. This job needs
+      # the tree at all because the table it prints comes from
+      # scripts/mdtable.py, the same renderer every rung used.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: ladder-*-${{ github.run_id }}
@@ -211,13 +238,13 @@ jobs:
       - name: One table for the whole ladder
         run: |
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
-          import json, os, pathlib
+          import json, os, pathlib, sys
           asked = json.loads(os.environ["SIZES"])
           root = pathlib.Path("rungs")
+          sys.path.insert(0, "scripts")
+          from mdtable import render
           print("## The ladder\n")
-          print("| Rows | Outcome |")
-          print("|---|---|")
-          missing = []
+          grid, missing = [], []
           for size in asked:
               # `merge-multiple: false` keeps one directory per rung, named for
               # the artifact, so a rung that uploaded nothing is visibly absent
@@ -225,11 +252,11 @@ jobs:
               hit = list(root.glob(f"ladder-{size}-*/bench.txt"))
               text = hit[0].read_text().strip() if hit else ""
               if text:
-                  print(f"| {size} | reported |")
+                  grid.append([size, "reported"])
               else:
-                  print(f"| {size} | **no table** -- see that rung's log |")
+                  grid.append([size, "**no table** -- see that rung's log"])
                   missing.append(size)
-          print()
+          print(render(["Rows", "Outcome"], ["l", "l"], grid))
           if missing:
               print(f"{len(missing)} of {len(asked)} rungs produced no table: "
                     + ", ".join(missing) + ".")
@@ -245,9 +272,14 @@ jobs:
         run: |
           for f in rungs/ladder-*/bench.txt; do
             [ -s "$f" ] || continue
-            size=$(basename "$(dirname "$f")" | sed 's/^ladder-//; s/-[0-9]*$//')
+            dir=$(dirname "$f")
+            size=$(basename "$dir" | sed 's/^ladder-//; s/-[0-9]*$//')
             {
-              echo "<details><summary>$size rows — full table</summary>"
+              echo "### $size rows"
+              echo
+              # The table renders; the log it came from goes in the fold.
+              [ -s "$dir/bench.md" ] && { cat "$dir/bench.md"; echo; }
+              echo "<details><summary>$size — full log</summary>"
               echo
               echo '```'
               cat "$f"
