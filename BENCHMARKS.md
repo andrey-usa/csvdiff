@@ -111,6 +111,32 @@ lz4**, where Rust's zstd is its *cheapest* codec at 0.96x its lz4. Same files,
 same machine. That is Zig's zstd decoder, not the format, and it is on the open
 list now.
 
+**Answered: it is std's decoder, and the wall time is not ours to take.** Two
+suspects were priced and both came back small. Twenty-five gdb samples of a 1M
+zstd pair land in `compress.zstd.Decompress.readInFrame`, `decodeLiterals`,
+`ReverseBitReader` and `HuffmanTree.query` -- the decode loop itself, not the
+reader around it. Sharing the 8.13 MB window across a column's pages instead of
+allocating one per page is **1.03x cpu and no result on wall**. Sizing the
+decode arena from `total_uncompressed_size` rather than the compressed one --
+short by 17x on this fixture -- measured nothing at all. Two columns and six
+cost the same 0.79s despite 3.2x the bytes, because the columns decode in
+parallel and the critical path is the widest one.
+
+The remaining difference is what the two ports link. Rust's zstd is
+`zstd-sys` -- C libzstd 1.5.7, a decade of hand-tuning -- while Zig's is std's
+pure-Zig decoder in a port that deliberately links no libc. Closing it means
+either giving that up or writing a zstd decoder, so **the wall-clock half of
+this item is closed, not open**. What the investigation did find was a memory
+bug, below.
+
+**A per-page window is invisible on the clock and 3x on the budget.** The same
+1M zstd pair holds 291 MB of live data and needed `--max-memory 4800` to
+finish, against 1600 once a column's pages share one window. This port runs on
+a fixed buffer that hands memory back and cannot reuse it, so 146 pages of
+8.13 MB windows are spent for good -- about 1.2 GB per file. The clock said 3%
+and nearly buried it; the budget is where a per-page allocation shows up in
+this port, and it is the number to check first next time.
+
 ### What this run cannot tell you
 
 The bytes-saved half is unmeasured, and the honest reason is that this host
