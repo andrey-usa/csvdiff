@@ -193,7 +193,8 @@ from its own output rather than from a core dump.
 | Workflow | Trigger | What it does |
 |---|---|---|
 | `ci-rust.yml` | push, PR touching `rust/**` | `cargo fmt --check`, `clippy -D warnings`, `cargo test`, a 10k smoke comparison, a self-contained-report check, and a job asserting all three engines agree on 200k rows |
-| `benchmark-rust.yml` | manual, weekly cron | generates any scale you name and runs any set of engines, one isolated job per (scale, engine), then writes a comparison table and the fastest engine per scale to the job summary |
+| `bench-2m.yml` | PR | two million rows, every native port and every scanner, one job per format — this port's numbers appear beside the other three rather than on their own |
+| `bench-ladder.yml` | manual | the same table at ten million rows and up, one job per size and format |
 
 ## Layout
 
