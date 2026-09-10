@@ -576,7 +576,8 @@ blank row, and a short key in the last bytes of the file.
 | `ci-c.yml` | the C port on gcc and clang, sanitizers, and the cross-port checks |
 | `ci-rust.yml` | `fmt`, `clippy -D warnings`, `cargo test`, and the engines agreeing on 200k rows |
 | `parity.yml` | every port returns identical counts, and every generator emits byte-identical files |
-| `benchmark-native.yml` | C and C++ on every push; all four, and any second ref, on demand |
+| `bench-2m.yml` | two million rows, every port and format, on every pull request |
+| `benchmark-native.yml` | on demand only: one tree, or this tree beside another branch's for an A/B |
 
 The generator carries money in integer cents and applies drift to those
 integers, never to a float, so byte-identity between generators does not depend
