@@ -418,12 +418,20 @@ there, and what it measured before it went, is in [ARCHIVE.md](ARCHIVE.md).
 
 ### Parquet codecs
 
-The Rust port carries **two** Parquet readers, and which one runs matters.
+The Rust and Zig ports each carry **two** Parquet readers, and which one runs
+matters. The table below is Rust's; Zig splits the same way and routes the same
+way, and its report names the reader that ran too.
 
 | | Reads | Speed |
 |---|---|---|
 | the columnar path (`parquet` in the report) | uncompressed and snappy, `BYTE_ARRAY` columns, v1 pages | the fast one — it joins on key columns and compares whole columns without ever building a row |
 | `turbo` (`turbo` in the report) | the above plus gzip, zstd and lz4, other column types, v2 pages | decodes pages into rows; **3.7x** the columnar path's wall time on a pair both can read |
+
+**A codec costs almost nothing; the fall-through costs 3.7x.** Held to one
+reader, snappy is 1.10x an uncompressed run, gzip 1.19x, lz4 1.04x, and zstd
+1.00x while reading 3.82x fewer bytes — so the 3.5-4x a default zstd run shows
+is the routing below, not the decompression. Write zstd. The numbers are in
+[BENCHMARKS.md](BENCHMARKS.md#2026-09-09-codecs--what-compression-costs-and-what-the-fall-through-costs).
 
 By default a Parquet pair goes to the columnar path, and **falls through to
 `turbo` when that path does not read the file** — a codec it does not carry, a
@@ -563,11 +571,18 @@ tests/fixtures/          every shape that has broken an engine here
 3. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
    About 100 MB of index per million rows predicts 10 GB at 100M, which is where
    `sortmerge` stops being the conservative choice and becomes the only one.
-4. **Compression is unmeasured.** Parquet here is generated uncompressed by
-   choice, so no table has ever timed a codec. Three ports could: Rust and Zig
-   read snappy, gzip, zstd and lz4, C++ reads snappy alone, and C carries no
-   codec at all — the same choice its reader makes. What decompression costs
-   against what it saves in bytes read is unmeasured on one host.
+4. **Zig's zstd decoder is 2.3x its own lz4**, where Rust's zstd is its
+   *cheapest* codec — 13.96s against 6.11s on the same 5m-row pair, same
+   machine, both through the row reader. gzip and lz4 are within reach of Rust's;
+   zstd alone is not, so this is the decoder in `zig/src/codec.zig` rather than
+   anything about the format. It is the one number in the codec table that has
+   no explanation yet.
+5. **What compression saves in bytes read is still unmeasured**, though what it
+   *costs* now is. The container these numbers come from cannot answer the other
+   half: `drop_caches` leaves the hypervisor's copy warm, and the one genuine
+   cold read available ran at about 18 MB/s. On a host with a characterisable
+   disk, zstd reading 281 MB where uncompressed reads 1,073 MB is worth whatever
+   that difference costs there.
 
 `--ignore` used to be on this list, accepted in silence in all four ports where
 `--key` and `--compare` refuse. It is an error now in all four — a name that
@@ -576,8 +591,15 @@ carries is real. The check found a `-i x,y,z` against a `z2` column in this
 repository's own C suite, where the counts came out the same either way and
 nothing could see it.
 
-Three things that used to be on this list have been measured off it, and the
-numbers are in [BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
+**Compression has been measured off this list**, and the numbers are in
+[BENCHMARKS.md](BENCHMARKS.md#2026-09-09-codecs--what-compression-costs-and-what-the-fall-through-costs).
+The short answer is that a codec costs between nothing and 19% of wall time with
+the reader held still, and zstd costs nothing measurable while reading 3.82x
+fewer bytes. The 3.5-4x a default run shows for gzip, zstd and lz4 is the
+fall-through to the row reader, not the codec.
+
+Three other things have been measured off it, and those numbers are in
+[BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
 the serial insert (blocked by allocation rather than ordering, and 1.4% of a
 200-column run), ndjson's cost per byte (the format, not a defect — name lookups
 are 12% of a 46% gap), and wide files (throughput flat from 20 columns to 200,
