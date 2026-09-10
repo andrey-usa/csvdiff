@@ -27,6 +27,7 @@
 //   cpp/build/gen-data --rows 10m --out-dir data --format parquet --compression snappy
 
 #include <fcntl.h>
+#include "../src/win32.hpp"   // O_BINARY: a no-op off Windows
 #include <unistd.h>
 
 #include <algorithm>
@@ -461,8 +462,8 @@ int main(int argc, char** argv) {
     const std::string ext = json ? ".ndjson" : ".csv";
     const std::string a_path = out_dir + "/" + prefix + "_a" + ext;
     const std::string b_path = out_dir + "/" + prefix + "_b" + ext;
-    const int fa = ::open(a_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    const int fb = ::open(b_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    const int fa = ::open(a_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
+    const int fb = ::open(b_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fa < 0 || fb < 0) {
         std::fprintf(stderr, "error: cannot create the output files in %s\n", out_dir.c_str());
         return 2;

@@ -3,6 +3,7 @@
 #include "../src/parquet.hpp"
 
 #include <fcntl.h>
+#include "../src/win32.hpp"   // O_BINARY: a no-op off Windows
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -17,7 +18,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string path = argv[1];
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = ::open(path.c_str(), O_RDONLY | O_BINARY);
     struct stat st{};
     if (fd < 0 || ::fstat(fd, &st) != 0) {
         std::fprintf(stderr, "cannot read %s\n", path.c_str());

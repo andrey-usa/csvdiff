@@ -30,7 +30,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "win32.h"   /* O_BINARY off Windows; the mmap shim on it */
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
@@ -194,7 +197,7 @@ typedef struct {
 } Slab;
 
 static bool slab_open(Slab *s, const char *path) {
-    s->fd = open(path, O_RDONLY);
+    s->fd = open(path, O_RDONLY | O_BINARY);
     if (s->fd < 0) return false;
     struct stat st;
     if (fstat(s->fd, &st) != 0) { close(s->fd); return false; }
@@ -1617,7 +1620,7 @@ typedef struct {
 /* Returns the process exit status: 0 identical, 1 differences, 2 error. */
 static int emit(const Summary *s, const char *json_path) {
     if (json_path) {
-        FILE *out = fopen(json_path, "w");
+        FILE *out = fopen(json_path, "wb");
         if (!out) return fail("cannot write the JSON summary");
         fprintf(out,
                 "{\"counts\":{\"a_rows\":%lld,\"b_rows\":%lld,\"a_keys\":%lld,\"b_keys\":%lld,"

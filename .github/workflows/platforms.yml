@@ -10,10 +10,15 @@ name: Platforms
 # platform is worth what the runner that proves it is worth, so every cell in
 # that table should have a job behind it.
 #
-# Windows and the Rust port are not here. `ci-rust.yml` already builds it there,
-# runs its tests, and re-runs the README's own PowerShell lines; a second lane
-# would buy nothing but a queue. What Windows is missing is the other three
-# ports, and that is a port rather than a workflow.
+# Windows is a second job because it is a different build entirely: gcc comes
+# from MSYS2 rather than the image, and the three POSIX suites do not run there
+# yet -- they are written for a POSIX shell and reach for binaries by their
+# extensionless names. `scripts/win_smoke.sh` is what stands in, and it asks the
+# question those suites ask: does this build give the same answers as the Rust
+# port, which has built and been tested on Windows for some time.
+#
+# The Rust port has no lane there because `ci-rust.yml` already builds it,
+# tests it, and re-runs the README's own PowerShell lines.
 #
 # macOS is capped at five concurrent jobs on a free plan, so only one macOS
 # family runs here. Adding the Intel one would double the count and queue.
@@ -134,4 +139,84 @@ jobs:
             echo "| port | runner | arch | result |"
             echo "| --- | --- | --- | --- |"
             echo "| ${{ matrix.port }} | ${{ matrix.os }} | $(uname -m) | $mark |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: "${{ matrix.port }} on windows"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        port: [c, cpp, zig]
+        include:
+          # MSYS2's bash for the two Makefile ports, so `make`, `uname` and the
+          # shell script all come from one place. The Zig port needs none of it.
+          - { port: c,   shell: "msys2 {0}" }
+          - { port: cpp, shell: "msys2 {0}" }
+          - { port: zig, shell: "bash" }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        if: matrix.port != 'zig'
+        with:
+          msystem: MINGW64
+          # `inherit` keeps the Windows PATH, which is where cargo and python
+          # are: this job needs both alongside gcc.
+          path-type: inherit
+          update: false
+          install: mingw-w64-x86_64-gcc make
+
+      # The oracle. Every check below is this port's answer against the Rust
+      # port's on the same file, so it is built first and on every lane.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: What this runner is
+        run: |
+          echo "arch=$(uname -m 2>/dev/null || echo x86_64)"
+          case "${{ matrix.port }}" in
+            c)    gcc --version | head -1 ;;
+            cpp)  g++ --version | head -1 ;;
+            zig)  python -m ziglang version ;;
+          esac
+          rustc --version
+
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        run: pip install ziglang==0.16.0
+
+      - name: Build the Rust port
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      # CC and CXX by name: MSYS2 ships `gcc` and `g++`, and the Makefiles'
+      # defaults (`cc`, `c++`) are not there.
+      - name: Build
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          case "${{ matrix.port }}" in
+            c)    make -C c && make -C c gen-data ;;
+            cpp)  make -C cpp && make -C cpp gen-data ;;
+            zig)  (cd zig && python -m ziglang build --release=fast) ;;
+          esac
+
+      - name: Same answers as the Rust port
+        run: bash scripts/win_smoke.sh ${{ matrix.port }}
+
+      - name: Say so
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = success ]; then mark='builds and agrees with rust'; else mark='**FAILED**'; fi
+          {
+            echo "| port | runner | arch | result |"
+            echo "| --- | --- | --- | --- |"
+            echo "| ${{ matrix.port }} | windows-latest | x86_64 | $mark |"
           } >> "$GITHUB_STEP_SUMMARY"

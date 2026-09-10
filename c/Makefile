@@ -20,13 +20,29 @@
 # at all. Asking the compiler whether it takes the flag costs one preprocessor
 # run at configure time and means the Makefile does not have to know which
 # compiler on which architecture it is talking to.
+#
+# On Windows two things change and nothing else does. gcc appends `.exe` whether
+# or not it is asked, so a target named `csvdiff` would never appear to be built
+# and make would relink on every run -- hence $(EXE). And `-pthread` goes: this
+# port's threads are CreateThread there (see the top of parallel.c), so linking
+# winpthreads would add a DLL to the binary for nothing.
 CC     ?= cc
+ifeq ($(OS),Windows_NT)
+EXE     := .exe
+endif
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(shell uname -s 2>/dev/null)))
+EXE     := .exe
+endif
+ifeq ($(EXE),)
+PTHREAD := -pthread
+endif
 NATIVE_QUIRK := $(shell $(CC) -Werror -Wno-invalid-feature-combination -E - </dev/null >/dev/null 2>&1 \
                     && echo -Wno-invalid-feature-combination)
 NATIVE_ARCH  := $(shell $(CC) -march=native -E - </dev/null >/dev/null 2>&1 && echo -march=native)
-CFLAGS ?= -std=c11 -O2 $(NATIVE_ARCH) -Wall -Wextra -Werror -pthread $(NATIVE_QUIRK)
-LDFLAGS ?= -pthread
-BIN     = csvdiff
+CFLAGS ?= -std=c11 -O2 $(NATIVE_ARCH) -Wall -Wextra -Werror $(PTHREAD) $(NATIVE_QUIRK)
+LDFLAGS ?= $(PTHREAD)
+BIN     = csvdiff$(EXE)
+GENBIN  = gen-data$(EXE)
 # Two programs live here, each with its own main, so the sources are named
 # rather than globbed. `c/*.c` would put both mains in one link -- which is
 # exactly how CI broke when the generator arrived.
@@ -34,30 +50,39 @@ ENGINE  = csvdiff.c parquet.c pqdiff.c parallel.c
 GEN     = gen-data.c pqwrite.c parallel.c
 OBJ     = csvdiff.o parquet.o pqdiff.o parallel.o
 
-all: $(BIN) gen-data
+all: $(BIN) $(GENBIN)
 
 $(BIN): $(OBJ)
 	$(CC) $(CFLAGS) -o $@ $(OBJ) $(LDFLAGS)
 
-csvdiff.o:  csvdiff.c pqdiff.h parquet.h parallel.h
+csvdiff.o:  csvdiff.c pqdiff.h parquet.h parallel.h win32.h
 parquet.o:  parquet.c parquet.h
-pqdiff.o:   pqdiff.c pqdiff.h parquet.h parallel.h
+pqdiff.o:   pqdiff.c pqdiff.h parquet.h parallel.h win32.h
 parallel.o: parallel.c parallel.h
 
 # The generator writes this port's own fixtures and benchmark inputs, byte for
 # byte the same files the other generators write. Having it here is what lets a
 # check run without a second toolchain built first.
-gen-data: $(GEN) pqwrite.h parallel.h
+$(GENBIN): $(GEN) pqwrite.h parallel.h win32.h
 	$(CC) $(CFLAGS) -o $@ $(GEN)
+
+# `make gen-data` is what every script and workflow here asks for by name. Off
+# Windows that already is the file; on Windows the file is `gen-data.exe`, so
+# the plain name becomes an alias for it -- and only there, because defining it
+# where the two names are the same is a rule that depends on itself.
+ifneq ($(EXE),)
+gen-data: $(GENBIN)
+.PHONY: gen-data
+endif
 
 # The engine under AddressSanitizer and UndefinedBehaviorSanitizer. It is a
 # target rather than a command in the workflow so that the source list has one
 # home: a second copy in CI is a copy that goes stale, and did.
 asan: $(ENGINE)
-	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra -pthread \
+	$(CC) -std=c11 -O1 -g -fsanitize=address,undefined -Wall -Wextra $(PTHREAD) \
 	    $(NATIVE_QUIRK) -o csvdiff-asan $(ENGINE)
 
 clean:
-	rm -f $(BIN) gen-data csvdiff-asan $(OBJ)
+	rm -f $(BIN) $(GENBIN) csvdiff-asan $(OBJ)
 
 .PHONY: all asan clean

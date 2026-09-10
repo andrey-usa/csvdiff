@@ -1,7 +1,10 @@
 #include "pqdiff.hpp"
 
 #include <fcntl.h>
+#include "win32.hpp"   // O_BINARY off Windows; the mmap shim on it
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -37,7 +40,7 @@ namespace {
 class Map {
   public:
     explicit Map(const std::string& path) {
-        fd_ = ::open(path.c_str(), O_RDONLY);
+        fd_ = ::open(path.c_str(), O_RDONLY | O_BINARY);
         if (fd_ < 0) throw Error("cannot read " + path);
         struct stat st{};
         if (::fstat(fd_, &st) != 0) {
@@ -578,7 +581,7 @@ class Phases {
 }  // namespace
 
 bool is_parquet(const std::string& path) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    const int fd = ::open(path.c_str(), O_RDONLY | O_BINARY);
     if (fd < 0) return false;
     char magic[4] = {0, 0, 0, 0};
     const ssize_t got = ::read(fd, magic, 4);

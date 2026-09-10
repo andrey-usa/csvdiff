@@ -2,7 +2,10 @@
 #include "pqdiff.hpp"
 
 #include <fcntl.h>
+#include "win32.hpp"   // O_BINARY off Windows; the mmap shim on it
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -211,7 +214,7 @@ enum class Dialect { Csv, Json };
 class Slab {
   public:
     explicit Slab(const std::string& path) {
-        fd_ = ::open(path.c_str(), O_RDONLY);
+        fd_ = ::open(path.c_str(), O_RDONLY | O_BINARY);
         if (fd_ < 0) throw Error("cannot read " + path);
         struct stat st{};
         if (::fstat(fd_, &st) != 0) {

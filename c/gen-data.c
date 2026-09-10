@@ -375,7 +375,7 @@ static int write_text(const char *path, bool b, int64_t rows, int64_t seed, bool
      * one of them cost a reader their first command. errno is captured at the
      * point of failure, because the free/fclose on the way out would clobber
      * it. */
-    FILE *fh = fopen(path, "w");
+    FILE *fh = fopen(path, "wb");
     if (!fh) return -errno;
     if (!json && fputs(CSV_HEADER, fh) < 0) { const int e = errno; fclose(fh); return -e; }
 
