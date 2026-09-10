@@ -299,8 +299,14 @@ before timing anything.
   report "no controller" on exactly the host worth measuring.
 - **The ports build in parallel, and they cannot move to a job of their own.** Every workflow
   that needs more than one port calls `scripts/build_ports.sh` with target names; it runs them up
-  to `nproc` at a time and exits non-zero naming each one that failed. Measured from clean on four
-  cores, `cpp cpp-gen cpp-scanners zig zig-v32` is 149s in a row and 35s at once. The obvious next
+  to `nproc` at a time and exits non-zero naming each one that failed. **It is worth a lot where
+  the work is spread over many independent builds and little where one build dominates**, because
+  parallelism cannot shorten the longest single build -- it only stops the others queueing behind
+  it. On the runner, Benchmark 10M's seven builds plus the disk cleanup went 4m56s to 2m13s and
+  the whole job 7m34s to 4m48s, while `parity`'s four went 48s to 43s: that set is bounded by
+  `cargo build --release`, which is most of its time. Size a change here by the *second* longest
+  build, not the sum. A local figure taken with a warm cargo cache will overstate it -- that is how
+  parity's got written up as 4x. The obvious next
   step -- build on one runner, upload the binaries, measure on another -- **does not work here**:
   both Makefiles compile with `-march=native` and the Zig scanner builds use `-Dcpu=native`, and
   the hosted fleet is not uniform. The workflows already branch on `grep avx512bw /proc/cpuinfo`
