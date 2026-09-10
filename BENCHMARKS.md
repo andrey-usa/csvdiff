@@ -73,6 +73,67 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (build flags) — the Rust column was compiled for a different machine
+
+A defect in the instrument, found while looking at why one port always seemed to
+trail. Every table produced through `scripts/build_ports.sh` — which is what
+`bench-2m`, `bench-ladder`, `bench-contention`, `formats` and `parity` all use,
+so every table a pull request has ever shown — built the Rust port for baseline
+x86-64 while building C and C++ for the runner.
+
+Not inferred from timings. From `rustc` itself, on the host that runs these:
+
+```
+$ rustc --print cfg | grep target_feature
+target_feature="fxsr"  target_feature="sse"  target_feature="sse2"
+
+$ rustc --print cfg -C target-cpu=native | grep target_feature
+... avx, avx2, avx512bw, avx512f, avx512vl, bmi1, bmi2, f16c, fma ...
+```
+
+Both Makefiles probe for and add `-march=native`, and Zig's default target is
+already the host — a `-Dcpu=native` build is byte-identical to one without, which
+is why that flag was never missed. Rust was the one port whose default is
+baseline, and nothing in `build_ports.sh` supplied otherwise. So the cross-port
+rows compared an SSE2 build against an AVX-512 one.
+
+This contradicts what both documents say. README.md and the note above the
+10m joint table below both state that every port is compiled for the runner, and
+`benchmark-native.yml` does set `RUSTFLAGS` by hand — so the tables *that*
+workflow produced are sound. The workflows that build through the shared script
+never set it, and those are the ones that run on a pull request.
+
+**What it was worth is not established.** Two interleaved passes on the same
+1m-row CSV pair, same host, same binaries:
+
+| pass | rounds | Rust (baseline) | Rust (native) |
+|---|---:|---:|---:|
+| first | 7 | 0.53s median | 0.46s median |
+| second | 9 | 0.53s median | 0.51s median |
+
+Native is ahead in both and behind in neither, but 13% and 4% are not the same
+answer and the second pass's ranges overlap. The reason to fix this is not a
+speed number — it is that a table comparing four ports has to compile them the
+same way to mean anything.
+
+Fixed in `build_ports.sh` rather than in the six workflows, so it cannot be
+forgotten again by the seventh. The flag carries the *resolved* CPU name rather
+than the literal `native`, because cargo fingerprints on the RUSTFLAGS text:
+spelled `native` the string matches across hosts, and a `rust/target` restored
+from another machine's cache would be handed back as-is — a binary using
+instructions the running host may not have, on a runner fleet that mixes CPUs.
+
+### And the build timings in those logs were wrong too
+
+`build_ports.sh` reported each target's duration as `SECONDS - started` computed
+in the join loop. The loop joins in order and blocks on each `wait`, so a target
+that finished early but sat behind a slow one was charged the wait as well. One
+CI run reported `zig (108s)` and `cpp (108s)` beside `cpp-gen (105s)` when the
+whole script took 123s — and `cpp-gen` had not started until a slot freed, so its
+own build cannot have taken 105s. Everything looked as slow as the slowest thing
+in front of it, which is the one reading that makes a parallel build script
+useless for deciding what to speed up. Each target times itself now.
+
 ## 2026-09-10 (measurement) — what this host cannot tell you about phases
 
 A negative result about the instrument rather than the code, recorded because it
