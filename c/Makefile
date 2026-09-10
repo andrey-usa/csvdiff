@@ -14,10 +14,17 @@
 # the port stops compiling when a cloud provider refreshes its fleet. The
 # warning is suppressed if the compiler in use knows the flag, and left alone if
 # it does not, so this stays quiet on gcc and on older clangs.
+#
+# `-march=native` is itself probed, for the same reason and a different host:
+# Apple clang on arm64 rejects the flag outright, so a Mac could not build this
+# at all. Asking the compiler whether it takes the flag costs one preprocessor
+# run at configure time and means the Makefile does not have to know which
+# compiler on which architecture it is talking to.
 CC     ?= cc
 NATIVE_QUIRK := $(shell $(CC) -Werror -Wno-invalid-feature-combination -E - </dev/null >/dev/null 2>&1 \
                     && echo -Wno-invalid-feature-combination)
-CFLAGS ?= -std=c11 -O2 -march=native -Wall -Wextra -Werror -pthread $(NATIVE_QUIRK)
+NATIVE_ARCH  := $(shell $(CC) -march=native -E - </dev/null >/dev/null 2>&1 && echo -march=native)
+CFLAGS ?= -std=c11 -O2 $(NATIVE_ARCH) -Wall -Wextra -Werror -pthread $(NATIVE_QUIRK)
 LDFLAGS ?= -pthread
 BIN     = csvdiff
 # Two programs live here, each with its own main, so the sources are named

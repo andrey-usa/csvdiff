@@ -1,0 +1,137 @@
+name: Platforms
+
+# Where each port actually builds and passes its own suite, on every runner
+# family GitHub offers. A status board rather than a gate.
+#
+# The README has a "What runs where" table, and the story it tells against
+# itself is why this file exists: the Rust row once said "native" on Windows on
+# the strength of a grep for `std::os::unix` that could not see inside a
+# dependency, and a reader hit the failure within the hour. A claim about a
+# platform is worth what the runner that proves it is worth, so every cell in
+# that table should have a job behind it.
+#
+# Windows and the Rust port are not here. `ci-rust.yml` already builds it there,
+# runs its tests, and re-runs the README's own PowerShell lines; a second lane
+# would buy nothing but a queue. What Windows is missing is the other three
+# ports, and that is a port rather than a workflow.
+#
+# macOS is capped at five concurrent jobs on a free plan, so only one macOS
+# family runs here. Adding the Intel one would double the count and queue.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "c/**"
+      - "cpp/**"
+      - "zig/**"
+      - "rust/src/**"
+      - "rust/Cargo.toml"
+      - ".github/workflows/platforms.yml"
+  schedule:
+    # Weekly, because the thing this catches is a runner image changing under
+    # a claim that used to be true.
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: platforms-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "${{ matrix.port }} on ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        port: [c, cpp, rust, zig]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # Every port but C++ needs the Rust one: `zig/test.sh` and `c/test.sh`
+      # hold their answers against it rather than against a golden file, which
+      # is the whole reason four ports are worth having.
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.port != 'cpp'
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.port != 'cpp'
+        with:
+          workspaces: rust
+
+      # Zig comes from PyPI rather than ziglang.org: it is the same release, and
+      # it needs no network beyond the one the runner already trusts. The shim
+      # goes on PATH rather than into /usr/local/bin the way the Linux-only
+      # workflows do it -- `sudo` is not a given on every runner family, and
+      # `zig/test.sh` looks for a plain `zig`.
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        run: |
+          pip3 install --break-system-packages ziglang==0.16.0 || pip3 install ziglang==0.16.0
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' > "$HOME/.local/bin/zig"
+          chmod +x "$HOME/.local/bin/zig"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: What this runner is
+        run: |
+          echo "os=${{ matrix.os }}  arch=$(uname -m)  cores=$(getconf _NPROCESSORS_ONLN)"
+          case "${{ matrix.port }}" in
+            c)    ${CC:-cc} --version | head -1 ;;
+            cpp)  ${CXX:-c++} --version | head -1 ;;
+            rust) rustc --version ;;
+            zig)  zig version ;;
+          esac
+
+      # The Rust port at default features -- it has no optional ones, and the
+      # binaries the other suites reach for (`csvdiff`, `gen-data`) both come
+      # out of this one build.
+      - name: Build the Rust port
+        if: matrix.port != 'cpp'
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - name: Build
+        run: |
+          case "${{ matrix.port }}" in
+            c)    make -C c && make -C c gen-data ;;
+            cpp)  make -C cpp && make -C cpp gen-data ;;
+            zig)  (cd zig && zig build --release=fast) ;;
+            rust) : ;;   # built above
+          esac
+
+      # Building is not the claim -- running is. A port that compiles and then
+      # answers wrongly on a new platform is worse than one that does not
+      # compile, because only the second kind announces itself.
+      #
+      # The Zig suite's Parquet checks write their fixtures with
+      # `cpp/build/gen-data`, and skip themselves by name when it is absent.
+      # It is two files and a few seconds, so build it and let them run.
+      - name: Build cpp gen-data for the Zig suite
+        if: matrix.port == 'zig'
+        run: make -C cpp gen-data
+
+      - name: Test
+        run: |
+          case "${{ matrix.port }}" in
+            c)    (cd c   && ./test.sh) ;;
+            cpp)  (cd cpp && ./test.sh) ;;
+            zig)  (cd zig && ./test.sh) ;;
+            rust) cargo test --release --manifest-path rust/Cargo.toml ;;
+          esac
+
+      - name: Say so
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = success ]; then mark='builds and passes'; else mark='**FAILED**'; fi
+          {
+            echo "| port | runner | arch | result |"
+            echo "| --- | --- | --- | --- |"
+            echo "| ${{ matrix.port }} | ${{ matrix.os }} | $(uname -m) | $mark |"
+          } >> "$GITHUB_STEP_SUMMARY"

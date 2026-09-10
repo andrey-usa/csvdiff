@@ -1,6 +1,7 @@
 # Two compilers, because the point of this port is to be the reference an
-# ordinary C++ programmer would write and check against.
-CXX      ?= g++
+# ordinary C++ programmer would write and check against. The default is the
+# generic name rather than `g++`: on a Mac `g++` is a shim for Apple clang when
+# it exists at all, and `c++` is the name every one of them answers to.
 # `-Wno-invalid-feature-combination` is not a style choice: GitHub has begun
 # rolling out runners whose CPUs advertise AVX10.1, and on those `-march=native`
 # makes clang warn that `+avx10.1-256` will be promoted to `avx10.1-512`. Under
@@ -8,8 +9,16 @@ CXX      ?= g++
 # runners and passing on others depending which machine it landed on. The
 # promotion is harmless -- it is clang telling us what it decided, not a problem
 # with the code -- and every other warning stays fatal.
-CXXFLAGS ?= -std=c++20 -O2 -march=native -Wall -Wextra -Wpedantic -Werror \
-            -Wno-invalid-feature-combination -pthread
+# Both flags are probed rather than assumed, the same way the C Makefile does it.
+# `-Wno-invalid-feature-combination` is a clang spelling that gcc does not know,
+# and `-march=native` is rejected outright by Apple clang on arm64 -- so hard
+# coding either one means a host that cannot build this at all.
+CXX      ?= c++
+NATIVE_QUIRK := $(shell $(CXX) -Werror -Wno-invalid-feature-combination -E -x c++ - </dev/null >/dev/null 2>&1 \
+                    && echo -Wno-invalid-feature-combination)
+NATIVE_ARCH  := $(shell $(CXX) -march=native -E -x c++ - </dev/null >/dev/null 2>&1 && echo -march=native)
+CXXFLAGS ?= -std=c++20 -O2 $(NATIVE_ARCH) -Wall -Wextra -Wpedantic -Werror \
+            $(NATIVE_QUIRK) -pthread
 SRC       = src/csvdiff.cpp src/pqdiff.cpp src/parquet.cpp src/json.cpp src/main.cpp
 BIN       = build/csvdiff
 GEN       = build/gen-data
