@@ -1,0 +1,248 @@
+name: Scale ceiling
+
+# How many rows each port can compare on one GitHub-hosted runner before it
+# stops, and how little memory each one needs to finish the same work.
+#
+# Two questions, and they are not the same question. The first is a ceiling:
+# walk a ladder of sizes until something fails, and report what stopped it. The
+# second is a floor: fix the size and lower a cgroup limit until the run is
+# killed. A port can lead on one and trail on the other, which is the reason
+# both tables are here rather than one.
+#
+# One port per runner, on purpose. The ladder is larger than any single runner's
+# disk -- fifty million rows of CSV is 18.4 GB of input for one pair -- so the
+# sizes are done one at a time and each pair is deleted after its runs. Putting
+# four ports on one runner would mean four ports sharing that disk and one of
+# them running out because of another's leftovers. Separate jobs also mean a
+# port that dies at 40m does not take the rest of the table with it.
+#
+# Peak RSS is reported but is not the memory answer. An engine that maps its
+# input has reclaimable pages, so its RSS is whatever the kernel let it keep
+# rather than what it needed. The floor job is the one that answers that, by
+# taking the memory away until the run dies.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: "Ladder, climbed until one fails (comma separated)"
+        default: "10m,20m,30m,40m,50m,60m"
+      floor_size:
+        description: "Size the memory floor is searched at"
+        default: "10m"
+      floor_hi:
+        description: "Memory-floor search: a limit in MB expected to pass"
+        default: "8192"
+      repeats:
+        description: "Runs per size; the best is kept"
+        default: "1"
+
+# The repository's rule is one benchmark at a time: two timing jobs on one host
+# measure each other's contention. These are separate hosted runners so they do
+# not contend with each other, but they should still not overlap another run of
+# themselves.
+concurrency:
+  group: scale-ceiling
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ceiling:
+    name: "ceiling: ${{ matrix.port }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false          # a port that dies at 40m is a result, not a reason to stop
+      matrix:
+        port: [c, cpp, rust, zig]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ladder needs every gigabyte: 60m rows of CSV is 22 GB for one pair,
+      # and the runner ships with about 25 GB of toolchains this job never uses.
+      - name: Free disk space
+        run: |
+          before=$(df --output=avail -m / | tail -1)
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          after=$(df --output=avail -m / | tail -1)
+          echo "freed $(( (after - before) / 1024 )) GB, $(( after / 1024 )) GB now available"
+
+      - name: What this runner is
+        run: |
+          {
+            echo "### ${{ matrix.port }}"
+            echo
+            echo '```'
+            grep -m1 "model name" /proc/cpuinfo
+            echo "cores: $(nproc)"
+            free -g | head -2
+            df -h / | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.port == 'rust'
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.port == 'rust'
+        with:
+          workspaces: rust
+
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        run: |
+          pip install ziglang==0.16.0
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+          zig version
+
+      # The C generator regardless of which port is measured: every generator
+      # emits byte-identical files, and this one is the fastest and needs only a
+      # compiler.
+      - name: Build
+        run: |
+          make -C c gen-data
+          case "${{ matrix.port }}" in
+            c)    make -C c ;;
+            cpp)  CXX=clang++ make -C cpp ;;
+            rust) cargo build --release --manifest-path rust/Cargo.toml ;;
+            zig)  (cd zig && zig build --release=fast) ;;
+          esac
+
+      - name: Climb the ladder
+        run: |
+          case "${{ matrix.port }}" in
+            c)    BIN=c/csvdiff ;;
+            cpp)  BIN=cpp/build/csvdiff ;;
+            rust) BIN=rust/target/release/csvdiff ;;
+            zig)  BIN=zig/zig-out/bin/csvdiff ;;
+          esac
+          mkdir -p out
+          python3 scripts/bench_scale.py \
+              --binary "$BIN" --label "${{ matrix.port }}" \
+              --sizes "${{ inputs.sizes }}" \
+              --repeats "${{ inputs.repeats }}" \
+              --threads "$(nproc)" \
+              --stop-on-fail \
+              --data-dir "$RUNNER_TEMP/scale" \
+              --json-out "out/ceiling-${{ matrix.port }}.json" \
+              2>&1 | tee "out/ceiling-${{ matrix.port }}.txt"
+
+      - name: This port's ladder, in the summary
+        if: always()
+        run: |
+          {
+            echo "<details><summary>${{ matrix.port }} — full ladder output</summary>"
+            echo
+            echo '```'
+            cat "out/ceiling-${{ matrix.port }}.txt" 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ceiling-${{ matrix.port }}
+          path: out/
+
+  floor:
+    name: "floor: ${{ matrix.port }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        port: [c, cpp, rust, zig]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h / | tail -1
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.port == 'rust'
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.port == 'rust'
+        with:
+          workspaces: rust
+
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        run: |
+          pip install ziglang==0.16.0
+          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
+          sudo chmod +x /usr/local/bin/zig
+
+      - name: Build
+        run: |
+          make -C c gen-data
+          case "${{ matrix.port }}" in
+            c)    make -C c ;;
+            cpp)  CXX=clang++ make -C cpp ;;
+            rust) cargo build --release --manifest-path rust/Cargo.toml ;;
+            zig)  (cd zig && zig build --release=fast) ;;
+          esac
+
+      - name: Take the memory away
+        run: |
+          case "${{ matrix.port }}" in
+            c)    BIN=c/csvdiff ;;
+            cpp)  BIN=cpp/build/csvdiff ;;
+            rust) BIN=rust/target/release/csvdiff ;;
+            zig)  BIN=zig/zig-out/bin/csvdiff ;;
+          esac
+          D="$RUNNER_TEMP/floor"; mkdir -p "$D" out
+          c/gen-data --rows "${{ inputs.floor_size }}" --out-dir "$D" --prefix f
+          # sudo, because writing a cgroup limit needs root; -E to keep the
+          # search bounds and the JSON destination.
+          sudo -E env \
+              CSVDIFF_FLOOR_HI="${{ inputs.floor_hi }}" \
+              CSVDIFF_FLOOR_LO=32 \
+              CSVDIFF_FLOOR_JSON="$RUNNER_TEMP/floor-raw-${{ matrix.port }}.json" \
+              scripts/memory_floor.sh "$PWD/$BIN" compare \
+                  "$D/f_a.csv" "$D/f_b.csv" -k account_id,txn_id -i updated_at \
+              2>&1 | tee "out/floor-${{ matrix.port }}.txt"
+          # The raw file knows the limit; the port and the size are this job's.
+          python3 scripts/floor_record.py \
+              --raw "$RUNNER_TEMP/floor-raw-${{ matrix.port }}.json" \
+              --port "${{ matrix.port }}" \
+              --size "${{ inputs.floor_size }}" \
+              --out "out/floor-${{ matrix.port }}.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: floor-${{ matrix.port }}
+          path: out/
+
+  collect:
+    name: the two tables
+    needs: [ceiling, floor]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - name: Merge
+        run: |
+          python3 scripts/scale_report.py \
+              --ceiling results/ceiling-*/ceiling-*.json \
+              --floor results/floor-*/floor-*.json \
+              --title "Scale ceiling — ${{ inputs.sizes }}, floor at ${{ inputs.floor_size }}" \
+              --out scale-report.md
+          cat scale-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scale-report
+          path: scale-report.md
