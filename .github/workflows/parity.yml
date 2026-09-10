@@ -14,14 +14,31 @@ name: Cross-language parity
 
 on:
   push:
-    branches: [main, "claude/**"]
+    # `main` only. Every branch here gets a pull request, and a branch listed
+    # beside it means each push runs this workflow twice on the same SHA -- once
+    # for the push, once for the pull_request -- which the per-ref concurrency
+    # group cannot collapse, because a push is `refs/heads/...` and a pull
+    # request is `refs/pull/N/merge`. Two different groups, two full runs. The
+    # `pull_request` trigger below covers the branch; this one covers what
+    # landed.
+    branches: [main]
     paths:
       - "c/**"
       - "cpp/**"
       - "rust/src/**"
       - "zig/src/**"
       - ".github/workflows/parity.yml"
+  # The same paths as the push above. This used to be a bare `pull_request:`,
+  # which meant every pull request built all four ports to compare them --
+  # including one that changed only CLAUDE.md, which spent 2m11s proving that
+  # documentation does not affect the counts.
   pull_request:
+    paths:
+      - "c/**"
+      - "cpp/**"
+      - "rust/src/**"
+      - "zig/src/**"
+      - ".github/workflows/parity.yml"
   workflow_dispatch:
 
 concurrency:

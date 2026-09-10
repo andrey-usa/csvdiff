@@ -14,7 +14,14 @@ name: CI (C)
 
 on:
   push:
-    branches: [main, "claude/**"]
+    # `main` only. Every branch here gets a pull request, and a branch listed
+    # beside it means each push runs this workflow twice on the same SHA -- once
+    # for the push, once for the pull_request -- which the per-ref concurrency
+    # group cannot collapse, because a push is `refs/heads/...` and a pull
+    # request is `refs/pull/N/merge`. Two different groups, two full runs. The
+    # `pull_request` trigger below covers the branch; this one covers what
+    # landed.
+    branches: [main]
     # `scripts/**`, not just the one harness: the shell-syntax step below covers
     # every script here, and a gate that does not fire on the file it guards is
     # not a gate.

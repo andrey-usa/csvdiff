@@ -6,7 +6,14 @@ name: CI (Rust)
 # only a local `cargo test` behind it.
 on:
   push:
-    branches: [main, "claude/**"]
+    # `main` only. Every branch here gets a pull request, and a branch listed
+    # beside it means each push runs this workflow twice on the same SHA -- once
+    # for the push, once for the pull_request -- which the per-ref concurrency
+    # group cannot collapse, because a push is `refs/heads/...` and a pull
+    # request is `refs/pull/N/merge`. Two different groups, two full runs. The
+    # `pull_request` trigger below covers the branch; this one covers what
+    # landed.
+    branches: [main]
     paths: ["rust/**", ".github/workflows/ci-rust.yml"]
   pull_request:
     paths: ["rust/**", ".github/workflows/ci-rust.yml"]
