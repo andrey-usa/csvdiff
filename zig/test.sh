@@ -16,7 +16,11 @@ fail=0
 # agree on, with the thousands separators, the engine label and the timing
 # stripped -- the label is `parquet` on a Parquet pair and `turbo` otherwise,
 # and only one of the two ports prints a time after it.
-answer() { sed 's/ | \(turbo\|parquet\).*//; s/,//g' ; }
+# `sed -E`, not the BRE spelling: BSD sed -- which is the sed on a Mac --
+# does not read `\|` as alternation, so the substitution silently matched
+# nothing there and every comparison failed on the engine label and the
+# timing after it. ERE is the one dialect both seds agree on.
+answer() { sed -E 's/ \| (turbo|parquet).*//; s/,//g' ; }
 
 check() {
   local label=$1 a=$2 b=$3; shift 3

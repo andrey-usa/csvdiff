@@ -48,7 +48,11 @@ trap 'rm -rf "$tmp"' EXIT
 # The engine label and the time after it differ by port and by run, and the Rust
 # port groups its digits where the others do not. Same normalisation the three
 # suites use.
-summary() { head -1 | sed 's/ | \(turbo\|parquet\).*//; s/,//g'; }
+# `sed -E`, not the BRE spelling: BSD sed -- which is the sed on a Mac --
+# does not read `\|` as alternation, so the substitution silently matched
+# nothing there and every comparison failed on the engine label and the
+# timing after it. ERE is the one dialect both seds agree on.
+summary() { head -1 | sed -E 's/ \| (turbo|parquet).*//; s/,//g'; }
 
 echo "generator bytes, $port against rust:"
 if [ "$GEN" = "$RGEN" ]; then

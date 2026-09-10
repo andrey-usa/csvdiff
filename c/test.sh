@@ -30,7 +30,11 @@ fail=0
 # The engine label and the time after it differ by port and by run, and the Rust
 # port groups its digits where this one does not -- which stays invisible until a
 # fixture passes a thousand rows, and then reads as a disagreement about counts.
-summary() { head -1 | sed 's/ | \(turbo\|parquet\).*//; s/,//g'; }
+# `sed -E`, not the BRE spelling: BSD sed -- which is the sed on a Mac --
+# does not read `\|` as alternation, so the substitution silently matched
+# nothing there and every comparison failed on the engine label and the
+# timing after it. ERE is the one dialect both seds agree on.
+summary() { head -1 | sed -E 's/ \| (turbo|parquet).*//; s/,//g'; }
 
 check() { # label, then the flags both are given
   local label=$1; shift
