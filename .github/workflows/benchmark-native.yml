@@ -34,20 +34,22 @@ on:
   # the `benchmark-host` group, so the second waited for the first and a
   # reviewer waited for both.
   #
-  # What is left here is what `bench-2m.yml` does not do: the run on `main`
-  # after a merge, and `alt_ref` on request, which builds another branch's Rust
-  # and Zig beside this one's for a side-by-side table.
-  push:
-    # main only: what landed is worth a number, and nothing is racing it there.
-    branches: [main]
-    paths:
-      - "c/**"
-      - "cpp/src/**"
-      - "cpp/Makefile"
-      - "rust/src/**"
-      - "zig/src/**"
-      - "scripts/bench_ports.py"
-      - ".github/workflows/benchmark-native.yml"
+  # The push trigger is gone too, and with it the last automatic run. It fired
+  # on every merge to `main` and re-measured what `bench-2m.yml` had already
+  # measured on the pull request -- on a different runner, so the two numbers
+  # could not be compared with each other anyway. This repository's own rule is
+  # to compare rows within a table and never across tables, which is exactly
+  # what a second measurement on a second host produces: another table.
+  #
+  # It also cost something real. Every benchmark here shares the
+  # `benchmark-host` concurrency group, so a merge would put this run in the
+  # queue against a ladder somebody had asked for.
+  #
+  # What is left is the thing nothing else does: `alt_ref` builds *another
+  # branch's* Rust and Zig beside this one's and puts them in one table, on one
+  # host, in one sitting. `bench-2m.yml` and `bench-ladder.yml` both measure a
+  # single tree. This is the only CI answer to "did my change make it faster",
+  # which is why the file stays when its automatic half does not.
   workflow_dispatch:
     inputs:
       rows:

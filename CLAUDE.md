@@ -319,8 +319,11 @@ before timing anything.
 - **One benchmark workflow at a time, repository-wide — and nobody has measured whether it needs
   to be.** `bench-2m.yml`, `bench-ladder.yml` and `benchmark-native.yml` share a single
   `benchmark-host` concurrency group so GitHub queues them; a per-ref group does not, because
-  another branch is another group. Check for a run in progress before pushing to a path that
-  triggers a benchmark or dispatching one by hand.
+  another branch is another group. Check for a run in progress before dispatching one by hand.
+  Pushing no longer starts one: `bench-2m.yml` on a pull request is the only benchmark that
+  runs without being asked, since `benchmark-native.yml` gave up its push trigger -- it was
+  re-measuring on `main` what the pull request had already measured, on a different host, and
+  queueing against whatever ladder somebody was waiting for.
   **The reason given for the group and the reason given for leaving `scale-ceiling.yml` out of it
   contradict each other, and both are assertions.** This rule used to say two timing jobs "share a
   host and measure each other's contention"; `scale-ceiling.yml`'s header says "these are separate
