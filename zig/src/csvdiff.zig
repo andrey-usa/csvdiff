@@ -1445,7 +1445,13 @@ const Prepare = struct {
     }
 
     fn go(self: *Prepare) !void {
+        // Near zero for text, where the fields are parsed later in the sweep,
+        // and the largest phase of a compressed Parquet run, where every page is
+        // decompressed and materialised here. It was outside the table until a
+        // zstd run showed 0.19s of phases against a 1.0s wall.
+        var phases = Phases.start(self.tag);
         self.side = try self.input.project(self.gpa, self.wanted, self.key_size, self.threads);
+        phases.mark("read columns (par)");
         self.index = try RowIndex.build(
             self.gpa,
             &self.side.?,
