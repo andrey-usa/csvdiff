@@ -61,13 +61,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Every port but C++ needs the Rust one: `zig/test.sh` and `c/test.sh`
-      # hold their answers against it rather than against a golden file, which
-      # is the whole reason four ports are worth having.
+      # Every lane needs the Rust port, C++ included: all three suites hold
+      # their answers against it rather than against a golden file, which is the
+      # whole reason four ports are worth having. This job first exempted the
+      # C++ lane and all three of its runners failed on `build the Rust port
+      # first` -- cpp/test.sh checks for it in its opening lines, same as the
+      # others.
       - uses: dtolnay/rust-toolchain@stable
-        if: matrix.port != 'cpp'
       - uses: Swatinem/rust-cache@v2
-        if: matrix.port != 'cpp'
         with:
           workspaces: rust
 
@@ -99,7 +100,6 @@ jobs:
       # binaries the other suites reach for (`csvdiff`, `gen-data`) both come
       # out of this one build.
       - name: Build the Rust port
-        if: matrix.port != 'cpp'
         run: cargo build --release --manifest-path rust/Cargo.toml
 
       - name: Build
@@ -178,6 +178,13 @@ jobs:
         with:
           workspaces: rust
 
+      # Before the step that reports it, which is the order the Linux job uses
+      # and the order this one did not: `python -m ziglang version` ran first
+      # and the lane died on `No module named ziglang`.
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        run: pip install ziglang==0.16.0
+
       - name: What this runner is
         run: |
           echo "arch=$(uname -m 2>/dev/null || echo x86_64)"
@@ -187,10 +194,6 @@ jobs:
             zig)  python -m ziglang version ;;
           esac
           rustc --version
-
-      - name: Install Zig
-        if: matrix.port == 'zig'
-        run: pip install ziglang==0.16.0
 
       - name: Build the Rust port
         run: cargo build --release --manifest-path rust/Cargo.toml
