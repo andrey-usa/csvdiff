@@ -64,6 +64,58 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (rle_fill) — 18.5% of the instructions, none of the time
+
+A negative result, recorded because it would cost the next person the same
+afternoon it cost this one.
+
+The entry below profiled the columnar path, found `rle_fill` at 18.5% of
+instructions -- second only to `pq_read_column` -- and called it the largest
+lever left. It unpacks bit-packed dictionary indices with one eight-byte load,
+one shift and one mask per value. A bit-packed group of eight is exactly `width`
+bytes, so with `width` known at compile time every shift and the mask fold to
+constants: the textbook specialisation.
+
+It was written -- a `switch` over widths 1 to 32, one loop each, from a macro.
+All 67 cases passed and the counts were unchanged. Paired and interleaved,
+fifteen rounds:
+
+| Input | Before | After | Paired ratio | |
+|---|---:|---:|---:|---|
+| Parquet, 5m rows | 1.028s | 1.036s | 0.991 (middle half 0.929-1.052) | not established |
+| Parquet, 5m rows, snappy | 1.562s | 1.582s | 1.054 (0.990-1.311) | not established |
+
+Both middle halves cross one and the snappy median is worse, so it was thrown
+away rather than shipped. The interesting question was why a real reduction in
+instructions bought nothing.
+
+### The ceiling
+
+Ask what the whole function is worth. A build with the unpacking deleted --
+`memset` in its place, answers wrong on purpose, `bit` still advanced so the rest
+of the reader stays in step -- is the ceiling on any optimisation of it:
+
+| | Wall |
+|---|---:|
+| real unpacking | 1.020s |
+| unpacking removed entirely | 1.057s |
+
+Removing the work made it slightly slower, which is noise around zero. **All of
+`rle_fill` is worth nothing measurable.** Its instructions issue in the shadow of
+the loads they wait on: the phase is memory-bound, and not issuing them buys
+exactly what that sounds like.
+
+### What this says about the profile below
+
+`callgrind` counts instructions. It found the CSV field scan, where count and
+time did line up -- 6.6% of wall for a wider step. It found `rle_fill`, where
+they do not line up at all. An instruction profile picks candidates; it does not
+rank them, and the entry below should not have read as though it did.
+
+The ceiling build is the cheap way to tell those apart, and it belongs before the
+optimisation rather than after: delete the work, accept wrong answers, time it.
+Ten minutes. Not running it first is what this entry cost.
+
 ## 2026-09-10 (C field scan) — a wider step where the target has one
 
 One 4-core container. `callgrind` on a single-threaded run first, to find out
@@ -116,8 +168,9 @@ The same run, on the columnar path:
 | `column_part` | 17.1% |
 | `plain_slices` | 6.6% |
 
-`rle_fill` unpacks bit-packed dictionary indices one value at a time. That is
-the largest single lever left in the columnar path, and it is unmeasured.
+`rle_fill` unpacks bit-packed dictionary indices one value at a time. That
+looked like the largest lever left in the columnar path. It was measured next,
+and it is not one -- see the entry above.
 
 ## 2026-09-10 (memory) — what each port needs, and what each does when it cannot have it
 

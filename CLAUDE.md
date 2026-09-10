@@ -266,6 +266,13 @@ before timing anything.
 - **"The SIMD question does not re-open" was about wide files, not the byte scan.** That finding
   said throughput is flat from 20 columns to 200. It is not a finding about how many bytes a
   scan step covers, and the two were confused once already.
+- **An instruction profile picks candidates; it does not rank them.** `callgrind` put `rle_fill`
+  at 18.5% of the columnar path's instructions. Deleting its work outright -- wrong answers, pure
+  ceiling -- changed the wall clock by nothing: the phase is memory-bound and those instructions
+  issue in the shadow of the loads they wait on. The same profile found the CSV scan, where the
+  two did line up. Before writing an optimisation, build the ceiling: replace the function's work
+  with something trivially wrong, keep the rest in step, and time it. Ten minutes, and it says
+  whether there is anything there at all.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
