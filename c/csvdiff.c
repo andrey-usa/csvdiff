@@ -24,6 +24,9 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
+#if defined(__SSE2__) || defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,9 +66,28 @@ static bool field_escaped(Field f) { return (f & ESCAPED_BIT) != 0; }
 static bool field_real(Field f) { return f != ABSENT && f != TOO_LONG; }
 
 /* ------------------------------------------------------------------------- */
-/* SWAR scanning: eight bytes per step, arithmetic rather than comparison.      */
-/* Subtracting ones borrows across a byte only where that byte was zero, and    */
-/* ~diff cancels the false positives the borrow creates.                        */
+/* Scanning for the next delimiter or newline.                                 */
+/*                                                                             */
+/* SWAR is the portable floor: eight bytes per step, arithmetic rather than     */
+/* comparison. Subtracting ones borrows across a byte only where that byte was  */
+/* zero, and ~diff cancels the false positives the borrow creates.             */
+/*                                                                             */
+/* `next_of2` gets a wider step where the target has one, because it is where   */
+/* the CSV path spends its time: 43% of instructions, with `parse_csv_row`      */
+/* above it at 27%, so seventy per cent of the work is finding field ends. The  */
+/* fields here average about ten bytes, which is the whole argument -- an       */
+/* eight-byte step needs two iterations for a typical field and a sixteen-byte  */
+/* one needs a single iteration.                                                */
+/*                                                                             */
+/* Measured against the commit before it, paired and interleaved, fifteen        */
+/* rounds on a 2m-row pair: 0.469s to 0.442s, ratio 0.934 with the middle half  */
+/* 0.824-0.978. On the same rows as ndjson it measured 0.984 (0.942-1.057) and  */
+/* on Parquet 1.004 (0.954-1.393) -- both crossing one, so nothing is claimed   */
+/* for either. ndjson's fields are longer, so the scan was already finding hits */
+/* in one step, and the columnar path does not come through here at all.        */
+/*                                                                             */
+/* `next_of1` is left as SWAR on purpose. It did not appear in the profile, and */
+/* an unmeasured second copy of this is complexity with no number behind it.    */
 /* ------------------------------------------------------------------------- */
 
 #define ONES UINT64_C(0x0101010101010101)
@@ -85,12 +107,42 @@ static uint64_t load64(const char *p) {
 }
 
 static size_t next_of2(const char *d, size_t from, size_t end, char a, char b) {
-    uint64_t ba = broadcast((unsigned char)a), bb = broadcast((unsigned char)b);
     size_t at = from;
-    for (; at + 8 <= end; at += 8) {
-        uint64_t w = load64(d + at);
-        uint64_t hits = match_bits(w, ba) | match_bits(w, bb);
-        if (hits) return at + (size_t)(__builtin_ctzll(hits) >> 3);
+    /* Chosen at compile time from what the build targets, so there is no
+     * dispatch on the hot path. The Makefile builds with -march=native, which
+     * defines these where the CPU has them; a build for a baseline x86-64 gets
+     * the SSE2 step, which that architecture always has, and anything else --
+     * aarch64, which this port also targets -- falls through to the SWAR loop
+     * below unchanged. Each step is a load, two compares, an or and a mask. */
+#if defined(__AVX2__)
+    {
+        const __m256i va = _mm256_set1_epi8(a), vb = _mm256_set1_epi8(b);
+        for (; at + 32 <= end; at += 32) {
+            const __m256i w = _mm256_loadu_si256((const __m256i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm256_movemask_epi8(
+                _mm256_or_si256(_mm256_cmpeq_epi8(w, va), _mm256_cmpeq_epi8(w, vb)));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+#if defined(__SSE2__)
+    {
+        const __m128i va = _mm_set1_epi8(a), vb = _mm_set1_epi8(b);
+        for (; at + 16 <= end; at += 16) {
+            const __m128i w = _mm_loadu_si128((const __m128i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm_movemask_epi8(
+                _mm_or_si128(_mm_cmpeq_epi8(w, va), _mm_cmpeq_epi8(w, vb)));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+    {
+        const uint64_t ba = broadcast((unsigned char)a), bb = broadcast((unsigned char)b);
+        for (; at + 8 <= end; at += 8) {
+            const uint64_t w = load64(d + at);
+            const uint64_t hits = match_bits(w, ba) | match_bits(w, bb);
+            if (hits) return at + (size_t)(__builtin_ctzll(hits) >> 3);
+        }
     }
     for (; at < end; at++)
         if (d[at] == a || d[at] == b) return at;
