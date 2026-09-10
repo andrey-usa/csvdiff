@@ -37,15 +37,35 @@ static int fail_oom(void) { return fail("out of memory reading the parquet file"
  * dictionary, and the two per-row arrays before the footer's row count is
  * trusted. Returns 0, or -1 having left the old block intact.
  */
-/* What `grow` would choose, so a charged growth can price it before buying it.
- * Zero means the doubling would overflow. */
+/*
+ * What `grow` would choose, so a charged growth can price it before buying it.
+ * Zero means the doubling would overflow.
+ *
+ * The first allocation is exact and only later ones double. Doubling exists to
+ * amortise repeated appends, and the first ask is not an append -- it is
+ * usually the only one, because both per-row arrays here are asked for at the
+ * size the footer says the column is. Rounding that up to a power of two was
+ * pure overshoot: a forty-million-row index wants 160 MB and was given 268 MB,
+ * and a plain column's values wanted 320 MB and were given 537 MB, on top of
+ * the twenty-odd reallocs and copies it took to climb there from 64.
+ */
 static size_t next_cap(size_t cap, size_t need) {
-    size_t want = cap ? cap : 64;
+    if (cap == 0) return need;
+    size_t want = cap;
     while (want < need) {
         if (want > (size_t)-1 / 2) return 0;
         want *= 2;
     }
     return want;
+}
+
+/* The footer's row count as a floor on the first ask, so the exact allocation
+ * above lands on the size the column ends at rather than on the first page's
+ * worth. It is a hint and not a trust: `grow_charged` still grows if the pages
+ * deliver more values than the footer claimed. */
+static size_t plain_need(size_t need, int64_t rows) {
+    const size_t claimed = rows > 0 ? (size_t)rows : 0;
+    return need > claimed ? need : claimed;
 }
 
 static int grow(void **p, size_t *cap, size_t need, size_t elem) {
@@ -957,8 +977,9 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                         }
                         out->index_len += n_vals;
                     } else {
-                        if (grow_charged((void **)&out->values, &values_cap, out->values_len + n_vals,
-                                 sizeof *out->values, out) != 0) goto done;
+                        if (grow_charged((void **)&out->values, &values_cap,
+                                         plain_need(out->values_len + n_vals, fm.rows),
+                                         sizeof *out->values, out) != 0) goto done;
                         PqSlice *dst = out->values + out->values_len;
                         if (optional) {
                             size_t k = 0;
@@ -1000,8 +1021,9 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                     if (plain_slices(page + vat, page_len - vat, page_base + vat, (int32_t)real,
                                      &got, &got_len, &got_cap) != 0)
                         goto done;
-                    if (grow_charged((void **)&out->values, &values_cap, out->values_len + n_vals,
-                             sizeof *out->values, out) != 0) goto done;
+                    if (grow_charged((void **)&out->values, &values_cap,
+                                     plain_need(out->values_len + n_vals, fm.rows),
+                                     sizeof *out->values, out) != 0) goto done;
                     PqSlice *dst = out->values + out->values_len;
                     if (optional) {
                         size_t k = 0;
