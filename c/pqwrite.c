@@ -5,6 +5,7 @@
 #include "pqwrite.h"
 
 #include <fcntl.h>
+#include "win32.h"   /* O_BINARY: a no-op off Windows */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -564,7 +565,7 @@ PqWriter *pqw_open(const char *path, char *const *names, size_t columns,
                    size_t row_group_rows, size_t dict_limit) {
     PqWriter *w = calloc(1, sizeof *w);
     if (!w) { fail("out of memory"); return NULL; }
-    w->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    w->fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     w->columns = columns;
     w->group_rows = row_group_rows ? row_group_rows : 1;
     w->dict_limit = dict_limit;

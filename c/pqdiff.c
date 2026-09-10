@@ -11,7 +11,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "win32.h"   /* O_BINARY off Windows; the mmap shim on it */
+#ifndef _WIN32
 #include <sys/mman.h>
+#endif
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -38,7 +41,7 @@ typedef struct {
 static int map_open(Map *m, const char *path) {
     m->data = NULL;
     m->size = 0;
-    m->fd = open(path, O_RDONLY);
+    m->fd = open(path, O_RDONLY | O_BINARY);
     if (m->fd < 0) return pq_set_error("cannot read one of the files");
     struct stat st;
     if (fstat(m->fd, &st) != 0) { close(m->fd); m->fd = -1; return pq_set_error("cannot read one of the files"); }
@@ -745,7 +748,7 @@ static void column_part(void *vctx, unsigned p) {
 /* ------------------------------------------------------------------------- */
 
 int pq_is_parquet(const char *path) {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDONLY | O_BINARY);
     if (fd < 0) return 0;
     char magic[4] = {0};
     const ssize_t got = read(fd, magic, 4);

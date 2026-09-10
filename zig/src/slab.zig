@@ -13,6 +13,7 @@
 //! absence produced two silently wrong answers in the Java port.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const f = @import("field.zig");
 const Field = f.Field;
 
@@ -43,14 +44,7 @@ pub const Slab = struct {
         defer file.close(io);
         const size = (file.stat(io) catch return Error.CannotReadFile).size;
         if (size == 0) return Slab{ .data = &[_]u8{} };
-        const mapped = std.posix.mmap(
-            null,
-            size,
-            .{ .READ = true },
-            .{ .TYPE = .PRIVATE },
-            file.handle,
-            0,
-        ) catch return Error.CannotReadFile;
+        const mapped = mapHandle(file.handle, size) catch return Error.CannotReadFile;
         return Slab{ .data = mapped, .mapping = mapped };
     }
 
@@ -60,7 +54,7 @@ pub const Slab = struct {
     }
 
     pub fn close(self: *Slab) void {
-        if (self.mapping) |m| std.posix.munmap(m);
+        if (self.mapping) |m| unmap(m);
         if (self.arena) |a| {
             if (self.gpa) |gpa| gpa.free(a);
         }
@@ -82,6 +76,73 @@ pub const Slab = struct {
         };
     }
 };
+
+/// The one call this port makes that the two platforms spell differently, and
+/// the only reason there is a switch anywhere in this file.
+///
+/// The POSIX side is `mmap`. The Windows side is a section object plus a view of
+/// it, declared here rather than taken from `std.os.windows`, which carries no
+/// binding for either call. Both give back the same thing: the whole file,
+/// read-only, private, mapped at offset zero -- which is the only mapping this
+/// port ever asks for.
+const Mapping = []align(std.heap.page_size_min) const u8;
+
+const PAGE_READONLY: std.os.windows.DWORD = 0x02;
+const FILE_MAP_READ: std.os.windows.DWORD = 0x0004;
+
+extern "kernel32" fn CreateFileMappingW(
+    hFile: std.os.windows.HANDLE,
+    lpAttributes: ?*anyopaque,
+    flProtect: std.os.windows.DWORD,
+    dwMaximumSizeHigh: std.os.windows.DWORD,
+    dwMaximumSizeLow: std.os.windows.DWORD,
+    lpName: ?[*:0]const u16,
+) callconv(.winapi) ?std.os.windows.HANDLE;
+
+extern "kernel32" fn MapViewOfFile(
+    hFileMappingObject: std.os.windows.HANDLE,
+    dwDesiredAccess: std.os.windows.DWORD,
+    dwFileOffsetHigh: std.os.windows.DWORD,
+    dwFileOffsetLow: std.os.windows.DWORD,
+    dwNumberOfBytesToMap: usize,
+) callconv(.winapi) ?std.os.windows.LPVOID;
+
+extern "kernel32" fn UnmapViewOfFile(lpBaseAddress: ?*const anyopaque) callconv(.winapi) std.os.windows.BOOL;
+
+fn mapHandle(handle: std.Io.File.Handle, size: u64) !Mapping {
+    const len: usize = @intCast(size);
+    switch (builtin.os.tag) {
+        .windows => {
+            // A zero maximum size means "as large as the file", which is what
+            // the length already says.
+            const section = CreateFileMappingW(handle, null, PAGE_READONLY, 0, 0, null) orelse
+                return Error.CannotReadFile;
+            // The view takes its own reference to the section, so the handle can
+            // go now and the mapping still lives until UnmapViewOfFile. Closing
+            // it here is what keeps this from leaking one handle per file.
+            defer std.os.windows.CloseHandle(section);
+            const view = MapViewOfFile(section, FILE_MAP_READ, 0, 0, len) orelse
+                return Error.CannotReadFile;
+            const bytes: [*]align(std.heap.page_size_min) const u8 = @ptrCast(@alignCast(view));
+            return bytes[0..len];
+        },
+        else => return std.posix.mmap(
+            null,
+            len,
+            .{ .READ = true },
+            .{ .TYPE = .PRIVATE },
+            handle,
+            0,
+        ) catch Error.CannotReadFile,
+    }
+}
+
+fn unmap(m: Mapping) void {
+    switch (builtin.os.tag) {
+        .windows => _ = UnmapViewOfFile(m.ptr),
+        else => std.posix.munmap(m),
+    }
+}
 
 /// A field's bytes with its escapes undone, one byte at a time and without
 /// allocating. A `\uXXXX` escape decodes to as many as four bytes, which is what

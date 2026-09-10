@@ -81,25 +81,42 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 
 ### What runs where
 
-Linux and Windows are tested. macOS is not, so that column is what the source
-implies rather than what a run has proved.
+Every cell below has a job behind it. `platforms.yml` runs all four ports on
+Linux x86-64, Linux aarch64 and macOS on Apple silicon, and three of them on
+Windows; the Rust port's Windows lane lives in `ci-rust.yml`.
 
-| Port | Linux | macOS | Windows | Why |
+| Port | Linux x86-64 | Linux aarch64 | macOS (arm64) | Windows |
 |---|---|---|---|---|
-| **C** | tested | should work | **WSL** | `sys/mman.h`, `pthread.h`, `unistd.h`: POSIX, and MSVC has none of them |
-| **C++** | tested | should work | **WSL** | the same POSIX headers, minus pthread — it uses `std::thread` |
-| **Rust** | tested | should work | **tested, native** | builds and runs on `windows-latest` in CI |
-| **Zig** | tested | cross-compiles in CI, not run | **WSL** | `std.posix.mmap` in `src/slab.zig`, and `environ.getPosix` in `src/main.zig` |
+| **C** | suite | suite | suite | native, agrees with Rust |
+| **C++** | suite | suite | suite | native, agrees with Rust |
+| **Rust** | suite | suite | suite | native, suite |
+| **Zig** | suite | suite | suite | native, agrees with Rust |
 
-The Rust row says "tested" because of a mistake. It first said "native" on the
-strength of a grep for `std::os::unix` finding nothing — which cannot see inside
-a dependency, and `memmap2::Advice` is gated `#[cfg(unix)]` in that crate, so the
-port did not compile on Windows at all. A reader hit it within the hour. There is
-a `windows-latest` job in `ci-rust.yml` now: a claim about a platform is worth
-what the runner that proves it is worth.
+"suite" means that port's own test suite ran there and passed — `c/test.sh`,
+`cpp/test.sh`, `zig/test.sh`, `cargo test`. The three Windows cells are weaker
+on purpose and the difference is worth knowing: those suites are written for a
+POSIX shell and reach for binaries by their extensionless names, so they do not
+run there yet. What runs instead is `scripts/win_smoke.sh`, which asks the
+question those suites ask — the generator's bytes, then answers over CSV,
+ndjson and Parquet at one and four threads, each against the Rust port on the
+same files. Enough to catch a wrong answer, not the same coverage.
 
-`test.sh` and `scripts/bench_ab.sh` are bash. On Windows they need WSL or Git
-Bash; `scripts/bench_ports.py` needs Python 3.
+No WSL in the table any more. The three POSIX ports build natively on Windows
+with mingw-w64 gcc: the mapping calls are `CreateFileMapping` and a view of it
+(`c/win32.h`, `cpp/src/win32.hpp`, and `mapHandle` in `zig/src/slab.zig`), the
+C port's threads are `CreateThread`, and every `open` carries `O_BINARY` so the
+generator's files stay byte-identical. WSL still works and is still a fine way
+to run the bash suites; it is no longer the only way to run the ports.
+
+The Rust row taught the rule the rest of this table follows. It first said
+"native" on the strength of a grep for `std::os::unix` finding nothing — which
+cannot see inside a dependency, and `memmap2::Advice` is gated `#[cfg(unix)]` in
+that crate, so the port did not compile on Windows at all. A reader hit it
+within the hour. A claim about a platform is worth what the runner that proves
+it is worth, and nothing above is claimed without one.
+
+`test.sh` and `scripts/bench_ab.sh` are bash. On Windows they need WSL, MSYS2 or
+Git Bash; `scripts/bench_ports.py` needs Python 3.
 
 ### Building
 
@@ -115,16 +132,32 @@ pulls in nothing that contains a comparison engine.
 ```
 
 ```powershell
-# Windows, PowerShell — the Rust port is the one that builds without WSL.
+# Windows, PowerShell. The Rust port needs nothing but cargo.
 # --manifest-path so this runs from the root like everything else; the
 # binaries still land in rust\target\release\.
 cargo build --release --manifest-path rust\Cargo.toml
 ```
 
-For the other three on Windows, install WSL (`wsl --install`) and use the bash
-commands above inside it. A fresh WSL has neither a current Rust nor any Zig at
-all, and the reasons are not obvious from inside it, so read the next section
-before you start.
+The C, C++ and Zig ports build natively on Windows too. The first two want a
+POSIX-ish shell for `make`, which is what [MSYS2](https://www.msys2.org/)
+provides — `pacman -S mingw-w64-x86_64-gcc make`, then from its **MINGW64**
+shell:
+
+```bash
+CC=gcc  make -C c    && make -C c   gen-data
+CXX=g++ make -C cpp  && make -C cpp gen-data
+```
+
+The Zig port needs no shell at all, since `zig build` is the whole build system:
+
+```powershell
+cd zig; zig build --release=fast; cd ..
+```
+
+WSL is still a good way to run the bash test suites, and it is what the next
+section is about. It is no longer needed to build anything. A fresh WSL has
+neither a current Rust nor any Zig at all, and the reasons are not obvious from
+inside it, so read on before you start.
 
 ### If you are on WSL
 
@@ -273,7 +306,8 @@ said nothing about it.
 1.05s against the Rust generator's 5.49s on this 4-vCPU runner (paired rounds,
 `scripts/bench_ab.sh`), because it renders rows in waves across all cores while
 the Rust one is single-threaded. Both write all three formats. Reach for the
-Rust generator when you are on Windows without WSL, or want a single toolchain.
+Rust generator when you want a single toolchain — it needs only cargo, where
+the C one wants a C compiler and `make`. Both build natively on Windows.
 
 ### Looking at one file first
 

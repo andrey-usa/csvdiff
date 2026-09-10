@@ -93,7 +93,9 @@ int main(int argc, char** argv) {
         const csvdiff::Result r = csvdiff::compare(a_path, b_path, opt);
 
         if (!json_path.empty()) {
-            std::ofstream out(json_path);
+            // std::ios::binary so the Microsoft runtime does not turn every \n in
+            // the payload into \r\n; the other ports write bytes.
+            std::ofstream out(json_path, std::ios::binary);
             if (!out) throw csvdiff::Error("cannot write " + json_path);
             out << csvdiff::to_json(r, a_path, b_path, opt);
         }

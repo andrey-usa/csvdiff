@@ -55,7 +55,10 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(arena);
     // The other two ports take this from the environment too, and print the same
     // shape of phase breakdown on stderr.
-    csvdiff.phases_on = init.minimal.environ.getPosix("CSVDIFF_PHASES") != null;
+    // `contains` rather than `getPosix`: the latter is the POSIX-only accessor
+    // and reading it on Windows does not compile. Only the presence of the
+    // variable matters here, which is exactly what `contains` reports.
+    csvdiff.phases_on = init.minimal.environ.contains(arena, "CSVDIFF_PHASES") catch false;
 
     const io = init.io;
     var stdout_buf: [4096]u8 = undefined;

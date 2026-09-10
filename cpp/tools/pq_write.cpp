@@ -1,6 +1,7 @@
 #include "pq_write.hpp"
 
 #include <fcntl.h>
+#include "../src/win32.hpp"   // O_BINARY: a no-op off Windows
 #include <unistd.h>
 
 #include <algorithm>
@@ -316,7 +317,7 @@ Writer::Writer(const std::string& path, std::vector<std::string> names, Codec co
       threads_(threads ? threads : std::max(1u, std::thread::hardware_concurrency())) {
     if (names_.empty()) throw Error("a parquet file needs at least one column");
     if (rg_rows_ <= 0) throw Error("the row group size must be positive");
-    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0644);
     if (fd_ < 0) throw Error("cannot create " + path);
     cols_.resize(names_.size());
     write_all("PAR1");
