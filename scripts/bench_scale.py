@@ -124,6 +124,11 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--data-dir", type=Path, default=ROOT / "bench/external/data")
     ap.add_argument("--keep", action="store_true", help="do not delete each pair after its runs")
+    ap.add_argument("--json-out", type=Path, default=None,
+                    help="write one record per size here, for a caller that has to merge ports")
+    ap.add_argument("--stop-on-fail", action="store_true",
+                    help="stop at the first size that fails, which is the ceiling")
+    ap.add_argument("--label", default=None, help="what to call this binary in the JSON")
     args = ap.parse_args()
 
     if not os.access(args.binary, os.X_OK):
@@ -133,6 +138,7 @@ def main() -> int:
     print(f"{'rows':>6} {'input':>9} {'wall':>9} {'rows/s':>12} {'cpu/wall':>9} "
           f"{'RSS':>9} {'above':>9}  result")
 
+    records: list[dict] = []
     for label in [s.strip() for s in args.sizes.split(",") if s.strip()]:
         a, b = generate(label, args.data_dir)
         fits = warm(a, b)
@@ -145,6 +151,10 @@ def main() -> int:
                                        + ["--threads", str(args.threads), "--json", str(out)], out)
             if not out.exists():
                 print(f"{label:>6} {mapped:8,.0f}M  failed (exit {code})")
+                records.append({"port": args.label or Path(args.binary).name, "size": label,
+                                "rows": rows_in(label), "input_mb": round(mapped, 1),
+                                "ok": False, "exit": code,
+                                "why": "killed (out of memory)" if code in (137, -9) else f"exit {code}"})
                 best = None
                 break
             counts = json.loads(out.read_text())["counts"]
@@ -159,9 +169,24 @@ def main() -> int:
             print(f"       changed {counts['changed']:,} · added {counts['added']:,} · "
                   f"removed {counts['removed']:,} · dup keys "
                   f"{counts['a_dup_keys']:,}/{counts['b_dup_keys']:,}", flush=True)
+            records.append({"port": args.label or Path(args.binary).name, "size": label,
+                            "rows": rows_in(label), "input_mb": round(mapped, 1),
+                            "ok": True, "wall_s": round(secs, 2),
+                            "rows_per_s": int(counts["a_rows"] / secs),
+                            "cores": round(cpu / secs, 2), "rss_mb": round(rss, 0),
+                            "above_mb": (round(rss - mapped) if rss >= mapped else None),
+                            "fits_in_ram": fits, "changed": counts["changed"]})
         if not args.keep and label not in ("10k", "1m"):
             a.unlink(missing_ok=True)
             b.unlink(missing_ok=True)
+        if best is None and args.stop_on_fail:
+            print(f"\nceiling: {label} is the first size that failed", flush=True)
+            break
+
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(records, indent=1))
+        print(f"\nwrote {args.json_out}")
     return 0
 
 

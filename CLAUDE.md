@@ -273,6 +273,16 @@ before timing anything.
   two did line up. Before writing an optimisation, build the ceiling: replace the function's work
   with something trivially wrong, keep the rest in step, and time it. Ten minutes, and it says
   whether there is anything there at all.
+- **The scale ceiling is two questions, not one.** `.github/workflows/scale-ceiling.yml` climbs a
+  ladder of sizes until a port fails (the ceiling) and separately lowers a cgroup limit until the
+  run is killed (the floor). They rank differently, which is why both tables exist. One port per
+  runner on purpose: the ladder is bigger than one runner's disk, and separate jobs mean a port
+  that dies at 40m does not take the rest of the table with it.
+- **Peak RSS is not the memory answer for anything that maps its input.** Mapped pages are
+  reclaimable, so RSS is whatever the kernel allowed, not what the engine needed. Use
+  `scripts/memory_floor.sh`, which takes the memory away until the run dies. It handles cgroup v1
+  and v2 -- the runners are v2, most older images are v1, and a script that knew only one would
+  report "no controller" on exactly the host worth measuring.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
