@@ -37,13 +37,21 @@ static int fail_oom(void) { return fail("out of memory reading the parquet file"
  * dictionary, and the two per-row arrays before the footer's row count is
  * trusted. Returns 0, or -1 having left the old block intact.
  */
-static int grow(void **p, size_t *cap, size_t need, size_t elem) {
-    if (need <= *cap) return 0;
-    size_t want = *cap ? *cap : 64;
+/* What `grow` would choose, so a charged growth can price it before buying it.
+ * Zero means the doubling would overflow. */
+static size_t next_cap(size_t cap, size_t need) {
+    size_t want = cap ? cap : 64;
     while (want < need) {
-        if (want > (size_t)-1 / 2) return fail_oom();
+        if (want > (size_t)-1 / 2) return 0;
         want *= 2;
     }
+    return want;
+}
+
+static int grow(void **p, size_t *cap, size_t need, size_t elem) {
+    if (need <= *cap) return 0;
+    const size_t want = next_cap(*cap, need);
+    if (want == 0) return fail_oom();
     /*
      * Plain realloc, deliberately. These arrays were tried on huge pages too --
      * they are the same eighty megabytes the slot table is, walked just as
@@ -60,6 +68,30 @@ static int grow(void **p, size_t *cap, size_t need, size_t elem) {
     *p = bigger;
     *cap = want;
     return 0;
+}
+
+/*
+ * `grow`, with the `--max-memory` ceiling told what the capacity costs.
+ *
+ * Only the row index used to be charged: four bytes a row, which is what a
+ * dictionary-encoded column keeps. The `values` array is eight bytes a row and
+ * is what a PLAIN column keeps instead, and `owned` holds whole decompressed
+ * pages -- neither was counted, so on exactly the columns that cost most the
+ * ceiling was reading low, by two times or more.
+ *
+ * Charged before the allocation rather than after, so a run that would go over
+ * is refused instead of briefly going over and then being told.
+ */
+static int grow_charged(void **p, size_t *cap, size_t need, size_t elem, PqColumn *out) {
+    if (need <= *cap) return 0;
+    const size_t want = next_cap(*cap, need);
+    if (want == 0) return fail_oom();
+    const size_t added = (want - *cap) * elem;
+    if (budget_take(added) != 0) return fail("over the --max-memory ceiling");
+    /* Recorded before the grow so that a failed allocation still gives it back
+     * when the column is freed: the column owns the charge, not this call. */
+    out->budgeted += added;
+    return grow(p, cap, need, elem);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -832,7 +864,8 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
             } else {
                 if (h.uncompressed < 0) { fail("a compressed parquet page declares no size"); goto done; }
                 const size_t want = (size_t)h.uncompressed;
-                if (grow((void **)&out->owned, &owned_cap, out->owned_len + want, 1) != 0) goto done;
+                if (grow_charged((void **)&out->owned, &owned_cap, out->owned_len + want, 1,
+                                 out) != 0) goto done;
                 char *dst = out->owned + out->owned_len;
                 if ((col_codec == C_SNAPPY ? snappy_decode : lz4_decode)(
                         data + h.after, body, dst, want) != 0)
@@ -910,8 +943,8 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                      * branched on once, outside.
                      */
                     if (dictionary) {
-                        if (grow((void **)&out->index, &index_cap, out->index_len + n_vals,
-                                 sizeof *out->index) != 0) goto done;
+                        if (grow_charged((void **)&out->index, &index_cap, out->index_len + n_vals,
+                                         sizeof *out->index, out) != 0) goto done;
                         int32_t *dst = out->index + out->index_len;
                         if (optional) {
                             size_t k = 0;
@@ -924,8 +957,8 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                         }
                         out->index_len += n_vals;
                     } else {
-                        if (grow((void **)&out->values, &values_cap, out->values_len + n_vals,
-                                 sizeof *out->values) != 0) goto done;
+                        if (grow_charged((void **)&out->values, &values_cap, out->values_len + n_vals,
+                                 sizeof *out->values, out) != 0) goto done;
                         PqSlice *dst = out->values + out->values_len;
                         if (optional) {
                             size_t k = 0;
@@ -948,9 +981,9 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                          * copying it every time -- which is most of what reading
                          * a plain column used to cost. */
                         const size_t want = (size_t)(fm.rows > 0 ? fm.rows : 1);
-                        if (grow((void **)&out->values, &values_cap,
-                                 want > out->index_len ? want : out->index_len,
-                                 sizeof *out->values) != 0)
+                        if (grow_charged((void **)&out->values, &values_cap,
+                                         want > out->index_len ? want : out->index_len,
+                                         sizeof *out->values, out) != 0)
                             goto done;
                         for (size_t i = 0; i < out->index_len; i++) {
                             const int32_t k = out->index[i];
@@ -967,8 +1000,8 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
                     if (plain_slices(page + vat, page_len - vat, page_base + vat, (int32_t)real,
                                      &got, &got_len, &got_cap) != 0)
                         goto done;
-                    if (grow((void **)&out->values, &values_cap, out->values_len + n_vals,
-                             sizeof *out->values) != 0) goto done;
+                    if (grow_charged((void **)&out->values, &values_cap, out->values_len + n_vals,
+                             sizeof *out->values, out) != 0) goto done;
                     PqSlice *dst = out->values + out->values_len;
                     if (optional) {
                         size_t k = 0;
