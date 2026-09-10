@@ -40,8 +40,38 @@ pub const Codec = enum {
 };
 
 /// Decompresses one page into a buffer sized from the page header.
+/// The sliding window gzip and zstd decode through, kept for as long as a caller
+/// has pages to read rather than allocated per page.
+///
+/// A zstd window is 8.13 MB. Allocating one per page is invisible on the clock --
+/// 3% of CPU and nothing on the wall -- but this port runs on a fixed buffer that
+/// hands memory back and cannot reuse it, so every window is spent for good. A
+/// 1M-row zstd pair needed a `--max-memory` of 4800 MB to hold 291 MB of live
+/// data; sharing one window across a column's pages brings that to 1600 MB.
+pub const Scratch = struct {
+    gpa: std.mem.Allocator,
+    window: []u8 = &.{},
+
+    pub fn deinit(self: *Scratch) void {
+        self.gpa.free(self.window);
+        self.window = &.{};
+    }
+
+    /// Grows to the high-water mark and stays there: the codecs below ask for one
+    /// of two fixed sizes, so this allocates at most twice in a column's life.
+    fn atLeast(self: *Scratch, bytes: usize) ![]u8 {
+        if (self.window.len < bytes) {
+            self.gpa.free(self.window);
+            self.window = &.{};
+            self.window = try self.gpa.alloc(u8, bytes);
+        }
+        return self.window[0..bytes];
+    }
+};
+
 pub fn decompress(
     gpa: std.mem.Allocator,
+    scratch: *Scratch,
     codec: Codec,
     input: []const u8,
     expected: usize,
@@ -55,8 +85,8 @@ pub fn decompress(
         },
         .snappy => try snappy(input, out),
         .lz4_raw => try lz4(input, out),
-        .gzip => try inflate(gpa, input, out),
-        .zstd => try unzstd(gpa, input, out),
+        .gzip => try inflate(scratch, input, out),
+        .zstd => try unzstd(scratch, input, out),
     }
     return out;
 }
@@ -190,9 +220,8 @@ fn lz4(input: []const u8, out: []u8) !void {
     if (sink.at != out.len) return Error.PageSizeMismatch;
 }
 
-fn inflate(gpa: std.mem.Allocator, input: []const u8, out: []u8) !void {
-    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
-    defer gpa.free(window);
+fn inflate(scratch: *Scratch, input: []const u8, out: []u8) !void {
+    const window = try scratch.atLeast(std.compress.flate.max_window_len);
     var in = std.Io.Reader.fixed(input);
     var d = std.compress.flate.Decompress.init(&in, .gzip, window);
     var w = std.Io.Writer.fixed(out);
@@ -200,12 +229,10 @@ fn inflate(gpa: std.mem.Allocator, input: []const u8, out: []u8) !void {
     if (n != out.len) return Error.PageSizeMismatch;
 }
 
-fn unzstd(gpa: std.mem.Allocator, input: []const u8, out: []u8) !void {
-    const window = try gpa.alloc(
-        u8,
+fn unzstd(scratch: *Scratch, input: []const u8, out: []u8) !void {
+    const window = try scratch.atLeast(
         std.compress.zstd.default_window_len + std.compress.zstd.block_size_max,
     );
-    defer gpa.free(window);
     var in = std.Io.Reader.fixed(input);
     var d = std.compress.zstd.Decompress.init(&in, window, .{ .verify_checksum = false });
     var w = std.Io.Writer.fixed(out);
@@ -238,4 +265,47 @@ test "lz4 reads literals and matches" {
     var out: [7]u8 = undefined;
     try lz4(&block, &out);
     try std.testing.expectEqualStrings("abcabca", &out);
+}
+
+test "one window serves a column's pages, rather than one each" {
+    // The port runs on a fixed buffer that cannot reuse what it hands back, so a
+    // window allocated per page is spent for good. Twenty-four pages at flate's
+    // 64 KB window is 1.5 MB of it; through one `Scratch` it is 64 KB, and this
+    // budget holds only the latter.
+    const page = [_]u8{
+        0x1f, 0x8b, 0x08, 0x00, 0x9f, 0x22, 0xa2, 0x6a, 0x02, 0xff, 0xd5, 0xcc,
+        0xd1, 0x0d, 0x80, 0x20, 0x0c, 0x45, 0xd1, 0x55, 0xde, 0x00, 0xc6, 0x9d,
+        0x4a, 0x79, 0x18, 0x22, 0xa6, 0xa5, 0xa0, 0x89, 0xdb, 0xcb, 0x1a, 0xfe,
+        0xdc, 0xf3, 0x77, 0x75, 0x3c, 0xb9, 0x96, 0x02, 0x97, 0xe8, 0x37, 0xe7,
+        0xf2, 0xe0, 0xca, 0xdb, 0x4c, 0xf2, 0x86, 0xa0, 0x53, 0x26, 0x33, 0x8a,
+        0x05, 0x04, 0x6a, 0x97, 0x07, 0xc7, 0xa8, 0xa9, 0x11, 0xa9, 0x99, 0x9e,
+        0x3b, 0xf4, 0xff, 0x83, 0x0f, 0x8d, 0xf0, 0x29, 0x58, 0x04, 0x01, 0x00,
+        0x00,
+    };
+    const raw = "csvdiff parquet page payload, repeated for a compressible block. " ** 4;
+
+    var buffer: [512 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+    const gpa = fixed.allocator();
+
+    var scratch = Scratch{ .gpa = gpa };
+    defer scratch.deinit();
+    for (0..24) |_| {
+        const out = try decompress(gpa, &scratch, .gzip, &page, raw.len);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings(raw, out);
+    }
+}
+
+test "a scratch grows to the largest window asked of it and stops" {
+    var scratch = Scratch{ .gpa = std.testing.allocator };
+    defer scratch.deinit();
+    const small = try scratch.atLeast(1024);
+    try std.testing.expectEqual(@as(usize, 1024), small.len);
+    const big = try scratch.atLeast(4096);
+    try std.testing.expectEqual(@as(usize, 4096), big.len);
+    // Asking for less than it holds reuses the buffer rather than shrinking it.
+    const again = try scratch.atLeast(1024);
+    try std.testing.expectEqual(@as(usize, 1024), again.len);
+    try std.testing.expectEqual(@as(usize, 4096), scratch.window.len);
 }

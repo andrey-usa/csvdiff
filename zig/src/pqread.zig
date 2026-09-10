@@ -131,6 +131,10 @@ const Chunk = struct {
     data_page_offset: u64,
     dictionary_page_offset: ?u64,
     total_compressed_size: i64,
+    /// What the values weigh once decoded, which is what the arena has to hold.
+    /// Equal to the compressed size only for an uncompressed file -- which is
+    /// why sizing the arena from that one went unnoticed until a codec was read.
+    total_uncompressed_size: i64,
 };
 
 const RowGroup = struct {
@@ -590,6 +594,7 @@ fn readColumnChunk(r: *thrift.Reader) !Chunk {
         .data_page_offset = 0,
         .dictionary_page_offset = null,
         .total_compressed_size = 0,
+        .total_uncompressed_size = 0,
     };
     var external = false;
     r.structBegin();
@@ -602,6 +607,7 @@ fn readColumnChunk(r: *thrift.Reader) !Chunk {
                     switch (g.id) {
                         4 => chunk.codec = try codec.Codec.fromId(try r.i32v()),
                         5 => chunk.num_values = try r.i64v(),
+                        6 => chunk.total_uncompressed_size = try r.i64v(),
                         7 => chunk.total_compressed_size = try r.i64v(),
                         9 => chunk.data_page_offset = @intCast(@max(0, try r.i64v())),
                         11 => {
@@ -725,14 +731,29 @@ fn decodeColumn(reader: *Reader, gpa: std.mem.Allocator, leaf: usize) !Decoded {
     // The arena is sized up front from what the column chunks say they hold.
     // Growing it by doubling would be the largest waste in the run under a
     // FixedBufferAllocator, which cannot reuse what it has handed back.
+    //
+    // It holds decoded values, so the estimate is the *uncompressed* size. It
+    // used to be the compressed one, which is the same number until a codec is
+    // in play and then short by the compression ratio -- 17x on this
+    // repository's zstd fixture, which is enough doublings to cost more than
+    // the decompression it was hiding behind.
     var expected: usize = 0;
     for (reader.row_groups) |group| {
-        expected += @intCast(@max(0, group.chunks[leaf].total_compressed_size));
+        const chunk = group.chunks[leaf];
+        expected += @intCast(@max(
+            chunk.total_compressed_size,
+            chunk.total_uncompressed_size,
+        ));
     }
     try sink.arena.ensureTotalCapacity(gpa, expected);
 
     var dictionary: std.ArrayList(Field) = .empty;
     defer dictionary.deinit(gpa);
+
+    // One window for every page of this column, released with it. Per page it
+    // was 8.13 MB of budget that never came back -- see `codec.Scratch`.
+    var scratch = codec.Scratch{ .gpa = gpa };
+    defer scratch.deinit();
 
     for (reader.row_groups) |group| {
         const chunk = group.chunks[leaf];
@@ -756,14 +777,14 @@ fn decodeColumn(reader: *Reader, gpa: std.mem.Allocator, leaf: usize) !Decoded {
                 2 => {
                     // The dictionary's values go into the arena once; every row
                     // of this row group then points at one of them.
-                    const page = try codec.decompress(gpa, chunk.codec, body, header.uncompressed);
+                    const page = try codec.decompress(gpa, &scratch, chunk.codec, body, header.uncompressed);
                     defer gpa.free(page);
                     dictionary.clearRetainingCapacity();
                     try decodeValues(&sink, &dictionary, page, 0, header.num_values, info, &.{});
                 },
                 0, 3 => {
                     seen += @intCast(header.num_values);
-                    try decodeDataPage(&sink, &header, body, chunk, info, dictionary.items);
+                    try decodeDataPage(&sink, &scratch, &header, body, chunk, info, dictionary.items);
                 },
                 // An index page carries no values; anything else is a page type
                 // that did not exist when this was written.
@@ -784,6 +805,7 @@ fn decodeColumn(reader: *Reader, gpa: std.mem.Allocator, leaf: usize) !Decoded {
 
 fn decodeDataPage(
     sink: *Sink,
+    scratch: *codec.Scratch,
     header: *const PageHeader,
     body: []const u8,
     chunk: Chunk,
@@ -804,14 +826,14 @@ fn decodeDataPage(
         levels = body[header.v2_rep_bytes..level_bytes];
         const rest = body[level_bytes..];
         if (header.v2_compressed and chunk.codec != .none) {
-            const page = try codec.decompress(gpa, chunk.codec, rest, header.uncompressed - level_bytes);
+            const page = try codec.decompress(gpa, scratch, chunk.codec, rest, header.uncompressed - level_bytes);
             owned = page;
             values = page;
         } else {
             values = rest;
         }
     } else {
-        const page = try codec.decompress(gpa, chunk.codec, body, header.uncompressed);
+        const page = try codec.decompress(gpa, scratch, chunk.codec, body, header.uncompressed);
         owned = page;
         if (info.max_def_level == 0) {
             values = page;

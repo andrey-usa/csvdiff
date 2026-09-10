@@ -229,6 +229,19 @@ before timing anything.
   A default gzip/zstd/lz4 run looks 3.5-4x worse only because it routes to the row reader, which
   is 3.7x the columnar path on its own. Never read a codec number without checking the engine
   field first -- it is the difference between measuring zstd and measuring the router.
+- **In the Zig port, check the budget before you decide an allocation is free.** Its allocator is
+  a fixed buffer that hands memory back and *cannot reuse it*, so an allocation inside a loop is
+  spent for good however promptly it is freed. Decompressing a 1M-row zstd pair allocated zstd's
+  8.13 MB window per page: 1.03x cpu and no result on wall over fifteen paired rounds, and
+  `--max-memory 4800` where 1600 now does, for 291 MB of live data. The clock said 3% and nearly
+  buried it. `--max-memory`, laddered until it stops refusing, is the measurement that finds this
+  class of bug; wall and cpu will not.
+- **A codec number is only the codec if the phase table covers the run.** A compressed Parquet run
+  used to print 0.19s of phases against a 1.0s wall, because the pass that decompresses and
+  materialises the columns sat outside every timer. It is `read columns (par)` now, and it is
+  85-90% of such a run. Where the phases do not add up to the wall, the missing pass is the one
+  worth looking at -- and two columns costing the same as six is a statement about the *widest*
+  column, not about the bytes.
 - **`drop_caches` does not give you a cold disk here.** The hypervisor keeps the blocks, so
   "cold" runs come back within 25% of warm ones. The only genuine cold read is the first touch
   after a container restart, and it ran at about 18 MB/s -- not reproducible, not representative.
