@@ -1,19 +1,28 @@
 /*
- * A Parquet reader for comparing, in C, uncompressed only.
+ * A Parquet reader for comparing, in C: uncompressed, snappy and LZ4.
  *
- * The C++ port's reader carries Snappy as well; this one deliberately does not,
- * because the question this port exists to answer is about readers rather than
- * codecs. A compressed column is refused by name.
+ * Snappy and LZ4 are written out here rather than pulled in, the same choice
+ * the Zig port made and for the same reason -- each is a byte-copy loop of
+ * about eighty lines, and a port whose selling point is that it carries no
+ * dependency should not acquire one to read the codec every Parquet writer
+ * defaults to. Gzip and zstd are not here: their decoders are real programs,
+ * and writing those out would be a library in this file rather than a loop.
+ * Both are refused by name.
  *
  * Two things it does that a general reader would not, both inherited from the
  * C++ design and both the reason the comparison above it can stay columnar.
  *
- * It hands back offsets into the mapped file rather than strings. A PLAIN byte
- * array is a four-byte length followed by its bytes, already contiguous and
- * already in the mapping, so a value stays an offset and a length -- the same
- * eight-byte packing the CSV engine uses for a field, and the reason nothing
- * here builds a string per cell. With no decompression there is no second
- * buffer to disambiguate: every offset is into the mapping, always.
+ * It hands back offsets rather than strings. A PLAIN byte array is a four-byte
+ * length followed by its bytes, already contiguous, so a value stays an offset
+ * and a length -- the same eight-byte packing the CSV engine uses for a field,
+ * and the reason nothing here builds a string per cell.
+ *
+ * What those offsets count from is `owned` when it is non-empty and the mapping
+ * when it is not. A column is wholly compressed or wholly not -- a column whose
+ * chunks disagree is refused -- so that one field settles it for every slice in
+ * the column, and `pq_base()` is the only place a caller has to ask. Reading an
+ * uncompressed file is unchanged: `owned` stays NULL and every offset is into
+ * the mapping, as it always was.
  *
  * And it keeps dictionary columns encoded, so two files can be compared by
  * mapping one dictionary onto the other once and then comparing integers.
@@ -63,6 +72,9 @@ typedef struct {
     PqSlice *dict;    size_t dict_len;
     int32_t *index;   size_t index_len;
     PqSlice *values;  size_t values_len;
+    /* Decompressed pages, when the column was compressed. Empty means every
+     * slice above counts from the mapping instead. See pq_base(). */
+    char    *owned;   size_t owned_len;
 } PqColumn;
 
 /* What a file says about itself, before any column is read. */
@@ -74,6 +86,11 @@ typedef struct {
 
 static inline size_t pq_rows(const PqColumn *c) {
     return c->dictionary ? c->index_len : c->values_len;
+}
+
+/* What this column's slices count from: its own buffer, or the mapping. */
+static inline const char *pq_base(const PqColumn *c, const char *mapping) {
+    return c->owned ? c->owned : mapping;
 }
 
 /*

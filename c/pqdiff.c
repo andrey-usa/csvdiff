@@ -555,7 +555,7 @@ static void read_keys_part(void *vctx, unsigned p) {
             note_failure(&c->fail[p]);
             return;
         }
-        s->col[j].base = c->m[p]->data;
+        s->col[j].base = pq_base(&s->col[j].c, c->m[p]->data);
     }
 }
 
@@ -671,11 +671,11 @@ static void column_part(void *vctx, unsigned p) {
         if (pq_read_column(c->am->data, c->am->size, name_slot(c->ameta, c->compared[j]), &A.c) != 0) {
             note_failure(&c->fail[j]); goto next;
         }
-        A.base = c->am->data;
+        A.base = pq_base(&A.c, c->am->data);
         if (pq_read_column(c->bm->data, c->bm->size, name_slot(c->bmeta, c->compared[j]), &B.c) != 0) {
             note_failure(&c->fail[j]); goto next;
         }
-        B.base = c->bm->data;
+        B.base = pq_base(&B.c, c->bm->data);
         if (pq_rows(&A.c) != c->a_rows || pq_rows(&B.c) != c->b_rows) {
             pq_set_error("parquet columns disagree about how many rows the file has");
             note_failure(&c->fail[j]);

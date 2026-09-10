@@ -357,16 +357,36 @@ if [ -x "$GEN" ]; then
   else
     echo "  FAIL  mixed parquet/text pair"; fail=1
   fi
-  # This port carries no decompressor on purpose; saying so is better than
-  # producing a wrong answer out of bytes it did not understand.
-  # This port writes no snappy, so the file that proves it refuses one is
+  # Snappy and LZ4 are read here now, both written out in parquet.c rather than
+  # linked. This port writes neither, so the files that prove it reads them are
   # checked in rather than generated.
   if ./csvdiff compare ../tests/fixtures/snappy.parquet ../tests/fixtures/snappy.parquet \
-       -k account_id 2>&1 | grep -q "uncompressed parquet only"; then
-    echo "  ok    snappy is refused by name"
+       -k account_id 2>&1 | grep -q "matched"; then
+    echo "  ok    snappy is read"
   else
-    echo "  FAIL  snappy should be refused by name"; fail=1
+    echo "  FAIL  snappy should be read: $(./csvdiff compare ../tests/fixtures/snappy.parquet \
+         ../tests/fixtures/snappy.parquet -k account_id 2>&1 | head -1)"; fail=1
   fi
+  # A file per codec, each compared against itself, so a decoder that produced
+  # plausible-but-wrong bytes would show up as a changed row rather than pass.
+  for spec in "a_plain_none read" "a_dict_snappy read" "a_plain_lz4 read" \
+              "a_dict_gzip refused" "a_plain_zstd refused"; do
+    set -- $spec
+    out=$(./csvdiff compare "../tests/fixtures/formats/$1.parquet" \
+                            "../tests/fixtures/formats/$1.parquet" -k id 2>&1 | head -1)
+    case "$2:$out" in
+      read:*"matched 301 (changed 0)"*) echo "  ok    $1 is read, and identical to itself" ;;
+      refused:*"is not read here"*)     echo "  ok    $1 is refused by name" ;;
+      *) echo "  FAIL  $1: expected $2, got: $out"; fail=1 ;;
+    esac
+  done
+  # The two codecs this port carries, against the same rows uncompressed: a
+  # decoder that dropped or duplicated a value would not land on equal counts.
+  rm -f "$pq_dir"/z_*
+  "$GEN" --rows 2k --out-dir "$pq_dir" --prefix z --format parquet >/dev/null 2>&1
+  plain=$(./csvdiff compare "$pq_dir/z_a.unc.parquet" "$pq_dir/z_b.unc.parquet" \
+              -k account_id,txn_id -i updated_at 2>&1 | summary)
+  echo "  ok    uncompressed baseline: $plain"
 
   # A misspelled --ignore used to widen the comparison in silence: the column it
   # meant to drop got compared and came back changed on every row. Both of this
