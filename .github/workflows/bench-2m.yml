@@ -144,22 +144,38 @@ jobs:
           fi
           python3 scripts/bench_formats_ports.py \
             --rows "$ROWS" --formats "${{ matrix.format }}" --repeats "$REPEATS" $scanners \
+            --md-out /tmp/bench.md \
             | tee /tmp/bench.txt
 
+      # The table outside the fence so it renders, the log inside it. Both
+      # together in a ``` block meant the markdown table was shown as its own
+      # source: a row of pipes rather than a table.
       - name: Publish the table
         if: always()
         run: |
           {
             echo "## $ROWS rows — ${{ matrix.format }}"
             echo
+            if [ -s /tmp/bench.md ]; then
+              cat /tmp/bench.md
+            else
+              echo "_No table: the run did not get that far. Its log is below._"
+            fi
+            echo
+            echo "<details><summary>full log</summary>"
+            echo
             echo '```'
-            cat /tmp/bench.txt
+            cat /tmp/bench.txt 2>/dev/null || echo "(no output)"
             echo '```'
+            echo
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bench-2m-${{ matrix.format }}-${{ github.run_id }}
-          path: /tmp/bench.txt
+          path: |
+            /tmp/bench.txt
+            /tmp/bench.md
           retention-days: 30

@@ -9,10 +9,22 @@ name: Benchmark ladder (10M and up)
 # stops fitting in cache, the generator stops fitting on the disk -- but they
 # are a question somebody asks deliberately, not a tax on every push.
 #
-# One job per *size*, and never one per port: a table's ports have to have run
-# on one host in one sitting or it compares machines instead of engines. Sizes
-# were never comparable with each other, so splitting there costs nothing that
-# was not already gone.
+# One job per *size and format*, and never one per port: a table's ports have to
+# have run on one host in one sitting or it compares machines instead of
+# engines. Sizes were never comparable with each other, and neither were
+# formats, so splitting on those two costs nothing that was not already gone.
+#
+# Formats were split off after a 40m run lost everything it had measured. The
+# CSV half had finished -- nine builds, real numbers -- and then the runner was
+# taken away partway through parquet, with `exit 143` and a shutdown signal. A
+# step that publishes at the end cannot help there: when the runner goes, no
+# further step runs at all, `if: always()` included, so the upload never
+# happened and the numbers survived only in the log. Separate jobs are the only
+# arrangement where finishing CSV means keeping CSV.
+#
+# It costs one generation per cell rather than one per size, and buys back more
+# than it costs: each job now generates only its own format, so the 40m CSV job
+# writes 14 GB instead of that plus 6 GB of parquet beside it.
 #
 # `fail-fast: false` is load-bearing. Forty million rows of CSV is about 15 GB
 # for the pair and fifty is 18.4 GB, so the top of a ladder can run the runner
@@ -52,9 +64,14 @@ on:
         description: "Runs per build; the best is kept"
         default: "2"
       matrix:
-        description: "Include the scanner builds (SWAR against AVX2 and AVX-512)"
+        description: "Include the scanner builds (SWAR vs AVX2 vs AVX-512) — triples each job"
         type: boolean
-        default: true
+        # Off by default now. Nine builds instead of four is three times the
+        # measurements and three times the wall clock for a question about
+        # instruction sets, which is not the question a ladder asks. It also
+        # produced the highest memory this workflow has recorded -- 15.1 GB on a
+        # 16 GB runner, at 40m rows of CSV. Turn it on deliberately.
+        default: false
 
 # The same group every benchmark in this repository names, so a ladder and a 2M
 # run queue for each other instead of measuring each other's contention. The
@@ -71,6 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sizes: ${{ steps.read.outputs.sizes }}
+      formats: ${{ steps.read.outputs.formats }}
     steps:
       - id: read
         # Refused rather than silently dropped: a size this cannot parse would
@@ -80,20 +98,30 @@ jobs:
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os, re, sys
-          raw = os.environ["SIZES"]
-          rungs = [s.strip() for s in raw.split(",") if s.strip()]
+          rungs = [s.strip() for s in os.environ["SIZES"].split(",") if s.strip()]
           if not rungs:
               sys.exit("no sizes given")
           for s in rungs:
               if not re.fullmatch(r"\d+[kmKM]?", s):
                   sys.exit(f"not a row count: {s!r}")
           print("sizes=" + json.dumps(rungs))
+          # Same refusal for formats, and for the same reason: a name this does
+          # not know would otherwise become a job that generates nothing and
+          # reports an empty table.
+          fmts = [f.strip().lower() for f in os.environ["FORMATS"].split(",") if f.strip()]
+          if not fmts:
+              sys.exit("no formats given")
+          for f in fmts:
+              if f not in ("csv", "ndjson", "parquet"):
+                  sys.exit(f"not a format: {f!r}")
+          print("formats=" + json.dumps(fmts))
           PY
         env:
           SIZES: ${{ github.event.inputs.sizes }}
+          FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
 
   rung:
-    name: "${{ matrix.size }} rows"
+    name: "${{ matrix.size }} rows — ${{ matrix.format }}"
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 240
@@ -101,17 +129,18 @@ jobs:
       fail-fast: false
       matrix:
         size: ${{ fromJSON(needs.plan.outputs.sizes) }}
+        format: ${{ fromJSON(needs.plan.outputs.formats) }}
     env:
-      FORMATS: ${{ github.event.inputs.formats || 'csv,parquet' }}
+      FORMAT: ${{ matrix.format }}
       REPEATS: ${{ github.event.inputs.repeats || '2' }}
-      MATRIX: ${{ github.event.inputs.matrix || 'true' }}
+      MATRIX: ${{ github.event.inputs.matrix || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: What this runner is
         run: |
           {
-            echo "## ${{ matrix.size }} — host"
+            echo "## ${{ matrix.size }} ${{ matrix.format }} — host"
             echo
             echo '```'
             grep -m1 "model name" /proc/cpuinfo
@@ -129,7 +158,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          key: ladder-${{ matrix.size }}
+          key: ladder-${{ matrix.size }}-${{ matrix.format }}
 
       - name: Install Zig
         run: |
@@ -175,25 +204,46 @@ jobs:
             scanners="--matrix"
           fi
           python3 scripts/bench_formats_ports.py \
-            --rows "${{ matrix.size }}" --formats "$FORMATS" --repeats "$REPEATS" $scanners \
+            --rows "${{ matrix.size }}" --formats "$FORMAT" --repeats "$REPEATS" $scanners \
+            --md-out /tmp/bench.md \
             | tee /tmp/bench.txt
 
+      # The table outside the code fence and the log inside it. They used to go
+      # in together, which meant the markdown table this script prints was
+      # sealed in a ``` block and shown as its own source -- a row of pipes,
+      # never a table. Everything else the script prints is narrative and does
+      # belong in a fence, so the two are published separately rather than the
+      # fence being dropped.
       - name: Publish this rung
         if: always()
         run: |
           {
-            echo "## ${{ matrix.size }} rows — $FORMATS"
+            echo "## ${{ matrix.size }} rows — $FORMAT"
+            echo
+            if [ -s /tmp/bench.md ]; then
+              cat /tmp/bench.md
+            else
+              echo "_This rung produced no table. Its log is below._"
+            fi
+            echo
+            echo "<details><summary>${{ matrix.size }} ${{ matrix.format }} — full log</summary>"
             echo
             echo '```'
-            cat /tmp/bench.txt 2>/dev/null || echo "this rung produced no table"
+            cat /tmp/bench.txt 2>/dev/null || echo "(no output)"
             echo '```'
+            echo
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ladder-${{ matrix.size }}-${{ github.run_id }}
-          path: /tmp/bench.txt
+          name: ladder-${{ matrix.size }}-${{ matrix.format }}-${{ github.run_id }}
+          # Both: the log for what happened, the table on its own for reading
+          # and for pasting into BENCHMARKS.md.
+          path: |
+            /tmp/bench.txt
+            /tmp/bench.md
           retention-days: 30
 
   collect:
@@ -202,6 +252,12 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # Before the download, not after: checkout cleans the workspace, so the
+      # other order would delete the rungs it is here to read. This job needs
+      # the tree at all because the table it prints comes from
+      # scripts/mdtable.py, the same renderer every rung used.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: ladder-*-${{ github.run_id }}
@@ -211,43 +267,54 @@ jobs:
       - name: One table for the whole ladder
         run: |
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
-          import json, os, pathlib
-          asked = json.loads(os.environ["SIZES"])
+          import json, os, pathlib, sys
+          sizes = json.loads(os.environ["SIZES"])
+          formats = json.loads(os.environ["FORMATS"])
           root = pathlib.Path("rungs")
+          sys.path.insert(0, "scripts")
+          from mdtable import render
           print("## The ladder\n")
-          print("| Rows | Outcome |")
-          print("|---|---|")
-          missing = []
-          for size in asked:
-              # `merge-multiple: false` keeps one directory per rung, named for
-              # the artifact, so a rung that uploaded nothing is visibly absent
-              # rather than merged into a neighbour's file.
-              hit = list(root.glob(f"ladder-{size}-*/bench.txt"))
-              text = hit[0].read_text().strip() if hit else ""
-              if text:
-                  print(f"| {size} | reported |")
-              else:
-                  print(f"| {size} | **no table** -- see that rung's log |")
-                  missing.append(size)
-          print()
+          grid, missing = [], []
+          for size in sizes:
+              row = [size]
+              for fmt in formats:
+                  # `merge-multiple: false` keeps one directory per cell, named
+                  # for the artifact, so a cell that uploaded nothing is visibly
+                  # absent rather than merged into a neighbour's file.
+                  hit = list(root.glob(f"ladder-{size}-{fmt}-*/bench.txt"))
+                  text = hit[0].read_text().strip() if hit else ""
+                  row.append("reported" if text else "**none**")
+                  if not text:
+                      missing.append(f"{size} {fmt}")
+              grid.append(row)
+          print(render(["Rows"] + formats, ["l"] + ["l"] * len(formats), grid))
+          total = len(sizes) * len(formats)
           if missing:
-              print(f"{len(missing)} of {len(asked)} rungs produced no table: "
+              print(f"{len(missing)} of {total} cells produced no table: "
                     + ", ".join(missing) + ".")
-              print("A rung that runs out of disk during generation is the usual "
-                    "reason; the rungs below it are still good numbers.")
+              print("Running out of disk while generating, or the runner itself "
+                    "being taken away, are the two usual reasons. Every other "
+                    "cell is unaffected -- that is why they are separate jobs.")
           else:
-              print(f"All {len(asked)} rungs reported.")
+              print(f"All {total} cells reported.")
           PY
         env:
           SIZES: ${{ needs.plan.outputs.sizes }}
+          FORMATS: ${{ needs.plan.outputs.formats }}
 
       - name: Every rung's table, in full
         run: |
           for f in rungs/ladder-*/bench.txt; do
             [ -s "$f" ] || continue
-            size=$(basename "$(dirname "$f")" | sed 's/^ladder-//; s/-[0-9]*$//')
+            dir=$(dirname "$f")
+            # ladder-<size>-<format>-<run id>
+            cell=$(basename "$dir" | sed 's/^ladder-//; s/-[0-9]*$//')
             {
-              echo "<details><summary>$size rows — full table</summary>"
+              echo "### ${cell%-*} rows — ${cell##*-}"
+              echo
+              # The table renders; the log it came from goes in the fold.
+              [ -s "$dir/bench.md" ] && { cat "$dir/bench.md"; echo; }
+              echo "<details><summary>$cell — full log</summary>"
               echo
               echo '```'
               cat "$f"

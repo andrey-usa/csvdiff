@@ -45,6 +45,8 @@ import sys
 import time
 from pathlib import Path
 
+from mdtable import render
+
 ROOT = Path(__file__).resolve().parent.parent
 KEY = "account_id,txn_id"
 IGNORE = "updated_at"
@@ -183,14 +185,16 @@ def main() -> int:
             answers[label] = counts(out)
 
     print(f"\ninput {size:,.0f} MB total, {args.repeats} interleaved runs each\n")
-    print("| Port | Best | Median | Worst | CPU | Peak RSS | Above the input |")
-    print("|---|---:|---:|---:|---:|---:|---:|")
+    grid = []
     for label, _, _ in builds:
         ts = sorted(t for t, _, _ in times[label])
         rss = max(r for _, r, _ in times[label])
         cpu = min(c for _, _, c in times[label])
-        print(f"| {label} | {ts[0]:.2f}s | {statistics.median(ts):.2f}s | {ts[-1]:.2f}s | "
-              f"{cpu:.1f}s | {rss:,.0f} MB | {rss - size:,.0f} MB |")
+        grid.append([label, f"{ts[0]:.2f}s", f"{statistics.median(ts):.2f}s",
+                     f"{ts[-1]:.2f}s", f"{cpu:.1f}s", f"{rss:,.0f} MB",
+                     f"{rss - size:,.0f} MB"])
+    print(render(["Port", "Best", "Median", "Worst", "CPU", "Peak RSS", "Above the input"],
+                 ["l", "r", "r", "r", "r", "r", "r"], grid), end="")
 
     # The correctness gate. Ports that disagree about how many rows changed mean
     # a bug in one of them, not an interesting benchmark, so say which.

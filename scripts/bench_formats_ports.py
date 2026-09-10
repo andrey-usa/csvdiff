@@ -41,6 +41,8 @@ import sys
 import time
 from pathlib import Path
 
+from mdtable import render
+
 ROOT = Path(__file__).resolve().parent.parent
 KEY = ["-k", "account_id,txn_id", "-i", "updated_at"]
 
@@ -168,6 +170,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--json-out", type=Path, default=None,
                         help="also write the rows here, unrounded, for a harness "
                              "that has to compare two runs of this script")
+    parser.add_argument("--md-out", type=Path, default=None,
+                        help="write just the results table here, as markdown")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--threads", type=int, default=None,
                         help="threads per run; the default is whatever each port picks")
@@ -250,16 +254,27 @@ def main(argv: list[str]) -> int:
     cores = os.cpu_count() or 1
     print(f"\n{cores} cores; \"cores\" is CPU seconds over wall seconds -- how many "
           f"were busy, out of {cores}.")
-    print("\n| Build | Format | Compare | Rows/s | CPU | Cores | Peak RSS | Above the input |")
-    print("|---|---|---:|---:|---:|---:|---:|---:|")
+    grid = []
     for row in results:
         if row.get("seconds") is None:
-            print(f"| {row['port']} | {row['format']} | — | — | — | — | — | — |")
+            grid.append([row["port"], row["format"], "-", "-", "-", "-", "-", "-"])
             continue
         rate = row["rows"] / row["seconds"]
-        print(f"| {row['port']} | {row['format']} | {row['seconds']:.2f}s | {rate:,.0f} | "
-              f"{row['cpu']:.1f}s | {row['cores']:.2f}x | "
-              f"{row['rss']:,.0f} MB | {row['above']:,.0f} MB |")
+        grid.append([row["port"], row["format"], f"{row['seconds']:.2f}s", f"{rate:,.0f}",
+                     f"{row['cpu']:.1f}s", f"{row['cores']:.2f}x",
+                     f"{row['rss']:,.0f} MB", f"{row['above']:,.0f} MB"])
+    md = render(["Build", "Format", "Compare", "Rows/s", "CPU", "Cores", "Peak RSS",
+                 "Above the input"],
+                ["l", "l", "r", "r", "r", "r", "r", "r"], grid)
+    print("\n" + md, end="")
+
+    # The table on its own, for a caller that wants to publish it as a table
+    # rather than as part of this log. Everything above is narrative -- what was
+    # generated, what each port did, whether the counts agreed -- and belongs in
+    # a code block; the table does not, and inside one it can never render.
+    if args.md_out:
+        args.md_out.parent.mkdir(parents=True, exist_ok=True)
+        args.md_out.write_text(md)
 
     # The table rounds seconds to two decimals, which is a couple of per cent at
     # the sizes this runs at -- fine to read, too coarse to compare two runs
