@@ -87,7 +87,19 @@ jobs:
       # Four ports at once rather than one after another; see
       # scripts/build_ports.sh for why that is 2-4x on a four-core runner.
       - name: Build the native ports
-        run: scripts/build_ports.sh c cpp rust-full zig
+        run: scripts/build_ports.sh c c-gen cpp cpp-gen rust-full zig
+
+      # Before the readers are asked anything, because if the generators
+      # disagree then the readers are being asked about different files.
+      #
+      # Nothing checked this. This job generates one dataset with `c/gen-data`
+      # and compares what the readers say about it, which is a different claim,
+      # and `c/test.sh --with-ports` compares C against C++ and stops there. So
+      # the Rust generator and the Python one had never been byte-compared to
+      # anything -- and a real divergence was sitting in that gap. See the
+      # script's KNOWN list.
+      - name: Every generator writes the same bytes
+        run: python3 scripts/generator_parity.py --rows 200k | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: One dataset, from the C generator
         run: |

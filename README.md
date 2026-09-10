@@ -575,7 +575,7 @@ blank row, and a short key in the last bytes of the file.
 |---|---|
 | `ci-c.yml` | the C port on gcc and clang, sanitizers, and the cross-port checks |
 | `ci-rust.yml` | `fmt`, `clippy -D warnings`, `cargo test`, and the engines agreeing on 200k rows |
-| `parity.yml` | every port returns identical counts, and every generator emits byte-identical files |
+| `parity.yml` | every port returns identical counts on one dataset, and every generator writes byte-identical files |
 | `bench-2m.yml` | two million rows, every port and format, on every pull request |
 | `benchmark-native.yml` | on demand only: one tree, or this tree beside another branch's for an A/B |
 
