@@ -314,12 +314,28 @@ before timing anything.
   on one runner and run on another is a `SIGILL` waiting for the wrong machine. Shortening the
   job is the only way to shorten the `benchmark-host` lock, because the lock is held for the whole
   job.
-- **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
-  measure each other's contention, which spoils both — including the one already running that
-  somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
-  benchmark or dispatching one by hand. The benchmark workflows name a single `benchmark-host`
-  concurrency group so GitHub queues them; a per-ref group does not, because another branch is
-  another group.
+- **One benchmark workflow at a time, repository-wide — and nobody has measured whether it needs
+  to be.** `bench-2m.yml`, `bench-ladder.yml` and `benchmark-native.yml` share a single
+  `benchmark-host` concurrency group so GitHub queues them; a per-ref group does not, because
+  another branch is another group. Check for a run in progress before pushing to a path that
+  triggers a benchmark or dispatching one by hand.
+  **The reason given for the group and the reason given for leaving `scale-ceiling.yml` out of it
+  contradict each other, and both are assertions.** This rule used to say two timing jobs "share a
+  host and measure each other's contention"; `scale-ceiling.yml`'s header says "these are separate
+  hosted runners so they do not contend with each other". Both cannot be right, and the answer
+  decides real things: `bench-2m.yml` runs three timing jobs at once on purpose, and the group
+  costs a pull request the wait for any benchmark already going. What would settle it is an A/A
+  test at the CI level — the same benchmark job run alone, then run as one of four identical jobs
+  started together, and the two tables compared. Until somebody runs it, the group stays because
+  the conservative arrangement is the cheap mistake. Within one workflow, jobs are split so that
+  every port-against-port comparison stays inside a single job, which is the part that is true
+  either way.
+- **`scale-ceiling.yml` stays out of the benchmark group on purpose, and it is not because it is
+  untimed** — it records wall, rows/s and cpu/wall like the others. It is because its ceiling job
+  is `timeout-minutes: 330`: a group that queued it in front of the pull-request benchmarks would
+  block every one of them for up to five and a half hours to protect a number nobody had shown was
+  at risk. Its own group stops it overlapping another run of itself, which is the part worth
+  having.
 - **A Windows checkout can hand WSL scripts CRLF, even though every blob in the repository is
   LF.** Git for Windows ships `core.autocrlf=true` in its system-wide config, not just as a user
   opt-in, so a plain `git clone` on the Windows side rewrites every tracked `.sh` on checkout —
