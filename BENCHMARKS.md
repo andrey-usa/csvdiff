@@ -64,6 +64,66 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (scale) — sixty million rows, and nobody's ceiling
+
+The first run of `scale-ceiling.yml` in its fanned-out shape: every (port, size)
+its own job on its own hosted runner, 24 of them, plus four jobs that take the
+memory away until the run dies. [Run 34476661822][r], 30 jobs, all green.
+
+[r]: https://github.com/andrey-usa/csvdiff/actions/runs/34476661822
+
+### The headline is what did not happen
+
+Nobody hit a ceiling. All four ports compared **sixty million rows — 21,053 MB
+of input for the pair** — on a four-core runner with 16 GB of RAM, and the report
+says "ladder ran out, not the port" for every one of them. Two earlier runs had
+died at forty million, which is what made sixty look like a reach; both of those
+were one job doing several sizes, or several formats, on one disk. A rung with a
+runner to itself has about 25 GB free after the toolchain cleanup, and 21 GB
+fits.
+
+So the honest statement of the ceiling is: **this ladder was too short to find
+one.** Not "the ports reach 60m" — that is where measuring stopped, not where
+they stop.
+
+### The memory floor — 10m rows, CSV
+
+The smallest cgroup limit the same comparison finishes inside, found by bisection.
+This is the number peak RSS cannot give you: an engine that maps its input has
+reclaimable pages, so its RSS is whatever the kernel allowed rather than what it
+needed.
+
+| Port | Smallest limit that finishes |
+|---|---:|
+| **c** | **733 MB** |
+| cpp | 892 MB |
+| zig | 892 MB |
+| rust | 924 MB |
+
+C leads by about 20% over the next three, which sit within 4% of each other.
+Consistent with the 126 MB this port needed for two million rows, measured
+locally in the memory entry below.
+
+### The wall times from that run are not in this entry, deliberately
+
+They were collected, and they are not comparable. Each cell ran on its own
+hosted runner, so two cells differ by hardware as much as by size — and the
+numbers show it plainly: Rust took 142s at forty million and 92s at sixty,
+Zig 320s at fifty and 99s at sixty. A size curve does not do that. A fleet
+spanning CPU generations does.
+
+That is a property of the fan-out, which was built for parallelism and for
+surviving a lost runner, and it costs the one thing the sequential shape had:
+one port's whole ladder on one machine. `scale-ceiling.yml` is the right
+instrument for *how far* and *how little memory*, and the wrong one for *how
+fast*. For that, `bench-ladder.yml` puts every port on one host per size.
+
+The report now says so above the table, and prints which CPU each cell drew
+whenever they were not all the same, so the caveat can be checked rather than
+taken on trust.
+
+---
+
 ## 2026-09-10 (rle_fill) — 18.5% of the instructions, none of the time
 
 A negative result, recorded because it would cost the next person the same

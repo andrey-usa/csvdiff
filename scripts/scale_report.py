@@ -52,9 +52,15 @@ def ceiling_tables(rows: list[dict]) -> str:
 
     by = {(r["port"], r["size"]): r for r in rows}
     out = ["### How far each port got\n",
-           "Wall time in seconds. Every rung is its own run on its own runner, so",
-           "**failed** is that size failing and says nothing about the ones above",
-           "it -- those were measured too. The reason is under the table.\n"]
+           "**Read down a column for whether a size completed, not across for how",
+           "long it took.** Every cell is its own job on its own hosted runner, and",
+           "those runners are not the same machine -- so two cells differ by "
+           "hardware",
+           "as well as by size, and the seconds below are not a curve. Where a size",
+           "matters more than the machine, `bench-ladder.yml` puts every port on one",
+           "host per size, which is the table to compare times in.\n",
+           "**failed** is that size failing and says nothing about the sizes above",
+           "it -- those ran too, independently. The reason is under the table.\n"]
     grid = []
     for s in sizes:
         cells = [s]
@@ -97,6 +103,23 @@ def ceiling_tables(rows: list[dict]) -> str:
                      f"{best['wall_s']:.2f}s", f"{best['rss_mb']:,.0f} MB", stopped])
     out += table(["Port", "Largest completed", "Input at that size", "Wall", "Peak RSS",
                   "Stopped by"], ["l", "r", "r", "r", "r", "l"], grid)
+
+    # The evidence for the warning above, and only when there is something to
+    # show: if every cell drew the same CPU the table is one value repeated, and
+    # if none of them recorded one there is nothing to say.
+    seen = {r.get("cpu") for r in rows if r.get("cpu")}
+    if len(seen) > 1:
+        out += ["", "### Which machine each cell drew\n",
+                "The reason the seconds above are not comparable, in full. These are",
+                "hosted runners, and the fleet spans CPU generations.\n"]
+        cpus = sorted(seen)
+        short = {c: f"m{i + 1}" for i, c in enumerate(cpus)}
+        by_cpu = {(r["port"], r["size"]): r.get("cpu") for r in rows}
+        cells = []
+        for s in sizes:
+            cells.append([s] + [short.get(by_cpu.get((p, s)), "-") for p in ports])
+        out += table(["Rows"] + ports, ["l"] + ["l"] * len(ports), cells)
+        out += [""] + [f"- `{short[c]}` — {c}" for c in cpus]
     return "\n".join(out) + "\n"
 
 
