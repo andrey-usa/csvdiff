@@ -66,13 +66,13 @@ jobs:
       # write their fixtures with `cpp/build/gen-data --format parquet`, and
       # they skip themselves by name rather than failing when it is absent --
       # which is how eleven of them silently did not run here.
-      # The three at once; see scripts/build_ports.sh. `rust` there is the
+      # The four at once; see scripts/build_ports.sh. `rust` there is the
       # --no-default-features build, which is the one this job wants: every run
       # here is `--engine turbo` or the columnar Parquet path.
       - name: Build the three ports
         env:
           CXX: clang++
-        run: scripts/build_ports.sh rust zig cpp cpp-gen
+        run: scripts/build_ports.sh c rust zig cpp cpp-gen
 
       # The dev profile, deliberately: the release profile links with thin LTO
       # in one codegen unit, which costs minutes per test binary and buys
@@ -145,7 +145,7 @@ jobs:
 
       # Wall time, CPU time and peak RSS on every row: what it cost, how many
       # cores it took to cost that, and what it held while doing it.
-      - name: Benchmark the three ports across the three formats
+      - name: Benchmark the four ports across the three formats
         run: |
           python3 scripts/bench_formats_ports.py \
             --rows ${{ github.event.inputs.rows || '1m' }} --repeats 2 \

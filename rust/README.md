@@ -72,7 +72,8 @@ Duplicate keys are counted and listed per file; the first occurrence of each key
 
 At ten million rows on a GitHub-hosted runner, four threads, best of two, with
 peak RSS on every row (the full matrix and how it is produced are in the root
-README; `bench-10m.yml` reruns it on every push that touches an engine):
+README; `bench-2m.yml` reruns a 2M version on every pull request that touches
+an engine, and `bench-ladder.yml` runs 10M and up on request):
 
 | Input | Compare | Rows/s | Peak RSS |
 |---|---:|---:|---:|

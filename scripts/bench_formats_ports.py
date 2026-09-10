@@ -44,6 +44,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 KEY = ["-k", "account_id,txn_id", "-i", "updated_at"]
 
+C = ROOT / "c/csvdiff"
 CPP = ROOT / "cpp/build/csvdiff"
 RUST = ROOT / "rust/target/release/csvdiff"
 ZIG = ROOT / "zig/zig-out/bin/csvdiff"
@@ -57,9 +58,14 @@ ALL = {"csv", "ndjson", "parquet"}
 def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[str], set[str]]]:
     """(label, argv prefix, extra flags, the formats it can read).
 
-    All three ports read all three formats. A Parquet pair is the one input none
+    All four ports read all three formats. A Parquet pair is the one input none
     of them scans: it goes to the columnar path instead, which is why the Parquet
     rows below are not measuring the scanner the CSV rows are.
+
+    The C port is here rather than only in `bench_ports.py` so that one table can
+    answer "did this change make a port slower" for every port at once. It was
+    the one port this script did not build, which meant the per-pull-request
+    benchmark and the leading port were in two different workflows.
 
     `matrix` adds the scanner builds -- SWAR against a vector register, one
     binary each so nothing is measuring a branch -- and the Rust engine without
@@ -69,6 +75,7 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     thread_flag = ["--threads", str(threads)] if threads else []
     report = ["--engine", "turbo", "-o", "/dev/null"]
     rows: list[tuple[str, list[str], list[str], set[str]]] = [
+        ("C", [str(C)], thread_flag, ALL),
         ("C++", [str(CPP)], thread_flag, ALL),
         ("Rust", [str(RUST)], report + thread_flag, ALL),
         ("Zig", [str(ZIG)], thread_flag, ALL),

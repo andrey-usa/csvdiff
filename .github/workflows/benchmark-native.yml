@@ -26,16 +26,17 @@ name: Benchmark (native)
 # would want numbers for. `synchronize` re-runs on a new push to the PR, which
 # is the one case where cancelling the previous run is the right thing.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - "c/**"
-      - "cpp/src/**"
-      - "cpp/Makefile"
-      - "rust/src/**"
-      - "zig/src/**"
-      - "scripts/bench_ports.py"
-      - ".github/workflows/benchmark-native.yml"
+  # No `pull_request` trigger any more. `bench-2m.yml` is the benchmark a pull
+  # request gets, and since the C port joined `bench_formats_ports.py` it covers
+  # all four ports across all three formats with the scanner builds beside them
+  # -- everything this workflow measured on a pull request and more. Two
+  # benchmarks on one pull request did not run side by side either: they share
+  # the `benchmark-host` group, so the second waited for the first and a
+  # reviewer waited for both.
+  #
+  # What is left here is what `bench-2m.yml` does not do: the run on `main`
+  # after a merge, and `alt_ref` on request, which builds another branch's Rust
+  # and Zig beside this one's for a side-by-side table.
   push:
     # main only: what landed is worth a number, and nothing is racing it there.
     branches: [main]
