@@ -9,6 +9,7 @@ It is **four byte-level ports to one result contract** — C, C++, Rust and Zig.
 They read the same files, return the same counts and the same exit codes, which
 is what makes a number from one directly comparable with a number from another.
 
+- [AGENTS.md](AGENTS.md) — the entry point for AI coding tools; `CLAUDE.md` adds the Claude Code specifics
 - [BENCHMARKS.md](BENCHMARKS.md) — every run, with CPU and memory
 - [ARCHIVE.md](ARCHIVE.md) — what was tried, what it was worth, what was removed
 

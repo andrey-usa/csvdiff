@@ -22,8 +22,8 @@ What the tests assert is not a particular answer but that the implementations ca
 one. Under the default options `CAFÉ` and `café` are different keys; under `--ignore-case` they are
 the same. Either is a defensible answer. Two implementations giving different ones is not.
 
-`EngineParityTest.awkwardInputAgrees` runs it across the Java engines and `parity.yml` runs it
-across all five languages.
+`parity.yml` runs it across all four ports, and each port's own `test.sh` holds the pair against
+the Rust port's answers.
 
 # Formats
 

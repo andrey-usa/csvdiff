@@ -1,12 +1,12 @@
 # csvdiff (Rust)
 
 The Rust port of `csvdiff`. Same comparison, same result contract and the same self-contained HTML
-report as the Python implementation in the repository root, the TypeScript one in `../ts`, the Java
-one in `../java` and the Go one in `../go` — CI asserts all five produce identical counts and column
-stats on the same input, and that their five data generators emit byte-identical files.
+report. `parity.yml` asserts all four ports return identical counts and column stats on the same
+input, and that their generators emit byte-identical files.
 
-It also carries the fastest engine in this project. `turbo` reads **CSV, newline-delimited JSON and
-Parquet**, decodes Parquet's pages itself rather than through a library, and splits the whole
+The default engine, `turbo`, is the byte-level design the ports share: it reads **CSV,
+newline-delimited JSON and Parquet**, decodes Parquet's pages itself rather than through a library,
+and splits the whole
 comparison across every core. The two sides need not be in the same format: a CSV export compares
 against the Parquet a warehouse emits, joined on the same key.
 
@@ -33,21 +33,22 @@ than failing obscurely, and `--engine auto` skips past it.
 ## Use
 
 ```bash
-cargo run --release -- compare july.csv august.csv --key order_id,line_no
-cargo run --release -- compare july.csv august.csv --key id --compare qty,price \
-    --ignore updated_at --trim --tolerance 0.005
-cargo run --release -- compare july.csv august.csv --profile orders \
+cargo run --release -- compare data/p_a.csv data/p_b.csv -k account_id,txn_id -i updated_at
+cargo run --release -- compare data/p_a.csv data/p_b.csv -k account_id,txn_id \
+    --trim --tolerance 0.005
+cargo run --release -- compare data/p_a.csv data/p_b.csv --profile demo \
     --json summary.json --export-dir out/
 ```
 
 Exit code 0 = identical, 1 = differences, 2 = error, 3 = duplicate keys (with `--fail-on-dups`),
 so it drops into a CI or pipeline gate unchanged.
 
-**Profiles** (`csvdiff.toml`, see `../csvdiff.example.toml`) store key/compare/ignore/normalisation
-per recurring comparison. The file format is shared with the other implementations.
+**Profiles** (`csvdiff.toml`, see the example at the repository root, `../csvdiff.example.toml`)
+store key/compare/ignore/normalisation per recurring comparison. Profiles are this port's feature —
+the C, C++ and Zig ports take the same settings as flags.
 
-The drag-and-drop page and the mailbox watcher are not ported; use the Python implementation for
-`csvdiff serve` and `csvdiff mail`.
+The drag-and-drop page and the mailbox watcher belonged to the removed Python implementation. No
+port has a `serve` or `mail` command.
 
 ## Options
 
@@ -63,7 +64,6 @@ The drag-and-drop page and the mailbox watcher are not ported; use the Python im
 | `--max-rows` | rows embedded per report section (default 50 000; counts are always exact) |
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
 | `--engine` | `auto` (default, resolves to `turbo`), `turbo`, `sortmerge`, or `native` |
-| `--threads` | how many threads the engine may use |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
@@ -137,12 +137,6 @@ floats in the shortest round-trip form laid out the way JavaScript lays it out, 
 timestamps ISO 8601. The Zig port implements the same rule, and `tests/fixtures/formats/typed.csv`
 is that rule written down, so a change to it fails a test rather than passing quietly in both ports.
 
-All three formats are read as text — no type inference, so `1.0` and `1` stay different unless a
-tolerance is set — and an empty field is absent whether or not it is quoted. Polars
-needs help with that last rule: it reads an unquoted empty field as null but keeps a *quoted* empty
-as a zero-length string, so the engine normalises it back before any user-supplied normalisation
-runs. A test pins that behaviour.
-
 The DuckDB and polars engines were removed. They were the project's original comparison points and
 the question they answered — is a bespoke byte-level engine worth writing — is settled; their
 numbers are in [ARCHIVE.md](../ARCHIVE.md). What they cost while they stayed was a twenty-minute
@@ -160,8 +154,8 @@ cargo run --release --bin gen-data -- --rows 10k --out-dir data
 cargo run --release --bin bench -- --rows 10k --engine turbo
 ```
 
-`gen-data` builds the same deterministic 20-column pair as the Python, TypeScript, Java and Go
-generators, keyed on `(account_id, txn_id)` with the same splitmix hash and the same drift recipe.
+`gen-data` builds the same deterministic 20-column pair as the C, C++ and Zig generators, keyed on
+`(account_id, txn_id)` with the same splitmix hash and the same drift recipe.
 `--format csv|ndjson|parquet` writes those same rows in any of the three formats — the Parquet
 writer is this project's own, dictionary-encoding a column chunk where that is smaller and writing
 it plain where it is not — so a format benchmark compares readers rather than converters, and the
@@ -218,7 +212,7 @@ src/rowstore.rs           de-duplication, join and sparse cell diffs for the in-
 src/columns.rs            column resolution, normalisation, cell equality, key ordering
 src/sections.rs           capping and the uncapped CSV exports
 src/report.rs             HTML renderer
-src/report.html           report template, shared with the other implementations
+src/report.html           the template it embeds, with `include_str!`
 src/profiles.rs           csvdiff.toml profiles
 src/gendata.rs            deterministic test payload generator
 src/bin/gen_data.rs       its command line

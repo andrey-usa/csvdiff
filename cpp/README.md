@@ -1,7 +1,7 @@
 # csvdiff — C++
 
 The byte-level comparison, in the language people reach for when they want the
-fastest thing they can read. Same design as the Java and Rust `turbo` engines:
+fastest thing they can read. Same design as the C, Rust and Zig `turbo` engines:
 the file is mapped, a field is an offset and a length packed into one word,
 delimiters are found eight bytes at a time with SWAR, and nothing becomes a
 `std::string` unless it reaches the report.
@@ -29,8 +29,8 @@ build/gen-data --rows 10m --out-dir data --format parquet --compression snappy
 ## What it is and is not
 
 This is a **benchmark and parity port**: it carries the comparison and the JSON
-half of the result contract, not the HTML report. The five full ports already
-produce that; what is interesting here is the engine.
+half of the result contract, not the HTML report — the Rust port is the only one
+that renders it; what is interesting here is the engine.
 
 Two limitations, both stated rather than papered over:
 

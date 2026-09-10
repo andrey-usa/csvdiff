@@ -1,30 +1,33 @@
 ---
 name: csvdiff-report
-description: Rules and workflow for changing the csvdiff HTML report — the template in csvdiff/report.py, its embedded CSS/JS, the gzip payload, and the virtualised grid. Use when adding a tab, column, filter, keyboard shortcut, or any change to what the report displays or how large it is.
+description: Rules and workflow for changing the csvdiff HTML report — the template in rust/src/report.html, its embedded CSS/JS, the gzip payload in rust/src/report.rs, and the virtualised grid. Use when adding a tab, column, filter, keyboard shortcut, or any change to what the report displays or how large it is.
 ---
 
 # Changing the csvdiff report
 
-The whole report is one Python string, `_TEMPLATE`, in `csvdiff/report.py`. There is no build
-step, no bundler and no dependency. `render()` serialises the result dict to JSON, gzips it,
-base64s it into a `<script type="application/gzip">` block, and the page decodes it on load with
-`DecompressionStream`.
+The report is Rust, and the whole thing lives in two files: `rust/src/report.html` is the
+hand-written template (markup, CSS and inline ES2020 JS) and `rust/src/report.rs` embeds it with
+`include_str!` and fills it in. There is no build step, no bundler and no dependency. `render()`
+serialises the result to JSON, gzips it at level 6, base64s it into a `<script
+type="application/gzip">` block, and the page decodes it on load with `DecompressionStream`.
+`--no-compress` writes plain JSON instead, escaping `</` so it cannot end the script element early.
 
 ## Before editing
 
-Read the result contract at the top of `rust/src/contract.rs`. The report renders that shape and
-nothing else. If the report needs data it does not have, add a field to the contract in **both**
-engines and assert it in `tests/test_engine.py` — never compute it in JavaScript from partial data.
+Read the result contract in `rust/src/contract.rs`. The report renders that shape and nothing else.
+If the report needs data it does not have, add a field to the contract, populate it in the engines
+that produce one, and assert the shape in `rust/tests/compare.rs` — never compute it in JavaScript
+from partial data.
 
 ## Rules
 
-- No external references. No CDN, no font import, no image URL. CI greps for `src=` and `href=`
-  pointing outside the document and fails the build.
+- No external references. No CDN, no font import, no image URL. CI greps rendered reports for
+  `src=` and `href=` pointing outside the document and fails the build.
 - No browser storage. The report is opened from `file://`, from an email attachment, and from an
   artifact download; `localStorage` and `fetch` are unavailable or blocked in those contexts.
 - Keep the payload sparse. Changed rows are `[key..., [[colIndex, old, new], ...]]`. Do not embed
   whole rows, do not repeat column names per cell, do not add a field that duplicates something
-  derivable in the page.
+  derivable in the page. The renderer keeps only differing cells, capped at `--max-rows`.
 - Keep the grid virtualised. `paint()` renders only the rows in the viewport plus a small margin.
   Any new tab must go through `build()` and `paint()`, not a full `innerHTML` table dump — the
   Columns tab is the one exception because it has one row per column, bounded by schema width.
@@ -36,11 +39,14 @@ engines and assert it in `tests/test_engine.py` — never compute it in JavaScri
 ## After editing
 
 ```bash
-pytest
-python scripts/bench.py --rows 10k
+cd rust
+cargo test
+cargo run --release --bin gen-data -- --rows 10k --out-dir data --prefix p
+cargo run --release -- compare data/p_a.csv data/p_b.csv \
+    -k account_id,txn_id -i updated_at -o data/report.html
 ```
 
-Then check the generated `bench/10k-*.html`:
+Then check the generated `data/report.html`:
 
 1. Open it and exercise the changed path — filter, sort, switch tabs, open the drawer.
 2. Confirm the file size did not jump. A 10k run with ~600 changed rows lands around 33 KB; a 1M
@@ -51,8 +57,11 @@ Then check the generated `bench/10k-*.html`:
 ```bash
 python - <<'PY'
 import re, subprocess
-js = re.findall(r"<script>(.*?)</script>", open("bench/10k.html").read(), re.S)[0]
+js = re.findall(r"<script>(.*?)</script>", open("data/report.html").read(), re.S)[0]
 open("/tmp/report.js", "w").write(js)
 print(subprocess.run(["node", "--check", "/tmp/report.js"], capture_output=True, text=True))
 PY
 ```
+
+`cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` gate CI too; run them before
+pushing.

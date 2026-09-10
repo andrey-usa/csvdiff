@@ -3,8 +3,8 @@ __pycache__/
 /build/
 /dist/
 # Generated data and benchmark output, anchored per implementation. Unanchored,
-# "bench/" would also match a source package named bench (the Java port has one)
-# and silently drop it from every commit.
+# "bench/" would also match a source directory named bench and silently drop it
+# from every commit.
 /data/
 /bench/
 /out/
@@ -22,8 +22,6 @@ __pycache__/
 csvdiff.toml
 *.html
 !examples/report.html
-!java/src/main/resources/**/*.html
-!go/internal/csvdiff/report.html
 !rust/src/report.html
 .claude/settings.local.json
 
