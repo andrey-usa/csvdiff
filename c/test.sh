@@ -734,4 +734,28 @@ case "$out" in
 esac
 rm -rf "$mdir"
 
+# The field scan steps 32 bytes where the build has AVX2, 16 with SSE2, and 8
+# otherwise, each falling through to the next and finally to a byte loop. Rows
+# shorter than a step are the case that only the tails see, so they are worth a
+# row of their own: a file whose every row is under eight bytes never enters any
+# wide loop, and one that straddles sixteen exercises the hand-off.
+echo "rows shorter than the scan step:"
+sdir=$(mktemp -d)
+{ echo 'k,v'; echo 'a,1'; echo 'b,2'; echo 'c,3'; } > "$sdir/tiny_a.csv"
+{ echo 'k,v'; echo 'a,1'; echo 'b,9'; echo 'd,4'; } > "$sdir/tiny_b.csv"
+out=$(./csvdiff compare "$sdir/tiny_a.csv" "$sdir/tiny_b.csv" -k k 2>&1 | summary)
+case "$out" in
+  *"matched 2 (changed 1)"*"added 1"*"removed 1"*) echo "  ok    three-byte rows: $out" ;;
+  *) echo "  FAIL  three-byte rows: $out"; fail=1 ;;
+esac
+# Straddling the sixteen-byte step: a row of exactly 15, 16 and 17 bytes.
+{ echo 'k,v'; echo 'k1,aaaaaaaaaaaa'; echo 'k2,aaaaaaaaaaaaa'; echo 'k3,aaaaaaaaaaaaaa'; } > "$sdir/edge_a.csv"
+{ echo 'k,v'; echo 'k1,aaaaaaaaaaaa'; echo 'k2,bbbbbbbbbbbbb'; echo 'k3,aaaaaaaaaaaaaa'; } > "$sdir/edge_b.csv"
+out=$(./csvdiff compare "$sdir/edge_a.csv" "$sdir/edge_b.csv" -k k 2>&1 | summary)
+case "$out" in
+  *"matched 3 (changed 1)"*) echo "  ok    rows straddling the step: $out" ;;
+  *) echo "  FAIL  rows straddling the step: $out"; fail=1 ;;
+esac
+rm -rf "$sdir"
+
 exit $fail

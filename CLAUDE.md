@@ -257,6 +257,15 @@ before timing anything.
   column buffers are in it; the mapped files and a few kilobytes of bookkeeping are not. Say
   "bounds what scales with the input", never "enforced" -- that word belongs to Zig's fixed
   buffer, which is a stronger guarantee.
+- **The CSV path is the field scan.** `next_of2` is 43% of its instructions and `parse_csv_row`
+  27%, so seventy per cent of the work is finding field ends. That is where a change pays and
+  everywhere else is rounding. `next_of2` steps 32 bytes with AVX2, 16 with SSE2 and 8 otherwise,
+  chosen at compile time so there is no dispatch on the hot path; aarch64 gets the SWAR loop.
+  Any change here has to be run through all three widths -- `-U__AVX2__` and `-U__SSE2__` build
+  them -- because only the tails see a row shorter than a step.
+- **"The SIMD question does not re-open" was about wide files, not the byte scan.** That finding
+  said throughput is flat from 20 columns to 200. It is not a finding about how many bytes a
+  scan step covers, and the two were confused once already.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a

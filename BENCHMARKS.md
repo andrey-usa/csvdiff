@@ -64,6 +64,61 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (C field scan) — a wider step where the target has one
+
+One 4-core container. `callgrind` on a single-threaded run first, to find out
+where the CSV path actually spends itself:
+
+| Function | Instructions |
+|---|---:|
+| `next_of2` | **43.2%** |
+| `parse_csv_row` | 27.1% |
+| `hash_field` | 9.2% |
+| `compare_part` | 5.0% |
+
+Seventy per cent of the work is finding field ends. `next_of2` was SWAR at eight
+bytes a step; the fields in this data average about ten, so a typical field cost
+two iterations. Sixteen bytes costs one, and thirty-two costs one with room to
+spare.
+
+Paired and interleaved against the commit before it, fifteen rounds each:
+
+| Input | Before | After | Paired ratio | |
+|---|---:|---:|---:|---|
+| CSV, 2m rows | 0.469s | **0.442s** | **0.934** (middle half 0.824-0.978) | real |
+| ndjson, 2m rows | 1.319s | 1.280s | 0.984 (0.942-1.057) | not established |
+| Parquet, 5m rows | 1.012s | 1.048s | 1.004 (0.954-1.393) | not established |
+
+**About 6.6% on CSV, and nothing claimed for the other two.** Both of their
+middle halves cross 1.0. ndjson's fields are longer, so the eight-byte step was
+already finding hits in one iteration; the columnar Parquet path does not use
+this scanner at all and is there as a control, which is what a ratio of 1.004
+looks like.
+
+The step is chosen at compile time from what the build targets -- `-march=native`
+defines `__AVX2__` where the CPU has it -- so there is no dispatch on the hot
+path, and a build for baseline x86-64 gets the SSE2 step that architecture
+always has. aarch64 falls through to the SWAR loop unchanged. All three were
+built and run against the same inputs, including the awkward fixtures, and give
+the same counts.
+
+`next_of1` beside it is left as SWAR. It did not appear in the profile, and a
+second copy of this with no number behind it is complexity for its own sake.
+
+### What the profile says is left
+
+The same run, on the columnar path:
+
+| Function | Instructions |
+|---|---:|
+| `pq_read_column` | 23.5% |
+| `rle_fill` | 18.5% |
+| `column_part` | 17.1% |
+| `plain_slices` | 6.6% |
+
+`rle_fill` unpacks bit-packed dictionary indices one value at a time. That is
+the largest single lever left in the columnar path, and it is unmeasured.
+
 ## 2026-09-10 (memory) — what each port needs, and what each does when it cannot have it
 
 One 4-core / 15 GB container. Peak RSS from `getrusage(RUSAGE_CHILDREN)`, each
