@@ -64,6 +64,71 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (measurement) — what this host cannot tell you about phases
+
+A negative result about the instrument rather than the code, recorded because it
+cost an afternoon and would cost the next one.
+
+### The claim that did not survive
+
+`CSVDIFF_PHASES=1` on a five-million-row CSV pair says the index build is about
+two thirds of the run, and three single runs at different thread counts said it
+got *worse* with more cores:
+
+| threads | both indexes | join and compare |
+|---|---:|---:|
+| 1 | 0.932s | 1.248s |
+| 2 | 0.864s | 0.643s |
+| 4 | 1.078s | 0.557s |
+
+That reads as a clear finding: the dominant phase anti-scales, the join scales
+2.2x, so the insert -- which is a serial loop in `build_index`, plainly visible
+in the source -- is the bottleneck and wants parallelising.
+
+It is not a finding. It is three samples.
+
+### What nine rounds say
+
+Interleaved, same order each round, median and middle half:
+
+| threads | n | min | median | max | middle half |
+|---|---:|---:|---:|---:|---|
+| 2 | 9 | 0.567s | 0.716s | 1.646s | 0.577-0.963 |
+| 4 | 9 | 0.590s | 0.671s | 0.964s | 0.622-0.708 |
+| 8 | 9 | 0.556s | 0.663s | 1.016s | 0.614-0.734 |
+
+The middle halves overlap almost entirely. There is no anti-scaling, and if
+anything four and eight threads are slightly ahead of two -- the opposite of
+what the single runs said. One round of `--threads 2` took 1.646s and another
+took 0.567s, on the same binary and the same file, three times apart.
+
+### What that means for work like this
+
+**A phase breakdown from one run is not a measurement here.** The spread on this
+host is wider than any effect worth chasing: a change that made the index build
+20% faster would sit entirely inside the noise of the thing it improved.
+
+The instrument for this is `scripts/bench_ab.sh`, which pairs and interleaves
+and reports a middle-half ratio precisely so that "not established" is one of
+the answers it can give. `CSVDIFF_PHASES` is for *where* the time goes, not for
+*how much* -- it has no repeats and prints whatever the machine was doing that
+second.
+
+This is the same host that could not measure cold-disk I/O, for the same kind of
+reason: it is shared, and the hypervisor is between the measurement and the
+hardware. A performance change here should be proposed from the source, and
+measured on a runner that has been asked for numbers rather than for a shell.
+
+### The one thing that is still true
+
+The insert in `build_index` really is serial -- `run_parts` for the sweep, then
+a plain `for (r = 0; r < ix->rows; r++)` with an inner probe loop. That is a
+fact about the code and does not depend on any timing. Whether it costs anything
+worth the correctness risk of partitioning the table is a question this host
+cannot answer, and the answer has to come before the refactor rather than after.
+
+---
+
 ## 2026-09-10 (scale) — sixty million rows, and nobody's ceiling
 
 The first run of `scale-ceiling.yml` in its fanned-out shape: every (port, size)
