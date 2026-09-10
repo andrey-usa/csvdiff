@@ -162,6 +162,22 @@ def generate(rows: str, fmt: str, data: Path) -> tuple[Path, Path, float]:
             time.monotonic() - started)
 
 
+def table_of(results: list[dict]) -> str:
+    """The results table as markdown, from whatever has been measured so far."""
+    grid = []
+    for row in results:
+        if row.get("seconds") is None:
+            grid.append([row["port"], row["format"], "-", "-", "-", "-", "-", "-"])
+            continue
+        rate = row["rows"] / row["seconds"] if row["seconds"] else 0
+        grid.append([row["port"], row["format"], f"{row['seconds']:.2f}s", f"{rate:,.0f}",
+                     f"{row['cpu']:.1f}s", f"{row['cores']:.2f}x",
+                     f"{row['rss']:,.0f} MB", f"{row['above']:,.0f} MB"])
+    return render(["Build", "Format", "Compare", "Rows/s", "CPU", "Cores", "Peak RSS",
+                   "Above the input"],
+                  ["l", "l", "r", "r", "r", "r", "r", "r"], grid)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -199,38 +215,72 @@ def main(argv: list[str]) -> int:
         print(f"\n{fmt}: {size:,.0f} MB, generated in {generated:.1f}s", flush=True)
         warm(a, b)
 
+        # Ports keep their declared order in the table no matter what
+        # happens to them at run time, so two runs of this script can be read
+        # side by side.
+        plan = []
         for label, prefix, flags, can_read in ports(args.threads, args.matrix):
             if fmt not in can_read:
                 print(f"  {label:5s} -- does not read {fmt}", flush=True)
-                results.append({"format": fmt, "port": label, "seconds": None})
-                continue
-            if not Path(prefix[0]).exists():
+                plan.append({"label": label, "state": "unreadable"})
+            elif not Path(prefix[0]).exists():
                 print(f"  {label:5s} -- not built", flush=True)
-                continue
-            best = None
-            for _ in range(args.repeats):
-                argv_run = prefix + ["compare", str(a), str(b)] + KEY + flags + \
-                    ["--json", str(summary)]
+                plan.append({"label": label, "state": "unbuilt"})
+            else:
+                plan.append({"label": label, "prefix": prefix, "flags": flags,
+                             "state": "ok"})
+        runnable = [e for e in plan if e["state"] == "ok"]
+        best: dict[str, tuple[float, float, float]] = {}
+        failed: set[str] = set()
+        rows_seen: dict[str, int] = {}
+
+        # One run of every port per round, and the rounds repeat -- which is
+        # what BENCHMARKS.md has always said this does and what it did not do.
+        # It used to run every repeat of one port before starting the next, so
+        # a machine drifting under the run charged that drift to whichever port
+        # happened to be in front of it.
+        #
+        # The starting port rotates. Fixed order makes position part of a
+        # port's number -- someone is always first into a cold page cache and
+        # someone always last -- and it decides who survives a truncated run.
+        # A 40m Parquet cell has died three times on a 16 GB runner, always
+        # after C and C++ and always before Rust and Zig, so the two ports at
+        # the back of the list have never produced a number at that size. That
+        # is not evidence they are slower. It is evidence they run last.
+        for rnd in range(args.repeats):
+            turn = rnd % len(runnable) if runnable else 0
+            for entry in runnable[turn:] + runnable[:turn]:
+                label = entry["label"]
+                argv_run = entry["prefix"] + ["compare", str(a), str(b)] + KEY + \
+                    entry["flags"] + ["--json", str(summary)]
                 seconds, rss, cpu, code = run(argv_run, args.timeout)
                 if code not in (0, 1):
+                    # A port that failed once has failed. A later round that
+                    # happens to succeed does not withdraw the failure.
                     print(f"  {label:5s} FAILED (exit {code})", flush=True)
-                    best = None
-                    break
+                    failed.add(label)
+                    continue
                 got = counts(summary)
                 answers.setdefault(f"{label}/{fmt}", got)
+                rows_seen[label] = got["a_rows"]
                 # The best run is the fastest one, and its CPU travels with it:
                 # pairing the fastest wall time with another run's CPU would
                 # make the utilisation a ratio of two different runs.
-                if best is None or seconds < best[0]:
-                    best = (seconds, rss, cpu)
-            if best is None:
+                if label not in best or seconds < best[label][0]:
+                    best[label] = (seconds, rss, cpu)
+
+        for entry in plan:
+            label, state = entry["label"], entry["state"]
+            if state == "unbuilt":
+                continue
+            if state == "unreadable" or label in failed or label not in best:
                 results.append({"format": fmt, "port": label, "seconds": None})
                 continue
-            seconds, rss, cpu = best
+            seconds, rss, cpu = best[label]
             results.append({
                 "format": fmt, "port": label, "seconds": seconds, "rss": rss,
                 "cpu": cpu, "cores": cpu / seconds if seconds > 0 else 0.0,
-                "input": size, "above": rss - size, "rows": got["a_rows"],
+                "input": size, "above": rss - size, "rows": rows_seen[label],
             })
             print(f"  {label:5s} {seconds:8.2f}s  {cpu:8.1f}s cpu  "
                   f"{cpu / seconds if seconds else 0:5.2f}x cores  "
@@ -240,6 +290,15 @@ def main(argv: list[str]) -> int:
         if not args.keep:
             for path in (a, b):
                 path.unlink(missing_ok=True)
+
+        # Written now rather than at the end. A run that is killed partway --
+        # which is how the 40m Parquet cell has ended three times -- used to
+        # leave nothing behind at all, because the table was assembled after
+        # every format had finished. What has been measured is now on disk as
+        # soon as it has been measured.
+        if args.md_out:
+            args.md_out.parent.mkdir(parents=True, exist_ok=True)
+            args.md_out.write_text(table_of(results))
 
     # Every port and every format has to return the same counts. A faster answer
     # that is not the same answer is not a result.
@@ -254,18 +313,7 @@ def main(argv: list[str]) -> int:
     cores = os.cpu_count() or 1
     print(f"\n{cores} cores; \"cores\" is CPU seconds over wall seconds -- how many "
           f"were busy, out of {cores}.")
-    grid = []
-    for row in results:
-        if row.get("seconds") is None:
-            grid.append([row["port"], row["format"], "-", "-", "-", "-", "-", "-"])
-            continue
-        rate = row["rows"] / row["seconds"]
-        grid.append([row["port"], row["format"], f"{row['seconds']:.2f}s", f"{rate:,.0f}",
-                     f"{row['cpu']:.1f}s", f"{row['cores']:.2f}x",
-                     f"{row['rss']:,.0f} MB", f"{row['above']:,.0f} MB"])
-    md = render(["Build", "Format", "Compare", "Rows/s", "CPU", "Cores", "Peak RSS",
-                 "Above the input"],
-                ["l", "l", "r", "r", "r", "r", "r", "r"], grid)
+    md = table_of(results)
     print("\n" + md, end="")
 
     # The table on its own, for a caller that wants to publish it as a table

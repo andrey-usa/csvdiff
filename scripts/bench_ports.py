@@ -172,21 +172,41 @@ def main() -> int:
 
     times: dict[str, list[tuple[float, float, float]]] = {l: [] for l, _, _ in builds}
     answers: dict[str, dict | None] = {}
-    for _ in range(args.repeats):
-        for label, prefix, flags in builds:
+    broken: dict[str, str] = {}
+    # The starting port rotates between rounds. With a fixed order someone is
+    # always first into a cold cache and someone always last, and position
+    # quietly becomes part of every port's number.
+    for rnd in range(args.repeats):
+        turn = rnd % len(builds)
+        for label, prefix, flags in builds[turn:] + builds[:turn]:
+            if label in broken:
+                continue
             out = f"{args.tmp}/ports_{slug(label)}.json"
             secs, rss, cpu, code = run(
                 prefix + ["compare", args.a, args.b, "-k", args.key, "-i", args.ignore,
                           "--json", out] + flags, f"{args.tmp}/ports_err.txt")
             if code not in (0, 1):
+                # One port failing used to end the whole benchmark, which meant
+                # every port after it in the list produced no number at all --
+                # and the ones at the back were never even attempted. A failure
+                # is still a failure: it is reported by name and the run exits
+                # nonzero below. It just no longer takes the other ports'
+                # measurements down with it.
                 why = open(f"{args.tmp}/ports_err.txt").read().strip()[:200]
-                raise SystemExit(f"{label} failed ({code}): {why}")
+                print(f"  {label:5s} FAILED ({code}): {why}", file=sys.stderr)
+                broken[label] = f"exit {code}"
+                times[label].clear()
+                answers.pop(label, None)
+                continue
             times[label].append((secs, rss, cpu))
             answers[label] = counts(out)
 
     print(f"\ninput {size:,.0f} MB total, {args.repeats} interleaved runs each\n")
     grid = []
     for label, _, _ in builds:
+        if not times[label]:
+            grid.append([label, "-", "-", "-", "-", "-", "-"])
+            continue
         ts = sorted(t for t, _, _ in times[label])
         rss = max(r for _, r, _ in times[label])
         cpu = min(c for _, _, c in times[label])
@@ -210,6 +230,10 @@ def main() -> int:
                 print(f"  {l}: {json.dumps(have[l], sort_keys=True)}")
             return 1
         print(f"  {json.dumps(first, sort_keys=True)}")
+    if broken:
+        print("\nfailed: " + ", ".join(f"{name} ({why})" for name, why in broken.items()),
+              file=sys.stderr)
+        return 1
     return 0
 
 

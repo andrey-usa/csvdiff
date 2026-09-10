@@ -12,9 +12,18 @@ Terse verdicts on things the project no longer carries are in
 
 **Interleaved, not one build at a time.** A machine's speed drifts under the
 runs themselves — the page cache fills, the kernel's supply of free 2 MB pages
-is picked over. Every build runs once per round, in the same order, and the
-rounds repeat. A number taken now and one taken twenty minutes ago compare
-machine states, not builds.
+is picked over. Every build runs once per round and the rounds repeat. A number
+taken now and one taken twenty minutes ago compare machine states, not builds.
+
+**The starting build rotates between rounds.** In a fixed order one build is
+always first into a cold page cache and one is always last, and that position
+quietly becomes part of its number. Rotating the start spreads both ends over
+every build instead of assigning them. It also decides who survives a run that
+is killed partway: a table that always ran the ports in the same order left the
+ones at the back with no measurement at all, which reads like slowness and is
+not. Tables are still printed in the declared order, so two runs can be read
+side by side, and each format's rows are written out as soon as they are
+measured rather than at the end.
 
 **Best, median and worst.** A build that is quick once and slow twice is not
 quick, and the spread is where memory pressure shows.
