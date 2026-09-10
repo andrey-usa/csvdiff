@@ -985,7 +985,8 @@ Counts agree across every port in both tables.
 ## 2026-09-09 — the other branch's Parquet, on its own runner
 
 Not this project's harness and **not comparable with the tables below** — one
-tree, its own workflow (`bench-10m.yml`), its own runner. Recorded because they
+tree, its own workflow (`bench-10m.yml`, since split into `bench-2m.yml` and
+`bench-ladder.yml`), its own runner. Recorded because they
 are real measurements of ports this project's table has columns for, and because
 the next joint run will want a baseline to be surprised against.
 

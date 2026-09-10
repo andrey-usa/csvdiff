@@ -44,6 +44,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 KEY = ["-k", "account_id,txn_id", "-i", "updated_at"]
 
+C = ROOT / "c/csvdiff"
 CPP = ROOT / "cpp/build/csvdiff"
 RUST = ROOT / "rust/target/release/csvdiff"
 ZIG = ROOT / "zig/zig-out/bin/csvdiff"
@@ -57,9 +58,14 @@ ALL = {"csv", "ndjson", "parquet"}
 def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[str], set[str]]]:
     """(label, argv prefix, extra flags, the formats it can read).
 
-    All three ports read all three formats. A Parquet pair is the one input none
+    All four ports read all three formats. A Parquet pair is the one input none
     of them scans: it goes to the columnar path instead, which is why the Parquet
     rows below are not measuring the scanner the CSV rows are.
+
+    The C port is here rather than only in `bench_ports.py` so that one table can
+    answer "did this change make a port slower" for every port at once. It was
+    the one port this script did not build, which meant the per-pull-request
+    benchmark and the leading port were in two different workflows.
 
     `matrix` adds the scanner builds -- SWAR against a vector register, one
     binary each so nothing is measuring a branch -- and the Rust engine without
@@ -69,6 +75,7 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     thread_flag = ["--threads", str(threads)] if threads else []
     report = ["--engine", "turbo", "-o", "/dev/null"]
     rows: list[tuple[str, list[str], list[str], set[str]]] = [
+        ("C", [str(C)], thread_flag, ALL),
         ("C++", [str(CPP)], thread_flag, ALL),
         ("Rust", [str(RUST)], report + thread_flag, ALL),
         ("Zig", [str(ZIG)], thread_flag, ALL),
@@ -158,6 +165,9 @@ def main(argv: list[str]) -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rows", default="1m")
     parser.add_argument("--formats", default="csv,ndjson,parquet")
+    parser.add_argument("--json-out", type=Path, default=None,
+                        help="also write the rows here, unrounded, for a harness "
+                             "that has to compare two runs of this script")
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--threads", type=int, default=None,
                         help="threads per run; the default is whatever each port picks")
@@ -250,6 +260,16 @@ def main(argv: list[str]) -> int:
         print(f"| {row['port']} | {row['format']} | {row['seconds']:.2f}s | {rate:,.0f} | "
               f"{row['cpu']:.1f}s | {row['cores']:.2f}x | "
               f"{row['rss']:,.0f} MB | {row['above']:,.0f} MB |")
+
+    # The table rounds seconds to two decimals, which is a couple of per cent at
+    # the sizes this runs at -- fine to read, too coarse to compare two runs
+    # with. The JSON keeps what was measured.
+    if args.json_out:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(
+            {"rows_arg": args.rows, "cores": cores, "results": results},
+            indent=2, sort_keys=True))
+        print(f"\nwrote {args.json_out}")
     return 0
 
 

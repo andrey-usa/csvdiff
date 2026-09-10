@@ -21,7 +21,6 @@ on:
       - "zig/**"
       - "cpp/**"
       - "tests/fixtures/formats/**"
-      - "scripts/bench_formats_ports.py"
       - ".github/workflows/formats.yml"
   pull_request:
     paths:
@@ -29,7 +28,6 @@ on:
       - "zig/**"
       - "cpp/**"
       - "tests/fixtures/formats/**"
-      - "scripts/bench_formats_ports.py"
       - ".github/workflows/formats.yml"
   workflow_dispatch:
     inputs:
@@ -66,13 +64,13 @@ jobs:
       # write their fixtures with `cpp/build/gen-data --format parquet`, and
       # they skip themselves by name rather than failing when it is absent --
       # which is how eleven of them silently did not run here.
-      # The three at once; see scripts/build_ports.sh. `rust` there is the
+      # The four at once; see scripts/build_ports.sh. `rust` there is the
       # --no-default-features build, which is the one this job wants: every run
       # here is `--engine turbo` or the columnar Parquet path.
-      - name: Build the three ports
+      - name: Build the four ports
         env:
           CXX: clang++
-        run: scripts/build_ports.sh rust zig cpp cpp-gen
+        run: scripts/build_ports.sh c rust zig cpp cpp-gen
 
       # The dev profile, deliberately: the release profile links with thin LTO
       # in one codegen unit, which costs minutes per test binary and buys
@@ -143,17 +141,11 @@ jobs:
                     f"| {c['added']} | {c['removed']} |")
           PY
 
-      # Wall time, CPU time and peak RSS on every row: what it cost, how many
-      # cores it took to cost that, and what it held while doing it.
-      - name: Benchmark the three ports across the three formats
-        run: |
-          python3 scripts/bench_formats_ports.py \
-            --rows ${{ github.event.inputs.rows || '1m' }} --repeats 2 \
-            | tee /tmp/bench.txt
-          {
-            echo "## Ports and formats — ${{ github.event.inputs.rows || '1m' }} rows"
-            echo
-            echo '```'
-            cat /tmp/bench.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+      # This job used to end with a 1M benchmark through
+      # `scripts/bench_formats_ports.py`. `bench-2m.yml` runs the same harness on
+      # every pull request at twice the rows, three repeats instead of two, and
+      # with the scanner builds beside the four ports, so the table here was a
+      # smaller copy of one taken minutes earlier -- and it made this workflow a
+      # timing job, which raised the question of whether it belonged in the
+      # `benchmark-host` group and had to queue behind other benchmarks. It does
+      # not, now: this is a correctness workflow and nothing in it is timed.
