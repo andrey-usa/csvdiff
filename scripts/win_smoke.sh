@@ -89,12 +89,24 @@ else
     if [ "$any" = 1 ] && [ "$same" = 1 ]; then
       echo "  ok    $fmt"
     else
-      # A \r\n translation shows up as a length difference and nothing else, so
-      # say the sizes: it is the whole diagnosis.
+      # Two different diagnoses, so say enough to tell them apart. A \r\n
+      # translation shows up as a length difference and nothing else, which the
+      # sizes give away. Equal lengths with different bytes is something else
+      # entirely -- the generator computing a different value on this platform --
+      # and for that the only useful thing to print is the first line that
+      # differs, from both sides.
       echo "  FAIL  $fmt is not byte-identical"
       for name in $(cd "$theirs" && ls); do
         printf '        %-24s mine %s  rust %s\n' "$name" \
                "$(wc -c <"$mine/$name" 2>/dev/null)" "$(wc -c <"$theirs/$name")"
+        cmp -s "$mine/$name" "$theirs/$name" && continue
+        where=$(cmp "$mine/$name" "$theirs/$name" 2>&1 | head -1)
+        printf '        %s\n' "${where#*: }"
+        line=$(printf '%s' "$where" | sed -n 's/.*line \([0-9][0-9]*\).*/\1/p')
+        if [ -n "$line" ]; then
+          printf '          mine: %s\n' "$(sed -n "${line}p" "$mine/$name"   | cut -c1-160)"
+          printf '          rust: %s\n' "$(sed -n "${line}p" "$theirs/$name" | cut -c1-160)"
+        fi
       done
       fail=1
     fi

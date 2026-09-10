@@ -22,8 +22,15 @@
 
 #include <windows.h>
 
+#include <direct.h>
 #include <io.h>
 #include <stddef.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#ifdef _WIN32
 
 /* ------------------------------------------------------------------------- */
 /* mmap                                                                       */
@@ -76,6 +83,27 @@ static inline int madvise(void *addr, size_t len, int advice) {
 }
 
 #endif /* _WIN32 */
+
+/* ------------------------------------------------------------------------- */
+/* Directories                                                                */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * One directory, created. The mode argument is the whole reason this exists:
+ * Microsoft's `mkdir` takes only a path, so the POSIX two-argument call does
+ * not compile there -- and it is a hard error rather than a warning, since the
+ * runtime declares a one-argument function of the same name.
+ *
+ * There are no permissions to carry across: a new directory on Windows inherits
+ * its parent's ACL, and 0777 was only ever "whatever the umask allows" anyway.
+ */
+static inline int make_dir(const char *path) {
+#ifdef _WIN32
+    return _mkdir(path);
+#else
+    return mkdir(path, 0777);
+#endif
+}
 
 /* ------------------------------------------------------------------------- */
 /* Text mode                                                                  */

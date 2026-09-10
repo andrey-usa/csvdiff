@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include "win32.h"   /* make_dir, and O_BINARY off Windows */
 
 #define COLUMNS 20
 
@@ -518,7 +519,7 @@ int main(int argc, char **argv) {
      * .gitignore, so on a fresh clone the README's own first command wrote
      * into a directory that was not there. One level only: a missing parent
      * still fails, and now says so. */
-    if (mkdir(out_dir, 0777) != 0 && errno != EEXIST) {
+    if (make_dir(out_dir) != 0 && errno != EEXIST) {
         fprintf(stderr, "error: cannot create %s: %s\n", out_dir, strerror(errno));
         return 1;
     }
