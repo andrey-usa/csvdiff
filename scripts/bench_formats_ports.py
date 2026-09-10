@@ -55,6 +55,7 @@ GEN = ROOT / "rust/target/release/gen-data"
 
 TEXT = {"csv", "ndjson"}
 ALL = {"csv", "ndjson", "parquet"}
+ALIAS = {"json": "ndjson"}
 
 
 def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[str], set[str]]]:
@@ -208,8 +209,19 @@ def main(argv: list[str]) -> int:
     results: list[dict] = []
     answers: dict[str, dict] = {}
 
-    for fmt in args.formats.split(","):
-        fmt = fmt.strip()
+    # Resolved and checked before anything is generated. `json` is what the
+    # generators' own --format flag calls this format, so it is accepted here
+    # too; a name that is neither is a mistake worth hearing about now rather
+    # than after the first format has been measured.
+    wanted = []
+    for name in args.formats.split(","):
+        fmt = ALIAS.get(name.strip(), name.strip())
+        if fmt not in ALL:
+            raise SystemExit(f"unknown format {name.strip()!r}: "
+                             f"pick from {', '.join(sorted(ALL))}")
+        wanted.append(fmt)
+
+    for fmt in wanted:
         a, b, generated = generate(args.rows, fmt, data)
         size = (a.stat().st_size + b.stat().st_size) / (1 << 20)
         print(f"\n{fmt}: {size:,.0f} MB, generated in {generated:.1f}s", flush=True)

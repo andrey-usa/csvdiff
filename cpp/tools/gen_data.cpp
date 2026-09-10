@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
         else if (f == "-h" || f == "--help") {
             std::printf(
                 "usage: gen-data --rows 10m --out-dir DIR [--prefix P] [--threads N]\n"
-                "                [--format csv|json|parquet] [--compression snappy|none]\n"
+                "                [--format csv|json|ndjson|parquet] [--compression snappy|none]\n"
                 "                [--row-group-size N] [--dict-limit N]\n"
                 "\n"
                 "--dict-limit is how many distinct values a column may have in one row\n"
@@ -411,6 +411,12 @@ int main(int argc, char** argv) {
     }
     if (prefix.empty()) prefix = rows_arg;
     if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
+
+    // `ndjson` and `json` name the same format. The Rust generator has always
+    // taken both; this port and the C one took only `json`, so a command that
+    // worked against one generator failed against another. Normalised here so
+    // the checks below still have one spelling to test.
+    if (format == "ndjson") format = "json";
 
     if (format == "parquet") {
         if (compression != "snappy" && compression != "none") {
@@ -450,7 +456,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (format != "csv" && format != "json") {
-        std::fprintf(stderr, "error: --format must be csv, json or parquet\n");
+        std::fprintf(stderr, "error: --format must be csv, json (ndjson) or parquet\n");
         return 2;
     }
 
