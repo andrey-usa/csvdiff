@@ -42,7 +42,17 @@ for f in "$BIN" "$GEN" "$RUST" "$RGEN"; do
 done
 
 fail=0
-tmp=$(mktemp -d)
+# A relative directory in the working tree, deliberately, rather than `mktemp -d`.
+# On Windows this script runs under MSYS2 while `path-type: inherit` also puts
+# Git for Windows' tools on PATH, and the two are separate installations with
+# separate roots: MSYS2's `/tmp` is its own `tmp` directory and Git's is the
+# user's `%TEMP%`. So a `/tmp/...` path handed to one tool resolves somewhere the
+# other cannot see -- which is exactly what happened, and it read as a byte
+# difference because `cmp -s` hides the reason it failed. A relative path is
+# resolved against the same working directory by all three kinds of binary here:
+# MSYS2's, Git's, and the native ports themselves.
+tmp=.win-smoke-tmp
+rm -rf "$tmp"; mkdir -p "$tmp"
 trap 'rm -rf "$tmp"' EXIT
 
 # The engine label and the time after it differ by port and by run, and the Rust
@@ -84,6 +94,11 @@ else
     same=1 any=0
     for name in $(cd "$theirs" && ls); do
       any=1
+      # Existence first and separately: `cmp -s` returns non-zero both for
+      # "these differ" and for "I could not open that", and reporting the second
+      # as the first sends the reader hunting for a portability bug that is not
+      # there. It cost a round of exactly that.
+      [ -r "$mine/$name" ] || { echo "  FAIL  $fmt: $GEN wrote no $name"; same=0; break; }
       cmp -s "$mine/$name" "$theirs/$name" || same=0
     done
     if [ "$any" = 1 ] && [ "$same" = 1 ]; then
