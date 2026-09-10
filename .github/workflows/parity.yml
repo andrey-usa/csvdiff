@@ -67,12 +67,10 @@ jobs:
             echo "::endgroup::"
           done
 
+      # Four ports at once rather than one after another; see
+      # scripts/build_ports.sh for why that is 2-4x on a four-core runner.
       - name: Build the native ports
-        run: |
-          make -C c
-          make -C cpp
-          cargo build --release --manifest-path rust/Cargo.toml
-          (cd zig && zig build --release=fast)
+        run: scripts/build_ports.sh c cpp rust-full zig
 
       - name: One dataset, from the C generator
         run: |

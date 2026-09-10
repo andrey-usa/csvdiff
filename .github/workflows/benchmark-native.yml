@@ -162,12 +162,12 @@ jobs:
         env:
           RUSTFLAGS: -C target-cpu=native
         run: |
-          make -C c
-          make -C cpp
+          # At once rather than in a row; see scripts/build_ports.sh.
+          targets="c cpp"
           if [ "${ALL_PORTS:-}" = 1 ]; then
-            cargo build --release --manifest-path rust/Cargo.toml
-            (cd zig && zig build --release=fast -Dcpu=native)
+            targets="$targets rust-full zig-native"
           fi
+          scripts/build_ports.sh $targets
 
       # The alt tree's builds are allowed to fail without ending the run: it is
       # another branch's work in progress, and the four ports this workflow is

@@ -28,6 +28,7 @@ rust/target/release/csvdiff head data/p_a.parquet -n 10   # stops at the first p
 python scripts/bench_ports.py data/p_a.csv data/p_b.csv --repeats 5    # every port, one table
 scripts/bench_ab.sh old/csvdiff new/csvdiff -- compare A.csv B.csv -k id   # two builds
 scripts/bench_ab.sh --self-test c/csvdiff -- compare A.csv B.csv -k id    # the harness itself
+scripts/build_ports.sh c cpp rust zig          # the ports at once, not in a row
 gh workflow run "Benchmark (native)" -f rows=10m -f all_ports=true
 ```
 
@@ -296,6 +297,17 @@ before timing anything.
   `scripts/memory_floor.sh`, which takes the memory away until the run dies. It handles cgroup v1
   and v2 -- the runners are v2, most older images are v1, and a script that knew only one would
   report "no controller" on exactly the host worth measuring.
+- **The ports build in parallel, and they cannot move to a job of their own.** Every workflow
+  that needs more than one port calls `scripts/build_ports.sh` with target names; it runs them up
+  to `nproc` at a time and exits non-zero naming each one that failed. Measured from clean on four
+  cores, `cpp cpp-gen cpp-scanners zig zig-v32` is 149s in a row and 35s at once. The obvious next
+  step -- build on one runner, upload the binaries, measure on another -- **does not work here**:
+  both Makefiles compile with `-march=native` and the Zig scanner builds use `-Dcpu=native`, and
+  the hosted fleet is not uniform. The workflows already branch on `grep avx512bw /proc/cpuinfo`
+  and `cpp/Makefile` already carries a note about runners advertising AVX10.1, so a binary built
+  on one runner and run on another is a `SIGILL` waiting for the wrong machine. Shortening the
+  job is the only way to shorten the `benchmark-host` lock, because the lock is held for the whole
+  job.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a
