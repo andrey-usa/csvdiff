@@ -59,14 +59,13 @@ jobs:
       # write their fixtures with `cpp/build/gen-data --format parquet`, and
       # they skip themselves by name rather than failing when it is absent --
       # which is how eleven of them silently did not run here.
+      # The three at once; see scripts/build_ports.sh. `rust` there is the
+      # --no-default-features build, which is the one this job wants: every run
+      # here is `--engine turbo` or the columnar Parquet path.
       - name: Build the three ports
-        run: |
-          # --no-default-features leaves out DuckDB and polars. Nothing in this
-          # job asks for either -- every run here is `--engine turbo` or the
-          # columnar Parquet path -- and compiling them is most of the job.
-          (cd rust && cargo build --release --no-default-features)
-          (cd zig && zig build --release=fast)
-          (cd cpp && CXX=clang++ make && CXX=clang++ make gen-data)
+        env:
+          CXX: clang++
+        run: scripts/build_ports.sh rust zig cpp cpp-gen
 
       # The dev profile, deliberately: the release profile links with thin LTO
       # in one codegen unit, which costs minutes per test binary and buys

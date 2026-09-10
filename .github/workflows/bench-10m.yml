@@ -94,16 +94,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Ten million rows of CSV is 3.5 GB and of JSON 8.5 GB, and the runner
-      # ships with about 25 GB of toolchains this job never touches.
-      - name: Free disk space
-        run: |
-          before=$(df --output=avail -m / | tail -1)
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
-          after=$(df --output=avail -m / | tail -1)
-          echo "freed $(( (after - before) / 1024 )) GB, $(( after / 1024 )) GB now available"
-
       - name: What this runner is
         run: |
           {
@@ -131,40 +121,58 @@ jobs:
           sudo chmod +x /usr/local/bin/zig
           zig version
 
-      - name: Build every port and every scanner
+      # Ten million rows of CSV is 3.5 GB and of JSON 8.5 GB, and the runner
+      # ships with about 25 GB of toolchains this job never touches. Deleting
+      # them is I/O and the builds are CPU, so they run at the same time:
+      # separately they were 1m22s and 3m34s of a 7m34s run, and nothing waits
+      # on the disk until the data is generated two steps down.
+      #
+      # Nothing in this job reads `$AGENT_TOOLSDIRECTORY` -- rustup installs to
+      # ~/.cargo and ziglang to site-packages -- which is what makes it safe to
+      # delete beside a build rather than before one. A step that adds
+      # `setup-python` or `setup-node` would have to move it back.
+      - name: Free the disk, and build every port at the same time
         run: |
+          before=$(df --output=avail -m / | tail -1)
+          (
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                        /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          ) >/tmp/freedisk.log 2>&1 &
+          freeing=$!
+
           # --no-default-features leaves out DuckDB and polars. This job runs
           # `--engine turbo` exclusively and never called either, and compiling
           # them cost nineteen minutes of a twenty-four minute step: nine for a
           # bundled DuckDB, seven for the polars and arrow chain, and four more
           # linking our own crate against both under thin LTO. The turbo engine,
           # its Parquet reader and the generator are all still here.
-          (cd rust && cargo build --release --no-default-features)
-          (cd zig && zig build --release=fast)
-          (cd cpp && CXX=clang++ make && CXX=clang++ make gen-data)
+          targets="rust zig cpp cpp-gen"
           if [ "$MATRIX" = "true" ]; then
-            (cd cpp && CXX=clang++ make scanners)
-            # -Dcpu=native is not optional here: without it the target is
-            # baseline x86-64, @Vector(32, u8) is lowered to scalar code, and
-            # the row would be measuring a slower SWAR rather than AVX2.
-            (cd zig && zig build --release=fast -Dscan=32 -Dcpu=native --prefix zig-out-v32)
-            # Rust's vector path is a target feature rather than a source
-            # switch, and changing RUSTFLAGS invalidates everything cargo has
-            # cached, so it needs a target directory and a build of its own.
-            # That used to mean a second full build of DuckDB and polars for one
-            # scanner row, which is why it was off by default; without them it
-            # is about a minute, so it is on.
+            # `cpp-scanners` is the SWAR and AVX2 binaries only. The AVX-512 one
+            # used to be built on every runner and deleted again on the ones that
+            # cannot run it, which is about half a minute of clang for a file
+            # that goes straight in the bin.
+            targets="$targets cpp-scanners zig-v32"
             if [ "$RUST_SIMD" = "true" ]; then
-              (cd rust && RUSTFLAGS="-C target-feature=+avx2" \
-                  cargo build --release --no-default-features --target-dir target-avx2)
+              targets="$targets rust-avx2"
             fi
             if grep -q avx512bw /proc/cpuinfo; then
-              (cd zig && zig build --release=fast -Dscan=64 -Dcpu=native --prefix zig-out-v64)
+              targets="$targets cpp-avx512 zig-v64"
             else
               echo "no AVX-512 on this runner: the 64-byte builds are skipped"
               rm -f cpp/build/csvdiff-avx512
             fi
           fi
+
+          # `if` rather than a bare call, so a failed build still prints how much
+          # disk the run has before the job stops.
+          if CXX=clang++ scripts/build_ports.sh $targets; then built=0; else built=1; fi
+
+          wait "$freeing" || true
+          cat /tmp/freedisk.log || true
+          after=$(df --output=avail -m / | tail -1)
+          echo "freed $(( (after - before) / 1024 )) GB, $(( after / 1024 )) GB now available"
+          exit "$built"
 
       - name: Run the matrix
         run: |
