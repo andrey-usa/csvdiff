@@ -37,8 +37,11 @@ def rows_in(label: str) -> int:
     return int(float(label[:-1]) * mult[label[-1]]) if label[-1] in mult else int(label)
 
 
+GENERATOR_OVERRIDE: list[str] | None = None
+
+
 def generator() -> list[str]:
-    """The fastest generator on hand.
+    """The fastest generator on hand, unless the caller named one.
 
     Every generator emits byte-identical files -- c/test.sh --with-ports holds
     the C one against the C++ one on every format and option -- so this is free
@@ -46,6 +49,8 @@ def generator() -> list[str]:
     nothing but a compiler. The Python one stays as the fallback, since it needs
     no toolchain at all, at 30.5s a million rows against the C generator's.
     """
+    if GENERATOR_OVERRIDE:
+        return GENERATOR_OVERRIDE
     built = ROOT / "c/gen-data"
     if not built.exists() and shutil.which("make"):
         done = subprocess.run(["make", "gen-data"], cwd=ROOT / "c", capture_output=True)
@@ -129,10 +134,23 @@ def main() -> int:
     ap.add_argument("--stop-on-fail", action="store_true",
                     help="stop at the first size that fails, which is the ceiling")
     ap.add_argument("--label", default=None, help="what to call this binary in the JSON")
+    ap.add_argument("--runner", default="", help="which runner this ran on, for the merged table")
+    ap.add_argument("--generator", default=None,
+                    help="the gen-data to use; the C one is picked when this is not given, "
+                         "which is wrong on a host where it does not build")
+    ap.add_argument("--fail-exit", action="store_true",
+                    help="exit non-zero if any size failed, so a CI step goes red on the rung "
+                         "that could not be climbed")
     args = ap.parse_args()
 
     if not os.access(args.binary, os.X_OK):
         raise SystemExit(f"not executable: {args.binary}")
+    if args.generator:
+        # One process, one comparison, so a module-level override is the whole
+        # mechanism. The C generator does not build on Windows; the Rust one
+        # does, and every generator writes byte-identical files.
+        global GENERATOR_OVERRIDE
+        GENERATOR_OVERRIDE = [args.generator]
 
     print(f"{Path(args.binary).name}, --threads {args.threads}, best of {args.repeats}\n")
     print(f"{'rows':>6} {'input':>9} {'wall':>9} {'rows/s':>12} {'cpu/wall':>9} "
@@ -151,7 +169,8 @@ def main() -> int:
                                        + ["--threads", str(args.threads), "--json", str(out)], out)
             if not out.exists():
                 print(f"{label:>6} {mapped:8,.0f}M  failed (exit {code})")
-                records.append({"port": args.label or Path(args.binary).name, "size": label,
+                records.append({"port": args.label or Path(args.binary).name,
+                                "runner": args.runner, "size": label,
                                 "rows": rows_in(label), "input_mb": round(mapped, 1),
                                 "ok": False, "exit": code,
                                 "why": "killed (out of memory)" if code in (137, -9) else f"exit {code}"})
@@ -169,7 +188,8 @@ def main() -> int:
             print(f"       changed {counts['changed']:,} · added {counts['added']:,} · "
                   f"removed {counts['removed']:,} · dup keys "
                   f"{counts['a_dup_keys']:,}/{counts['b_dup_keys']:,}", flush=True)
-            records.append({"port": args.label or Path(args.binary).name, "size": label,
+            records.append({"port": args.label or Path(args.binary).name,
+                            "runner": args.runner, "size": label,
                             "rows": rows_in(label), "input_mb": round(mapped, 1),
                             "ok": True, "wall_s": round(secs, 2),
                             "rows_per_s": int(counts["a_rows"] / secs),
@@ -187,6 +207,8 @@ def main() -> int:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(records, indent=1))
         print(f"\nwrote {args.json_out}")
+    if args.fail_exit and any(not r.get("ok") for r in records):
+        return 1
     return 0
 
 

@@ -3,30 +3,40 @@ name: Scale ceiling
 # How many rows each port can compare on one GitHub-hosted runner before it
 # stops, and how little memory each one needs to finish the same work.
 #
-# Two questions, and they are not the same question. The first is a ceiling:
-# walk a ladder of sizes until something fails, and report what stopped it. The
-# second is a floor: fix the size and lower a cgroup limit until the run is
-# killed. A port can lead on one and trail on the other, which is the reason
-# both tables are here rather than one.
+# Two questions, and they are not the same one. The first is a ceiling: climb a
+# ladder of sizes until something fails, and report what stopped it. The second
+# is a floor: fix the size and lower a cgroup limit until the run is killed. A
+# port can lead on one and trail on the other, which is why both tables exist.
 #
-# One port per runner, on purpose. The ladder is larger than any single runner's
-# disk -- fifty million rows of CSV is 18.4 GB of input for one pair -- so the
-# sizes are done one at a time and each pair is deleted after its runs. Putting
-# four ports on one runner would mean four ports sharing that disk and one of
-# them running out because of another's leftovers. Separate jobs also mean a
-# port that dies at 40m does not take the rest of the table with it.
+# One build per runner, on purpose. Every job gets its own VM -- its own cores,
+# its own memory, its own 14 GB disk -- so four ports on four runners do not
+# share the disk that the ladder is trying to fill. A port that dies at 40m
+# takes nothing else down with it, which is why the matrix does not fail fast.
 #
-# Peak RSS is reported but is not the memory answer. An engine that maps its
-# input has reclaimable pages, so its RSS is whatever the kernel let it keep
-# rather than what it needed. The floor job is the one that answers that, by
-# taking the memory away until the run dies.
+# The ladder is a step per size rather than one step for all of them. A single
+# step is one collapsed block in the UI: you cannot see which sizes passed until
+# it ends, and if it ends by being killed you cannot see anything. A step per
+# size shows progress as it happens, and the ceiling is the first red tick.
+#
+# Three runner families, because "runs on GitHub Actions" is a claim about all
+# of them:
+#
+#   ubuntu-latest      x86-64, 4 cores, 16 GB. The reference.
+#   ubuntu-24.04-arm   aarch64, same size. The first time this port has run on
+#                      ARM at all -- the field scan's SWAR fallback is the path
+#                      taken there, and it has only ever been checked by
+#                      undefining the SIMD macros on an x86 host.
+#   windows-latest     Rust only. It is the one port that builds there; the
+#                      other three need POSIX headers MSVC does not have.
+#
+# Peak RSS is reported and is not the memory answer. An engine that maps its
+# input has reclaimable pages, so RSS is whatever the kernel allowed rather than
+# what was needed. The floor job answers that, by taking memory away until the
+# run dies -- which needs cgroups, so it is Linux only.
 
 on:
   workflow_dispatch:
     inputs:
-      sizes:
-        description: "Ladder, climbed until one fails (comma separated)"
-        default: "10m,20m,30m,40m,50m,60m"
       floor_size:
         description: "Size the memory floor is searched at"
         default: "10m"
@@ -37,10 +47,6 @@ on:
         description: "Runs per size; the best is kept"
         default: "1"
 
-# The repository's rule is one benchmark at a time: two timing jobs on one host
-# measure each other's contention. These are separate hosted runners so they do
-# not contend with each other, but they should still not overlap another run of
-# themselves.
 concurrency:
   group: scale-ceiling
   cancel-in-progress: false
@@ -50,19 +56,32 @@ permissions:
 
 jobs:
   ceiling:
-    name: "ceiling: ${{ matrix.port }}"
-    runs-on: ubuntu-latest
+    name: "${{ matrix.port }} on ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 330
     strategy:
-      fail-fast: false          # a port that dies at 40m is a result, not a reason to stop
+      fail-fast: false
       matrix:
-        port: [c, cpp, rust, zig]
+        include:
+          - { os: ubuntu-latest,     port: c }
+          - { os: ubuntu-latest,     port: cpp }
+          - { os: ubuntu-latest,     port: rust }
+          - { os: ubuntu-latest,     port: zig }
+          - { os: ubuntu-24.04-arm,  port: c }
+          - { os: ubuntu-24.04-arm,  port: cpp }
+          - { os: ubuntu-24.04-arm,  port: rust }
+          - { os: ubuntu-24.04-arm,  port: zig }
+          - { os: windows-latest,    port: rust }
+    defaults:
+      run:
+        shell: bash          # Git Bash on the Windows runner, so one script serves all three
     steps:
       - uses: actions/checkout@v4
 
-      # The ladder needs every gigabyte: 60m rows of CSV is 22 GB for one pair,
-      # and the runner ships with about 25 GB of toolchains this job never uses.
+      # 60m rows of CSV is 22 GB for one pair and the runner advertises 14 GB,
+      # so the preinstalled toolchains this job never touches have to go first.
       - name: Free disk space
+        if: runner.os == 'Linux'
         run: |
           before=$(df --output=avail -m / | tail -1)
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -73,13 +92,15 @@ jobs:
       - name: What this runner is
         run: |
           {
-            echo "### ${{ matrix.port }}"
+            echo "### ${{ matrix.port }} on ${{ matrix.os }}"
             echo
             echo '```'
-            grep -m1 "model name" /proc/cpuinfo
-            echo "cores: $(nproc)"
-            free -g | head -2
-            df -h / | tail -1
+            uname -m
+            if [ -r /proc/cpuinfo ]; then
+              grep -m1 -E "model name|Model" /proc/cpuinfo || true
+              grep -o -m1 -E "avx2|avx512f|asimd|neon" /proc/cpuinfo | sort -u | tr '\n' ' '; echo
+            fi
+            df -h . | tail -1
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -98,46 +119,66 @@ jobs:
           sudo chmod +x /usr/local/bin/zig
           zig version
 
-      # The C generator regardless of which port is measured: every generator
-      # emits byte-identical files, and this one is the fastest and needs only a
-      # compiler.
       - name: Build
         run: |
-          make -C c gen-data
           case "${{ matrix.port }}" in
-            c)    make -C c ;;
-            cpp)  CXX=clang++ make -C cpp ;;
+            c)    make -C c && make -C c gen-data ;;
+            cpp)  make -C cpp && make -C c gen-data ;;
+            zig)  (cd zig && zig build --release=fast) && make -C c gen-data ;;
             rust) cargo build --release --manifest-path rust/Cargo.toml ;;
-            zig)  (cd zig && zig build --release=fast) ;;
           esac
 
-      - name: Climb the ladder
+      # The binary, the generator, and where the pairs go. The C generator is
+      # the fastest and every generator writes byte-identical files, so it is
+      # used wherever it builds; on Windows it does not, and the Rust one does.
+      - name: Resolve paths
         run: |
+          EXE=""; [ "$RUNNER_OS" = "Windows" ] && EXE=".exe"
           case "${{ matrix.port }}" in
-            c)    BIN=c/csvdiff ;;
-            cpp)  BIN=cpp/build/csvdiff ;;
-            rust) BIN=rust/target/release/csvdiff ;;
-            zig)  BIN=zig/zig-out/bin/csvdiff ;;
+            c)    BIN="c/csvdiff" ;;
+            cpp)  BIN="cpp/build/csvdiff" ;;
+            rust) BIN="rust/target/release/csvdiff$EXE" ;;
+            zig)  BIN="zig/zig-out/bin/csvdiff$EXE" ;;
           esac
-          mkdir -p out
-          python3 scripts/bench_scale.py \
-              --binary "$BIN" --label "${{ matrix.port }}" \
-              --sizes "${{ inputs.sizes }}" \
-              --repeats "${{ inputs.repeats }}" \
-              --threads "$(nproc)" \
-              --stop-on-fail \
-              --data-dir "$RUNNER_TEMP/scale" \
-              --json-out "out/ceiling-${{ matrix.port }}.json" \
-              2>&1 | tee "out/ceiling-${{ matrix.port }}.txt"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            GEN="rust/target/release/gen-data$EXE"
+          else
+            GEN="c/gen-data"
+          fi
+          {
+            echo "LADDER_BIN=$BIN"
+            echo "LADDER_GEN=$GEN"
+            echo "LADDER_PORT=${{ matrix.port }}"
+            echo "LADDER_RUNNER=${{ matrix.os }}"
+            echo "LADDER_REPEATS=${{ inputs.repeats }}"
+            echo "LADDER_THREADS=$(nproc 2>/dev/null || echo 4)"
+            echo "LADDER_DATA=${RUNNER_TEMP}/scale"
+          } >> "$GITHUB_ENV"
+          ls -l "$BIN" "$GEN"
 
-      - name: This port's ladder, in the summary
+      # One step per rung. A red tick here is the ceiling, and it stops the
+      # rest -- which is the ladder ending rather than something to fix.
+      - name: "10m rows"
+        run: bash scripts/ladder_step.sh 10m
+      - name: "20m rows"
+        run: bash scripts/ladder_step.sh 20m
+      - name: "30m rows"
+        run: bash scripts/ladder_step.sh 30m
+      - name: "40m rows"
+        run: bash scripts/ladder_step.sh 40m
+      - name: "50m rows"
+        run: bash scripts/ladder_step.sh 50m
+      - name: "60m rows"
+        run: bash scripts/ladder_step.sh 60m
+
+      - name: Where it stopped
         if: always()
         run: |
           {
-            echo "<details><summary>${{ matrix.port }} — full ladder output</summary>"
+            echo "<details><summary>${{ matrix.port }} on ${{ matrix.os }} — rungs recorded</summary>"
             echo
             echo '```'
-            cat "out/ceiling-${{ matrix.port }}.txt" 2>/dev/null || echo "(no output)"
+            ls -1 out/ 2>/dev/null || echo "(none)"
             echo '```'
             echo
             echo "</details>"
@@ -146,17 +187,26 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ceiling-${{ matrix.port }}
+          name: ceiling-${{ matrix.port }}-${{ matrix.os }}
           path: out/
 
   floor:
-    name: "floor: ${{ matrix.port }}"
-    runs-on: ubuntu-latest
+    name: "floor: ${{ matrix.port }} on ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        port: [c, cpp, rust, zig]
+        # Linux only: taking memory away needs a cgroup, and Windows has none.
+        include:
+          - { os: ubuntu-latest,    port: c }
+          - { os: ubuntu-latest,    port: cpp }
+          - { os: ubuntu-latest,    port: rust }
+          - { os: ubuntu-latest,    port: zig }
+          - { os: ubuntu-24.04-arm, port: c }
+          - { os: ubuntu-24.04-arm, port: cpp }
+          - { os: ubuntu-24.04-arm, port: rust }
+          - { os: ubuntu-24.04-arm, port: zig }
     steps:
       - uses: actions/checkout@v4
 
@@ -185,7 +235,7 @@ jobs:
           make -C c gen-data
           case "${{ matrix.port }}" in
             c)    make -C c ;;
-            cpp)  CXX=clang++ make -C cpp ;;
+            cpp)  make -C cpp ;;
             rust) cargo build --release --manifest-path rust/Cargo.toml ;;
             zig)  (cd zig && zig build --release=fast) ;;
           esac
@@ -200,26 +250,24 @@ jobs:
           esac
           D="$RUNNER_TEMP/floor"; mkdir -p "$D" out
           c/gen-data --rows "${{ inputs.floor_size }}" --out-dir "$D" --prefix f
-          # sudo, because writing a cgroup limit needs root; -E to keep the
-          # search bounds and the JSON destination.
           sudo -E env \
               CSVDIFF_FLOOR_HI="${{ inputs.floor_hi }}" \
               CSVDIFF_FLOOR_LO=32 \
-              CSVDIFF_FLOOR_JSON="$RUNNER_TEMP/floor-raw-${{ matrix.port }}.json" \
+              CSVDIFF_FLOOR_JSON="$RUNNER_TEMP/floor-raw.json" \
               scripts/memory_floor.sh "$PWD/$BIN" compare \
                   "$D/f_a.csv" "$D/f_b.csv" -k account_id,txn_id -i updated_at \
-              2>&1 | tee "out/floor-${{ matrix.port }}.txt"
-          # The raw file knows the limit; the port and the size are this job's.
+              2>&1 | tee "out/floor-${{ matrix.port }}-${{ matrix.os }}.txt"
           python3 scripts/floor_record.py \
-              --raw "$RUNNER_TEMP/floor-raw-${{ matrix.port }}.json" \
+              --raw "$RUNNER_TEMP/floor-raw.json" \
               --port "${{ matrix.port }}" \
+              --runner "${{ matrix.os }}" \
               --size "${{ inputs.floor_size }}" \
-              --out "out/floor-${{ matrix.port }}.json"
+              --out "out/floor-${{ matrix.port }}-${{ matrix.os }}.json"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: floor-${{ matrix.port }}
+          name: floor-${{ matrix.port }}-${{ matrix.os }}
           path: out/
 
   collect:
@@ -238,7 +286,7 @@ jobs:
           python3 scripts/scale_report.py \
               --ceiling results/ceiling-*/ceiling-*.json \
               --floor results/floor-*/floor-*.json \
-              --title "Scale ceiling — ${{ inputs.sizes }}, floor at ${{ inputs.floor_size }}" \
+              --title "Scale ceiling — floor searched at ${{ inputs.floor_size }}" \
               --out scale-report.md
           cat scale-report.md >> "$GITHUB_STEP_SUMMARY"
 

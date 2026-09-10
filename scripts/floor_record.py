@@ -20,6 +20,7 @@ def main() -> int:
     ap.add_argument("--raw", type=Path, required=True)
     ap.add_argument("--port", required=True)
     ap.add_argument("--size", required=True)
+    ap.add_argument("--runner", default="", help="which runner produced it")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
@@ -28,7 +29,7 @@ def main() -> int:
         record = json.loads(args.raw.read_text())
     except (OSError, json.JSONDecodeError):
         pass
-    record.update({"port": args.port, "size": args.size})
+    record.update({"port": args.port, "size": args.size, "runner": args.runner})
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(record))
     print(record)

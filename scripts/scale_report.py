@@ -20,6 +20,17 @@ import json
 from pathlib import Path
 
 ORDER = ["c", "cpp", "rust", "zig"]
+RUNNERS = ["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest"]
+
+
+def who(r: dict) -> str:
+    """A row is a port on a runner. On one runner the runner is noise, so it is
+    only spelled out when the results span more than one."""
+    return f"{r.get('port','?')} · {r['runner']}" if r.get("runner") else r.get("port", "?")
+
+
+def runner_rank(name: str) -> int:
+    return RUNNERS.index(name) if name in RUNNERS else len(RUNNERS)
 
 
 def load(paths: list[str]) -> list[dict]:
@@ -41,15 +52,21 @@ def ceiling_tables(rows: list[dict]) -> str:
     """Every size every port reached, and then the ceiling on its own."""
     if not rows:
         return "_No ceiling results._\n"
-    ports = sorted({r["port"] for r in rows}, key=rank)
+    multi = len({r.get("runner", "") for r in rows}) > 1
+    if not multi:
+        for r in rows:
+            r["runner"] = ""
+    ports = sorted({who(r) for r in rows},
+                   key=lambda n: (runner_rank(n.split(" · ")[1]) if " · " in n else 0,
+                                  rank(n.split(" · ")[0])))
     sizes: list[str] = []
     for r in rows:
         if r["size"] not in sizes:
             sizes.append(r["size"])
     sizes.sort(key=lambda s: next(x["rows"] for x in rows if x["size"] == s))
 
-    by = {(r["port"], r["size"]): r for r in rows}
-    out = ["### How far each port got\n",
+    by = {(who(r), r["size"]): r for r in rows}
+    out = ["### How far each build got\n",
            "Wall time in seconds. **failed** is where the port stopped, and the",
            "reason is under the table.\n",
            "| Rows | " + " | ".join(ports) + " |",
@@ -67,10 +84,10 @@ def ceiling_tables(rows: list[dict]) -> str:
         out.append(f"| {s} | " + " | ".join(cells) + " |")
 
     out += ["", "### The ceiling\n",
-            "| Port | Largest completed | Input at that size | Wall | Peak RSS | Stopped by |",
+            "| Build | Largest completed | Input at that size | Wall | Peak RSS | Stopped by |",
             "|---|---:|---:|---:|---:|---|"]
     for p in ports:
-        mine = [r for r in rows if r["port"] == p]
+        mine = [r for r in rows if who(r) == p]
         ok = [r for r in mine if r.get("ok")]
         bad = [r for r in mine if not r.get("ok")]
         if not ok:
@@ -87,12 +104,15 @@ def floor_table(rows: list[dict]) -> str:
     if not rows:
         return "\n_No memory-floor results._\n"
     rows = sorted(rows, key=lambda r: (r.get("floor_mb") or 1 << 30, rank(r.get("port", ""))))
+    for r in rows:
+        if r.get("runner"):
+            r["port"] = who(r)
     out = ["", "### The memory floor\n",
            "The smallest cgroup limit the same comparison finishes inside. Lower is",
            "better, and it is not the same ordering as speed. Peak RSS would not",
            "answer this: mapped pages are reclaimable, so that figure is whatever the",
            "kernel allowed, not what the engine needed.\n",
-           "| Port | Size compared | Smallest limit that finishes |",
+           "| Build | Size compared | Smallest limit that finishes |",
            "|---|---|---:|"]
     for r in rows:
         mb = r.get("floor_mb")
