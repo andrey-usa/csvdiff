@@ -115,6 +115,25 @@ def run(argv: list[str], out: Path) -> tuple[float, float, float, int]:
             usage.ru_maxrss / 1024, os.waitstatus_to_exitcode(status))
 
 
+def cpu_model() -> str | None:
+    """The CPU this rung ran on, so the report can say when two rungs did not
+    share one.
+
+    Every rung is its own job on its own hosted runner now, and those runners
+    are not the same machine: the fleet spans CPU generations, and a rung that
+    lands on a slower one takes longer for a reason that has nothing to do with
+    its size. Without this the wall-time column reads as a curve and is partly a
+    map of which hardware each cell drew.
+    """
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -171,7 +190,7 @@ def main() -> int:
                   f"{counts['a_dup_keys']:,}/{counts['b_dup_keys']:,}", flush=True)
             records.append({"port": args.label or Path(args.binary).name, "size": label,
                             "rows": rows_in(label), "input_mb": round(mapped, 1),
-                            "ok": True, "wall_s": round(secs, 2),
+                            "ok": True, "wall_s": round(secs, 2), "cpu": cpu_model(),
                             "rows_per_s": int(counts["a_rows"] / secs),
                             "cores": round(cpu / secs, 2), "rss_mb": round(rss, 0),
                             "above_mb": (round(rss - mapped) if rss >= mapped else None),
