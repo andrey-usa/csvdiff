@@ -722,12 +722,34 @@ fi
 
 # And on the columnar path, which allocates in a different file.
 if [ -x "$GEN" ]; then
-  "$GEN" --rows 5k --out-dir "$mdir" --prefix q --format parquet >/dev/null 2>&1
+  # 20k rather than 5k. At five thousand rows the whole comparison now fits
+  # inside one megabyte, so a `--max-memory 1` refusal could not happen and this
+  # check passed only while the ceiling was counting every column ever read
+  # instead of the ones held. A test that is green for the wrong reason goes red
+  # when the reason is fixed, which is what happened here.
+  "$GEN" --rows 20k --out-dir "$mdir" --prefix q --format parquet >/dev/null 2>&1
   out=$(./csvdiff compare "$mdir/q_a.unc.parquet" "$mdir/q_b.unc.parquet" \
           -k account_id,txn_id -i updated_at --max-memory 1 2>&1 | head -1)
   case "$out" in
     *"needs more than the 1 MB"*) echo "  ok    the parquet path honours the ceiling too" ;;
     *) echo "  FAIL  parquet ignored the ceiling: $out"; fail=1 ;;
+  esac
+
+  # The ceiling is what a run holds, not what it has ever read. The columnar
+  # path reads one compared column at a time and frees it before asking for the
+  # next, so comparing seventeen of them must not need seventeen columns' worth
+  # of headroom -- which is what it used to ask for, because the budget was
+  # taken and never given back. One thread, so this is about the accounting
+  # rather than about how many columns are genuinely in flight.
+  one=$(./csvdiff compare "$mdir/q_a.unc.parquet" "$mdir/q_b.unc.parquet" \
+          -k account_id,txn_id -i updated_at --threads 1 --compare status \
+          --max-memory 16 2>&1 | head -1)
+  many=$(./csvdiff compare "$mdir/q_a.unc.parquet" "$mdir/q_b.unc.parquet" \
+          -k account_id,txn_id -i updated_at --threads 1 \
+          --max-memory 16 2>&1 | head -1)
+  case "$one$many" in
+    *"more than the"*) echo "  FAIL  a ceiling that fits one column refused: $one$many"; fail=1 ;;
+    *) echo "  ok    the ceiling counts what is held, not every column read" ;;
   esac
 fi
 

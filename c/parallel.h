@@ -43,6 +43,12 @@ size_t budget_used(void);
 /* Returns 0 when `bytes` fits, or -1 when it does not; the caller reports. */
 int budget_take(size_t bytes);
 
+/* Hands back what a matching `budget_take` took, so the total tracks what is
+ * held rather than what has ever been asked for. Saturates at zero: a give
+ * without a take is a bug, and one that wrapped would silently lift the
+ * ceiling for everything after it. */
+void budget_give(size_t bytes);
+
 /* Whether a take has been refused. Sticky, because the refusal happens deep in
  * an index build whose caller reports the error, and "out of memory" and "more
  * than you allowed" are different things to be told. */

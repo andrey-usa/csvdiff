@@ -75,6 +75,11 @@ typedef struct {
     /* Decompressed pages, when the column was compressed. Empty means every
      * slice above counts from the mapping instead. See pq_base(). */
     char    *owned;   size_t owned_len;
+    /* What this column took from the `--max-memory` ceiling, so freeing it can
+     * give exactly that back. A column is read, compared and released before
+     * the next is asked for, so without this the ceiling counted every column
+     * a run ever read rather than the one or two it holds. */
+    size_t   budgeted;
 } PqColumn;
 
 /* What a file says about itself, before any column is read. */
