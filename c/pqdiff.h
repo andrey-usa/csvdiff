@@ -54,6 +54,7 @@ int pq_is_parquet(const char *path);
 int pq_compare(const char *a_path, const char *b_path,
                char *const *key, size_t nkey,
                char *const *ignore, size_t nignore,
+               char *const *compare, size_t ncompare,
                unsigned threads, PqResult *out);
 
 void pq_result_free(PqResult *r);
