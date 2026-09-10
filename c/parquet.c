@@ -718,6 +718,7 @@ void pq_meta_free(PqMeta *m) {
 }
 
 void pq_column_free(PqColumn *c) {
+    budget_give(c->budgeted);
     free(c->dict);
     free(c->index);
     free(c->values);
@@ -771,9 +772,16 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
 
     /* Sized once from the footer's row count, so appending a page never has to
      * move eighty megabytes of what is already decoded. */
-    if (fm.rows > 0 && budget_take((size_t)fm.rows * sizeof *out->index) != 0) {
-        fail("over the --max-memory ceiling");
-        goto done;
+    if (fm.rows > 0) {
+        const size_t want = (size_t)fm.rows * sizeof *out->index;
+        if (budget_take(want) != 0) {
+            fail("over the --max-memory ceiling");
+            goto done;
+        }
+        /* Recorded on the column, not in a local, because what gives it back is
+         * `pq_column_free`, which runs wherever the caller is finished with it
+         * -- including the error paths below. */
+        out->budgeted = want;
     }
     if (fm.rows > 0 &&
         grow((void **)&out->index, &index_cap, (size_t)fm.rows, sizeof *out->index) != 0)

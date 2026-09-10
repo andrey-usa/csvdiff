@@ -2,6 +2,7 @@
 
 #include "parallel.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -137,28 +138,52 @@ unsigned cpu_count(void) {
 
 /*
  * One process, one comparison, so a file-scope total is the whole mechanism.
- * It is written before threads start and read after they finish -- every
- * `budget_take` here happens on the calling thread, at a phase boundary, which
- * is why it needs no lock.
+ *
+ * The total is *live* bytes, not bytes ever asked for, which is the difference
+ * between a ceiling and a tally. It did not start that way: there was a
+ * `budget_take` and nothing that gave anything back, so a run that read
+ * seventeen columns one at a time, freeing each before the next, spent
+ * seventeen columns' worth of a ceiling it never held more than one of. At two
+ * million rows that refused at 419 MB a run whose high-water mark was 171 MB.
+ *
+ * It also needs to be safe from more than one thread now, which it did not used
+ * to be. The comment here said every take happened on the calling thread at a
+ * phase boundary; that was true when it was written and stopped being true when
+ * the columnar reader started taking inside `pq_read_column`, which the column
+ * workers call. Four threads doing a read-modify-write on one size_t is a race
+ * whether or not it has ever lost.
  */
-static size_t budget_cap = 0;
-static size_t budget_so_far = 0;
-static int    budget_over = 0;
+static size_t          budget_cap = 0;
+static _Atomic size_t  budget_live = 0;
+static atomic_int      budget_over = 0;
 
 void budget_set(size_t mb) {
     budget_cap = mb ? mb * (size_t)1024 * 1024 : 0;
-    budget_so_far = 0;
-    budget_over = 0;
+    atomic_store(&budget_live, 0);
+    atomic_store(&budget_over, 0);
 }
 
 size_t budget_limit(void) { return budget_cap; }
-size_t budget_used(void)  { return budget_so_far; }
-int    budget_exceeded(void) { return budget_over; }
+size_t budget_used(void)  { return atomic_load(&budget_live); }
+int    budget_exceeded(void) { return atomic_load(&budget_over); }
 
 int budget_take(size_t bytes) {
     if (budget_cap == 0) return 0;
-    /* An overflowing sum is over any ceiling, so saturate rather than wrap. */
-    if (bytes > budget_cap - budget_so_far) { budget_over = 1; return -1; }
-    budget_so_far += bytes;
-    return 0;
+    size_t cur = atomic_load(&budget_live);
+    for (;;) {
+        /* An overflowing sum is over any ceiling, so subtract rather than add. */
+        if (bytes > budget_cap - cur) { atomic_store(&budget_over, 1); return -1; }
+        if (atomic_compare_exchange_weak(&budget_live, &cur, cur + bytes)) return 0;
+    }
+}
+
+void budget_give(size_t bytes) {
+    if (budget_cap == 0 || bytes == 0) return;
+    size_t cur = atomic_load(&budget_live);
+    for (;;) {
+        /* Saturating, so a give that does not match a take cannot wrap the
+         * total into something enormous and make every later take succeed. */
+        const size_t next = bytes > cur ? 0 : cur - bytes;
+        if (atomic_compare_exchange_weak(&budget_live, &cur, next)) return;
+    }
 }
