@@ -72,6 +72,34 @@ for target in "$@"; do
     fi
 done
 
+# Every other port is compiled for the machine it runs on: both Makefiles probe
+# and add `-march=native`, and Zig's default target is already the host (a build
+# with `-Dcpu=native` is byte-identical to one without). Rust was the exception.
+# With no RUSTFLAGS, `cargo build --release` targets baseline x86-64 -- sse, sse2
+# and fxsr, nothing else -- so every table this script produced compared an SSE2
+# Rust against an AVX-512 C and C++.
+#
+# That is not the documented intent. README.md says "every port is compiled for
+# the machine it runs on: -march=native for C and C++, -C target-cpu=native for
+# Rust, -Dcpu=native for Zig", BENCHMARKS.md says the same of its current tables,
+# and `benchmark-native.yml` sets the flag by hand. The six workflows that build
+# through this script never did, and those are the ones a pull request sees.
+#
+# The *resolved* CPU name goes in the flag rather than the literal `native`, so
+# the text differs between hosts. Cargo fingerprints on the RUSTFLAGS string, so
+# a `rust/target` restored from a cache that was filled on another machine
+# rebuilds instead of being reused. Spelled `native`, the string would match
+# across hosts and cargo would hand back a binary built for someone else's
+# instruction set -- which fails as SIGILL, on a runner fleet that mixes CPUs.
+#
+# An explicit RUSTFLAGS from the caller still wins, as it always did.
+if [ -z "${RUSTFLAGS:-}" ]; then
+    native_cpu=$(rustc --print target-cpus 2>/dev/null |
+                 sed -n 's/.*currently \([A-Za-z0-9_-]*\).*/\1/p' | head -1)
+    export RUSTFLAGS="-C target-cpu=${native_cpu:-native}"
+    echo "build_ports: RUSTFLAGS=$RUSTFLAGS"
+fi
+
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 logs=$(mktemp -d)
 trap 'rm -rf "$logs"' EXIT
@@ -79,17 +107,33 @@ trap 'rm -rf "$logs"' EXIT
 jobs=${BUILD_JOBS:-$(nproc 2>/dev/null || echo 4)}
 echo "building ${*} with up to $jobs at a time"
 
-declare -a names pids started
+declare -a names pids
 for target in "$@"; do
     # Wait for a slot. `wait -n` returns when any one child finishes; its exit
     # status is collected properly in the join loop below, so it is ignored here.
     while [ "$(jobs -rp | wc -l)" -ge "$jobs" ]; do
         wait -n 2>/dev/null || true
     done
-    ( cd "$root" && eval "$(command_for "$target")" ) >"$logs/$target.log" 2>&1 &
+    # Each target times itself. The duration used to be computed in the join
+    # loop below as `SECONDS - started`, which is not how long the target took:
+    # the loop joins in order and blocks on each `wait`, so a target that
+    # finished early but sits behind a slow one was charged the wait as well.
+    # In one CI run that reported `zig (108s)` and `cpp (108s)` beside
+    # `cpp-gen (105s)` when the whole script took 123s -- cpp-gen had not even
+    # started until a slot freed, so its own build could not have been 105s.
+    # Everything looked as slow as the slowest thing in front of it, which is
+    # the one reading that makes a parallel build script useless for deciding
+    # what to speed up.
+    (
+        cd "$root" || exit 1
+        started=$SECONDS
+        eval "$(command_for "$target")"
+        status=$?
+        echo "$(( SECONDS - started ))" >"$logs/$target.time"
+        exit "$status"
+    ) >"$logs/$target.log" 2>&1 &
     names+=("$target")
     pids+=("$!")
-    started+=("$SECONDS")
 done
 
 broken=0
@@ -101,7 +145,7 @@ for i in "${!pids[@]}"; do
         status="FAILED"
         broken=$(( broken + 1 ))
     fi
-    echo "::group::$status  $name  ($(( SECONDS - started[i] ))s)"
+    echo "::group::$status  $name  ($(cat "$logs/$name.time" 2>/dev/null || echo "?")s)"
     cat "$logs/$name.log"
     echo "::endgroup::"
     [ "$status" = "ok" ] || echo "build_ports: $name failed" >&2
