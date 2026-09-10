@@ -246,6 +246,56 @@ before timing anything.
   "cold" runs come back within 25% of warm ones. The only genuine cold read is the first touch
   after a container restart, and it ran at about 18 MB/s -- not reproducible, not representative.
   Any claim about bytes read costing time needs a host with a characterisable disk.
+- **`--compare` lives in two resolvers in the C port**, not one: `csvdiff.c` for text and
+  `pqdiff.c` for the columnar path, because they resolve columns against different structures.
+  A change to one that skips the other is a flag that works on CSV and is ignored on Parquet.
+  The same is true of `--key` and `--ignore`; only Rust has a single `resolve`.
+- **A compressed Parquet column in C means `owned`, and `pq_base()` is how you read it.** A
+  column is wholly compressed or wholly not -- one whose chunks disagree is refused -- so
+  `PqColumn.owned` being non-NULL settles what every slice in that column counts from. Never take
+  `mapping->data` as the base directly; `pq_base(&col.c, mapping->data)` is the only correct form,
+  and an uncompressed file still resolves to the mapping exactly as before. `owned` moves as it
+  grows, which is why a slice is an offset and not a pointer.
+- **C carries snappy and LZ4 and refuses gzip and zstd**, and that line is where it stays: the
+  first two are byte-copy loops of about eighty lines, the other two are real decoders and would
+  be the dependency this port exists without. `c/parquet.h` says so at the top.
+- **A checked `malloc` is not OOM resilience.** Under Linux's default overcommit there is a band
+  where `malloc` returns a pointer and the kernel kills the process on touch -- exit 137, no
+  message. Measured on a 15 GB box: 8 GB allocates and touches fine, 14 GB allocates and is
+  killed, 20 GB is refused up front. That band is why C has `--max-memory`, and why the sizes
+  that scale with row count go through `budget_take` *before* they are allocated. Adding a new
+  allocation that grows with the input means adding it to the budget, or the ceiling quietly
+  stops meaning what it says.
+- **C's budget bounds what grows, not the process.** The per-row index arrays and the Parquet
+  column buffers are in it; the mapped files and a few kilobytes of bookkeeping are not. Say
+  "bounds what scales with the input", never "enforced" -- that word belongs to Zig's fixed
+  buffer, which is a stronger guarantee.
+- **The CSV path is the field scan.** `next_of2` is 43% of its instructions and `parse_csv_row`
+  27%, so seventy per cent of the work is finding field ends. That is where a change pays and
+  everywhere else is rounding. `next_of2` steps 32 bytes with AVX2, 16 with SSE2 and 8 otherwise,
+  chosen at compile time so there is no dispatch on the hot path; aarch64 gets the SWAR loop.
+  Any change here has to be run through all three widths -- `-U__AVX2__` and `-U__SSE2__` build
+  them -- because only the tails see a row shorter than a step.
+- **"The SIMD question does not re-open" was about wide files, not the byte scan.** That finding
+  said throughput is flat from 20 columns to 200. It is not a finding about how many bytes a
+  scan step covers, and the two were confused once already.
+- **An instruction profile picks candidates; it does not rank them.** `callgrind` put `rle_fill`
+  at 18.5% of the columnar path's instructions. Deleting its work outright -- wrong answers, pure
+  ceiling -- changed the wall clock by nothing: the phase is memory-bound and those instructions
+  issue in the shadow of the loads they wait on. The same profile found the CSV scan, where the
+  two did line up. Before writing an optimisation, build the ceiling: replace the function's work
+  with something trivially wrong, keep the rest in step, and time it. Ten minutes, and it says
+  whether there is anything there at all.
+- **The scale ceiling is two questions, not one.** `.github/workflows/scale-ceiling.yml` climbs a
+  ladder of sizes until a port fails (the ceiling) and separately lowers a cgroup limit until the
+  run is killed (the floor). They rank differently, which is why both tables exist. One port per
+  runner on purpose: the ladder is bigger than one runner's disk, and separate jobs mean a port
+  that dies at 40m does not take the rest of the table with it.
+- **Peak RSS is not the memory answer for anything that maps its input.** Mapped pages are
+  reclaimable, so RSS is whatever the kernel allowed, not what the engine needed. Use
+  `scripts/memory_floor.sh`, which takes the memory away until the run dies. It handles cgroup v1
+  and v2 -- the runners are v2, most older images are v1, and a script that knew only one would
+  report "no controller" on exactly the host worth measuring.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a

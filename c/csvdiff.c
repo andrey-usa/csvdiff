@@ -24,6 +24,9 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
+#if defined(__SSE2__) || defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,9 +66,28 @@ static bool field_escaped(Field f) { return (f & ESCAPED_BIT) != 0; }
 static bool field_real(Field f) { return f != ABSENT && f != TOO_LONG; }
 
 /* ------------------------------------------------------------------------- */
-/* SWAR scanning: eight bytes per step, arithmetic rather than comparison.      */
-/* Subtracting ones borrows across a byte only where that byte was zero, and    */
-/* ~diff cancels the false positives the borrow creates.                        */
+/* Scanning for the next delimiter or newline.                                 */
+/*                                                                             */
+/* SWAR is the portable floor: eight bytes per step, arithmetic rather than     */
+/* comparison. Subtracting ones borrows across a byte only where that byte was  */
+/* zero, and ~diff cancels the false positives the borrow creates.             */
+/*                                                                             */
+/* `next_of2` gets a wider step where the target has one, because it is where   */
+/* the CSV path spends its time: 43% of instructions, with `parse_csv_row`      */
+/* above it at 27%, so seventy per cent of the work is finding field ends. The  */
+/* fields here average about ten bytes, which is the whole argument -- an       */
+/* eight-byte step needs two iterations for a typical field and a sixteen-byte  */
+/* one needs a single iteration.                                                */
+/*                                                                             */
+/* Measured against the commit before it, paired and interleaved, fifteen        */
+/* rounds on a 2m-row pair: 0.469s to 0.442s, ratio 0.934 with the middle half  */
+/* 0.824-0.978. On the same rows as ndjson it measured 0.984 (0.942-1.057) and  */
+/* on Parquet 1.004 (0.954-1.393) -- both crossing one, so nothing is claimed   */
+/* for either. ndjson's fields are longer, so the scan was already finding hits */
+/* in one step, and the columnar path does not come through here at all.        */
+/*                                                                             */
+/* `next_of1` is left as SWAR on purpose. It did not appear in the profile, and */
+/* an unmeasured second copy of this is complexity with no number behind it.    */
 /* ------------------------------------------------------------------------- */
 
 #define ONES UINT64_C(0x0101010101010101)
@@ -85,12 +107,42 @@ static uint64_t load64(const char *p) {
 }
 
 static size_t next_of2(const char *d, size_t from, size_t end, char a, char b) {
-    uint64_t ba = broadcast((unsigned char)a), bb = broadcast((unsigned char)b);
     size_t at = from;
-    for (; at + 8 <= end; at += 8) {
-        uint64_t w = load64(d + at);
-        uint64_t hits = match_bits(w, ba) | match_bits(w, bb);
-        if (hits) return at + (size_t)(__builtin_ctzll(hits) >> 3);
+    /* Chosen at compile time from what the build targets, so there is no
+     * dispatch on the hot path. The Makefile builds with -march=native, which
+     * defines these where the CPU has them; a build for a baseline x86-64 gets
+     * the SSE2 step, which that architecture always has, and anything else --
+     * aarch64, which this port also targets -- falls through to the SWAR loop
+     * below unchanged. Each step is a load, two compares, an or and a mask. */
+#if defined(__AVX2__)
+    {
+        const __m256i va = _mm256_set1_epi8(a), vb = _mm256_set1_epi8(b);
+        for (; at + 32 <= end; at += 32) {
+            const __m256i w = _mm256_loadu_si256((const __m256i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm256_movemask_epi8(
+                _mm256_or_si256(_mm256_cmpeq_epi8(w, va), _mm256_cmpeq_epi8(w, vb)));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+#if defined(__SSE2__)
+    {
+        const __m128i va = _mm_set1_epi8(a), vb = _mm_set1_epi8(b);
+        for (; at + 16 <= end; at += 16) {
+            const __m128i w = _mm_loadu_si128((const __m128i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm_movemask_epi8(
+                _mm_or_si128(_mm_cmpeq_epi8(w, va), _mm_cmpeq_epi8(w, vb)));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+    {
+        const uint64_t ba = broadcast((unsigned char)a), bb = broadcast((unsigned char)b);
+        for (; at + 8 <= end; at += 8) {
+            const uint64_t w = load64(d + at);
+            const uint64_t hits = match_bits(w, ba) | match_bits(w, bb);
+            if (hits) return at + (size_t)(__builtin_ctzll(hits) >> 3);
+        }
     }
     for (; at < end; at++)
         if (d[at] == a || d[at] == b) return at;
@@ -974,8 +1026,14 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     if (ix->failed) ok = false;
 
     if (ok) {
-        ix->row_start = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->row_start);
-        ix->row_hash = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->row_hash);
+        const size_t n = ix->rows ? ix->rows : 1;
+        if (budget_take(n * (sizeof *ix->row_start + sizeof *ix->row_hash)) != 0) {
+            for (unsigned p = 0; p < ways; p++) { free(chunks[p].start); free(chunks[p].hash); }
+            free(chunks);
+            return false;
+        }
+        ix->row_start = malloc(n * sizeof *ix->row_start);
+        ix->row_hash = malloc(n * sizeof *ix->row_hash);
         ok = ix->row_start && ix->row_hash;
     }
     if (ok) {
@@ -1005,6 +1063,12 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     ix->pos_bits = 1;
     while (ix->pos_bits < 32 && ((size_t)1 << ix->pos_bits) < ix->rows + 2) ix->pos_bits++;
     ix->pos_mask = ix->pos_bits >= 32 ? 0xFFFFFFFFu : (uint32_t)(((uint64_t)1 << ix->pos_bits) - 1);
+    {
+        const size_t n = ix->rows ? ix->rows : 1;
+        if (budget_take(cap * sizeof *ix->table +
+                        n * (sizeof *ix->first_row + sizeof *ix->occurrences)) != 0)
+            return false;
+    }
     ix->table = alloc_huge(cap * sizeof *ix->table);
     ix->first_row = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->first_row);
     ix->occurrences = malloc((ix->rows ? ix->rows : 1) * sizeof *ix->occurrences);
@@ -1519,6 +1583,15 @@ static int fail(const char *message) {
     return 2;
 }
 
+/* The one refusal worth naming in full: it is the answer to the question
+ * --max-memory asked. */
+static int fail_budget(void) {
+    fprintf(stderr,
+            "error: the comparison needs more than the %zu MB it was given\n",
+            budget_limit() / (1024 * 1024));
+    return 2;
+}
+
 /* ------------------------------------------------------------------------- */
 /* The report                                                                  */
 /*                                                                             */
@@ -1574,11 +1647,12 @@ static int emit(const Summary *s, const char *json_path) {
 /* ------------------------------------------------------------------------- */
 
 static int compare_parquet(const char *a_path, const char *b_path, const Names *key,
-                           const Names *ignore, unsigned threads, const char *json_path) {
+                           const Names *ignore, const Names *compare, unsigned threads,
+                           const char *json_path) {
     PqResult r;
     if (pq_compare(a_path, b_path, key->items, key->len, ignore->items, ignore->len,
-                   threads, &r) != 0)
-        return fail(pq_error());
+                   compare->items, compare->len, threads, &r) != 0)
+        return budget_exceeded() ? fail_budget() : fail(pq_error());
 
     OutCol *cols = calloc(r.ncols ? r.ncols : 1, sizeof *cols);
     if (!cols) { pq_result_free(&r); return fail("out of memory"); }
@@ -1608,23 +1682,53 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "compare") != 0) return fail("unknown command");
 
-    Names key = {0}, ignore = {0};
+    Names key = {0}, ignore = {0}, compare = {0};
     const char *a_path = NULL, *b_path = NULL, *json_path = NULL;
     unsigned threads = 0;   /* 0 means one per core, on the Parquet path */
+    size_t   max_memory_mb = 0;   /* 0 means no ceiling */
+    /* Three lists to release now, and a fourth would be a fourth place to
+     * forget one: every exit from the scan goes through here. */
+#define ARGS_FAIL(msg) \
+    do { names_free(&key); names_free(&ignore); names_free(&compare); return fail(msg); } while (0)
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i];
-        if ((!strcmp(f, "-k") || !strcmp(f, "--key")) && i + 1 < argc) key = split_commas(argv[++i]);
-        else if ((!strcmp(f, "-i") || !strcmp(f, "--ignore")) && i + 1 < argc) ignore = split_commas(argv[++i]);
-        else if (!strcmp(f, "--json") && i + 1 < argc) json_path = argv[++i];
-        else if ((!strcmp(f, "-t") || !strcmp(f, "--threads")) && i + 1 < argc)
+        /* A known flag with nothing after it used to fall through to the
+         * unknown-option arm, so `compare a b -k` said "unknown option" and
+         * blamed the flag for not being recognised when it was recognised and
+         * empty. Naming the flag costs one comparison at startup. */
+        const int wants_value =
+            !strcmp(f, "-k") || !strcmp(f, "--key") ||
+            !strcmp(f, "-i") || !strcmp(f, "--ignore") ||
+            !strcmp(f, "-c") || !strcmp(f, "--compare") ||
+            !strcmp(f, "--json") ||
+            !strcmp(f, "-t") || !strcmp(f, "--threads") ||
+            !strcmp(f, "--max-memory") ||
+            !strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine");
+        if (wants_value && i + 1 >= argc) {
+            if (!strcmp(f, "-k") || !strcmp(f, "--key")) ARGS_FAIL("--key needs a value");
+            if (!strcmp(f, "-i") || !strcmp(f, "--ignore")) ARGS_FAIL("--ignore needs a value");
+            if (!strcmp(f, "-c") || !strcmp(f, "--compare")) ARGS_FAIL("--compare needs a value");
+            if (!strcmp(f, "--json")) ARGS_FAIL("--json needs a value");
+            if (!strcmp(f, "-t") || !strcmp(f, "--threads")) ARGS_FAIL("--threads needs a value");
+            if (!strcmp(f, "--max-memory")) ARGS_FAIL("--max-memory needs a value");
+            ARGS_FAIL("that option needs a value");
+        }
+        if (!strcmp(f, "-k") || !strcmp(f, "--key")) key = split_commas(argv[++i]);
+        else if (!strcmp(f, "-i") || !strcmp(f, "--ignore")) ignore = split_commas(argv[++i]);
+        else if (!strcmp(f, "-c") || !strcmp(f, "--compare")) compare = split_commas(argv[++i]);
+        else if (!strcmp(f, "--json")) json_path = argv[++i];
+        else if (!strcmp(f, "-t") || !strcmp(f, "--threads"))
             threads = (unsigned)strtoul(argv[++i], NULL, 10);
-        else if ((!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) && i + 1 < argc) i++;
-        else if (f[0] == '-') { names_free(&key); names_free(&ignore); return fail("unknown option"); }
+        else if (!strcmp(f, "--max-memory")) max_memory_mb = strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) i++;
+        else if (f[0] == '-') ARGS_FAIL("unknown option");
         else if (!a_path) a_path = f;
         else if (!b_path) b_path = f;
     }
-    if (!a_path || !b_path) { names_free(&key); names_free(&ignore); return fail("compare needs two files"); }
-    if (key.len == 0) { names_free(&key); names_free(&ignore); return fail("--key is required"); }
+    if (!a_path || !b_path) ARGS_FAIL("compare needs two files");
+    if (key.len == 0) ARGS_FAIL("--key is required");
+#undef ARGS_FAIL
+    budget_set(max_memory_mb);
 
     /* A column store and a byte stream have no common ground to be compared on:
      * one of them would have to be turned into the other, which is the cost the
@@ -1635,12 +1739,15 @@ int main(int argc, char **argv) {
         if (ap != bp) {
             names_free(&key);
             names_free(&ignore);
+            names_free(&compare);
             return fail("one file is parquet and the other is not; convert one of them first");
         }
         if (ap) {
-            const int st = compare_parquet(a_path, b_path, &key, &ignore, threads, json_path);
+            const int st = compare_parquet(a_path, b_path, &key, &ignore, &compare,
+                                           threads, json_path);
             names_free(&key);
             names_free(&ignore);
+            names_free(&compare);
             return st;
         }
     }
@@ -1694,11 +1801,29 @@ int main(int argc, char **argv) {
             fail("ignore column(s) present in neither file");
             goto done;
         }
-    for (size_t i = 0; i < a_head.len; i++) {
-        const char *c = a_head.items[i];
-        if (name_index(&b_head, c) >= 0 && name_index(&key, c) < 0 && name_index(&ignore, c) < 0) {
+    if (compare.len > 0) {
+        /* Named explicitly: the order is the caller's, and a name that is not
+         * in both files is an error rather than a column quietly dropped --
+         * the same rule the other three ports apply. Key and ignored columns
+         * are filtered out here as they are below, so `-k id -c id,a` compares
+         * `a` rather than refusing. */
+        for (size_t i = 0; i < compare.len; i++) {
+            const char *c = compare.items[i];
+            if (name_index(&a_head, c) < 0 || name_index(&b_head, c) < 0) {
+                fail("compare column(s) not present in both files");
+                goto done;
+            }
+            if (name_index(&key, c) >= 0 || name_index(&ignore, c) >= 0) continue;
             char *dup = strdup(c);
             if (!dup || !names_push(&compared, dup)) { free(dup); fail("out of memory"); goto done; }
+        }
+    } else {
+        for (size_t i = 0; i < a_head.len; i++) {
+            const char *c = a_head.items[i];
+            if (name_index(&b_head, c) >= 0 && name_index(&key, c) < 0 && name_index(&ignore, c) < 0) {
+                char *dup = strdup(c);
+                if (!dup || !names_push(&compared, dup)) { free(dup); fail("out of memory"); goto done; }
+            }
         }
     }
 
@@ -1767,8 +1892,9 @@ int main(int argc, char **argv) {
         run_parts(build_part, &bc, 2);
         phase_mark(&whole, "both indexes");
         if (!bc.ok[0] || !bc.ok[1]) {
-            fail(ai.failed || bi.failed ? "a field is larger than this engine packs"
-                                        : "out of memory");
+            if (budget_exceeded()) fail_budget();
+            else fail(ai.failed || bi.failed ? "a field is larger than this engine packs"
+                                             : "out of memory");
             goto done;
         }
     }
@@ -1858,7 +1984,7 @@ done:
     free(ap.slot_next); free(bp.slot_next);
     free(col_changed); free(col_blanked); free(col_filled);
     names_free(&a_head); names_free(&b_head); names_free(&compared);
-    names_free(&key); names_free(&ignore);
+    names_free(&key); names_free(&ignore); names_free(&compare);
     slab_close(&a);
     slab_close(&b);
     return status;

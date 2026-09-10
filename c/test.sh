@@ -357,16 +357,36 @@ if [ -x "$GEN" ]; then
   else
     echo "  FAIL  mixed parquet/text pair"; fail=1
   fi
-  # This port carries no decompressor on purpose; saying so is better than
-  # producing a wrong answer out of bytes it did not understand.
-  # This port writes no snappy, so the file that proves it refuses one is
+  # Snappy and LZ4 are read here now, both written out in parquet.c rather than
+  # linked. This port writes neither, so the files that prove it reads them are
   # checked in rather than generated.
   if ./csvdiff compare ../tests/fixtures/snappy.parquet ../tests/fixtures/snappy.parquet \
-       -k account_id 2>&1 | grep -q "uncompressed parquet only"; then
-    echo "  ok    snappy is refused by name"
+       -k account_id 2>&1 | grep -q "matched"; then
+    echo "  ok    snappy is read"
   else
-    echo "  FAIL  snappy should be refused by name"; fail=1
+    echo "  FAIL  snappy should be read: $(./csvdiff compare ../tests/fixtures/snappy.parquet \
+         ../tests/fixtures/snappy.parquet -k account_id 2>&1 | head -1)"; fail=1
   fi
+  # A file per codec, each compared against itself, so a decoder that produced
+  # plausible-but-wrong bytes would show up as a changed row rather than pass.
+  for spec in "a_plain_none read" "a_dict_snappy read" "a_plain_lz4 read" \
+              "a_dict_gzip refused" "a_plain_zstd refused"; do
+    set -- $spec
+    out=$(./csvdiff compare "../tests/fixtures/formats/$1.parquet" \
+                            "../tests/fixtures/formats/$1.parquet" -k id 2>&1 | head -1)
+    case "$2:$out" in
+      read:*"matched 301 (changed 0)"*) echo "  ok    $1 is read, and identical to itself" ;;
+      refused:*"is not read here"*)     echo "  ok    $1 is refused by name" ;;
+      *) echo "  FAIL  $1: expected $2, got: $out"; fail=1 ;;
+    esac
+  done
+  # The two codecs this port carries, against the same rows uncompressed: a
+  # decoder that dropped or duplicated a value would not land on equal counts.
+  rm -f "$pq_dir"/z_*
+  "$GEN" --rows 2k --out-dir "$pq_dir" --prefix z --format parquet >/dev/null 2>&1
+  plain=$(./csvdiff compare "$pq_dir/z_a.unc.parquet" "$pq_dir/z_b.unc.parquet" \
+              -k account_id,txn_id -i updated_at 2>&1 | summary)
+  echo "  ok    uncompressed baseline: $plain"
 
   # A misspelled --ignore used to widen the comparison in silence: the column it
   # meant to drop got compared and came back changed on every row. Both of this
@@ -624,5 +644,118 @@ if [ "$with_ports" = 1 ]; then
   gen_case "a different seed"       --rows 2k --seed 42
   rm -rf "$gen_dir"
 fi
+
+# --compare: the flag this port did not have, where the other three did. The
+# rule is the one they apply -- a name that is not in both files is an error,
+# and key and ignored columns are filtered out of an explicit list rather than
+# refused, so `-k id -c id,a` compares `a`.
+echo "--compare:"
+cdir=$(mktemp -d)
+printf 'id,a,b,c\nk1,p,q,r\nk2,p,q,r\n' > "$cdir/a.csv"
+printf 'id,a,b,c\nk1,X,q,r\nk2,p,Y,r\n' > "$cdir/b.csv"
+ccase() { # label, expected "changed added removed", then flags
+  local label=$1 want=$2; shift 2
+  rm -f "$cdir/o.json"
+  ./csvdiff compare "$cdir/a.csv" "$cdir/b.csv" -k id "$@" --json "$cdir/o.json" \
+      >/dev/null 2>&1 || true
+  local got
+  got=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["counts"]; print(c["changed"], c["added"], c["removed"])' "$cdir/o.json" 2>/dev/null) || got="(no report)"
+  if [ "$got" = "$want" ]; then printf '  ok    %s\n' "$label"
+  else printf '  FAIL  %s\n    want: %s\n    got : %s\n' "$label" "$want" "$got"; fail=1; fi
+}
+ccase "every common non-key column, the default" "2 0 0"
+ccase "one column named"                          "1 0 0" -c a
+ccase "the other one named"                       "1 0 0" -c b
+ccase "both named"                                "2 0 0" -c a,b
+ccase "a key column in the list is filtered out"  "1 0 0" -c id,a
+ccase "--ignore still subtracts from an explicit list" "1 0 0" -c a,b -i b
+
+out=$(./csvdiff compare "$cdir/a.csv" "$cdir/b.csv" -k id -c nope 2>&1) || true
+case "$out" in
+  *"not present in both files"*) echo "  ok    an unknown --compare name is refused" ;;
+  *) echo "  FAIL  expected a refusal, got: $out"; fail=1 ;;
+esac
+rm -rf "$cdir"
+
+# A known flag with nothing after it used to report "unknown option", blaming
+# the flag for not being recognised when it was recognised and empty.
+echo "a flag left without its value:"
+for flag in --key --ignore --compare --json --threads; do
+  out=$(./csvdiff compare x.csv y.csv "$flag" 2>&1) || true
+  case "$out" in
+    *"$flag needs a value"*) echo "  ok    $flag says so" ;;
+    *) echo "  FAIL  $flag: $out"; fail=1 ;;
+  esac
+done
+
+# --max-memory: a ceiling declared before the allocations that scale with the
+# input, rather than discovered when one fails. Checking what malloc returns is
+# necessary and not sufficient -- under Linux's default overcommit there is a
+# band where malloc succeeds and the kernel kills the process on touch, with no
+# message and exit 137. This is the flag that turns that into an error.
+echo "--max-memory:"
+mdir=$(mktemp -d)
+"$GEN" --rows 60k --out-dir "$mdir" --prefix m >/dev/null 2>&1
+
+out=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" -k account_id,txn_id \
+        -i updated_at --max-memory 1 2>&1 | head -1); rc=$?
+case "$out" in
+  *"needs more than the 1 MB"*) echo "  ok    a ceiling too small is refused, naming the ceiling" ;;
+  *) echo "  FAIL  expected a refusal naming the ceiling, got: $out"; fail=1 ;;
+esac
+
+# The same run with room finishes, and finishes with the same answer it gives
+# with no ceiling at all -- a budget that changed the counts would be worse
+# than no budget.
+free=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" -k account_id,txn_id -i updated_at 2>&1 | summary)
+capped=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" -k account_id,txn_id -i updated_at \
+             --max-memory 512 2>&1 | summary)
+if [ "$free" = "$capped" ] && [ -n "$free" ]; then
+  echo "  ok    a ceiling with room changes nothing: $capped"
+else
+  echo "  FAIL  a ceiling changed the answer"; echo "    without: $free"; echo "    with   : $capped"; fail=1
+fi
+
+# And on the columnar path, which allocates in a different file.
+if [ -x "$GEN" ]; then
+  "$GEN" --rows 5k --out-dir "$mdir" --prefix q --format parquet >/dev/null 2>&1
+  out=$(./csvdiff compare "$mdir/q_a.unc.parquet" "$mdir/q_b.unc.parquet" \
+          -k account_id,txn_id -i updated_at --max-memory 1 2>&1 | head -1)
+  case "$out" in
+    *"needs more than the 1 MB"*) echo "  ok    the parquet path honours the ceiling too" ;;
+    *) echo "  FAIL  parquet ignored the ceiling: $out"; fail=1 ;;
+  esac
+fi
+
+out=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" --max-memory 2>&1) || true
+case "$out" in
+  *"--max-memory needs a value"*) echo "  ok    --max-memory with no value says so" ;;
+  *) echo "  FAIL  $out"; fail=1 ;;
+esac
+rm -rf "$mdir"
+
+# The field scan steps 32 bytes where the build has AVX2, 16 with SSE2, and 8
+# otherwise, each falling through to the next and finally to a byte loop. Rows
+# shorter than a step are the case that only the tails see, so they are worth a
+# row of their own: a file whose every row is under eight bytes never enters any
+# wide loop, and one that straddles sixteen exercises the hand-off.
+echo "rows shorter than the scan step:"
+sdir=$(mktemp -d)
+{ echo 'k,v'; echo 'a,1'; echo 'b,2'; echo 'c,3'; } > "$sdir/tiny_a.csv"
+{ echo 'k,v'; echo 'a,1'; echo 'b,9'; echo 'd,4'; } > "$sdir/tiny_b.csv"
+out=$(./csvdiff compare "$sdir/tiny_a.csv" "$sdir/tiny_b.csv" -k k 2>&1 | summary)
+case "$out" in
+  *"matched 2 (changed 1)"*"added 1"*"removed 1"*) echo "  ok    three-byte rows: $out" ;;
+  *) echo "  FAIL  three-byte rows: $out"; fail=1 ;;
+esac
+# Straddling the sixteen-byte step: a row of exactly 15, 16 and 17 bytes.
+{ echo 'k,v'; echo 'k1,aaaaaaaaaaaa'; echo 'k2,aaaaaaaaaaaaa'; echo 'k3,aaaaaaaaaaaaaa'; } > "$sdir/edge_a.csv"
+{ echo 'k,v'; echo 'k1,aaaaaaaaaaaa'; echo 'k2,bbbbbbbbbbbbb'; echo 'k3,aaaaaaaaaaaaaa'; } > "$sdir/edge_b.csv"
+out=$(./csvdiff compare "$sdir/edge_a.csv" "$sdir/edge_b.csv" -k k 2>&1 | summary)
+case "$out" in
+  *"matched 3 (changed 1)"*) echo "  ok    rows straddling the step: $out" ;;
+  *) echo "  FAIL  rows straddling the step: $out"; fail=1 ;;
+esac
+rm -rf "$sdir"
 
 exit $fail

@@ -19,6 +19,36 @@
 void run_parts(void (*fn)(void *ctx, unsigned part), void *ctx, unsigned ways);
 
 /*
+ * A ceiling on the allocations that scale with the input, declared before they
+ * are made rather than discovered when one fails.
+ *
+ * Checking what malloc returns is necessary and not sufficient. Under Linux's
+ * default heuristic overcommit there is a band -- on a 15 GB box, around 14 GB
+ * -- where malloc hands back a pointer and the kernel kills the process when
+ * the pages are touched. A port that checks every return still dies there, with
+ * no message and exit 137. So the sizes that scale with row count are declared
+ * to `budget_take` first, and a run that would not fit says so and stops while
+ * it still can.
+ *
+ * What this bounds is the per-row index arrays and the Parquet column buffers:
+ * the allocations whose size follows the input, and the ones that are large
+ * enough to matter. It is not a ceiling on the process -- the mapped files are
+ * not in it, nor is a few kilobytes of bookkeeping -- so it is a budget for the
+ * part that grows, which is the part that runs out.
+ */
+void budget_set(size_t mb);          /* 0 means no ceiling, which is the default */
+size_t budget_limit(void);           /* the ceiling in bytes, 0 when unset */
+size_t budget_used(void);
+
+/* Returns 0 when `bytes` fits, or -1 when it does not; the caller reports. */
+int budget_take(size_t bytes);
+
+/* Whether a take has been refused. Sticky, because the refusal happens deep in
+ * an index build whose caller reports the error, and "out of memory" and "more
+ * than you allowed" are different things to be told. */
+int budget_exceeded(void);
+
+/*
  * 2 MB-aligned, and asked for on huge pages. Uninitialised: the caller fills it,
  * because one table here wants zeroes and another wants -1.
  *

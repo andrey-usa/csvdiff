@@ -64,6 +64,213 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (rle_fill) — 18.5% of the instructions, none of the time
+
+A negative result, recorded because it would cost the next person the same
+afternoon it cost this one.
+
+The entry below profiled the columnar path, found `rle_fill` at 18.5% of
+instructions -- second only to `pq_read_column` -- and called it the largest
+lever left. It unpacks bit-packed dictionary indices with one eight-byte load,
+one shift and one mask per value. A bit-packed group of eight is exactly `width`
+bytes, so with `width` known at compile time every shift and the mask fold to
+constants: the textbook specialisation.
+
+It was written -- a `switch` over widths 1 to 32, one loop each, from a macro.
+All 67 cases passed and the counts were unchanged. Paired and interleaved,
+fifteen rounds:
+
+| Input | Before | After | Paired ratio | |
+|---|---:|---:|---:|---|
+| Parquet, 5m rows | 1.028s | 1.036s | 0.991 (middle half 0.929-1.052) | not established |
+| Parquet, 5m rows, snappy | 1.562s | 1.582s | 1.054 (0.990-1.311) | not established |
+
+Both middle halves cross one and the snappy median is worse, so it was thrown
+away rather than shipped. The interesting question was why a real reduction in
+instructions bought nothing.
+
+### The ceiling
+
+Ask what the whole function is worth. A build with the unpacking deleted --
+`memset` in its place, answers wrong on purpose, `bit` still advanced so the rest
+of the reader stays in step -- is the ceiling on any optimisation of it:
+
+| | Wall |
+|---|---:|
+| real unpacking | 1.020s |
+| unpacking removed entirely | 1.057s |
+
+Removing the work made it slightly slower, which is noise around zero. **All of
+`rle_fill` is worth nothing measurable.** Its instructions issue in the shadow of
+the loads they wait on: the phase is memory-bound, and not issuing them buys
+exactly what that sounds like.
+
+### What this says about the profile below
+
+`callgrind` counts instructions. It found the CSV field scan, where count and
+time did line up -- 6.6% of wall for a wider step. It found `rle_fill`, where
+they do not line up at all. An instruction profile picks candidates; it does not
+rank them, and the entry below should not have read as though it did.
+
+The ceiling build is the cheap way to tell those apart, and it belongs before the
+optimisation rather than after: delete the work, accept wrong answers, time it.
+Ten minutes. Not running it first is what this entry cost.
+
+## 2026-09-10 (C field scan) — a wider step where the target has one
+
+One 4-core container. `callgrind` on a single-threaded run first, to find out
+where the CSV path actually spends itself:
+
+| Function | Instructions |
+|---|---:|
+| `next_of2` | **43.2%** |
+| `parse_csv_row` | 27.1% |
+| `hash_field` | 9.2% |
+| `compare_part` | 5.0% |
+
+Seventy per cent of the work is finding field ends. `next_of2` was SWAR at eight
+bytes a step; the fields in this data average about ten, so a typical field cost
+two iterations. Sixteen bytes costs one, and thirty-two costs one with room to
+spare.
+
+Paired and interleaved against the commit before it, fifteen rounds each:
+
+| Input | Before | After | Paired ratio | |
+|---|---:|---:|---:|---|
+| CSV, 2m rows | 0.469s | **0.442s** | **0.934** (middle half 0.824-0.978) | real |
+| ndjson, 2m rows | 1.319s | 1.280s | 0.984 (0.942-1.057) | not established |
+| Parquet, 5m rows | 1.012s | 1.048s | 1.004 (0.954-1.393) | not established |
+
+**About 6.6% on CSV, and nothing claimed for the other two.** Both of their
+middle halves cross 1.0. ndjson's fields are longer, so the eight-byte step was
+already finding hits in one iteration; the columnar Parquet path does not use
+this scanner at all and is there as a control, which is what a ratio of 1.004
+looks like.
+
+The step is chosen at compile time from what the build targets -- `-march=native`
+defines `__AVX2__` where the CPU has it -- so there is no dispatch on the hot
+path, and a build for baseline x86-64 gets the SSE2 step that architecture
+always has. aarch64 falls through to the SWAR loop unchanged. All three were
+built and run against the same inputs, including the awkward fixtures, and give
+the same counts.
+
+`next_of1` beside it is left as SWAR. It did not appear in the profile, and a
+second copy of this with no number behind it is complexity for its own sake.
+
+### What the profile says is left
+
+The same run, on the columnar path:
+
+| Function | Instructions |
+|---|---:|
+| `pq_read_column` | 23.5% |
+| `rle_fill` | 18.5% |
+| `column_part` | 17.1% |
+| `plain_slices` | 6.6% |
+
+`rle_fill` unpacks bit-packed dictionary indices one value at a time. That
+looked like the largest lever left in the columnar path. It was measured next,
+and it is not one -- see the entry above.
+
+## 2026-09-10 (memory) — what each port needs, and what each does when it cannot have it
+
+One 4-core / 15 GB container. Peak RSS from `getrusage(RUSAGE_CHILDREN)`, each
+port in its own process so the high-water mark is its own.
+
+2,000,200 against 2,000,100 rows of CSV, 368 MB a side:
+
+| Port | Peak RSS |
+|---|---:|
+| **C** | **827 MB** |
+| Zig | 874 MB |
+| C++ | 924 MB |
+| Rust | 1,003 MB |
+
+736 MB of that is the two mapped files, so what the ports actually differ over
+is the 91-267 MB on top. C is lowest, and the same order holds on the 5m-row
+Parquet pair: C 1,630 MB, Zig 1,613 MB, C++ 1,764 MB, Rust 1,853 MB.
+
+### And what happens when it runs out
+
+The same pair under a tightening `ulimit -v`, which makes allocation fail rather
+than the kernel intervene:
+
+| Ceiling | C | C++ | Rust | Zig |
+|---|---|---|---|---|
+| 2048 MB | finishes | finishes | finishes | finishes |
+| 1024 MB | **finishes** | `std::bad_alloc`, exit 2 | **abort, exit 134** | **finishes** |
+| 512 MB | clean error | clean error | clean error | clean error |
+
+Rust aborts where the other three do not: `memory allocation of 456 bytes
+failed`, SIGABRT, because the default Rust allocator has no failure path to
+take. C++ surfaces the exception name rather than a sentence. C and Zig finish
+the run.
+
+### The band where checking `malloc` does not help
+
+`ulimit -v` is the kind test. Linux's default heuristic overcommit is the real
+one, and on this box it has three regions:
+
+| Request | What happens |
+|---|---|
+| 8 GB | `malloc` succeeds, every page touched, fine |
+| **14 GB** | **`malloc` succeeds, SIGKILL on touch** -- exit 137, no message |
+| 20 GB | `malloc` returns NULL, refused up front |
+
+The middle row is why a port that checks every allocation still dies without a
+diagnosis, and why C now takes `--max-memory`: a ceiling declared before the
+allocations that scale with the input, which on this pair is about 124 MB for
+2m rows of CSV and about 1,008 MB for the 5m-row Parquet pair. It costs nothing
+measurable -- 1.00s against 1.02s on the Parquet pair, which is noise.
+
+## 2026-09-10 (C codecs) — the columnar path, on compressed files
+
+Same container, same 5m-row pair, same method as the codec entry below: median
+of five warm runs, every file written by one pyarrow call so the codec is the
+only variable.
+
+C read no codec at all when that entry was taken. It reads snappy and LZ4 now,
+both written out in `c/parquet.c` rather than linked, and it reads them on the
+columnar path -- which is the whole result:
+
+| Port | none | snappy | lz4 |
+|---|---:|---:|---:|
+| **C** | **0.98s** | **1.61s** | **1.65s** |
+| C++ | 1.64s | 2.08s | refused |
+| Rust | 1.52s | 2.12s | 5.41s |
+| Zig | 1.26s | 1.79s | 5.98s |
+
+C is fastest on every codec it reads. The LZ4 column is the interesting one:
+**3.3x Rust and 3.6x Zig**, and not because the decoder is better. Rust and Zig
+have no LZ4 in their columnar readers, so an LZ4 file falls through to the row
+reader and pays the 3.7x that costs. C decompresses into a buffer the columnar
+path reads from, so the codec is the only thing it adds.
+
+Decompression costs C about 0.63s on this pair, 64% over uncompressed, which is
+more than the 10-19% the row readers pay for the same codecs. That is the same
+arithmetic from the other side: the columnar path is fast enough that a codec is
+a larger share of a smaller number.
+
+Gzip and zstd are refused by name. Their decoders are real programs rather than
+eighty-line loops, and this port carries no dependency.
+
+### The copy loop, paired
+
+Nine interleaved rounds of the same binary with one change -- the match copy
+doing eight bytes at a time where the source is at least eight behind, instead
+of one:
+
+| Codec | Byte loop | Eight at a time | Paired ratio |
+|---|---:|---:|---:|
+| snappy | 1.62s | 1.52s | **0.936** (middle half 0.920-0.950) |
+| lz4 | 1.61s | 1.53s | **0.951** (0.929-0.958) |
+
+6.4% and 4.9%, with the middle half clear of 1.0 in both. Small, and the reason
+it is worth the five lines is that it is free: a match whose distance is at
+least eight reads only bytes already written, so the chunked copy means exactly
+what the byte loop meant. A closer match is a repeating run and stays a byte
+loop.
+
 ## 2026-09-09 (codecs) — what compression costs, and what the fall-through costs
 
 One 4-core / 16 GB container, idle, page cache warm, median of five runs.
@@ -81,7 +288,8 @@ thing that differs.
 | Rust | **1.48s** | 2.29s | 6.49s | 5.20s | 5.37s |
 | Zig | 1.32s | **1.96s** | 7.38s | **13.96s** | 6.11s |
 
-Read that as four numbers and a trap. Rust and Zig take the columnar path for
+C's four refusals are of their time: it reads snappy and LZ4 now, and the entry
+above has those numbers. Read the rest as four numbers and a trap. Rust and Zig take the columnar path for
 uncompressed and snappy and fall through to the row reader for the other three,
 so the 3.5-4x jump at gzip is **not** what gzip costs. It is the fall-through,
 already measured at 3.7x in the entry below.

@@ -365,6 +365,15 @@ static int build_index(const Keys *k, const KeySide *s, unsigned threads, Index 
      * actually limited by. */
     size_t cap = 1u << 12;
     while (cap * 2 < s->rows * 3 + 16) cap <<= 1;
+    {
+        const size_t n = s->rows ? s->rows : 1;
+        if (budget_take(cap * sizeof *ix->slots +
+                        n * (sizeof *ix->firsts + sizeof *ix->counts + sizeof *ix->hashes)) != 0) {
+            free(hs);
+            index_free(ix);
+            return pq_set_error("over the --max-memory ceiling");
+        }
+    }
     ix->slots = alloc_slots(cap);
     ix->firsts = malloc((s->rows ? s->rows : 1) * sizeof *ix->firsts);
     ix->counts = malloc((s->rows ? s->rows : 1) * sizeof *ix->counts);
@@ -555,7 +564,7 @@ static void read_keys_part(void *vctx, unsigned p) {
             note_failure(&c->fail[p]);
             return;
         }
-        s->col[j].base = c->m[p]->data;
+        s->col[j].base = pq_base(&s->col[j].c, c->m[p]->data);
     }
 }
 
@@ -671,11 +680,11 @@ static void column_part(void *vctx, unsigned p) {
         if (pq_read_column(c->am->data, c->am->size, name_slot(c->ameta, c->compared[j]), &A.c) != 0) {
             note_failure(&c->fail[j]); goto next;
         }
-        A.base = c->am->data;
+        A.base = pq_base(&A.c, c->am->data);
         if (pq_read_column(c->bm->data, c->bm->size, name_slot(c->bmeta, c->compared[j]), &B.c) != 0) {
             note_failure(&c->fail[j]); goto next;
         }
-        B.base = c->bm->data;
+        B.base = pq_base(&B.c, c->bm->data);
         if (pq_rows(&A.c) != c->a_rows || pq_rows(&B.c) != c->b_rows) {
             pq_set_error("parquet columns disagree about how many rows the file has");
             note_failure(&c->fail[j]);
@@ -759,6 +768,7 @@ static int has_name(char *const *v, size_t n, const char *needle) {
 int pq_compare(const char *a_path, const char *b_path,
                char *const *key, size_t nkey,
                char *const *ignore, size_t nignore,
+               char *const *compare, size_t ncompare,
                unsigned threads, PqResult *out) {
     memset(out, 0, sizeof *out);
 
@@ -800,13 +810,34 @@ int pq_compare(const char *a_path, const char *b_path,
             goto done;
         }
 
-    compared = malloc((ameta.names_len ? ameta.names_len : 1) * sizeof *compared);
+    /* Sized for whichever list is longer: --compare may name a column twice,
+     * which is harmless but would run past ameta.names_len entries. */
+    {
+        const size_t room = ncompare > ameta.names_len ? ncompare : ameta.names_len;
+        compared = malloc((room ? room : 1) * sizeof *compared);
+    }
     if (!compared) { pq_set_error("out of memory"); goto done; }
-    for (size_t i = 0; i < ameta.names_len; i++) {
-        const char *n = ameta.names[i];
-        if (name_slot(&bmeta, n) == bmeta.names_len) continue;
-        if (has_name(key, nkey, n) || has_name(ignore, nignore, n)) continue;
-        compared[nc++] = ameta.names[i];       /* borrowed from ameta, freed with it */
+    if (ncompare > 0) {
+        /* Named explicitly: the order is the caller's, and a name that is not
+         * in both files is an error rather than a column quietly dropped. Key
+         * and ignored columns are filtered out here as they are below, so
+         * `-k id -c id,a` compares `a` rather than refusing. */
+        for (size_t j = 0; j < ncompare; j++) {
+            const size_t sa = name_slot(&ameta, compare[j]);
+            if (sa == ameta.names_len || name_slot(&bmeta, compare[j]) == bmeta.names_len) {
+                pq_set_error("compare column(s) not present in both files");
+                goto done;
+            }
+            if (has_name(key, nkey, compare[j]) || has_name(ignore, nignore, compare[j])) continue;
+            compared[nc++] = ameta.names[sa];  /* borrowed from ameta, freed with it */
+        }
+    } else {
+        for (size_t i = 0; i < ameta.names_len; i++) {
+            const char *n = ameta.names[i];
+            if (name_slot(&bmeta, n) == bmeta.names_len) continue;
+            if (has_name(key, nkey, n) || has_name(ignore, nignore, n)) continue;
+            compared[nc++] = ameta.names[i];   /* borrowed from ameta, freed with it */
+        }
     }
 
     /* --- keys ------------------------------------------------------------ */

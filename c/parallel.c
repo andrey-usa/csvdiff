@@ -60,3 +60,35 @@ unsigned cpu_count(void) {
     const long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (unsigned)n : 1u;
 }
+
+/* ------------------------------------------------------------------------- */
+/* The memory budget                                                          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * One process, one comparison, so a file-scope total is the whole mechanism.
+ * It is written before threads start and read after they finish -- every
+ * `budget_take` here happens on the calling thread, at a phase boundary, which
+ * is why it needs no lock.
+ */
+static size_t budget_cap = 0;
+static size_t budget_so_far = 0;
+static int    budget_over = 0;
+
+void budget_set(size_t mb) {
+    budget_cap = mb ? mb * (size_t)1024 * 1024 : 0;
+    budget_so_far = 0;
+    budget_over = 0;
+}
+
+size_t budget_limit(void) { return budget_cap; }
+size_t budget_used(void)  { return budget_so_far; }
+int    budget_exceeded(void) { return budget_over; }
+
+int budget_take(size_t bytes) {
+    if (budget_cap == 0) return 0;
+    /* An overflowing sum is over any ceiling, so saturate rather than wrap. */
+    if (bytes > budget_cap - budget_so_far) { budget_over = 1; return -1; }
+    budget_so_far += bytes;
+    return 0;
+}
