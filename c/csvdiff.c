@@ -1574,10 +1574,11 @@ static int emit(const Summary *s, const char *json_path) {
 /* ------------------------------------------------------------------------- */
 
 static int compare_parquet(const char *a_path, const char *b_path, const Names *key,
-                           const Names *ignore, unsigned threads, const char *json_path) {
+                           const Names *ignore, const Names *compare, unsigned threads,
+                           const char *json_path) {
     PqResult r;
     if (pq_compare(a_path, b_path, key->items, key->len, ignore->items, ignore->len,
-                   threads, &r) != 0)
+                   compare->items, compare->len, threads, &r) != 0)
         return fail(pq_error());
 
     OutCol *cols = calloc(r.ncols ? r.ncols : 1, sizeof *cols);
@@ -1608,23 +1609,48 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "compare") != 0) return fail("unknown command");
 
-    Names key = {0}, ignore = {0};
+    Names key = {0}, ignore = {0}, compare = {0};
     const char *a_path = NULL, *b_path = NULL, *json_path = NULL;
     unsigned threads = 0;   /* 0 means one per core, on the Parquet path */
+    /* Three lists to release now, and a fourth would be a fourth place to
+     * forget one: every exit from the scan goes through here. */
+#define ARGS_FAIL(msg) \
+    do { names_free(&key); names_free(&ignore); names_free(&compare); return fail(msg); } while (0)
     for (int i = 2; i < argc; i++) {
         const char *f = argv[i];
-        if ((!strcmp(f, "-k") || !strcmp(f, "--key")) && i + 1 < argc) key = split_commas(argv[++i]);
-        else if ((!strcmp(f, "-i") || !strcmp(f, "--ignore")) && i + 1 < argc) ignore = split_commas(argv[++i]);
-        else if (!strcmp(f, "--json") && i + 1 < argc) json_path = argv[++i];
-        else if ((!strcmp(f, "-t") || !strcmp(f, "--threads")) && i + 1 < argc)
+        /* A known flag with nothing after it used to fall through to the
+         * unknown-option arm, so `compare a b -k` said "unknown option" and
+         * blamed the flag for not being recognised when it was recognised and
+         * empty. Naming the flag costs one comparison at startup. */
+        const int wants_value =
+            !strcmp(f, "-k") || !strcmp(f, "--key") ||
+            !strcmp(f, "-i") || !strcmp(f, "--ignore") ||
+            !strcmp(f, "-c") || !strcmp(f, "--compare") ||
+            !strcmp(f, "--json") ||
+            !strcmp(f, "-t") || !strcmp(f, "--threads") ||
+            !strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine");
+        if (wants_value && i + 1 >= argc) {
+            if (!strcmp(f, "-k") || !strcmp(f, "--key")) ARGS_FAIL("--key needs a value");
+            if (!strcmp(f, "-i") || !strcmp(f, "--ignore")) ARGS_FAIL("--ignore needs a value");
+            if (!strcmp(f, "-c") || !strcmp(f, "--compare")) ARGS_FAIL("--compare needs a value");
+            if (!strcmp(f, "--json")) ARGS_FAIL("--json needs a value");
+            if (!strcmp(f, "-t") || !strcmp(f, "--threads")) ARGS_FAIL("--threads needs a value");
+            ARGS_FAIL("that option needs a value");
+        }
+        if (!strcmp(f, "-k") || !strcmp(f, "--key")) key = split_commas(argv[++i]);
+        else if (!strcmp(f, "-i") || !strcmp(f, "--ignore")) ignore = split_commas(argv[++i]);
+        else if (!strcmp(f, "-c") || !strcmp(f, "--compare")) compare = split_commas(argv[++i]);
+        else if (!strcmp(f, "--json")) json_path = argv[++i];
+        else if (!strcmp(f, "-t") || !strcmp(f, "--threads"))
             threads = (unsigned)strtoul(argv[++i], NULL, 10);
-        else if ((!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) && i + 1 < argc) i++;
-        else if (f[0] == '-') { names_free(&key); names_free(&ignore); return fail("unknown option"); }
+        else if (!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) i++;
+        else if (f[0] == '-') ARGS_FAIL("unknown option");
         else if (!a_path) a_path = f;
         else if (!b_path) b_path = f;
     }
-    if (!a_path || !b_path) { names_free(&key); names_free(&ignore); return fail("compare needs two files"); }
-    if (key.len == 0) { names_free(&key); names_free(&ignore); return fail("--key is required"); }
+    if (!a_path || !b_path) ARGS_FAIL("compare needs two files");
+    if (key.len == 0) ARGS_FAIL("--key is required");
+#undef ARGS_FAIL
 
     /* A column store and a byte stream have no common ground to be compared on:
      * one of them would have to be turned into the other, which is the cost the
@@ -1635,12 +1661,15 @@ int main(int argc, char **argv) {
         if (ap != bp) {
             names_free(&key);
             names_free(&ignore);
+            names_free(&compare);
             return fail("one file is parquet and the other is not; convert one of them first");
         }
         if (ap) {
-            const int st = compare_parquet(a_path, b_path, &key, &ignore, threads, json_path);
+            const int st = compare_parquet(a_path, b_path, &key, &ignore, &compare,
+                                           threads, json_path);
             names_free(&key);
             names_free(&ignore);
+            names_free(&compare);
             return st;
         }
     }
@@ -1694,11 +1723,29 @@ int main(int argc, char **argv) {
             fail("ignore column(s) present in neither file");
             goto done;
         }
-    for (size_t i = 0; i < a_head.len; i++) {
-        const char *c = a_head.items[i];
-        if (name_index(&b_head, c) >= 0 && name_index(&key, c) < 0 && name_index(&ignore, c) < 0) {
+    if (compare.len > 0) {
+        /* Named explicitly: the order is the caller's, and a name that is not
+         * in both files is an error rather than a column quietly dropped --
+         * the same rule the other three ports apply. Key and ignored columns
+         * are filtered out here as they are below, so `-k id -c id,a` compares
+         * `a` rather than refusing. */
+        for (size_t i = 0; i < compare.len; i++) {
+            const char *c = compare.items[i];
+            if (name_index(&a_head, c) < 0 || name_index(&b_head, c) < 0) {
+                fail("compare column(s) not present in both files");
+                goto done;
+            }
+            if (name_index(&key, c) >= 0 || name_index(&ignore, c) >= 0) continue;
             char *dup = strdup(c);
             if (!dup || !names_push(&compared, dup)) { free(dup); fail("out of memory"); goto done; }
+        }
+    } else {
+        for (size_t i = 0; i < a_head.len; i++) {
+            const char *c = a_head.items[i];
+            if (name_index(&b_head, c) >= 0 && name_index(&key, c) < 0 && name_index(&ignore, c) < 0) {
+                char *dup = strdup(c);
+                if (!dup || !names_push(&compared, dup)) { free(dup); fail("out of memory"); goto done; }
+            }
         }
     }
 
@@ -1858,7 +1905,7 @@ done:
     free(ap.slot_next); free(bp.slot_next);
     free(col_changed); free(col_blanked); free(col_filled);
     names_free(&a_head); names_free(&b_head); names_free(&compared);
-    names_free(&key); names_free(&ignore);
+    names_free(&key); names_free(&ignore); names_free(&compare);
     slab_close(&a);
     slab_close(&b);
     return status;

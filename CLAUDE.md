@@ -233,6 +233,10 @@ before timing anything.
   "cold" runs come back within 25% of warm ones. The only genuine cold read is the first touch
   after a container restart, and it ran at about 18 MB/s -- not reproducible, not representative.
   Any claim about bytes read costing time needs a host with a characterisable disk.
+- **`--compare` lives in two resolvers in the C port**, not one: `csvdiff.c` for text and
+  `pqdiff.c` for the columnar path, because they resolve columns against different structures.
+  A change to one that skips the other is a flag that works on CSV and is ignored on Parquet.
+  The same is true of `--key` and `--ignore`; only Rust has a single `resolve`.
 - **One benchmark at a time, repository-wide.** Two timing jobs running at once share a host and
   measure each other's contention, which spoils both — including the one already running that
   somebody is waiting on. Check for a run in progress before pushing to a path that triggers a

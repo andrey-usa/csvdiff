@@ -625,4 +625,47 @@ if [ "$with_ports" = 1 ]; then
   rm -rf "$gen_dir"
 fi
 
+# --compare: the flag this port did not have, where the other three did. The
+# rule is the one they apply -- a name that is not in both files is an error,
+# and key and ignored columns are filtered out of an explicit list rather than
+# refused, so `-k id -c id,a` compares `a`.
+echo "--compare:"
+cdir=$(mktemp -d)
+printf 'id,a,b,c\nk1,p,q,r\nk2,p,q,r\n' > "$cdir/a.csv"
+printf 'id,a,b,c\nk1,X,q,r\nk2,p,Y,r\n' > "$cdir/b.csv"
+ccase() { # label, expected "changed added removed", then flags
+  local label=$1 want=$2; shift 2
+  rm -f "$cdir/o.json"
+  ./csvdiff compare "$cdir/a.csv" "$cdir/b.csv" -k id "$@" --json "$cdir/o.json" \
+      >/dev/null 2>&1 || true
+  local got
+  got=$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["counts"]; print(c["changed"], c["added"], c["removed"])' "$cdir/o.json" 2>/dev/null) || got="(no report)"
+  if [ "$got" = "$want" ]; then printf '  ok    %s\n' "$label"
+  else printf '  FAIL  %s\n    want: %s\n    got : %s\n' "$label" "$want" "$got"; fail=1; fi
+}
+ccase "every common non-key column, the default" "2 0 0"
+ccase "one column named"                          "1 0 0" -c a
+ccase "the other one named"                       "1 0 0" -c b
+ccase "both named"                                "2 0 0" -c a,b
+ccase "a key column in the list is filtered out"  "1 0 0" -c id,a
+ccase "--ignore still subtracts from an explicit list" "1 0 0" -c a,b -i b
+
+out=$(./csvdiff compare "$cdir/a.csv" "$cdir/b.csv" -k id -c nope 2>&1) || true
+case "$out" in
+  *"not present in both files"*) echo "  ok    an unknown --compare name is refused" ;;
+  *) echo "  FAIL  expected a refusal, got: $out"; fail=1 ;;
+esac
+rm -rf "$cdir"
+
+# A known flag with nothing after it used to report "unknown option", blaming
+# the flag for not being recognised when it was recognised and empty.
+echo "a flag left without its value:"
+for flag in --key --ignore --compare --json --threads; do
+  out=$(./csvdiff compare x.csv y.csv "$flag" 2>&1) || true
+  case "$out" in
+    *"$flag needs a value"*) echo "  ok    $flag says so" ;;
+    *) echo "  FAIL  $flag: $out"; fail=1 ;;
+  esac
+done
+
 exit $fail
