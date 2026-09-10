@@ -471,7 +471,7 @@ static int64_t parse_rows(const char *s) {
 static int usage(void) {
     fprintf(stderr,
             "usage: gen-data --rows 10m --out-dir DIR [--prefix P]\n"
-            "                [--format csv|json|parquet] [--seed N]\n"
+            "                [--format csv|json|ndjson|parquet] [--seed N]\n"
             "                [--row-group-size N] [--dict-limit N]\n\n"
             "Writes DIR/P_a.EXT and DIR/P_b.EXT. Parquet is uncompressed: this port\n"
             "carries no codec, by the same choice its reader makes.\n\n"
@@ -508,6 +508,13 @@ int main(int argc, char **argv) {
     if (rows <= 0 || !out_dir) return usage();
     if (!prefix) prefix = "data";
     build_days();
+
+    /* `ndjson` and `json` name the same format. The Rust generator has always
+     * taken both; this port and the C++ one took only `json`, so a command that
+     * worked against one generator failed against another -- in a project whose
+     * whole premise is that the ports agree. Normalised here so the rest of the
+     * function still has one spelling to test. */
+    if (!strcmp(format, "ndjson")) format = "json";
 
     const char *ext;
     if (!strcmp(format, "csv")) ext = ".csv";
