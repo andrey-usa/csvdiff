@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 
+#include "parallel.h"
 #include "parquet.h"
 
 #include <stdio.h>
@@ -770,6 +771,10 @@ int pq_read_column(const char *data, size_t size, size_t which, PqColumn *out) {
 
     /* Sized once from the footer's row count, so appending a page never has to
      * move eighty megabytes of what is already decoded. */
+    if (fm.rows > 0 && budget_take((size_t)fm.rows * sizeof *out->index) != 0) {
+        fail("over the --max-memory ceiling");
+        goto done;
+    }
     if (fm.rows > 0 &&
         grow((void **)&out->index, &index_cap, (size_t)fm.rows, sizeof *out->index) != 0)
         goto done;

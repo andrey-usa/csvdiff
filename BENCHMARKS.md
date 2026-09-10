@@ -64,6 +64,57 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-10 (memory) — what each port needs, and what each does when it cannot have it
+
+One 4-core / 15 GB container. Peak RSS from `getrusage(RUSAGE_CHILDREN)`, each
+port in its own process so the high-water mark is its own.
+
+2,000,200 against 2,000,100 rows of CSV, 368 MB a side:
+
+| Port | Peak RSS |
+|---|---:|
+| **C** | **827 MB** |
+| Zig | 874 MB |
+| C++ | 924 MB |
+| Rust | 1,003 MB |
+
+736 MB of that is the two mapped files, so what the ports actually differ over
+is the 91-267 MB on top. C is lowest, and the same order holds on the 5m-row
+Parquet pair: C 1,630 MB, Zig 1,613 MB, C++ 1,764 MB, Rust 1,853 MB.
+
+### And what happens when it runs out
+
+The same pair under a tightening `ulimit -v`, which makes allocation fail rather
+than the kernel intervene:
+
+| Ceiling | C | C++ | Rust | Zig |
+|---|---|---|---|---|
+| 2048 MB | finishes | finishes | finishes | finishes |
+| 1024 MB | **finishes** | `std::bad_alloc`, exit 2 | **abort, exit 134** | **finishes** |
+| 512 MB | clean error | clean error | clean error | clean error |
+
+Rust aborts where the other three do not: `memory allocation of 456 bytes
+failed`, SIGABRT, because the default Rust allocator has no failure path to
+take. C++ surfaces the exception name rather than a sentence. C and Zig finish
+the run.
+
+### The band where checking `malloc` does not help
+
+`ulimit -v` is the kind test. Linux's default heuristic overcommit is the real
+one, and on this box it has three regions:
+
+| Request | What happens |
+|---|---|
+| 8 GB | `malloc` succeeds, every page touched, fine |
+| **14 GB** | **`malloc` succeeds, SIGKILL on touch** -- exit 137, no message |
+| 20 GB | `malloc` returns NULL, refused up front |
+
+The middle row is why a port that checks every allocation still dies without a
+diagnosis, and why C now takes `--max-memory`: a ceiling declared before the
+allocations that scale with the input, which on this pair is about 124 MB for
+2m rows of CSV and about 1,008 MB for the 5m-row Parquet pair. It costs nothing
+measurable -- 1.00s against 1.02s on the Parquet pair, which is noise.
+
 ## 2026-09-10 (C codecs) — the columnar path, on compressed files
 
 Same container, same 5m-row pair, same method as the codec entry below: median
