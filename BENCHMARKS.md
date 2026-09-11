@@ -117,11 +117,22 @@ speed number — it is that a table comparing four ports has to compile them the
 same way to mean anything.
 
 Fixed in `build_ports.sh` rather than in the six workflows, so it cannot be
-forgotten again by the seventh. The flag carries the *resolved* CPU name rather
-than the literal `native`, because cargo fingerprints on the RUSTFLAGS text:
-spelled `native` the string matches across hosts, and a `rust/target` restored
-from another machine's cache would be handed back as-is — a binary using
-instructions the running host may not have, on a runner fleet that mixes CPUs.
+forgotten again by the seventh — and finding the fix took two red pull requests.
+The first attempt resolved the host CPU and put its name in the flag, which was
+right about the cache and wrong about something worse. `-C target-cpu` reaches
+*every* crate cargo compiles, not just the csvdiff binary the tables measure —
+including the proc-macro build tools behind `serde`'s derive, whose compiled
+binaries execute on the runner mid-build. On GitHub's VM fleet the resolver
+picked `znver4`, and one of those tools died with SIGILL — illegal instruction —
+because the guest advertises AVX-512 that it cannot execute: lanes that resolved
+`znver3` built fine, while `znver4` lanes and the parity job failed, and CI
+(Rust), which builds without the flag, passed on the same SHA. The automatic
+default is therefore capped at `x86-64-v3`, a fixed string: it is the
+fleet-wide executable floor (every current ubuntu-latest VM runs AVX2 — the
+`csvdiff-avx2` scanner build is already unconditional — and C and C++'s
+`-march=native` has never faulted on one), keeping the gain over SSE2, and a
+uniform fingerprint is now safe where `native` was not, because code a
+`rust/target` cache hands back runs on all of them.
 
 ### And the build timings in those logs were wrong too
 

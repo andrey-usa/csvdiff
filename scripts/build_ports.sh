@@ -80,23 +80,38 @@ done
 # Rust against an AVX-512 C and C++.
 #
 # That is not the documented intent. README.md says "every port is compiled for
-# the machine it runs on: -march=native for C and C++, -C target-cpu=native for
-# Rust, -Dcpu=native for Zig", BENCHMARKS.md says the same of its current tables,
-# and `benchmark-native.yml` sets the flag by hand. The six workflows that build
+# the machine it runs on: -march=native for C and C++, -C target-cpu for Rust,
+# -Dcpu=native for Zig", BENCHMARKS.md says the same of its current tables, and
+# `benchmark-native.yml` sets the flag by hand. The six workflows that build
 # through this script never did, and those are the ones a pull request sees.
 #
-# The *resolved* CPU name goes in the flag rather than the literal `native`, so
-# the text differs between hosts. Cargo fingerprints on the RUSTFLAGS string, so
-# a `rust/target` restored from a cache that was filled on another machine
-# rebuilds instead of being reused. Spelled `native`, the string would match
-# across hosts and cargo would hand back a binary built for someone else's
-# instruction set -- which fails as SIGILL, on a runner fleet that mixes CPUs.
+# The automatic default is `x86-64-v3` rather than the host's resolved CPU, and
+# it is a fixed string rather than a per-host name. Both choices are about where
+# the flag lands. `-C target-cpu` reaches *every* crate cargo compiles, not just
+# the csvdiff binary the tables measure -- including the proc-macro build tools
+# (`proc-macro2`, behind serde's derive) whose compiled binaries then *run* on
+# the runner half-way through the build. Resolving the host CPU on GitHub's VM
+# fleet picked `znver4`, and one of those build tools died with SIGILL -- illegal
+# instruction -- because the guest advertises AVX-512 that it cannot execute.
+# Lanes that resolved `znver3` were fine, and CI (Rust), which builds without the
+# flag, passed on the same SHA. C and C++ never hit this because `-march=native`
+# only touches binaries that run later, on the host they were built on. Capping
+# at `x86-64-v3` keeps the gain over SSE2 -- every current ubuntu-latest VM
+# executes AVX2 without difficulty, the `csvdiff-avx2` build is already
+# unconditional -- and stays inside what the whole fleet runs. A fixed string
+# also makes cargo's fingerprint uniform across hosts, which is safe now rather
+# than the trap it was with a resolved name: a `rust/target` restored from
+# another machine's cache still runs here, and vice versa.
 #
 # An explicit RUSTFLAGS from the caller still wins, as it always did.
 if [ -z "${RUSTFLAGS:-}" ]; then
-    native_cpu=$(rustc --print target-cpus 2>/dev/null |
-                 sed -n 's/.*currently \([A-Za-z0-9_-]*\).*/\1/p' | head -1)
-    export RUSTFLAGS="-C target-cpu=${native_cpu:-native}"
+    if [ "$(uname -m 2>/dev/null)" = "x86_64" ]; then
+        export RUSTFLAGS="-C target-cpu=x86-64-v3"
+    else
+        native_cpu=$(rustc --print target-cpus 2>/dev/null |
+                     sed -n 's/.*currently \([A-Za-z0-9_-]*\).*/\1/p' | head -1)
+        export RUSTFLAGS="-C target-cpu=${native_cpu:-native}"
+    fi
     echo "build_ports: RUSTFLAGS=$RUSTFLAGS"
 fi
 

@@ -56,7 +56,10 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > runner, in one sitting — the two branches that used to be measured against
 > each other were merged, so there is no second checkout and no pinned commit
 > any more. Every port is compiled for the machine it runs on: `-march=native`
-> for C and C++, `-C target-cpu=native` for Rust, `-Dcpu=native` for Zig.
+> for C and C++, `-C target-cpu=x86-64-v3` for Rust, `-Dcpu=native` for Zig.
+> (Rust's flag is capped at the fleet's executable floor — resolving the host
+> CPU picked `znver4` and a build-time compiler crashed with SIGILL; see
+> [the defect in BENCHMARKS.md](BENCHMARKS.md).
 >
 > Compare rows within this table. Not with the tables in
 > [BENCHMARKS.md](BENCHMARKS.md) above or below it: this runner's ndjson
