@@ -2,7 +2,7 @@
 
 The byte-level comparison with **the memory it may use passed in**, not assumed.
 
-Same design as the Java, Rust and C++ `turbo` engines: the file is mapped, a
+Same design as the C, Rust and C++ `turbo` engines: the file is mapped, a
 field is an offset and a length packed into one word, delimiters are found eight
 bytes at a time with SWAR, and nothing becomes a string unless it reaches the
 report.
@@ -129,7 +129,7 @@ so every newline ends a record.
 ## What it is and is not
 
 A **benchmark and parity port**: the comparison and a JSON summary, not the HTML
-report the five full ports produce.
+report the Rust port produces.
 
 `--ignore-case` is ASCII-only. Folding outside ASCII needs a Unicode table this
 port does not carry, and folding partially is worse than not folding at all —

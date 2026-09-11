@@ -1,6 +1,6 @@
 # csvdiff — C
 
-The same byte-level comparison as the Rust, Java, C++ and Zig `turbo` engines,
+The same byte-level comparison as the Rust, C++ and Zig ports,
 in C99-shaped C11, to find out what the memory floor actually is when nothing is
 allocated that the design does not require.
 
@@ -99,8 +99,8 @@ set:
   thing being measured. The C++ port draws this line differently — it
   implements `--ignore-case` and refuses non-ASCII input — which is also
   defensible; this port simply does not offer the flag.
-- **No `--export-dir`, no `--profile`, no HTML.** The five full ports produce
-  those.
+- **No `--export-dir`, no `--profile`, no HTML.** `--export-dir` and `--profile` are
+  Rust-port features; the Rust port is the only one that renders HTML.
 - **Uncompressed Parquet only, and BYTE_ARRAY columns only.** Snappy, zstd,
   gzip, data page v2 and nested columns are each refused by name. The C++ port
   carries Snappy; this one deliberately does not.
