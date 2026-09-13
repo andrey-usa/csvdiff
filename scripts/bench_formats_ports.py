@@ -197,6 +197,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--keep", action="store_true", help="do not delete the payloads")
     parser.add_argument("--matrix", action="store_true",
                         help="also run the scanner builds and the Rust engine without its report")
+    parser.add_argument("--first", default=None, metavar="LABEL",
+                        help="run the rows whose label starts with LABEL before all the "
+                             "others; the table keeps its declared order either way")
     args = parser.parse_args(argv)
 
     for tool in (RUST, ZIG, GEN):
@@ -242,6 +245,18 @@ def main(argv: list[str]) -> int:
                 plan.append({"label": label, "prefix": prefix, "flags": flags,
                              "state": "ok"})
         runnable = [e for e in plan if e["state"] == "ok"]
+        # `--first` reorders who runs, not what the table shows. A rung that dies
+        # partway keeps whatever ran before it died, and declared order decided
+        # who that was: a 200m measurement had the runner taken away after C and
+        # C++ and before Rust and Zig, so the cells at the back of a truncated
+        # ladder were blank for a reason that had nothing to do with them -- the
+        # exact failure this rotation comment exists to name. Naming the port
+        # that matters most puts its number on disk first. Rows that share the
+        # label's prefix (the matrix Rust rows) come along with it.
+        if args.first:
+            first = [e for e in runnable if e["label"].startswith(args.first)]
+            rest = [e for e in runnable if not e["label"].startswith(args.first)]
+            runnable = first + rest
         best: dict[str, tuple[float, float, float]] = {}
         failed: set[str] = set()
         rows_seen: dict[str, int] = {}

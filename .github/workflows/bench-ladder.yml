@@ -72,6 +72,9 @@ on:
         # produced the highest memory this workflow has recorded -- 15.1 GB on a
         # 16 GB runner, at 40m rows of CSV. Turn it on deliberately.
         default: false
+      first:
+        description: "Port whose rows run first (label prefix), so a truncated rung keeps its number"
+        default: "Rust"
 
 # The same group every benchmark in this repository names, so a ladder and a 2M
 # run queue for each other instead of measuring each other's contention. The
@@ -134,6 +137,7 @@ jobs:
       FORMAT: ${{ matrix.format }}
       REPEATS: ${{ github.event.inputs.repeats || '2' }}
       MATRIX: ${{ github.event.inputs.matrix || 'false' }}
+      FIRST: ${{ github.event.inputs.first || 'Rust' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -205,6 +209,7 @@ jobs:
           fi
           python3 scripts/bench_formats_ports.py \
             --rows "${{ matrix.size }}" --formats "$FORMAT" --repeats "$REPEATS" $scanners \
+            --first "$FIRST" \
             --md-out /tmp/bench.md \
             | tee /tmp/bench.txt
 
