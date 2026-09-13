@@ -158,6 +158,16 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
 - `resource.ru_maxrss` is **KB on Linux, bytes on macOS** — the harnesses in `scripts/` handle both.
 - The Rust port has **two Parquet readers**. Route on the *requested* engine, not the resolved one
   (`auto` is already `turbo` for Parquet input), and mark only capability refusals.
+- **Never pass `--engine turbo` to the Rust port in a benchmark.** It is the one flag that retires
+  the columnar Parquet reader, which is what `auto` picks and what a user gets, and
+  `bench_formats_ports.py` passed it on every Rust row for the life of the table. On a 500k pair
+  the two readers are 0.15s against 0.43s and 91 MB against 263 MB above the input, for identical
+  counts. `auto` already falls through to `turbo` for a codec or page version the columnar reader
+  refuses, so there is nothing to gain by naming it and a whole reader to lose. It was in four
+  places: `bench_formats_ports.py`, `bench_ports.py`, `benchmark-native.yml` — all three
+  benchmarks, all three measuring the wrong reader — and `parity.yml` / `formats.yml`, where it
+  meant the reader `auto` picks was never checked against the other ports at all. Both readers get
+  a row in the parity jobs now, and both have to agree with C, C++ and Zig.
 - Neither Rust nor Zig reads brotli or LZO — both refuse by name. C reads snappy and LZ4 and
   refuses gzip and zstd by design.
 - In Zig, an allocation from the fixed buffer is **spent for good** even when freed. Every `alloc`

@@ -746,7 +746,18 @@ fn plain_slices(
     out: &mut Vec<Slice>,
     path: &str,
 ) -> Result<()> {
-    alloc::grow(
+    // `room` and not `grow`: `got` is cleared before each data page, but `dict`
+    // accumulates across row groups, and an *exact* reserve on a vector that is
+    // still growing reallocates and copies the whole thing every time. The copying
+    // goes as the square of the row-group count, so it is nothing at the two
+    // groups a 2M-row file has and about 10 GB of handles at the fifty a 50M-row
+    // file has -- which is the size this whole change is about.
+    //
+    // Not a measured win: A/B'd at 2M with the generator patched down to 100k
+    // rows a group, twenty groups, nine rounds, and the two builds could not be
+    // told apart. Twenty groups is too few for a quadratic to show. It stays on
+    // the scaling argument, which costs nothing to take.
+    alloc::room(
         out,
         count.max(0) as usize,
         "one handle per value in the page",
