@@ -216,18 +216,18 @@ impl Reader {
             })
             .collect();
 
-        let mut fields = vec![ABSENT; rows * width];
+        let mut fields = crate::alloc::filled(ABSENT, rows * width, "one field per cell")?;
         let mut arena: Vec<u8> = Vec::new();
         let ways = threads.clamp(1, jobs.len().max(1));
 
         for wave in jobs.chunks(ways) {
             let mut decoded: Vec<Result<Decoded>> = Vec::with_capacity(wave.len());
+            let one = |i: usize| self.decode_column(wave[i].1, limit);
             std::thread::scope(|scope| {
-                let handles: Vec<_> = wave[1..]
-                    .iter()
-                    .map(|&(_, leaf)| scope.spawn(move || self.decode_column(leaf, limit)))
+                let handles: Vec<_> = (1..wave.len())
+                    .map(|i| crate::parallel::spawn_at(scope, &one, i))
                     .collect();
-                decoded.push(self.decode_column(wave[0].1, limit));
+                decoded.push(one(0));
                 for handle in handles {
                     decoded.push(
                         handle.join().unwrap_or_else(|_| {

@@ -21,12 +21,14 @@
 //! for byte with the Python, TypeScript, Java and Go implementations of this
 //! tool, so a report from any of them is interchangeable.
 
+pub mod alloc;
 pub mod columns;
 pub mod contract;
 pub mod engine;
 pub mod error;
 pub mod gendata;
 pub mod options;
+pub mod parallel;
 pub mod parquet;
 pub mod profiles;
 pub mod report;

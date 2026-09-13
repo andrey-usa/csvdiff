@@ -73,6 +73,81 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-13 (memory) — the Rust port stops aborting, and costs nothing for it
+
+Not a speed entry. The question was whether making every input-scaled allocation
+in the Rust port fallible shows up in the clock, and the answer is no: four
+paired A/B runs, all four "no result".
+
+Host: 4 vCPU, 16 GB, the container these tables come from. Both builds compiled
+the same way; `scripts/bench_ab.sh`, interleaved, paired ratio of per-round
+medians. 2M rows a side, and CSV again at 6M because the per-row check is in the
+sweep and a longer run has a lower noise floor.
+
+| Format | Rows | Rounds | wall (old/new) | cpu (old/new) | Verdict |
+|--------|-----:|-------:|---------------:|--------------:|---------|
+| csv     | 2M | 7 | 1.04x 0.94-1.07 | 1.03x 0.98-1.04 | no result |
+| parquet | 2M | 7 | 1.01x 0.90-1.05 | 1.00x 0.94-1.02 | no result |
+| ndjson  | 2M | 7 | 1.01x 1.00-1.04 | 1.01x 1.00-1.04 | no result |
+| csv     | 6M | 9 | 1.03x 1.00-1.04 | 1.01x 0.97-1.05 | no result |
+
+Which is what the shape of the change predicts. `try_reserve` costs the same as
+`reserve` on the path that succeeds, and the one addition to a per-row loop is
+`len == capacity` before a push — the comparison `push` already makes, with a
+different branch on the taken side.
+
+What it bought, measured by walking `RLIMIT_DATA` down 29 rungs from 4000 MB to
+4 MB on a 2M-row pair of each format:
+
+| Path | Answered | Refused (exit 2) | Signal 6 | Hung |
+|------|---------:|-----------------:|---------:|-----:|
+| parquet before | 12 | 0  | 17 | 0 |
+| parquet after  | 12 | **17** | **0** | 0 |
+| csv before     | 13 | 0  | 15 | 1 |
+| csv after      | 13 | 14 | 2  | 0 |
+| ndjson before  | 13 | 0  | 15 | 1 |
+| ndjson after   | 13 | 14 | 2  | 0 |
+
+Read the first column before the others: 12, 13 and 13 rungs answered, before and
+after, the same rungs each time. The ceiling did not move and was never going to
+— none of this makes the port fit in less. What changed is that below the ceiling
+it now says so.
+
+The two rungs that still abort on the text paths are 300 and 250 MB, and the
+allocations that fail there are 6, 10, 12 and 17 bytes — single `String`s in the
+report's row samples, which have no fallible form in Rust. That band sits between
+220 and 320 MB on this pair and is a constant, because the samples are capped by
+`--max-rows`: at 50M it is invisible against a 13 GB comparison, which is why the
+Parquet ladder is clean end to end.
+
+Two failures worse than the abort turned up while walking that ladder, neither
+visible before because the abort got there first:
+
+- `Scope::spawn` panics when the OS refuses a thread. Under a memory cap that is
+  exactly when it happens — a thread's stack is a private mapping, which is what
+  `RLIMIT_DATA` bounds — so the run that had just discovered it was short of
+  memory exited 101 with `failed to spawn thread: Os { code: 11 }`.
+- With `RUST_BACKTRACE=1` set it did not manage even that. Printing the panic
+  takes the backtrace lock, symbolising allocates, that allocation fails, and the
+  allocation error hook reaches for the lock the panicking thread already holds.
+  `gdb` on the stuck process: two threads, both in `futex_do_wait`, one of them
+  through `default_alloc_error_hook -> std::sys::backtrace::lock`. On a runner a
+  hang is worse than an abort, because the rung burns its whole timeout and
+  reports nothing.
+
+And one number that is not about the fix at all. The 500k parity run across all
+three formats, which is where the next thing to look at is:
+
+| Build | Parquet | Above the input |
+|-------|--------:|----------------:|
+| Zig   |   0.21s |           71 MB |
+| C     |   0.21s |           88 MB |
+| C++   |   0.26s |           92 MB |
+| Rust  |   0.66s |      **258 MB** |
+
+Same counts from all four. The Rust Parquet path is the slowest row and the
+widest, by about the same factor, which is the open question this entry hands on.
+
 ## 2026-09-13 (scale) — 50M rows of Parquet, and the port that cannot do it
 
 The first numbers this project has for fifty million rows of Parquet. There were

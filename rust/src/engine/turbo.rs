@@ -49,10 +49,12 @@ use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of};
 use text::{RowParser, csv_header, detect_delimiter, json_header, shared_tail, sniff_dialect};
 
+use crate::alloc;
 use crate::columns::{compare_keys, differs, empty_to_null, normalise, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
+use crate::parallel;
 use crate::rowstore::Joined;
 use crate::sections::assemble;
 
@@ -361,10 +363,10 @@ impl Phases {
 /// the dependent load chain the prefetch is there to hide. Faulting them in order
 /// instead is work the kernel is far better at: at ten million rows it halves the
 /// insert, 1.55s to 0.74s.
-fn empty_table(cap: usize) -> Vec<u64> {
-    let mut table = Vec::with_capacity(cap);
+fn empty_table(cap: usize) -> Result<Vec<u64>> {
+    let mut table = alloc::sized(cap, "the key index")?;
     table.resize(cap, EMPTY_SLOT);
-    table
+    Ok(table)
 }
 
 /// A slot holds the top bits of its key's hash and the position in `first_row`
@@ -454,12 +456,12 @@ impl RowIndex {
             cap <<= 1;
         }
         let mut idx = RowIndex {
-            row_at: Vec::with_capacity(total),
-            row_hash: Vec::with_capacity(total),
-            table: empty_table(cap),
+            row_at: alloc::sized(total, "one offset per row")?,
+            row_hash: alloc::sized(total, "one hash per row")?,
+            table: empty_table(cap)?,
             mask: cap - 1,
-            first_row: Vec::with_capacity(total),
-            occurrences: Vec::with_capacity(total),
+            first_row: alloc::sized(total, "one row per distinct key")?,
+            occurrences: alloc::sized(total, "one count per distinct key")?,
             rows: 0,
             dup_keys: 0,
             dup_rows: 0,
@@ -483,7 +485,7 @@ impl RowIndex {
                     opt,
                     &mut probe,
                     &mut mine,
-                );
+                )?;
             }
             chunk.at = Vec::new();
             chunk.hash = Vec::new();
@@ -502,7 +504,7 @@ impl RowIndex {
         opt: &Options,
         probe: &mut [Field],
         mine: &mut [Field],
-    ) {
+    ) -> Result<()> {
         self.rows += 1;
         let row = self.row_at.len() as i32;
         self.row_at.push(at);
@@ -521,9 +523,9 @@ impl RowIndex {
                 // nearly all distinct crossed it and doubled a table that had
                 // been sized precisely so it would not have to.
                 if self.first_row.len() * 3 > self.table.len() * 2 {
-                    self.rehash();
+                    self.rehash()?;
                 }
-                return;
+                return Ok(());
             }
             // The tag rejects almost every collision without leaving this word.
             if tag_is(word, hash) {
@@ -545,7 +547,7 @@ impl RowIndex {
                             self.dup_rows += 1; // the first occurrence counts once the key repeats
                         }
                         self.dup_rows += 1;
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -588,9 +590,9 @@ impl RowIndex {
 
     /// Only reached if the row count was underestimated: `build` sizes the table
     /// for the rows it is about to insert, so the common path never grows it.
-    fn rehash(&mut self) {
+    fn rehash(&mut self) -> Result<()> {
         let size = self.table.len() * 2;
-        self.table = empty_table(size);
+        self.table = empty_table(size)?;
         self.mask = size - 1;
         for key in 0..self.first_row.len() {
             let row = self.first_row[key];
@@ -601,6 +603,7 @@ impl RowIndex {
             }
             self.table[slot] = slot_for(hash, key);
         }
+        Ok(())
     }
 
     /// The row carrying `fields`' key in this index, or `None`. `other` is the
@@ -706,10 +709,7 @@ where
     }
     std::thread::scope(|scope| {
         let handles: Vec<_> = (1..parts)
-            .map(|i| {
-                let each = &each;
-                scope.spawn(move || each(i))
-            })
+            .map(|i| parallel::spawn_at(scope, &each, i))
             .collect();
         let mut out = vec![each(0)];
         for handle in handles {
@@ -746,18 +746,18 @@ where
         return items.iter().map(&each).collect();
     }
     let chunk = items.len().div_ceil(parts);
+    let slices: Vec<&[T]> = items.chunks(chunk).collect();
+    let one = |p: usize| slices[p].iter().map(&each).collect::<Vec<U>>();
     let mut out: Vec<U> = Vec::with_capacity(items.len());
     std::thread::scope(|scope| {
-        let handles: Vec<_> = items
-            .chunks(chunk)
-            .skip(1)
-            .map(|part| {
-                let each = &each;
-                scope.spawn(move || part.iter().map(each).collect::<Vec<U>>())
-            })
+        let handles: Vec<_> = (1..slices.len())
+            .map(|p| parallel::spawn_at(scope, &one, p))
             .collect();
-        out.extend(items.chunks(chunk).next().into_iter().flatten().map(&each));
+        out.extend(one(0));
         for handle in handles {
+            // A panicking worker would mean losing rows silently, which is worse
+            // than the panic: there is no error path out of here, and a short
+            // report that looks complete is the one outcome to avoid.
             out.extend(handle.join().expect("a report row worker"));
         }
     });
@@ -823,10 +823,12 @@ fn sweep_text(
                      use --engine native"
                 )));
             }
-            chunk.at.push(pos as u64);
-            chunk
-                .hash
-                .push(key_hash(&side.slab, &fields, key_size, opt));
+            alloc::push(&mut chunk.at, pos as u64, "one offset per row")?;
+            alloc::push(
+                &mut chunk.hash,
+                key_hash(&side.slab, &fields, key_size, opt),
+                "one hash per row",
+            )?;
             if next <= pos {
                 break; // no progress: a malformed tail rather than an endless loop
             }
@@ -851,8 +853,8 @@ fn sweep_columnar(
         let lo = rows * i / parts;
         let hi = rows * (i + 1) / parts;
         let mut chunk = Chunk {
-            at: Vec::with_capacity(hi - lo),
-            hash: Vec::with_capacity(hi - lo),
+            at: alloc::sized(hi - lo, "one offset per row")?,
+            hash: alloc::sized(hi - lo, "one hash per row")?,
         };
         let mut fields = vec![ABSENT; side.width];
         for row in lo..hi {
@@ -1013,7 +1015,9 @@ fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> 
 /// expensive delays one worker rather than the whole round.
 fn on_threads<T: Send>(threads: usize, work: impl Fn() -> Vec<T> + Sync) -> Vec<T> {
     std::thread::scope(|scope| {
-        let handles: Vec<_> = (1..threads.max(1)).map(|_| scope.spawn(&work)).collect();
+        let handles: Vec<_> = (1..threads.max(1))
+            .map(|_| parallel::spawn(scope, &work))
+            .collect();
         let mut all = work();
         for handle in handles {
             all.extend(handle.join().expect("a join worker"));
@@ -1579,8 +1583,15 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         let index = RowIndex::build(&side, key_size, opt, per_file, tag)?;
         Ok((side, index))
     };
+    let b_held = parallel::Once::new(b_input);
+    let read_b = || -> Result<(Side, RowIndex)> {
+        let input = b_held
+            .take()
+            .ok_or_else(|| Error::new("the B side was read twice"))?;
+        prepare(input, "B ")
+    };
     let (from_a, from_b) = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| prepare(b_input, "B "));
+        let worker = parallel::spawn(scope, &read_b);
         let mine = prepare(a_input, "A ");
         let theirs = worker
             .join()

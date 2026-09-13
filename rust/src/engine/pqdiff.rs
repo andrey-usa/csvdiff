@@ -30,10 +30,12 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use memmap2::Mmap;
 
+use crate::alloc;
 use crate::columns::{compare_keys, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
+use crate::parallel;
 use crate::parquet;
 use crate::rowstore::Joined;
 use crate::sections::assemble;
@@ -261,8 +263,8 @@ impl Ids {
 }
 
 /// Codes one column's dictionary into `ids`, with -1 for an absent value.
-fn code(col: &Col<'_>, ids: &mut Ids, opt: &Options) -> Vec<i32> {
-    let mut out = Vec::with_capacity(col.c.dict.len());
+fn code(col: &Col<'_>, ids: &mut Ids, opt: &Options) -> Result<Vec<i32>> {
+    let mut out = alloc::sized(col.c.dict.len(), "one id per dictionary entry")?;
     for k in 0..col.c.dict.len() {
         let cell = col.dict_at(k);
         if absent(cell, opt) {
@@ -276,7 +278,7 @@ fn code(col: &Col<'_>, ids: &mut Ids, opt: &Options) -> Vec<i32> {
             out.push(ids.of(cell.bytes));
         }
     }
-    out
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +385,12 @@ const PREFETCH_AHEAD: usize = 32;
 /// another, and both then probe a slot table of tens of megabytes: a serial chain
 /// of misses, each waiting on an address known long before the load was issued.
 #[inline]
+/// A worker that panicked. Nothing in here is expected to, but a panic in a
+/// thread must not become a wrong answer in the caller.
+fn panicked() -> Error {
+    Error::new("a comparison worker panicked")
+}
+
 fn prefetch_slot(slots: &[u64], mask: u64, h: u64) {
     #[cfg(target_arch = "x86_64")]
     // Safety: the index is masked into the table's length, so the pointer is in
@@ -397,9 +405,9 @@ fn prefetch_slot(slots: &[u64], mask: u64, h: u64) {
     }
 }
 
-fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -> Index {
+fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -> Result<Index> {
     let n = s.rows;
-    let mut hs = vec![0u64; n];
+    let mut hs = alloc::filled(0u64, n, "one hash per row")?;
     let ways = if n < (1 << 15) { 1 } else { threads.max(1) };
     if ways == 1 {
         for (r, h) in hs.iter_mut().enumerate() {
@@ -407,16 +415,29 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
         }
     } else {
         let per = n.div_ceil(ways);
+        // How many chunks got a thread. The OS can refuse one -- a thread wants
+        // a stack, and a stack is a private mapping, which is the same budget
+        // everything else here comes out of -- and the chunks it refuses are
+        // hashed below instead of taking the process down with a panic.
+        let mut spawned = 0usize;
         std::thread::scope(|scope| {
             for (p, chunk) in hs.chunks_mut(per).enumerate() {
-                scope.spawn(move || {
+                let go = move || {
                     let from = p * per;
                     for (i, h) in chunk.iter_mut().enumerate() {
                         *h = row_hash(as_id, s, from + i, opt);
                     }
-                });
+                };
+                if std::thread::Builder::new().spawn_scoped(scope, go).is_err() {
+                    break;
+                }
+                spawned = p + 1;
             }
         });
+        let left = (spawned * per).min(n);
+        for (r, h) in hs.iter_mut().enumerate().skip(left) {
+            *h = row_hash(as_id, s, r, opt);
+        }
     }
 
     let mut ix = Index {
@@ -434,12 +455,12 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
     // gives: a fresh mapping is one shared page of zeroes until something writes
     // to it, and nothing reads this table before the inserts start, so every one
     // of its pages would be first touched by a random probe.
-    ix.slots = Vec::with_capacity(cap);
+    ix.slots = alloc::sized(cap, "the key index")?;
     ix.slots.resize(cap, 0u64);
     ix.mask = cap as u64 - 1;
-    ix.firsts.reserve(n);
-    ix.counts.reserve(n);
-    ix.hashes.reserve(n);
+    alloc::grow(&mut ix.firsts, n, "one row per distinct key")?;
+    alloc::grow(&mut ix.counts, n, "one count per distinct key")?;
+    alloc::grow(&mut ix.hashes, n, "one hash per distinct key")?;
 
     for (r, &h) in hs.iter().enumerate() {
         if let Some(&soon) = hs.get(r + PREFETCH_AHEAD) {
@@ -470,7 +491,7 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
             at = (at + 1) & ix.mask as usize;
         }
     }
-    ix
+    Ok(ix)
 }
 
 /// Looks one side's row up in the other side's table.
@@ -662,19 +683,20 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     //
     // Both files' key columns are read at once, then any column both sides
     // store as a dictionary is reduced to one shared id per row.
+    let read_b_keys = || -> Result<Vec<parquet::Column>> {
+        opt.key
+            .iter()
+            .map(|k| parquet::read_column(&b_map, slot_of(&b_meta.names, k), &b_name))
+            .collect()
+    };
     let (a_key_cols, b_key_cols) = std::thread::scope(|scope| {
-        let bh = scope.spawn(|| -> Result<Vec<parquet::Column>> {
-            opt.key
-                .iter()
-                .map(|k| parquet::read_column(&b_map, slot_of(&b_meta.names, k), &b_name))
-                .collect()
-        });
+        let bh = parallel::spawn(scope, &read_b_keys);
         let a: Result<Vec<parquet::Column>> = opt
             .key
             .iter()
             .map(|k| parquet::read_column(&a_map, slot_of(&a_meta.names, k), &a_name))
             .collect();
-        (a, bh.join().unwrap())
+        (a, bh.join().unwrap_or_else(|_| Err(panicked())))
     });
 
     let mut a_keys = KeySide {
@@ -710,26 +732,31 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         }
         *coded = true;
         let mut ids = Ids::default();
-        let a_map_j = code(&a_keys.col[j], &mut ids, opt);
-        let b_map_j = code(&b_keys.col[j], &mut ids, opt);
-        let apply = |col: &Col<'_>, m: &[i32]| -> Vec<i32> {
-            col.c
-                .index
-                .iter()
-                .map(|&k| if k < 0 { -1 } else { m[k as usize] })
-                .collect()
+        let a_map_j = code(&a_keys.col[j], &mut ids, opt)?;
+        let b_map_j = code(&b_keys.col[j], &mut ids, opt)?;
+        let apply = |col: &Col<'_>, m: &[i32]| -> Result<Vec<i32>> {
+            let mut out = alloc::sized(col.c.index.len(), "one key id per row")?;
+            out.extend(
+                col.c
+                    .index
+                    .iter()
+                    .map(|&k| if k < 0 { -1 } else { m[k as usize] }),
+            );
+            Ok(out)
         };
-        a_keys.id[j] = apply(&a_keys.col[j], &a_map_j);
-        b_keys.id[j] = apply(&b_keys.col[j], &b_map_j);
+        a_keys.id[j] = apply(&a_keys.col[j], &a_map_j)?;
+        b_keys.id[j] = apply(&b_keys.col[j], &b_map_j)?;
     }
 
     // --- the join ---------------------------------------------------------
     let per_side = (threads / 2).max(1);
+    let build_b = || build_index(&as_id, &b_keys, opt, per_side);
     let (ai, bi) = std::thread::scope(|scope| {
-        let bh = scope.spawn(|| build_index(&as_id, &b_keys, opt, per_side));
+        let bh = parallel::spawn(scope, &build_b);
         let a = build_index(&as_id, &a_keys, opt, per_side);
-        (a, bh.join().unwrap())
+        (a, bh.join().unwrap_or_else(|_| Err(panicked())))
     });
+    let (ai, bi) = (ai?, bi?);
 
     // Both directions split over contiguous ranges of one side's distinct keys.
     // Each range accumulates into its own lists, and the ranges merge in order,
@@ -752,12 +779,12 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let a_ways = split(ai.firsts.len());
     let b_ways = split(bi.firsts.len());
 
-    let a_range = |p: usize| -> Part {
+    let a_range = |p: usize| -> Result<Part> {
         let mut out = Part::default();
         let lo = ai.firsts.len() * p / a_ways;
         let hi = ai.firsts.len() * (p + 1) / a_ways;
-        out.pa.reserve(hi - lo);
-        out.pb.reserve(hi - lo);
+        alloc::grow(&mut out.pa, hi - lo, "one matched row per key, A side")?;
+        alloc::grow(&mut out.pb, hi - lo, "one matched row per key, B side")?;
         for at in lo..hi {
             if let Some(&soon) = ai.hashes.get(at + PREFETCH_AHEAD) {
                 prefetch_slot(&bi.slots, bi.mask, soon);
@@ -782,9 +809,9 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             out.pa.push(row);
             out.pb.push(mate);
         }
-        out
+        Ok(out)
     };
-    let b_range = |p: usize| -> Part {
+    let b_range = |p: usize| -> Result<Part> {
         let mut out = Part::default();
         let lo = bi.firsts.len() * p / b_ways;
         let hi = bi.firsts.len() * (p + 1) / b_ways;
@@ -810,25 +837,26 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 out.held.push(row);
             }
         }
-        out
+        Ok(out)
     };
 
     let (a_parts, b_parts) = std::thread::scope(|scope| {
         let ah: Vec<_> = (0..a_ways)
-            .map(|p| scope.spawn(move || a_range(p)))
+            .map(|p| parallel::spawn_at(scope, &a_range, p))
             .collect();
         let bh: Vec<_> = (0..b_ways)
-            .map(|p| scope.spawn(move || b_range(p)))
+            .map(|p| parallel::spawn_at(scope, &b_range, p))
             .collect();
         (
             ah.into_iter()
-                .map(|h| h.join().unwrap())
-                .collect::<Vec<_>>(),
+                .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                .collect::<Result<Vec<_>>>(),
             bh.into_iter()
-                .map(|h| h.join().unwrap())
-                .collect::<Vec<_>>(),
+                .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                .collect::<Result<Vec<_>>>(),
         )
     });
+    let (a_parts, b_parts) = (a_parts?, b_parts?);
 
     let mut added = Capped::default();
     for p in &b_parts {
@@ -843,8 +871,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let mut removed = Capped::default();
     {
         let total: usize = a_parts.iter().map(|p| p.pa.len()).sum();
-        pair_a.reserve(total);
-        pair_b.reserve(total);
+        alloc::grow(&mut pair_a, total, "one matched pair per key, A side")?;
+        alloc::grow(&mut pair_b, total, "one matched pair per key, B side")?;
         for p in &a_parts {
             pair_a.extend_from_slice(&p.pa);
             pair_b.extend_from_slice(&p.pb);
@@ -881,7 +909,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                 return Ok(mine);
             }
             let mut out = ColOut {
-                bits: vec![0u64; words],
+                bits: alloc::filled(0u64, words, "one bit per pair in the column")?,
                 ..ColOut::default()
             };
             let a_col = Col::new(
@@ -905,8 +933,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             let coded = a_col.c.dictionary && b_col.c.dictionary && opt.tolerance == 0.0;
             if coded {
                 let mut ids = Ids::default();
-                let amap = code(&a_col, &mut ids, opt);
-                let bmap = code(&b_col, &mut ids, opt);
+                let amap = code(&a_col, &mut ids, opt)?;
+                let bmap = code(&b_col, &mut ids, opt)?;
                 let (aix, bix) = (&a_col.c.index, &b_col.c.index);
                 let mut xa = vec![0i32; BLOCK];
                 let mut xb = vec![0i32; BLOCK];
@@ -925,6 +953,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                     for i in 0..m {
                         neq[i] = (xa[i] != xb[i]) as u8;
                     }
+                    alloc::room(&mut hits, m, "the changed cells in one column")?;
                     scan_mask(&neq[..m], base, |p| hits.push(p));
                     base += BLOCK;
                 }
@@ -945,6 +974,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
                             opt,
                         ) as u8;
                     }
+                    alloc::room(&mut hits, m, "the changed cells in one column")?;
                     scan_mask(&neq[..m], base, |p| hits.push(p));
                     base += BLOCK;
                 }
@@ -984,8 +1014,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let mut cols: Vec<ColOut> = (0..nc).map(|_| ColOut::default()).collect();
     {
         let gathered: Vec<Result<Vec<(usize, ColOut)>>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..lanes).map(|_| scope.spawn(work)).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            let handles: Vec<_> = (0..lanes).map(|_| parallel::spawn(scope, &work)).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(panicked())))
+                .collect()
         });
         for got in gathered {
             for (c, out) in got? {
@@ -1006,7 +1039,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         .collect();
 
     // --- which pairs changed ---------------------------------------------
-    let mut any = vec![0u64; words];
+    let mut any = alloc::filled(0u64, words, "one bit per pair")?;
     for c in &cols {
         for (w, v) in any.iter_mut().zip(&c.bits) {
             *w |= *v;
