@@ -75,9 +75,21 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     binary each so nothing is measuring a branch -- and the Rust engine without
     its report, which is the only row here that is not comparing like with like:
     the Rust port renders the HTML the other two do not produce at all.
+
+    The Rust rows do **not** pass `--engine turbo`, and used to. The Rust port
+    carries two Parquet readers, and `engine.rs` says in as many words that an
+    explicit `--engine turbo` is the one thing that retires the columnar one:
+    *"Only an explicit --engine turbo should do that."* So this table spent its
+    life measuring the reader a user never gets. On a 500k pair the two are
+    0.15s against 0.43s, and 91 MB against 263 MB above the input, for identical
+    counts -- which is the whole of the Rust Parquet column in every table this
+    project has published, and most of why the port could not do 50M. `auto`
+    picks the columnar reader and falls through to `turbo` for a codec or a page
+    version it cannot read, so dropping the flag loses no coverage.
     """
     thread_flag = ["--threads", str(threads)] if threads else []
-    report = ["--engine", "turbo", "-o", "/dev/null"]
+    # Only the report suppression. See the note above about `--engine`.
+    report = ["-o", "/dev/null"]
     rows: list[tuple[str, list[str], list[str], set[str]]] = [
         ("C", [str(C)], thread_flag, ALL),
         ("C++", [str(CPP)], thread_flag, ALL),
