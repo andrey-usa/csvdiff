@@ -73,7 +73,7 @@ other branch's agent that pointed this out.
 
 ---
 
-## 2026-09-13 (memory) — the Rust port stops aborting, and costs nothing for it
+## 2026-09-13 (memory) — the Rust port stops aborting, and the Parquet column was wrong
 
 Not a speed entry. The question was whether making every input-scaled allocation
 in the Rust port fallible shows up in the clock, and the answer is no: four
@@ -135,29 +135,53 @@ visible before because the abort got there first:
   hang is worse than an abort, because the rung burns its whole timeout and
   reports nothing.
 
-And one table that is not about the fix at all, which is where the next thing to
-look at is. 500k rows, parquet, `--repeats 2`, `--matrix`, same host:
+### And the Rust Parquet column has been wrong the whole time
 
-| Build       | Compare | Above the input |
-|-------------|--------:|----------------:|
-| C           |   0.15s |           89 MB |
-| Zig         |   0.20s |           72 MB |
-| C++         |   0.25s |           91 MB |
-| Rust engine |   0.46s |      **261 MB** |
-| Rust        |   1.01s |          257 MB |
-| Rust avx2   |   0.71s |          254 MB |
-| Zig v64     |   0.30s |           78 MB |
+Chasing the width above found something bigger than the width. The Rust port
+carries two Parquet readers, and `engine.rs` is explicit about what selects
+between them:
 
-`Rust engine` is the row to read, and the reason to run `--matrix` for a question
-like this: it is the same binary with `--max-rows 1`, so it builds no report rows,
-where the plain `Rust` row renders an HTML report the other three ports do not
-produce at all. Reading the `Rust` row against C's would have charged the report
-to the Parquet reader.
+> `requested`, not `engine`: `auto` has already been resolved to `Turbo` for any
+> Parquet input by this point, so testing the resolved value here would send every
+> pair to `turbo` and quietly retire the columnar path. **Only an explicit
+> `--engine turbo` should do that.**
 
-It does not survive the control. The report is half the wall time — 1.01s against
-0.46s — and **none** of the memory: 257 MB with it, 261 MB without. So the width
-is the reader, and the fair speed comparison is 0.46s against 0.15s and 0.20s
-rather than 1.01s against them. Same counts from every row.
+`scripts/bench_formats_ports.py` passed `--engine turbo` on every Rust row. It had
+been bundled into a constant called `report` next to `-o /dev/null`, so it read as
+part of suppressing the HTML report and was never the thing anyone looked at.
+
+Same 500k pair, same binary, one flag, identical counts:
+
+| Rust on Parquet | Compare | Peak RSS | Above the input |
+|-----------------|--------:|---------:|----------------:|
+| `--engine turbo` |  0.43s |   346 MB |          263 MB |
+| `auto`           |  0.15s |   174 MB |           91 MB |
+
+So the Rust Parquet column in every table this project has published is of the
+reader `auto` does not pick. With the flag dropped, 500k rows, `--repeats 2`, all
+three formats, same host:
+
+| Build | Format  | Compare | Above the input |
+|-------|---------|--------:|----------------:|
+| C     | parquet |   0.15s |           87 MB |
+| Zig   | parquet |   0.15s |           73 MB |
+| C++   | parquet |   0.20s |           92 MB |
+| Rust  | parquet |   0.25s |          114 MB |
+
+Against 1.01s and 257 MB for the same row the day before. A gap that looked like
+four times the time and three times the memory is about one and a half times each.
+Counts identical everywhere.
+
+It also explains the 50M rung better than "the allocator has no failure path"
+does. Turbo materialises one eight-byte field per cell — 50M rows by nineteen
+columns is 7.6 GB a side before anything else is allocated — so under a 13,941 MB
+cap it never had a chance, whichever way it reported that. Whether the columnar
+reader fits at 50M is not a question a 500k run answers; the ladder can.
+
+Two lessons worth more than the numbers. A benchmark flag hidden in a constant
+named for something else is a flag nobody reads. And this was found by following
+a memory figure that looked too large, which is the same reason the harness prints
+"above the input" at all.
 
 ## 2026-09-13 (scale) — 50M rows of Parquet, and the port that cannot do it
 

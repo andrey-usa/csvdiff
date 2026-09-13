@@ -610,24 +610,33 @@ tests/fixtures/          every shape that has broken an engine here
    a prefix cannot see that; C rules it out with a bounded scan of the mate's
    tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
    the largest thing left here.
-2. **The Rust port's Parquet path holds about three times what the other three
-   hold.** At 50M rows under a 13,941 MB cap, C, C++ and Zig all finished and
-   agreed and Rust did not fit, and the reason is not how it failed — it is how
-   much it keeps. One table, 500k rows, `--matrix`, above the input: Zig 72 MB,
-   C 89 MB, C++ 91 MB, **Rust 257 MB**.
+2. **Whether the Rust port can do 50M rows of Parquet is now an open question
+   rather than a settled no**, because the benchmark was measuring the wrong
+   reader. The port carries two Parquet readers and `engine.rs` says in as many
+   words that an explicit `--engine turbo` is the one thing that retires the
+   columnar one — *"Only an explicit --engine turbo should do that"* — and
+   `scripts/bench_formats_ports.py` passed exactly that flag on every Rust row.
+   So every Rust Parquet number this project has published, including the 50M
+   rung it failed, is of the reader `auto` does not pick and a user does not get.
 
-   The obvious explanation is wrong, which is why the `Rust engine` row exists:
-   it is the same binary with `--max-rows 1`, so it builds no report rows where
-   the plain Rust row renders an HTML report the other three do not produce at
-   all. It comes in at **261 MB** — the same. The report is half the wall time
-   (1.01s against 0.46s) and none of the memory. Compare the engine row, not the
-   Rust row: 0.46s against C's 0.15s, Zig's 0.20s and C++'s 0.25s.
+   One 500k table, before and after dropping the flag, identical counts either
+   way:
 
-   So it is the reader. Where to start: `read_column` holds `index` at four bytes
-   a row *and* `values` at eight while a column is being read, and the C and Zig
-   readers have not been priced the same way. Now that a refusal names the
-   structure that did not fit, walking `--memory-cap` up until 50M passes turns
-   the gap into a number rather than a ratio at 500k.
+   | Rust on Parquet | Compare | Above the input |
+   |---|---:|---:|
+   | `--engine turbo`, as the harness ran it | 1.01s | 257 MB |
+   | `auto`, as a user gets it | **0.25s** | **114 MB** |
+
+   For scale, the other three on the same run: C 0.15s / 87 MB, C++ 0.20s /
+   92 MB, Zig 0.15s / 73 MB. The gap that looked like 4x the time and 3x the
+   memory is about 1.5x of each — a real gap, and an ordinary one.
+
+   What that predicts is the open part. Turbo materialises one eight-byte field
+   per cell, which at 50M rows and nineteen columns is 7.6 GB a side before
+   anything else, so it never had a chance under a 13,941 MB cap; the columnar
+   reader holds a fraction of that. Whether the fraction is small enough is not
+   something a 500k run can answer, and the ladder can: dispatch the 50m/parquet
+   rung and find out.
 3. **100M rows.** Where the ceiling actually sits, measured on a 16 GB runner
    rather than predicted: **CSV finishes at 150M and dies at 200M**, and Parquet
    now finishes at 50M for three ports out of four. About 100 MB of index per
