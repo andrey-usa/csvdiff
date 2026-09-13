@@ -171,9 +171,37 @@ mod tests {
 
     #[test]
     fn the_size_is_in_bytes_not_entries() {
-        // 4 Mi entries of 8 bytes is 32 MB, not 4.
-        let e = sized::<u64>(4 * 1024 * 1024 * 1024 * 1024, "pairs").unwrap_err();
-        assert!(e.to_string().ends_with(" MB"), "{e}");
+        // A count that fits on its own and does not fit once multiplied by the
+        // element size, so `try_reserve` must report `CapacityOverflow` rather
+        // than ask the allocator. Asking the allocator is what the first version
+        // of this test did -- 32 TB of `u64`, which Linux refuses and macOS
+        // cheerfully overcommits, so it passed here and failed on the platform
+        // matrix.
+        let n = (isize::MAX as usize) / 4;
+        let e = sized::<u64>(n, "pairs").unwrap_err();
+        let m = e.to_string();
+        assert!(m.starts_with("out of memory: pairs needs "), "{m}");
+        // n entries would be ~2 EB of u64; the count alone is a quarter of that.
+        let mb: usize = m
+            .rsplit(' ')
+            .nth(1)
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0);
+        assert_eq!(mb, n.saturating_mul(8) / (1024 * 1024), "{m}");
+    }
+
+    #[test]
+    fn sizes_are_rendered_at_the_unit_that_says_something() {
+        assert_eq!(human_bytes(512), "512 bytes");
+        assert_eq!(human_bytes(1024), "1 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1 MB");
+        assert_eq!(human_bytes(33_554_432), "32 MB");
+    }
+
+    #[test]
+    fn a_refusal_names_the_structure_and_its_size() {
+        let e = refuse("the key index", 33_554_432);
+        assert_eq!(e.to_string(), "out of memory: the key index needs 32 MB");
     }
 
     #[test]
