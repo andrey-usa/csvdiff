@@ -138,6 +138,19 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
   twenty-five.
 - **Peak RSS is not the memory answer for anything that maps its input.** `scripts/memory_floor.sh`
   takes memory away until the run dies; that is the honest floor.
+- **A benchmark rung dies of memory, not disk — cap it with `RLIMIT_DATA`, never `RLIMIT_AS`.**
+  Five dispatched ladder runs failed and every one was `exit 143` with "the runner has received a
+  shutdown signal", during the comparison, after the data generated cleanly: 200m csv wrote
+  70,176 MB with 107 GB still free, 50m parquet wrote 7,673 MB and died three minutes in. The
+  workflow blamed disk for weeks. A reclaimed runner runs **no** further step, `if: always()`
+  included, so the rung reported nothing — not even that it had run out of memory.
+  `bench_formats_ports.py --memory-cap MB` bounds each port through `RLIMIT_DATA`, which since
+  Linux 4.7 covers the heap and private anonymous mappings but **not** file-backed ones, so the
+  mapped input is free and only what scales with the row count is capped. Measured: a 702 MB pair
+  compares fine under a 256 MB cap and is refused under 96. `RLIMIT_AS` would refuse the mapping
+  itself and report a port as failing at a size it handles comfortably. Under the cap all four
+  ports fail legibly instead of taking the host — C and Zig "out of memory", C++ `std::bad_alloc`,
+  Rust aborting on signal 6 with the allocation it could not make.
 
 ## Gotchas
 
