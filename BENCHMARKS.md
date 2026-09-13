@@ -73,6 +73,49 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-13 (scale) — 50M rows of Parquet, and the port that cannot do it
+
+The first numbers this project has for fifty million rows of Parquet. There were
+none before because the rung never survived: ten dispatched ladder runs, every
+failure `exit 143` with "the runner has received a shutdown signal", during the
+comparison, after the data generated cleanly. The runner was being reclaimed for
+memory and a reclaimed runner runs no further step, so the rung reported nothing
+at all — not even that it had run out of memory.
+
+Capping each port through `RLIMIT_DATA` changed the outcome from nothing to this.
+One rung, `50m` / parquet, `--repeats 1`, no scanner matrix, on a 16 GB runner
+with the cap at **13,941 MB**. Input 7,673 MB, generated in 87.5s.
+
+| Build | Compare |    Rows/s |   CPU | Cores |  Peak RSS | Above the input |
+|-------|--------:|----------:|------:|------:|----------:|----------------:|
+| C     |  28.33s | 1,765,240 | 19.0s | 0.67x | 13,740 MB |        6,066 MB |
+| C++   |  24.60s | 2,033,134 | 42.7s | 1.74x | 14,075 MB |        6,402 MB |
+| Rust  |       — |         — |     — |     — |         — |               — |
+| Zig   |  14.68s | 3,405,471 | 36.8s | 2.51x | 14,458 MB |        6,785 MB |
+
+`counts: identical everywhere` across the three that answered: 49,950,000
+matched, 2,994,637 changed, 50,000 added and removed.
+
+**Zig is 1.9x C here**, which is the reverse of every other Parquet row in this
+document and is the most interesting thing in the table. C spends 0.67 cores
+against Zig's 2.51 — it is not slow, it is idle, and at this size being idle
+costs 14 seconds.
+
+**Rust aborted on signal 6.** Its default allocator has no failure path, so
+where C, C++ and Zig each hit the ceiling and said so, Rust called `abort`. That
+is why its row is dashes rather than a refusal, and it is a defect in the port
+rather than a property of the size — the other three prove 50M parquet fits.
+`--first Rust` is what makes this legible: Rust ran first, failed first, and the
+other three still produced their numbers.
+
+Two notes on reading the peak RSS. It exceeds the cap for C++ and Zig, and that
+is correct rather than a leak: `RLIMIT_DATA` bounds the heap and anonymous
+mappings, while RSS counts the file-backed mapping of the input too. And these
+are single-repeat numbers on a shared runner — good enough to say Zig leads and
+Rust aborts, not good enough to argue about 24.60s against 28.33s.
+
+---
+
 ## 2026-09-10 (build flags) — the Rust column was compiled for a different machine
 
 A defect in the instrument, found while looking at why one port always seemed to
