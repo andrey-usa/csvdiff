@@ -610,35 +610,45 @@ tests/fixtures/          every shape that has broken an engine here
    a prefix cannot see that; C rules it out with a bounded scan of the mate's
    tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
    the largest thing left here.
-2. **Zig does not build for Windows** — two things, neither of them the one
-   this list used to name. `src/slab.zig` calls `std.posix.mmap`, whose `MAP`
-   type is `void` there, so the port needs a `CreateFileMapping` backend before
-   it compiles at all; and `src/main.zig` reads `CSVDIFF_PHASES` through
-   `environ.getPosix`, which on Windows reaches a Zig 0.16 stdlib error inside
-   `process/Environ.zig`. macOS was the other half of the claim and it was
-   simply wrong: the port cross-compiles for `aarch64-macos` and `x86_64-macos`,
-   and CI does that on every run now. What *was* Linux-bound was worse than a
-   build error — `Phases.now()` called `std.os.linux.clock_gettime`
-   unconditionally, which compiles on macOS, because `std.os.linux` is a
-   namespace and not a target check, and then issues Linux syscall numbers to a
-   kernel that does not use them. That one is fixed: a `builtin.os.tag` switch,
-   with a `@compileError` for any target that has no clock rather than a
-   plausible-looking number.
-3. **100M rows.** 50M is measured and is where the input stops fitting in RAM.
-   About 100 MB of index per million rows predicts 10 GB at 100M, which is where
-   `sortmerge` stops being the conservative choice and becomes the only one.
-4. **Zig's zstd decoder is 2.3x its own lz4**, where Rust's zstd is its
-   *cheapest* codec — 13.96s against 6.11s on the same 5m-row pair, same
-   machine, both through the row reader. gzip and lz4 are within reach of Rust's;
-   zstd alone is not, so this is the decoder in `zig/src/codec.zig` rather than
-   anything about the format. It is the one number in the codec table that has
-   no explanation yet.
-5. **What compression saves in bytes read is still unmeasured**, though what it
+2. **The Rust port is the only one that cannot do 50M rows of Parquet on a 16 GB
+   runner.** Capped at 13,941 MB, C, C++ and Zig all finished and agreed —
+   28.33s, 24.60s and 14.68s, peaking between 13.7 and 14.5 GB — and Rust
+   aborted on signal 6, because its default allocator has no failure path to
+   take. The other three report a refusal and carry on; Rust cannot. That is the
+   gap, and it is in the port rather than in the size.
+3. **100M rows.** Where the ceiling actually sits, measured on a 16 GB runner
+   rather than predicted: **CSV finishes at 150M and dies at 200M**, and Parquet
+   now finishes at 50M for three ports out of four. About 100 MB of index per
+   million rows predicts 10 GB at 100M, which is where `sortmerge` stops being
+   the conservative choice and becomes the only one. Note what the CSV numbers
+   say about the old version of this line: the input has not needed to fit in RAM
+   for a long time, because the ports map it and stream — 200M rows of CSV is
+   70 GB of input and the run got as far as the comparison.
+4. **What compression saves in bytes read is still unmeasured**, though what it
    *costs* now is. The container these numbers come from cannot answer the other
    half: `drop_caches` leaves the hypervisor's copy warm, and the one genuine
    cold read available ran at about 18 MB/s. On a host with a characterisable
    disk, zstd reading 281 MB where uncompressed reads 1,073 MB is worth whatever
    that difference costs there.
+
+**Zig builds and runs on Windows**, so that is off this list too. Both blockers
+it named are gone: `src/slab.zig` has a `CreateFileMappingW` / `MapViewOfFile`
+backend beside the `mmap` one, and `src/main.zig` reads `CSVDIFF_PHASES` through
+`environ.contains` rather than the POSIX-only `getPosix`. It is not an inference
+from the source either — `platforms.yml` builds all four ports on Linux x86 and
+arm and on macOS, builds C, C++ and Zig natively on `windows-latest`, and checks
+each one's answers against the Rust port's on the same file. Fifteen jobs, green.
+
+**Zig's zstd has an explanation now**, and it is not in this repository:
+[BENCHMARKS.md](BENCHMARKS.md) has it. Twenty-five stack samples land in
+`compress.zstd.Decompress`'s own decode loop — `readInFrame`, `decodeLiterals`,
+`HuffmanTree.query` — not in the reader around it, and the two candidates in our
+code priced out at 1.03x cpu and nothing at all. Rust's zstd is `zstd-sys`, C
+libzstd 1.5.7; Zig's is std's pure-Zig decoder in a port that deliberately links
+no libc. So the wall-clock half is a decision — give that up, or write a zstd
+decoder — rather than a mystery. The investigation did find a real bug, and it
+was a memory one: a sliding window allocated per page, worth 3x on `--max-memory`
+and nothing on the clock.
 
 `--ignore` used to be on this list, accepted in silence in all four ports where
 `--key` and `--compare` refuse. It is an error now in all four — a name that
