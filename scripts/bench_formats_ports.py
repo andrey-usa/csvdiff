@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -104,7 +105,8 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     return rows
 
 
-def run(argv: list[str], timeout: float) -> tuple[float, float, float, int]:
+def run(argv: list[str], timeout: float,
+        memory_cap_mb: int | None = None) -> tuple[float, float, float, int]:
     """Times one child: wall seconds, peak RSS in MB, CPU seconds, exit code.
 
     CPU is user plus system for that exact child, from the same `wait4` rusage
@@ -120,6 +122,23 @@ def run(argv: list[str], timeout: float) -> tuple[float, float, float, int]:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
         os.dup2(devnull, 2)
+        if memory_cap_mb:
+            # RLIMIT_DATA, not RLIMIT_AS. Every port maps its input, and since
+            # Linux 4.7 this limit covers the heap and private anonymous
+            # mappings but *not* a file-backed one -- so it bounds what scales
+            # with the row count and leaves the mapping alone, which is the
+            # distinction the ports' own --max-memory draws. Measured: a 702 MB
+            # pair compares fine under a 256 MB cap, and is refused under 96 MB.
+            #
+            # This is what stops a rung too large for its runner from taking the
+            # whole runner with it. Without it the kernel reclaims the VM, the
+            # step dies with exit 143 and "the runner has received a shutdown
+            # signal", and the rung reports nothing at all -- not even that it
+            # ran out of memory. All four ports fail legibly under the cap
+            # instead: C and Zig say "out of memory", C++ "std::bad_alloc", and
+            # Rust aborts on signal 6 with the allocation it could not make.
+            limit = memory_cap_mb * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))
         try:
             os.execv(argv[0], argv)
         except OSError:
@@ -193,6 +212,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--threads", type=int, default=None,
                         help="threads per run; the default is whatever each port picks")
     parser.add_argument("--timeout", type=float, default=1800)
+    parser.add_argument("--memory-cap", type=int, default=None, metavar="MB",
+                        help="cap each port's heap and anonymous memory (not its "
+                             "mapped input) so a size too large for this host is "
+                             "refused by the port rather than killing the host")
     parser.add_argument("--data-dir", default=str(ROOT / "data/bench"))
     parser.add_argument("--keep", action="store_true", help="do not delete the payloads")
     parser.add_argument("--matrix", action="store_true",
@@ -280,7 +303,8 @@ def main(argv: list[str]) -> int:
                 label = entry["label"]
                 argv_run = entry["prefix"] + ["compare", str(a), str(b)] + KEY + \
                     entry["flags"] + ["--json", str(summary)]
-                seconds, rss, cpu, code = run(argv_run, args.timeout)
+                seconds, rss, cpu, code = run(argv_run, args.timeout,
+                                              args.memory_cap)
                 if code not in (0, 1):
                     # A port that failed once has failed. A later round that
                     # happens to succeed does not withdraw the failure.
@@ -330,6 +354,13 @@ def main(argv: list[str]) -> int:
     # Every port and every format has to return the same counts. A faster answer
     # that is not the same answer is not a result.
     distinct = {json.dumps(v, sort_keys=True) for v in answers.values()}
+    # Three outcomes, not two. No port producing counts is an absence, not a
+    # disagreement, and calling it "DISAGREE" sent a reader looking for a
+    # discrepancy between ports that had each failed before answering -- which is
+    # what every port does when the run is capped below what the size needs.
+    if not distinct:
+        print("\ncounts: none -- no port got far enough to answer")
+        return 1
     print("\ncounts:", "identical everywhere" if len(distinct) == 1 else "DISAGREE")
     if len(distinct) != 1:
         for name, value in answers.items():

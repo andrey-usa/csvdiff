@@ -26,11 +26,28 @@ name: Benchmark ladder (10M and up)
 # than it costs: each job now generates only its own format, so the 40m CSV job
 # writes 14 GB instead of that plus 6 GB of parquet beside it.
 #
-# `fail-fast: false` is load-bearing. Forty million rows of CSV is about 15 GB
-# for the pair and fifty is 18.4 GB, so the top of a ladder can run the runner
-# out of disk. When it does, that rung fails and the rungs below it still
-# report -- which is most of what you wanted to know anyway, and is why this
-# reads as a ladder rather than one number.
+# `fail-fast: false` is load-bearing: a rung that cannot finish should not take
+# the rungs below it with it, which is why this reads as a ladder rather than one
+# number.
+#
+# **What kills a rung is memory, not disk.** That was written the other way round
+# here for a while, and five dispatched runs say otherwise -- every single
+# failure was `exit 143` with a shutdown signal, during the comparison, after the
+# data had generated cleanly:
+#
+#   200m csv      wrote 70,176 MB with 107 GB still free, then died 24m in
+#    50m parquet  wrote  7,673 MB, then died 3m in
+#
+# Disk was never short. The runner was being reclaimed for memory, and a
+# reclaimed runner runs no further step -- `if: always()` included -- so the rung
+# reported nothing at all, not even that it had run out of memory.
+#
+# `--memory-cap` is the fix, and it is why a rung can now say so. It caps each
+# port's heap and anonymous memory through `RLIMIT_DATA`, which since Linux 4.7
+# excludes file-backed mappings -- so the mapped input is untouched and only what
+# scales with the row count is bounded. The port then fails on its own: C and Zig
+# say "out of memory", C++ "std::bad_alloc", Rust aborts naming the allocation it
+# could not make. All four leave the runner alive and the table written.
 #
 # **A failed rung does not cancel the larger ones, deliberately.** The obvious
 # rule -- 30m failed, so 40m is pointless, stop it -- saves less than it costs.
@@ -207,9 +224,17 @@ jobs:
           if [ "$MATRIX" = "true" ]; then
             scanners="--matrix"
           fi
+          # Leave the OS and the page cache room to work: the cap bounds one
+          # port at a time, since the harness runs them in sequence, so the
+          # margin only has to cover everything that is not the port.
+          total_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
+          cap=$(( total_mb - 2048 ))
+          echo "host has ${total_mb} MB; capping each port at ${cap} MB"
+
           python3 scripts/bench_formats_ports.py \
             --rows "${{ matrix.size }}" --formats "$FORMAT" --repeats "$REPEATS" $scanners \
             --first "$FIRST" \
+            --memory-cap "$cap" \
             --md-out /tmp/bench.md \
             | tee /tmp/bench.txt
 

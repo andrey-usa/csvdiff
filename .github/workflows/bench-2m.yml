@@ -142,8 +142,18 @@ jobs:
           if [ "$MATRIX" = "true" ]; then
             scanners="--matrix"
           fi
+          # Two million rows costs the ports about a gigabyte, so this cap is
+          # not near anything -- it is here so that a change which balloons a
+          # port's memory is reported as a refusal in the table rather than as a
+          # lost runner with no table at all. See bench-ladder.yml, where the
+          # same cap is load-bearing.
+          total_mb=$(awk '/^MemTotal:/ { printf "%d", $2 / 1024 }' /proc/meminfo)
+          cap=$(( total_mb - 2048 ))
+          echo "host has ${total_mb} MB; capping each port at ${cap} MB"
+
           python3 scripts/bench_formats_ports.py \
             --rows "$ROWS" --formats "${{ matrix.format }}" --repeats "$REPEATS" $scanners \
+            --memory-cap "$cap" \
             --md-out /tmp/bench.md \
             | tee /tmp/bench.txt
 
