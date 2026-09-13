@@ -135,18 +135,29 @@ visible before because the abort got there first:
   hang is worse than an abort, because the rung burns its whole timeout and
   reports nothing.
 
-And one number that is not about the fix at all. The 500k parity run across all
-three formats, which is where the next thing to look at is:
+And one table that is not about the fix at all, which is where the next thing to
+look at is. 500k rows, parquet, `--repeats 2`, `--matrix`, same host:
 
-| Build | Parquet | Above the input |
-|-------|--------:|----------------:|
-| Zig   |   0.21s |           71 MB |
-| C     |   0.21s |           88 MB |
-| C++   |   0.26s |           92 MB |
-| Rust  |   0.66s |      **258 MB** |
+| Build       | Compare | Above the input |
+|-------------|--------:|----------------:|
+| C           |   0.15s |           89 MB |
+| Zig         |   0.20s |           72 MB |
+| C++         |   0.25s |           91 MB |
+| Rust engine |   0.46s |      **261 MB** |
+| Rust        |   1.01s |          257 MB |
+| Rust avx2   |   0.71s |          254 MB |
+| Zig v64     |   0.30s |           78 MB |
 
-Same counts from all four. The Rust Parquet path is the slowest row and the
-widest, by about the same factor, which is the open question this entry hands on.
+`Rust engine` is the row to read, and the reason to run `--matrix` for a question
+like this: it is the same binary with `--max-rows 1`, so it builds no report rows,
+where the plain `Rust` row renders an HTML report the other three ports do not
+produce at all. Reading the `Rust` row against C's would have charged the report
+to the Parquet reader.
+
+It does not survive the control. The report is half the wall time — 1.01s against
+0.46s — and **none** of the memory: 257 MB with it, 261 MB without. So the width
+is the reader, and the fair speed comparison is 0.46s against 0.15s and 0.20s
+rather than 1.01s against them. Same counts from every row.
 
 ## 2026-09-13 (scale) — 50M rows of Parquet, and the port that cannot do it
 

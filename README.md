@@ -613,14 +613,21 @@ tests/fixtures/          every shape that has broken an engine here
 2. **The Rust port's Parquet path holds about three times what the other three
    hold.** At 50M rows under a 13,941 MB cap, C, C++ and Zig all finished and
    agreed and Rust did not fit, and the reason is not how it failed — it is how
-   much it keeps. Above the input, at 500k rows on a 4-core host: Zig 71 MB,
-   C 88 MB, C++ 92 MB, **Rust 258 MB**. The same run has Rust at 0.66s against
-   0.21s for C and Zig, so this is the slowest Parquet row *and* the widest —
-   whether those are one finding or two is not established here. Where to start
-   looking: `read_column` holds both `index` (four bytes a row) and `values`
-   (eight) while a column is being read, and the C and Zig readers have not been
-   priced the same way. Now that a refusal names the structure, walking
-   `--memory-cap` up until 50M passes turns the gap into a number.
+   much it keeps. One table, 500k rows, `--matrix`, above the input: Zig 72 MB,
+   C 89 MB, C++ 91 MB, **Rust 257 MB**.
+
+   The obvious explanation is wrong, which is why the `Rust engine` row exists:
+   it is the same binary with `--max-rows 1`, so it builds no report rows where
+   the plain Rust row renders an HTML report the other three do not produce at
+   all. It comes in at **261 MB** — the same. The report is half the wall time
+   (1.01s against 0.46s) and none of the memory. Compare the engine row, not the
+   Rust row: 0.46s against C's 0.15s, Zig's 0.20s and C++'s 0.25s.
+
+   So it is the reader. Where to start: `read_column` holds `index` at four bytes
+   a row *and* `values` at eight while a column is being read, and the C and Zig
+   readers have not been priced the same way. Now that a refusal names the
+   structure that did not fit, walking `--memory-cap` up until 50M passes turns
+   the gap into a number rather than a ratio at 500k.
 3. **100M rows.** Where the ceiling actually sits, measured on a 16 GB runner
    rather than predicted: **CSV finishes at 150M and dies at 200M**, and Parquet
    now finishes at 50M for three ports out of four. About 100 MB of index per
