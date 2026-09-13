@@ -56,7 +56,13 @@ def ports() -> list[tuple[str, list[str], list[str]]]:
     """(label, argv prefix, extra flags). A port that is not built is skipped by
     name rather than dropped: a missing build is not the same result as a slow
     one."""
-    report = ["--engine", "turbo", "-o", "/dev/null"]
+    # Only the report suppression. `--engine turbo` used to be here too, and it
+    # is the one flag that retires the columnar Parquet reader -- see the note in
+    # `bench_formats_ports.py`. On a 500k pair the two readers are 0.15s against
+    # 0.43s and 91 MB against 263 MB above the input, for identical counts, so
+    # every Rust Parquet number this script has produced was of the reader `auto`
+    # does not pick.
+    report = ["-o", "/dev/null"]
     out = []
     for label, path, flags in [
         ("C", ROOT / "c/csvdiff", []),

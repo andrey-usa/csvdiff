@@ -66,7 +66,8 @@ jobs:
       # which is how eleven of them silently did not run here.
       # The four at once; see scripts/build_ports.sh. `rust` there is the
       # --no-default-features build, which is the one this job wants: every run
-      # here is `--engine turbo` or the columnar Parquet path.
+      # here goes through `turbo` or the columnar Parquet path, and since both
+      # Rust rows exist it is now both rather than only the first.
       - name: Build the four ports
         env:
           CXX: clang++
@@ -108,7 +109,12 @@ jobs:
           }
           for ext in csv ndjson parquet; do
             run cpp ./cpp/build/csvdiff "" $ext
-            run rust "./rust/target/release/csvdiff" "--engine turbo -o /dev/null" $ext
+            # Both Rust readers on Parquet. `--engine turbo` is the one flag that
+            # retires the columnar one, so the row that named it was checking the
+            # reader `auto` does not pick -- and nothing was checking the one it
+            # does.
+            run rust "./rust/target/release/csvdiff" "-o /dev/null" $ext
+            run rust-turbo "./rust/target/release/csvdiff" "--engine turbo -o /dev/null" $ext
             run zig ./zig/zig-out/bin/csvdiff "" $ext
           done
           # One Parquet side against one text side: not the columnar path, which
