@@ -73,6 +73,86 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-13 (scale) — Parquet's ceiling is between 50M and 100M, for all four ports
+
+Two rungs, dispatched together, one job each: `50m` and `100m`, parquet,
+`--repeats 1`, `--first Rust`, on separate 16 GB runners with each port capped at
+**13,941 MB** through `RLIMIT_DATA`.
+
+### 50M — all four finish, and the Rust column is nothing like it was
+
+Input 7,673 MB, generated in 87.6s.
+
+| Build | Compare |    Rows/s |   CPU | Cores |  Peak RSS | Above the input |
+|-------|--------:|----------:|------:|------:|----------:|----------------:|
+| Zig   |  12.13s | 4,123,944 | 37.0s | 3.05x | 14,232 MB |        6,558 MB |
+| C     |  16.60s | 3,012,375 | 23.6s | 1.42x | 13,812 MB |        6,138 MB |
+| C++   |  19.08s | 2,620,827 | 41.8s | 2.19x | 14,188 MB |        6,515 MB |
+| Rust  |  29.70s | 1,683,942 | 30.9s | 1.04x | 13,738 MB |    **6,064 MB** |
+
+`counts: identical everywhere`. Four out of four, where the last 50M table had
+three: the Rust port failed that rung, and the reason was the benchmark passing
+`--engine turbo` and retiring the columnar reader, not the port.
+
+Read the last column and then the one before it. **Rust is the narrowest of the
+four** — 6,064 MB above the input against Zig's 6,558 — which is the reverse of
+the claim the previous entry set out to explain, and it settles it: the Rust
+Parquet reader does not hold more than the others. It holds the least.
+
+What it does instead is run on one core. **1.04x cores**, against Zig's 3.05x,
+and that is the whole of 29.70s against 12.13s. The same reader showed 2.18x at
+500k. So it parallelises at small sizes and stops somewhere before this one, and
+that is the open question now — a narrower and more answerable one than "it holds
+too much", which was false.
+
+C is worth a glance too, at 1.42x: second fastest on a third of Zig's CPU.
+
+### 100M — nobody, and all four say so
+
+Input 15,347 MB, generated in 222.8s.
+
+```
+Rust  FAILED (exit 2): error: the parquet engine failed: out of memory:
+                       one dictionary index per row needs 381 MB
+C     FAILED (exit 2): error: out of memory reading the parquet file
+C++   FAILED (exit 2): error: std::bad_alloc
+Zig   FAILED (exit 2): error: out of memory
+counts: none -- no port got far enough to answer
+```
+
+So the Parquet ceiling on a 16 GB runner is between 50M and 100M rows, for every
+port. Not a prediction: a rung that ran, generated 15 GB cleanly, and came back
+with four refusals.
+
+This is also the first rung where everything built earlier today paid off at once.
+Rust's line names the structure *and* its size, and 381 MiB is exactly
+100,005,000 × 4 bytes, so the refusal is precise rather than approximate. Before
+today that line read `FAILED (exit -6)` and said nothing, because the port aborted
+on signal 6 and the harness sent its stderr to /dev/null. Three separate fixes
+have to be in place for those four lines to exist.
+
+### The prediction, and how it did
+
+Written down before the dispatch, from two local points — 500k at 114 MB and 2M at
+377 MB above the input — fitted to 26 MB + 175 MB per million rows:
+
+| Rung | Predicted | Measured | Verdict |
+|------|----------:|---------:|---------|
+| 50m  | 8,793 MB, fits | 6,064 MB | verdict right, **number 45% high** |
+| 100m | 17,560 MB, refuses | refused | verdict right |
+
+Both verdicts held and one number was badly wrong. The real slope at scale is
+about 121 MB per million rows, not 175. The fit was taken from 500k and 2M, and
+the index table sizes in powers of two, so a point at either of those sizes can
+sit just after a doubling and carry a step as though it were a slope. Two points
+cannot tell the difference; three across a wider range would have.
+
+Worth recording what that error then did: on seeing 6,064 rather than 8,793, the
+next guess was that 100M would need about 12 GB and therefore **pass**. It did
+not. A slope wrong in one direction made a correct prediction look doubtful, which
+is a better argument for writing predictions down before the run than for any
+particular fitting method.
+
 ## 2026-09-13 (memory) — the Rust port stops aborting, and the Parquet column was wrong
 
 Not a speed entry. The question was whether making every input-scaled allocation
@@ -184,6 +264,13 @@ a memory figure that looked too large, which is the same reason the harness prin
 "above the input" at all.
 
 ## 2026-09-13 (scale) — 50M rows of Parquet, and the port that cannot do it
+
+> **Superseded the same day, and the title is wrong.** The Rust port does do this
+> rung — see *Parquet's ceiling is between 50M and 100M* at the top of this file,
+> where it finishes in 29.70s and is the narrowest of the four. What failed here
+> was the harness, which passed `--engine turbo` and so measured a reader `auto`
+> does not pick. The numbers below are real; the conclusion drawn from them was
+> not. Left as it was written, because that is what this file is for.
 
 The first numbers this project has for fifty million rows of Parquet. There were
 none before because the rung never survived: ten dispatched ladder runs, every
