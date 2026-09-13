@@ -610,12 +610,24 @@ tests/fixtures/          every shape that has broken an engine here
    a prefix cannot see that; C rules it out with a bounded scan of the mate's
    tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
    the largest thing left here.
-2. **The Rust port is the only one that cannot do 50M rows of Parquet on a 16 GB
-   runner.** Capped at 13,941 MB, C, C++ and Zig all finished and agreed —
-   28.33s, 24.60s and 14.68s, peaking between 13.7 and 14.5 GB — and Rust
-   aborted on signal 6, because its default allocator has no failure path to
-   take. The other three report a refusal and carry on; Rust cannot. That is the
-   gap, and it is in the port rather than in the size.
+2. **The Rust port's Parquet path holds about three times what the other three
+   hold.** At 50M rows under a 13,941 MB cap, C, C++ and Zig all finished and
+   agreed and Rust did not fit, and the reason is not how it failed — it is how
+   much it keeps. One table, 500k rows, `--matrix`, above the input: Zig 72 MB,
+   C 89 MB, C++ 91 MB, **Rust 257 MB**.
+
+   The obvious explanation is wrong, which is why the `Rust engine` row exists:
+   it is the same binary with `--max-rows 1`, so it builds no report rows where
+   the plain Rust row renders an HTML report the other three do not produce at
+   all. It comes in at **261 MB** — the same. The report is half the wall time
+   (1.01s against 0.46s) and none of the memory. Compare the engine row, not the
+   Rust row: 0.46s against C's 0.15s, Zig's 0.20s and C++'s 0.25s.
+
+   So it is the reader. Where to start: `read_column` holds `index` at four bytes
+   a row *and* `values` at eight while a column is being read, and the C and Zig
+   readers have not been priced the same way. Now that a refusal names the
+   structure that did not fit, walking `--memory-cap` up until 50M passes turns
+   the gap into a number rather than a ratio at 500k.
 3. **100M rows.** Where the ceiling actually sits, measured on a 16 GB runner
    rather than predicted: **CSV finishes at 150M and dies at 200M**, and Parquet
    now finishes at 50M for three ports out of four. About 100 MB of index per
@@ -630,6 +642,32 @@ tests/fixtures/          every shape that has broken an engine here
    cold read available ran at about 18 MB/s. On a host with a characterisable
    disk, zstd reading 281 MB where uncompressed reads 1,073 MB is worth whatever
    that difference costs there.
+
+**All four ports now refuse a budget they cannot meet**, and all four exit 2, so
+*how* the Rust port fails is off this list — what it costs is item 2 above, and
+the two are not the same thing. It died on signal 6 because `Vec::with_capacity`
+ends in `handle_alloc_error`, which aborts and cannot be replaced on stable Rust.
+The allocations that scale with the input go through `rust/src/alloc.rs` now and
+return instead, naming what did not fit — `out of memory: the key index needs
+32 MB`. Two worse failures turned up behind it while walking a cap down one rung
+at a time: `Scope::spawn` *panics* when the OS refuses a thread, which under a
+memory cap is exactly when it happens, because a thread's stack is a private
+mapping and that is what `RLIMIT_DATA` bounds; and printing that panic with
+`RUST_BACKTRACE=1` set deadlocked against the backtrace lock, so the process
+hung — on a benchmark runner the one outcome worse than an abort, because nothing
+after it runs, not even the rung reporting that it failed. Both are fixed, and
+`rust/tests/out_of_memory.rs` walks the ladder on every build. Cost: four paired
+A/B runs, three formats at 2M and CSV again at 6M, all four "no result" — the
+checks do not show up.
+
+One band is left and it is a property of the language rather than of this code: an
+individual `String` has no fallible form, so a budget that fits the comparison but
+not the report's row samples still aborts. The samples are capped by `--max-rows`,
+which makes that band a constant rather than a function of the input. Measured
+on a 2M-row CSV pair by walking the cap in 20 MB steps: 320 MB and above answers,
+220 MB and below refuses, and the rungs between abort on a `String` of six to
+seventeen bytes. Invisible against a 13 GB comparison at 50M, which is why the
+Parquet ladder is clean at every rung from 4 GB down to 4 MB.
 
 **Zig builds and runs on Windows**, so that is off this list too. Both blockers
 it named are gone: `src/slab.zig` has a `CreateFileMappingW` / `MapViewOfFile`

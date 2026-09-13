@@ -96,10 +96,7 @@ fn gzip(raw: &[u8]) -> Result<Vec<u8>> {
         .clamp(1, blocks.len());
     let mut pieces = std::thread::scope(|scope| -> Result<Vec<(usize, Vec<u8>, Crc)>> {
         let handles: Vec<_> = (1..threads)
-            .map(|_| {
-                let take = &take;
-                scope.spawn(take)
-            })
+            .map(|_| crate::parallel::spawn(scope, &take))
             .collect();
         let mut all = take()?;
         for handle in handles {
@@ -114,7 +111,7 @@ fn gzip(raw: &[u8]) -> Result<Vec<u8>> {
     pieces.sort_by_key(|(i, _, _)| *i);
 
     // ID1, ID2, deflate, no flags, no mtime, no extra flags, unknown OS.
-    let mut out = Vec::with_capacity(raw.len() / 2 + 64);
+    let mut out = crate::alloc::sized(raw.len() / 2 + 64, "the compressed report")?;
     out.extend_from_slice(&[0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff]);
     let mut crc = Crc::new();
     for (_, data, part) in &pieces {
@@ -136,11 +133,11 @@ fn crc_of(data: &[u8]) -> Crc {
 /// in a full flush, which is what makes the next block independent of this one.
 fn deflate(data: &[u8], last: bool) -> Result<Vec<u8>> {
     let mut c = Compress::new(Compression::new(6), false);
-    let mut out = Vec::with_capacity(data.len() / 2 + 1024);
+    let mut out = crate::alloc::sized(data.len() / 2 + 1024, "one compressed block")?;
     let mut at = 0;
     while at < data.len() {
         if out.len() == out.capacity() {
-            out.reserve(1 << 16);
+            crate::alloc::room(&mut out, 1 << 16, "one compressed block")?;
         }
         let before = c.total_in();
         c.compress_vec(&data[at..], &mut out, FlushCompress::None)
@@ -161,7 +158,7 @@ fn deflate(data: &[u8], last: bool) -> Result<Vec<u8>> {
     // its marker every time it is asked, so that test never comes true.
     loop {
         if out.len() == out.capacity() {
-            out.reserve(1 << 16);
+            crate::alloc::room(&mut out, 1 << 16, "one compressed block")?;
         }
         let room = out.capacity() - out.len();
         let before = c.total_out();

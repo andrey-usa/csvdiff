@@ -56,7 +56,52 @@ compare options:
 Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
 ";
 
+/// Replaces the panic hook with one that cannot hang.
+///
+/// The hook the standard library installs takes a lock, then symbolises the
+/// stack, and symbolising allocates. Under a memory budget that allocation can
+/// fail, and the allocation error hook reaches for the same lock the panicking
+/// thread is already holding: the process stops, in a state no timeout of its
+/// own will end. On a benchmark runner a hang is the worst of the three
+/// outcomes -- worse than the abort it replaced -- because nothing after it
+/// runs. Two threads panicking at once also interleave the default hook's
+/// output mid-word, which is how `memory allocation of 800040080004008000400
+/// bytes failed` got printed.
+///
+/// So: one line, one write, no backtrace. `RUST_BACKTRACE` still asks for one,
+/// and that capture is the caller's risk to take -- but it does not hold the
+/// lock that made this a deadlock rather than a crash.
+fn quiet_panics() {
+    std::panic::set_hook(Box::new(|info| {
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+            .unwrap_or("a panic with no message");
+        let mut err = std::io::stderr().lock();
+        match info.location() {
+            Some(at) => {
+                let _ = writeln!(
+                    err,
+                    "error: internal: {what} at {}:{}",
+                    at.file(),
+                    at.line()
+                );
+            }
+            None => {
+                let _ = writeln!(err, "error: internal: {what}");
+            }
+        }
+        if std::env::var_os("RUST_BACKTRACE").is_some() {
+            let _ = writeln!(err, "{}", std::backtrace::Backtrace::force_capture());
+        }
+        let _ = err.flush();
+    }));
+}
+
 fn main() -> ExitCode {
+    quiet_panics();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let status = run(&args);
     report_peak_rss();

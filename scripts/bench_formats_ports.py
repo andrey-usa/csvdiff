@@ -106,8 +106,9 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
 
 
 def run(argv: list[str], timeout: float,
-        memory_cap_mb: int | None = None) -> tuple[float, float, float, int]:
-    """Times one child: wall seconds, peak RSS in MB, CPU seconds, exit code.
+        memory_cap_mb: int | None = None,
+        errors: Path | None = None) -> tuple[float, float, float, int, str]:
+    """Times one child: wall seconds, peak RSS in MB, CPU seconds, exit code, why.
 
     CPU is user plus system for that exact child, from the same `wait4` rusage
     the RSS comes from. Wall time says how long you waited; CPU divided by wall
@@ -115,13 +116,22 @@ def run(argv: list[str], timeout: float,
     between an engine that is slow and an engine that is idle. A port that
     finishes in the same wall time on half the CPU has the headroom the other
     one has already spent.
+
+    `why` is the child's last line of stderr, which is empty on a run that
+    worked and is the whole diagnosis on one that did not. It used to go to
+    /dev/null with stdout, so a rung that ran out of memory reported `FAILED
+    (exit 2)` and nothing else -- and the ports name what did not fit.
     """
     started = time.monotonic()
     pid = os.fork()
     if pid == 0:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, 1)
-        os.dup2(devnull, 2)
+        if errors is None:
+            os.dup2(devnull, 2)
+        else:
+            fd = os.open(errors, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.dup2(fd, 2)
         if memory_cap_mb:
             # RLIMIT_DATA, not RLIMIT_AS. Every port maps its input, and since
             # Linux 4.7 this limit covers the heap and private anonymous
@@ -135,8 +145,8 @@ def run(argv: list[str], timeout: float,
             # step dies with exit 143 and "the runner has received a shutdown
             # signal", and the rung reports nothing at all -- not even that it
             # ran out of memory. All four ports fail legibly under the cap
-            # instead: C and Zig say "out of memory", C++ "std::bad_alloc", and
-            # Rust aborts on signal 6 with the allocation it could not make.
+            # instead, and all four exit 2: C and Zig say "out of memory", C++
+            # "std::bad_alloc", and Rust names the structure that did not fit.
             limit = memory_cap_mb * 1024 * 1024
             resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))
         try:
@@ -149,13 +159,31 @@ def run(argv: list[str], timeout: float,
         done, status, usage = os.wait4(pid, os.WNOHANG)
         if done:
             return (time.monotonic() - started, usage.ru_maxrss / 1024,
-                    usage.ru_utime + usage.ru_stime, os.waitstatus_to_exitcode(status))
+                    usage.ru_utime + usage.ru_stime,
+                    os.waitstatus_to_exitcode(status), last_line(errors))
         if time.monotonic() > deadline:
             os.kill(pid, 9)
             _, _, usage = os.wait4(pid, 0)
             return (time.monotonic() - started, 0.0,
-                    usage.ru_utime + usage.ru_stime, -1)
+                    usage.ru_utime + usage.ru_stime, -1, last_line(errors))
         time.sleep(0.05)
+
+
+def last_line(path: Path | None) -> str:
+    """The child's final line of stderr, or "" if it wrote none.
+
+    The last one and not the first: a port that fails on several threads at once
+    writes several lines, and the ones behind it are the same refusal again.
+    """
+    if path is None:
+        return ""
+    try:
+        text = path.read_text(errors="replace").strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    return text.splitlines()[-1].strip()[:200]
 
 
 def warm(*paths: Path) -> None:
@@ -232,6 +260,7 @@ def main(argv: list[str]) -> int:
     data = Path(args.data_dir)
     data.mkdir(parents=True, exist_ok=True)
     summary = Path("/tmp/bench_ports_summary.json")
+    errors = Path("/tmp/bench_ports_stderr.txt")
     results: list[dict] = []
     answers: dict[str, dict] = {}
 
@@ -303,12 +332,13 @@ def main(argv: list[str]) -> int:
                 label = entry["label"]
                 argv_run = entry["prefix"] + ["compare", str(a), str(b)] + KEY + \
                     entry["flags"] + ["--json", str(summary)]
-                seconds, rss, cpu, code = run(argv_run, args.timeout,
-                                              args.memory_cap)
+                seconds, rss, cpu, code, why = run(argv_run, args.timeout,
+                                                   args.memory_cap, errors)
                 if code not in (0, 1):
                     # A port that failed once has failed. A later round that
                     # happens to succeed does not withdraw the failure.
-                    print(f"  {label:5s} FAILED (exit {code})", flush=True)
+                    said = f": {why}" if why else ""
+                    print(f"  {label:5s} FAILED (exit {code}){said}", flush=True)
                     failed.add(label)
                     continue
                 got = counts(summary)

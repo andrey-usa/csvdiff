@@ -149,8 +149,9 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
   mapped input is free and only what scales with the row count is capped. Measured: a 702 MB pair
   compares fine under a 256 MB cap and is refused under 96. `RLIMIT_AS` would refuse the mapping
   itself and report a port as failing at a size it handles comfortably. Under the cap all four
-  ports fail legibly instead of taking the host — C and Zig "out of memory", C++ `std::bad_alloc`,
-  Rust aborting on signal 6 with the allocation it could not make.
+  ports now fail legibly instead of taking the host, and all four exit 2 — C and Zig
+  "out of memory", C++ `std::bad_alloc`, Rust naming the structure that did not fit
+  (`out of memory: the key index needs 32 MB`).
 
 ## Gotchas
 
@@ -161,6 +162,22 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
   refuses gzip and zstd by design.
 - In Zig, an allocation from the fixed buffer is **spent for good** even when freed. Every `alloc`
   counts against `--max-memory` for the whole run.
+- **In Rust, an allocation that scales with the input goes through `src/alloc.rs`, and a scoped
+  thread through `src/parallel.rs`.** Neither is style. `Vec::with_capacity`, `vec![]` and
+  `reserve` end in `handle_alloc_error`, which aborts with no failure path — there is no stable way
+  to replace that hook — so the sized helpers use `try_reserve` and return instead. And
+  `Scope::spawn` *panics* when the OS refuses a thread, which under a memory cap is precisely when
+  it happens, because a thread's stack is a private mapping and that is what `RLIMIT_DATA` bounds;
+  `parallel::spawn` runs the work on the calling thread instead. Walk `rust/tests/out_of_memory.rs`'
+  ladder after touching either. What is *not* covered: an individual `String`, which has no
+  fallible form, so a budget that fits the comparison but not the report's row samples still
+  aborts. That band is a constant, because the samples are capped by `--max-rows`: on a 2M-row CSV
+  pair it is between 220 and 320 MB, and it is irrelevant against a 13 GB comparison at 50M.
+- **A panic under a tight budget used to hang rather than crash**, which on a runner is worse:
+  `RUST_BACKTRACE=1` makes the default hook take the backtrace lock and then symbolise, symbolising
+  allocates, the allocation fails, and the allocation error hook reaches for the lock its own thread
+  holds. `main.rs` installs a hook that writes one line and no backtrace. Do not put the default
+  hook back.
 - In C, `--compare`/`--key`/`--ignore` live in **two resolvers** — `csvdiff.c` for text and
   `pqdiff.c` for the columnar path. Change both, or the flag works on CSV and is ignored on Parquet.
 - A compressed Parquet column in C means `owned`, and `pq_base()` is the only correct base — never

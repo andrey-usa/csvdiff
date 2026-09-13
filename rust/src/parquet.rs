@@ -21,6 +21,7 @@
 //! comparing integers -- which is what makes the per-column diff a vector
 //! operation instead of a string compare per row.
 
+use crate::alloc;
 use crate::error::{Error, Result};
 
 fn fail<T>(what: &str, path: &str) -> Result<T> {
@@ -497,13 +498,18 @@ fn read_page_head(data: &[u8], at: usize, path: &str) -> Result<PageHead> {
 /// a time, and a back-reference is copied eight bytes at a time where the
 /// distance allows it. Both matter more than they look: this is the one loop
 /// that touches every byte of a compressed file.
-fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
+///
+/// `Ok(false)` is a malformed stream; `Err` is the one allocation it makes --
+/// the room for the expanded page -- refusing. The two are worth keeping apart:
+/// the caller reports them differently, and calling a budget a corrupt file
+/// sends the reader after the wrong bug.
+fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
     let mut at = 0usize;
     let mut want = 0u64;
     let mut shift = 0;
     loop {
         if at >= input.len() {
-            return false;
+            return Ok(false);
         }
         let b = input[at];
         at += 1;
@@ -513,12 +519,13 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
         }
         shift += 7;
         if shift > 63 {
-            return false;
+            return Ok(false);
         }
     }
 
     let base = out.len();
     let want = want as usize;
+    alloc::grow(out, want, "the expanded snappy page")?;
     out.resize(base + want, 0);
     let mut dst = base;
     let end = base + want;
@@ -532,7 +539,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
             if len > 60 {
                 let extra = len - 60;
                 if at + extra > input.len() {
-                    return false;
+                    return Ok(false);
                 }
                 let mut v = 0usize;
                 for i in 0..extra {
@@ -542,7 +549,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
                 len = v + 1;
             }
             if at + len > input.len() || len > end - dst {
-                return false;
+                return Ok(false);
             }
             out[dst..dst + len].copy_from_slice(&input[at..at + len]);
             dst += len;
@@ -552,7 +559,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
         let (len, offset) = match tag & 0x03 {
             1 => {
                 if at >= input.len() {
-                    return false;
+                    return Ok(false);
                 }
                 let o = (((tag >> 5) as usize) << 8) | input[at] as usize;
                 at += 1;
@@ -560,7 +567,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
             }
             2 => {
                 if at + 2 > input.len() {
-                    return false;
+                    return Ok(false);
                 }
                 let o = input[at] as usize | ((input[at + 1] as usize) << 8);
                 at += 2;
@@ -568,7 +575,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
             }
             _ => {
                 if at + 4 > input.len() {
-                    return false;
+                    return Ok(false);
                 }
                 let mut o = 0usize;
                 for i in 0..4 {
@@ -579,7 +586,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
             }
         };
         if offset == 0 || offset > dst - base || len > end - dst {
-            return false;
+            return Ok(false);
         }
         let from = dst - offset;
         if offset >= 8 {
@@ -603,7 +610,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> bool {
         }
         dst += len;
     }
-    dst == end
+    Ok(dst == end)
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +746,11 @@ fn plain_slices(
     out: &mut Vec<Slice>,
     path: &str,
 ) -> Result<()> {
+    alloc::grow(
+        out,
+        count.max(0) as usize,
+        "one handle per value in the page",
+    )?;
     let mut at = 0usize;
     for _ in 0..count {
         if at + 4 > page.len() {
@@ -805,7 +817,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
     let mut defs: Vec<i32> = Vec::new();
     let mut idx: Vec<i32> = Vec::new();
     let mut got: Vec<Slice> = Vec::new();
-    index.reserve(fm.rows as usize);
+    alloc::grow(&mut index, fm.rows as usize, "one dictionary index per row")?;
 
     // The column starts out held as dictionary indices and stays that way only
     // if every page cooperates. A writer that gives up on the dictionary
@@ -831,7 +843,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
         if codec < 0 {
             codec = c.codec;
             if codec == CODEC_SNAPPY {
-                owned.reserve(uncompressed as usize);
+                alloc::grow(&mut owned, uncompressed as usize, "the uncompressed column")?;
             }
         } else if codec != c.codec {
             return fail(
@@ -860,7 +872,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
             // from. `in_owned` is the whole of the distinction.
             let (page_from, page_len, page_base, in_owned) = if c.codec == CODEC_SNAPPY {
                 let was = owned.len();
-                if !snappy_append(&data[h.after..h.after + body_len], &mut owned) {
+                if !snappy_append(&data[h.after..h.after + body_len], &mut owned)? {
                     return fail(
                         "a snappy page in the parquet file will not decompress",
                         path,
@@ -898,6 +910,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                         return fail("a parquet page ends inside its levels", path);
                     }
                     defs.clear();
+                    alloc::grow(&mut defs, n_vals, "definition levels for the page")?;
                     defs.resize(n_vals, 0);
                     if !RleReader::new(&body[4..4 + dl], 1).fill(&mut defs) {
                         return fail("a parquet page ran out of definition levels", path);
@@ -925,6 +938,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                         return fail("a parquet dictionary index is wider than 32 bits", path);
                     }
                     idx.clear();
+                    alloc::grow(&mut idx, real, "dictionary indices for the page")?;
                     idx.resize(real, 0);
                     if !RleReader::new(&body[vat + 1..], width).fill(&mut idx) {
                         return fail("a parquet page ran out of dictionary indices", path);
@@ -958,7 +972,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                     if dictionary {
                         // Fold what has been read into the plain form. This
                         // copies eight-byte handles, not values.
-                        values.reserve(fm.rows as usize);
+                        alloc::grow(&mut values, fm.rows as usize, "one handle per row")?;
                         for &k in &index {
                             values.push(if k >= 0 {
                                 dict[k as usize]
@@ -970,7 +984,6 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                         dictionary = false;
                     }
                     got.clear();
-                    got.reserve(real);
                     plain_slices(
                         &body[vat..],
                         page_base + vat as u64,

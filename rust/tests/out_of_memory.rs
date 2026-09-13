@@ -1,0 +1,206 @@
+//! A budget that is not enough is an error, not a signal.
+//!
+//! The three other ports in this repository answer a memory ceiling the way they
+//! answer a missing column — a line on stderr and exit 2 — and this one used to
+//! answer it with `abort`, because Rust's default allocator calls
+//! `handle_alloc_error` and there is no way to return from that. On the 50M-row
+//! Parquet rung of the benchmark ladder that was the difference between a
+//! refusal and no answer at all: C, C++ and Zig each printed what they could not
+//! fit and the harness moved on, and this port died on signal 6.
+//!
+//! Two failures beside the abort, both worse in their way and both found by
+//! walking the cap down one rung at a time:
+//!
+//!   * `Scope::spawn` panics when the OS will not give it a thread, which under a
+//!     memory cap is exactly when it happens, because a thread's stack is a
+//!     private mapping and that is what `RLIMIT_DATA` bounds. Exit 101.
+//!   * printing that panic with `RUST_BACKTRACE=1` set took the backtrace lock,
+//!     allocated to symbolise, failed, and reached for the same lock from the
+//!     allocation error hook. The process hung, which no timeout of its own ends.
+//!
+//! So this test asserts three things about the same run: an exit code of 2, a
+//! message that says what ran out, and that it finishes at all.
+//!
+//! Linux only, deliberately. `RLIMIT_DATA` has covered private anonymous
+//! mappings since Linux 4.7, and not file-backed ones — which is what makes it
+//! the right cap for a tool that maps its input: it bounds what grows with the
+//! row count and leaves the mapping alone. No other platform promises that, so
+//! there is nothing to assert there.
+
+#![cfg(target_os = "linux")]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+/// Enough rows that the index cannot fit in a few megabytes, small enough that
+/// writing it costs nothing: 120,000 rows is about 3.7 MB on disk and wants
+/// somewhere over 12 MB to compare.
+const ROWS: usize = 120_000;
+
+struct Fixture {
+    dir: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        // A counter and not a clock: `Instant::now().elapsed()` is zero, which
+        // gave both tests in this file the same directory, and whichever
+        // finished first deleted the other's files out from under it.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "csvdiff-oom-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        const HEADER: &str = "account_id,txn_id,amount,updated_at\n";
+        let mut a = String::from(HEADER);
+        let mut b = String::from(HEADER);
+        for i in 0..ROWS {
+            // A key that repeats every ten thousand rows, so there are duplicate
+            // keys to count as well as distinct ones to index.
+            let key = format!("a{},t{}", i % 9_999, i);
+            a.push_str(&format!("{key},{}.{},2026-01-01\n", i % 977, i % 97));
+            // One row in a hundred differs, so the comparison has changed cells
+            // to hold and a report with something in it to write. An identical
+            // pair would skip the part of the run that allocates most.
+            if i % 100 == 0 {
+                b.push_str(&format!("{key},{}.{},2026-02-02\n", i % 977, (i + 1) % 97));
+            } else {
+                b.push_str(&format!("{key},{}.{},2026-01-01\n", i % 977, i % 97));
+            }
+        }
+        fs::write(dir.join("a.csv"), &a).expect("write a");
+        fs::write(dir.join("b.csv"), &b).expect("write b");
+        Fixture { dir }
+    }
+
+    fn a(&self) -> PathBuf {
+        self.dir.join("a.csv")
+    }
+
+    fn b(&self) -> PathBuf {
+        self.dir.join("b.csv")
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// What one run under `cap_mb` megabytes of `RLIMIT_DATA` did.
+struct Run {
+    code: Option<i32>,
+    stderr: String,
+    hung: bool,
+}
+
+/// `ulimit -d` rather than `setrlimit`: this crate has no libc dependency and is
+/// not about to take one for a test. The limit applies to the `exec`ed child, so
+/// what it bounds is the binary under test and nothing else.
+fn run_capped(cap_mb: usize, a: &Path, b: &Path, report: &Path) -> Run {
+    let script = format!(
+        "ulimit -d {}; exec {} compare {} {} -k account_id,txn_id -o {}",
+        cap_mb * 1024,
+        env!("CARGO_BIN_EXE_csvdiff"),
+        a.display(),
+        b.display(),
+        report.display(),
+    );
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("bash");
+
+    // A deadline rather than `wait`, because the failure this test exists to
+    // catch included a deadlock: `wait` on a hung child is a hung test suite,
+    // and a hung suite reads as an infrastructure problem rather than as this
+    // bug.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait().expect("wait") {
+            Some(status) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let mut raw = Vec::new();
+                    let _ = pipe.read_to_end(&mut raw);
+                    stderr = String::from_utf8_lossy(&raw).into_owned();
+                }
+                return Run {
+                    code: status.code(),
+                    stderr,
+                    hung: false,
+                };
+            }
+            None if Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Run {
+                    code: None,
+                    stderr: String::new(),
+                    hung: true,
+                };
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+#[test]
+fn a_budget_that_is_not_enough_is_an_error_not_a_signal() {
+    let fx = Fixture::new();
+    let report = fx.dir.join("out.html");
+
+    // Every rung from "nearly enough" down to "cannot even start" has to answer
+    // the same way. One cap would not do: the old code refused at some sizes and
+    // aborted at others, depending on which allocation happened to be the one
+    // that crossed the line.
+    for cap_mb in [12, 8, 6, 4, 2] {
+        let run = run_capped(cap_mb, &fx.a(), &fx.b(), &report);
+        assert!(!run.hung, "{cap_mb} MB: the run did not finish");
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{cap_mb} MB: expected exit 2, got {:?}; stderr: {}",
+            run.code,
+            run.stderr.trim()
+        );
+        assert!(
+            run.stderr.contains("out of memory"),
+            "{cap_mb} MB: nothing in stderr says what ran out: {}",
+            run.stderr.trim()
+        );
+        // The refusal names the structure that did not fit, which is the answer
+        // to *how much would have been enough*.
+        assert!(
+            run.stderr.contains("needs"),
+            "{cap_mb} MB: the refusal does not say how big it was: {}",
+            run.stderr.trim()
+        );
+    }
+}
+
+#[test]
+fn the_same_files_compare_when_the_budget_is_enough() {
+    // Without this the test above proves only that the invocation is broken.
+    let fx = Fixture::new();
+    let report = fx.dir.join("out.html");
+    let run = run_capped(512, &fx.a(), &fx.b(), &report);
+    assert!(!run.hung, "the unconstrained run did not finish");
+    assert!(
+        matches!(run.code, Some(0) | Some(1)),
+        "expected an answer, got {:?}; stderr: {}",
+        run.code,
+        run.stderr.trim()
+    );
+    assert!(report.exists(), "no report was written");
+}
