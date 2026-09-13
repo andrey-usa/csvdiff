@@ -610,41 +610,38 @@ tests/fixtures/          every shape that has broken an engine here
    a prefix cannot see that; C rules it out with a bounded scan of the mate's
    tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
    the largest thing left here.
-2. **Whether the Rust port can do 50M rows of Parquet is now an open question
-   rather than a settled no**, because the benchmark was measuring the wrong
-   reader. The port carries two Parquet readers and `engine.rs` says in as many
-   words that an explicit `--engine turbo` is the one thing that retires the
-   columnar one — *"Only an explicit --engine turbo should do that"* — and
-   `scripts/bench_formats_ports.py` passed exactly that flag on every Rust row.
-   So every Rust Parquet number this project has published, including the 50M
-   rung it failed, is of the reader `auto` does not pick and a user does not get.
+2. **The Rust Parquet reader runs on one core at fifty million rows.** At 50M
+   under a 13,941 MB cap all four ports finish and agree, and the Rust row is
+   **1.04x cores** against Zig's 3.05x — which is the whole of 29.70s against
+   12.13s. The same reader manages 2.18x at 500k, so it parallelises at small
+   sizes and stops somewhere before this one. Find where.
 
-   One 500k table, before and after dropping the flag, identical counts either
-   way:
+   | Build | Compare |   CPU | Cores | Above the input |
+   |-------|--------:|------:|------:|----------------:|
+   | Zig   |  12.13s | 37.0s | 3.05x |        6,558 MB |
+   | C     |  16.60s | 23.6s | 1.42x |        6,138 MB |
+   | C++   |  19.08s | 41.8s | 2.19x |        6,515 MB |
+   | Rust  |  29.70s | 30.9s | 1.04x |    **6,064 MB** |
 
-   | Rust on Parquet | Compare | Above the input |
-   |---|---:|---:|
-   | `--engine turbo`, as the harness ran it | 1.01s | 257 MB |
-   | `auto`, as a user gets it | **0.25s** | **114 MB** |
+   This replaces an item that claimed the Rust reader held about three times what
+   the others hold. It does not: it holds the **least** of the four. That number
+   came from a benchmark passing `--engine turbo`, which `engine.rs` says is the
+   one flag that retires the columnar reader — so every Rust Parquet figure this
+   project published was of the reader `auto` does not pick and a user never gets.
+   C at 1.42x is worth a look on the same grounds.
+3. **Where the ceiling sits, now measured rather than predicted.** On a 16 GB
+   runner: **CSV finishes at 150M and dies at 200M**, and **Parquet finishes at
+   50M for all four ports and at 100M for none of them**. The 100M rung generated
+   15,347 MB cleanly and came back with four refusals, each naming what it could
+   not fit — Rust's says `one dictionary index per row needs 381 MB`, which is
+   exactly 100,005,000 × 4 bytes. So the Parquet ceiling is somewhere between 50M
+   and 100M, and closing on it is a matter of dispatching rungs between, not of
+   arithmetic. That is also where `sortmerge` stops being the conservative choice
+   and becomes the only one.
 
-   For scale, the other three on the same run: C 0.15s / 87 MB, C++ 0.20s /
-   92 MB, Zig 0.15s / 73 MB. The gap that looked like 4x the time and 3x the
-   memory is about 1.5x of each — a real gap, and an ordinary one.
-
-   What that predicts is the open part. Turbo materialises one eight-byte field
-   per cell, which at 50M rows and nineteen columns is 7.6 GB a side before
-   anything else, so it never had a chance under a 13,941 MB cap; the columnar
-   reader holds a fraction of that. Whether the fraction is small enough is not
-   something a 500k run can answer, and the ladder can: dispatch the 50m/parquet
-   rung and find out.
-3. **100M rows.** Where the ceiling actually sits, measured on a 16 GB runner
-   rather than predicted: **CSV finishes at 150M and dies at 200M**, and Parquet
-   now finishes at 50M for three ports out of four. About 100 MB of index per
-   million rows predicts 10 GB at 100M, which is where `sortmerge` stops being
-   the conservative choice and becomes the only one. Note what the CSV numbers
-   say about the old version of this line: the input has not needed to fit in RAM
-   for a long time, because the ports map it and stream — 200M rows of CSV is
-   70 GB of input and the run got as far as the comparison.
+   Note what the CSV numbers say about the old version of this line: the input has
+   not needed to fit in RAM for a long time, because the ports map it and stream —
+   200M rows of CSV is 70 GB of input and the run got as far as the comparison.
 4. **What compression saves in bytes read is still unmeasured**, though what it
    *costs* now is. The container these numbers come from cannot answer the other
    half: `drop_caches` leaves the hypervisor's copy warm, and the one genuine
