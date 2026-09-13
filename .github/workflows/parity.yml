@@ -123,7 +123,15 @@ jobs:
             a="data/p_a.$fmt"; b="data/p_b.$fmt"
             run c    "$fmt" c/csvdiff compare "$a" "$b"
             run cpp  "$fmt" cpp/build/csvdiff compare "$a" "$b"
-            run rust "$fmt" rust/target/release/csvdiff compare "$a" "$b" --engine turbo -o /dev/null
+            # No --engine: that flag is the one thing that retires the columnar
+            # Parquet reader, so naming it here left the reader `auto` actually
+            # picks -- the one a user gets on an uncompressed Parquet pair --
+            # never checked against the other three ports. Both readers are
+            # checked now; the extra run costs a second and they both have to
+            # agree with C, C++ and Zig.
+            run rust "$fmt" rust/target/release/csvdiff compare "$a" "$b" -o /dev/null
+            run rust-turbo "$fmt" rust/target/release/csvdiff compare "$a" "$b" \
+              --engine turbo -o /dev/null
             run zig  "$fmt" zig/zig-out/bin/csvdiff compare "$a" "$b"
           done
           python3 - <<'PY'
