@@ -602,14 +602,25 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **The byte proof reaches ndjson in one port out of four.** Settling a matched
-   row from its raw bytes is not C's alone — all four do it for CSV, each with
-   the same guard that two headers ordering the same columns differently would
-   break it, and Zig's `sharedTail` says so in as many words. What is C-only is
-   the JSON form, because a name repeated in one object takes its last value and
-   a prefix cannot see that; C rules it out with a bounded scan of the mate's
-   tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
-   the largest thing left here.
+1. **The byte proof reaches ndjson in two ports out of four — Zig and C++ are
+   left.** Settling a matched row from its raw bytes is not C's alone: all four do
+   it for CSV, each with the same guard that two headers ordering the same columns
+   differently would break it. The JSON form was C-only, because a name repeated
+   in one object takes its last value and a prefix cannot see that; C rules it out
+   with a bounded scan of the mate's tail, and the Rust port now does too.
+
+   What it bought there, 4M rows a side on a 4-core host, one table: **2.51s to
+   2.07s wall and 8.85s to 7.23s of CPU**, which moves Rust from behind C on
+   ndjson to in front of it — C 2.29s, Zig 2.43s. Counts identical to the other
+   three ports, and to the same build with the proof absent.
+
+   Zig's `sharedTail` returns null for JSON exactly as Rust's `shared_tail` did,
+   so the same port applies and the same measurement is available. One thing the
+   Rust work found that a reader should know before starting: the proof pays only
+   if it runs **before** the mate's row is parsed. Placed after the key lookup —
+   which is where C puts it, because C's lookup parses only the keys — it cost 2%
+   instead of saving 14%, since Rust's lookup had already materialised the whole
+   mate row. Check what Zig's does first.
 2. **At fifty million rows the Rust Parquet reader waits instead of working, and
    it is the only port that does.** The 50M rung, all four finishing and agreeing
    under a 13,941 MB cap:

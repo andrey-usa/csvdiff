@@ -47,7 +47,10 @@ use std::time::Instant;
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of};
-use text::{RowParser, csv_header, detect_delimiter, json_header, shared_tail, sniff_dialect};
+use text::{
+    RowParser, csv_header, detect_delimiter, json_header, json_tail_is_clean, shared_tail,
+    sniff_dialect,
+};
 
 use crate::alloc;
 use crate::columns::{compare_keys, differs, empty_to_null, normalise, resolve};
@@ -353,6 +356,42 @@ impl Phases {
     }
 }
 
+/// What a caller offers as a byte proof that a candidate row needs no parsing.
+///
+/// Both forms carry A's row from its start through the end of the last value
+/// either file wants — **including the keys**, which is what lets the proof stand
+/// in for the key comparison as well as the column comparison, and therefore run
+/// before the mate is parsed at all. Where they differ is what makes the run a
+/// whole number of values rather than a truncation of one.
+#[derive(Clone, Copy)]
+enum Proof<'b> {
+    /// A column sits at a fixed offset, so the run has to end on a field
+    /// boundary: `delimiter` or a newline. Without that, `12,3` would match a row
+    /// opening `12,34`.
+    Csv { bytes: &'b [u8], delimiter: u8 },
+    /// A value is found by name and a name repeated in one object takes its last
+    /// value, so the run ends one byte past the last value — its closing quote —
+    /// and the mate's remaining bytes must name nothing this run tracks.
+    Json { bytes: &'b [u8] },
+}
+
+/// How many failures in a row before the byte proof is only tried every
+/// `PROOF_BACKOFF` rows. A power of two: the loop masks against it.
+const PROOF_BACKOFF: usize = 64;
+
+/// Where a row ends: the next row's start, or the end of the file.
+///
+/// Rows are inserted in the order they were swept and the sweep runs the chunks
+/// in file order, so `row_at` ascends and row `n + 1` begins where row `n` stops.
+fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
+    let next = row as usize + 1;
+    if next < ix.row_at.len() {
+        ix.row_at[next] as usize
+    } else {
+        size
+    }
+}
+
 /// An empty table of `cap` slots, with the zeroes written rather than taken from
 /// the kernel.
 ///
@@ -625,7 +664,7 @@ impl RowIndex {
         hash: u64,
         key_size: usize,
         opt: &Options,
-        span: Option<(&[u8], u8)>,
+        span: Option<Proof<'_>>,
         probe: &mut [Field],
     ) -> Option<(i32, bool)> {
         let mut slot = self.slot(hash);
@@ -643,9 +682,14 @@ impl RowIndex {
                     // row needs parsing to say so. A candidate the tag let
                     // through with a different key fails this on its first few
                     // bytes, so the cost of being wrong is a handful of them.
-                    if let Some((bytes, delimiter)) = span
-                        && self.row_matches(side, candidate, bytes, delimiter)
-                    {
+                    let proved = match span {
+                        Some(Proof::Csv { bytes, delimiter }) => {
+                            self.row_matches(side, candidate, bytes, delimiter)
+                        }
+                        Some(Proof::Json { bytes }) => self.json_matches(side, candidate, bytes),
+                        None => false,
+                    };
+                    if proved {
                         return Some((candidate, true));
                     }
                     self.fields_of(side, candidate, probe);
@@ -656,6 +700,28 @@ impl RowIndex {
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+
+    /// Whether `candidate`'s row opens with exactly `bytes` and names nothing this
+    /// run tracks in what follows.
+    ///
+    /// The second half is the whole difference from CSV. A byte-equal prefix says
+    /// the two rows hold the same values *written in the prefix*; it cannot say
+    /// the mate does not name one of them again further on, and in JSON a repeated
+    /// name takes its last value. What is left to scan is the trailing ignored
+    /// columns, which is the only reason this is cheaper than parsing the row.
+    fn json_matches(&self, side: &Side, candidate: i32, bytes: &[u8]) -> bool {
+        let Some(parser) = side.parser() else {
+            return false;
+        };
+        let data = side.slab.data();
+        let lo = self.row_at[candidate as usize] as usize;
+        let end = row_end(self, candidate, data.len());
+        let need = bytes.len();
+        if need > end.saturating_sub(lo) {
+            return false;
+        }
+        data[lo..lo + need] == *bytes && json_tail_is_clean(parser, data, lo + need, end)
     }
 
     /// Whether `candidate`'s row opens with exactly `bytes` and ends that run on
@@ -1075,6 +1141,10 @@ fn join(
         (Some(pa), Some(pb)) => shared_tail(pa, pb),
         _ => None,
     };
+    // What JSON gets instead, since `shared_tail` cannot promise it an offset.
+    // See `json_values_agree`.
+    let json_proof =
+        nc > 0 && a.slab.dialect() == Dialect::Json && b.slab.dialect() == Dialect::Json;
     // Which of B's rows some key of A matched.
     //
     // B's half of the join used to answer "is this key in A?" for every key in
@@ -1116,6 +1186,11 @@ fn join(
             removed_total: 0,
         };
         let (mut fa, mut fb) = (vec![ABSENT; width], vec![ABSENT; width]);
+        // A proof that keeps failing is a scan for nothing: two files where every
+        // row really has changed would pay for it on every row. After
+        // `PROOF_BACKOFF` failures in a row it is tried every `PROOF_BACKOFF`
+        // rows instead, until one succeeds and it is on again.
+        let mut refused = 0usize;
         let lo = a_keys * p / a_ways;
         let hi = a_keys * (p + 1) / a_ways;
         let keys = &ai.first_row[lo..hi];
@@ -1133,7 +1208,7 @@ fn join(
             // A's row up to the end of the last column either file wants. The
             // end has to be a boundary in A as well: a quoted field ends on its
             // closing quote, and what follows is not part of the run.
-            let span = span_tail.and_then(|(slot, delimiter)| {
+            let csv_span = span_tail.and_then(|(slot, delimiter)| {
                 let f = fa[slot];
                 if !field::is_real(f) {
                     return None;
@@ -1147,7 +1222,41 @@ fn join(
                 if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
                     return None;
                 }
-                Some((&data[from..to], delimiter))
+                Some(Proof::Csv {
+                    bytes: &data[from..to],
+                    delimiter,
+                })
+            });
+            // Through the byte that closes the last value either file wants --
+            // whichever it turns out to be, since two objects need not list their
+            // names in the same order. `width` and not `nc`: the keys have to be
+            // inside the run for it to stand in for the key comparison.
+            let span = csv_span.or_else(|| {
+                if !json_proof {
+                    return None;
+                }
+                if refused >= PROOF_BACKOFF && i & (PROOF_BACKOFF - 1) != 0 {
+                    return None;
+                }
+                let data = a.slab.data();
+                let lo = ai.row_at[row as usize] as usize;
+                let end = row_end(ai, row, data.len());
+                let mut t = lo;
+                for &f in fa.iter().take(width) {
+                    if !field::is_real(f) {
+                        continue;
+                    }
+                    let e = field::offset_of(f) + field::len_of(f);
+                    if e > t {
+                        t = e;
+                    }
+                }
+                if t >= end || t < lo {
+                    return None;
+                }
+                Some(Proof::Json {
+                    bytes: &data[lo..t + 1],
+                })
             });
             let Some((mate, same_bytes)) =
                 bi.lookup(b, &a.slab, &fa, hash, key_size, opt, span, &mut fb)
@@ -1160,6 +1269,16 @@ fn join(
             };
             out.matched += 1;
             mark(mate);
+            // `same_bytes` is the proof's own verdict, so it is what the backoff
+            // counts. A run of failures means two files where the rows really do
+            // differ, and scanning them is work for nothing.
+            if json_proof && span.is_some() {
+                if same_bytes {
+                    refused = 0;
+                } else if refused < PROOF_BACKOFF {
+                    refused += 1;
+                }
+            }
             // The two rows carry the same bytes across every column either file
             // wants, so no column differs and the mate was never read.
             if same_bytes {

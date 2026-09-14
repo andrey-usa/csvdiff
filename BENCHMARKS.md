@@ -73,6 +73,57 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (ndjson) — the byte proof reaches a second port, and where it has to sit
+
+README item 1 had called porting C's ndjson tail scan "the largest thing left
+here". This is that port, into Rust, and the interesting part is not the speedup
+but that the first version of it was *slower*.
+
+4M rows a side, 9 rounds, `scripts/bench_ab.sh`, paired and interleaved, against
+the same build without the proof:
+
+| Version | wall best | median | cpu best | median | Verdict |
+|---------|----------:|-------:|---------:|-------:|---------|
+| after the key lookup | 2.458s | 2.597s | 8.70s | 9.10s | **2% more work** |
+| before the mate is parsed | 2.068s | 2.180s | 7.21s | 7.53s | **14% less work** |
+
+Same proof, same tail scan, same tests. What changed is where it runs.
+
+C puts its proof after `index_lookup` returns a mate, and that is right for C,
+because C's lookup compares only the key columns. Rust's `lookup` calls
+`fields_of` on the candidate — it parses the mate's **whole row** to compare its
+keys — so a proof placed after it cannot save the parse. It can only skip the
+seventeen-column field comparison that follows, while adding a ~400-byte memcmp
+and a tail scan. That is the 2%, and it is what the first A/B measured.
+
+Moving it beside the CSV proof, which already runs before `fields_of` for exactly
+this reason, is what turned 2% lost into 14% gained. It also forced the design to
+be more careful than C's: a proof that stands in for the key comparison has to
+cover the keys, so the run reaches through the last value of **every** wanted
+field rather than the last compared one. `width`, not `nc`.
+
+Where that leaves the ndjson column, same 4M pair, best of three:
+
+| Port | Wall | CPU | Cores |
+|------|-----:|----:|------:|
+| **Rust (now)** | **2.07s** | 7.23s | 3.49x |
+| C | 2.29s | 6.84s | 2.99x |
+| Zig | 2.43s | 8.92s | 3.67x |
+| Rust (before) | 2.51s | 8.85s | 3.53x |
+| C++ | 4.78s | 13.47s | 2.82x |
+
+C still does the least CPU work of the four; Rust gets ahead on wall by spreading
+more of it. Read within this table only — it is one host and one size.
+
+Correctness, since a byte proof that is wrong is worse than no proof: counts and
+per-column figures identical to the no-proof build at 4M, and identical across C,
+C++, Zig and Rust on a fixture built for the ways this goes wrong — a compared
+name repeated in the mate's tail, the same values written in a different order,
+a value that is a prefix of the mate's longer one, an escaped name, a difference
+confined to an ignored column, and the keys written after the last compared
+value. Those are `rust/tests/turbo.rs` now, and the first of them was confirmed to
+fail when the tail scan is stubbed out.
+
 ## 2026-09-14 (contention) — separate hosted runners do not contend, and the first run said otherwise
 
 `bench-contention.yml` had never been dispatched since it was written. It exists
