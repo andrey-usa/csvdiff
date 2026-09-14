@@ -517,7 +517,27 @@ const Want = enum { whole, keys };
 
 /// A run of one row's bytes, and the delimiter that has to end it in the other
 /// file for that run to be a whole number of columns.
-const Span = struct { bytes: []const u8, delimiter: u8 };
+/// What a caller offers as a byte proof that a candidate row needs no parsing.
+///
+/// Both forms carry A's row from its start through the end of the last value
+/// either file wants -- **including the keys**, which is what lets the proof
+/// stand in for the key comparison as well as the column comparison, and so run
+/// before the mate is parsed at all. Where they differ is what makes the run a
+/// whole number of values rather than a truncation of one.
+const Span = union(enum) {
+    /// A column sits at a fixed offset, so the run has to end on a field
+    /// boundary: `delimiter` or a newline. Without it `12,3` would match a row
+    /// opening `12,34`.
+    csv: struct { bytes: []const u8, delimiter: u8 },
+    /// A value is found by name and a name repeated in one object takes its last
+    /// value, so the run ends one byte past the last value -- its closing quote --
+    /// and the mate's remaining bytes must name nothing this run tracks.
+    json: struct { bytes: []const u8 },
+};
+
+/// How many failures in a row before the byte proof is only tried every
+/// `PROOF_BACKOFF` rows. A power of two: the loop masks against it.
+const PROOF_BACKOFF: usize = 64;
 
 /// What a probe found: the row, and whether the bytes settled it outright.
 const Hit = struct { row: i32, same_bytes: bool };
@@ -983,9 +1003,11 @@ const RowIndex = struct {
                     // through with a different key fails this on its first few
                     // bytes, so the cost of being wrong is a handful of them.
                     if (span) |sp| {
-                        if (self.rowMatches(candidate, sp)) {
-                            return .{ .row = candidate, .same_bytes = true };
-                        }
+                        const proved = switch (sp) {
+                            .csv => self.rowMatches(candidate, sp.csv.bytes, sp.csv.delimiter),
+                            .json => self.jsonMatches(candidate, sp.json.bytes),
+                        };
+                        if (proved) return .{ .row = candidate, .same_bytes = true };
                     }
                     switch (want) {
                         .whole => self.fieldsOf(candidate, probe),
@@ -1010,17 +1032,47 @@ const RowIndex = struct {
     ///
     /// The boundary is what makes the run a whole number of columns rather than
     /// a truncation of one: without it `12,3` would match a row opening `12,34`.
-    fn rowMatches(self: *const RowIndex, candidate: i32, sp: Span) bool {
+    fn rowMatches(self: *const RowIndex, candidate: i32, bytes: []const u8, delimiter: u8) bool {
         const data = self.side.slab.data;
         const from: usize = @intCast(self.row_at.items[@intCast(candidate)]);
-        // Both tests, and in this order: `data.len - sp.bytes.len` underflows for
+        // Both tests, and in this order: `data.len - bytes.len` underflows for
         // a run longer than this whole file, which a release build would wrap
         // rather than trap. A's rows and B's bytes come from different files and
         // nothing bounds one by the other.
-        if (sp.bytes.len > data.len or from > data.len - sp.bytes.len) return false;
-        const to = from + sp.bytes.len;
-        if (to < data.len and data[to] != sp.delimiter and data[to] != '\n') return false;
-        return std.mem.eql(u8, data[from..to], sp.bytes);
+        if (bytes.len > data.len or from > data.len - bytes.len) return false;
+        const to = from + bytes.len;
+        if (to < data.len and data[to] != delimiter and data[to] != '\n') return false;
+        return std.mem.eql(u8, data[from..to], bytes);
+    }
+
+    /// Where `row` ends: the next row's start, or the end of the file.
+    ///
+    /// Rows are inserted in the order they were swept and the sweep runs its
+    /// chunks in file order, so `row_at` ascends and row `n + 1` begins where
+    /// row `n` stops.
+    fn rowEnd(self: *const RowIndex, row: i32) usize {
+        const next: usize = @as(usize, @intCast(row)) + 1;
+        if (next < self.row_at.items.len) return @intCast(self.row_at.items[next]);
+        return self.side.slab.data.len;
+    }
+
+    /// Whether `candidate`'s row opens with exactly `bytes` and names nothing
+    /// this run tracks in what follows.
+    ///
+    /// The second half is the whole difference from CSV. A byte-equal prefix says
+    /// the two rows hold the same values *written in the prefix*; it cannot say
+    /// the mate does not name one of them again further on, and in JSON a
+    /// repeated name takes its last value. What is left to scan is the trailing
+    /// ignored columns, which is the only reason this is cheaper than parsing.
+    fn jsonMatches(self: *const RowIndex, candidate: i32, bytes: []const u8) bool {
+        const parser = self.side.parser() orelse return false;
+        const data = self.side.slab.data;
+        const from: usize = @intCast(self.row_at.items[@intCast(candidate)]);
+        const end = self.rowEnd(candidate);
+        if (bytes.len > end -| from) return false;
+        const to = from + bytes.len;
+        if (!std.mem.eql(u8, data[from..to], bytes)) return false;
+        return text.jsonTailIsClean(parser, data, to, end);
     }
 
     fn uniqueKeys(self: RowIndex) i64 {
@@ -1322,6 +1374,9 @@ const Join = struct {
     /// the same shape; see `text.sharedTail`. Null compares every pair column by
     /// column, which is what a mixed pair, a columnar side or JSON gets.
     span_tail: ?text.Tail,
+    /// What JSON gets instead: no fixed offset to promise, so the run is built
+    /// per row and the mate's tail is scanned. See `RowIndex.jsonMatches`.
+    json_proof: bool,
     next: std.atomic.Value(usize),
 
     fn run(self: *Join) void {
@@ -1354,6 +1409,11 @@ const Join = struct {
         // fail, so it need not be asked through an error union.
         const plain = !needsNormalising(self.opt);
         const mine = keys[lo..hi];
+        // A proof that keeps failing is a scan for nothing: two files where every
+        // row really has changed would pay for it on every row. After
+        // `PROOF_BACKOFF` failures in a row it is tried every `PROOF_BACKOFF`
+        // rows instead, until one succeeds and it is on again.
+        var refused: usize = 0;
         for (mine, 0..) |row, at| {
             if (at + PREFETCH_AHEAD < mine.len) {
                 self.bi.prefetch(self.ai.row_hash.items[@intCast(mine[at + PREFETCH_AHEAD])]);
@@ -1377,13 +1437,45 @@ const Join = struct {
                 if (to < data.len and data[to] != tail.delimiter and data[to] != '\n') {
                     break :blk null;
                 }
-                break :blk .{ .bytes = data[from..to], .delimiter = tail.delimiter };
+                break :blk .{ .csv = .{ .bytes = data[from..to], .delimiter = tail.delimiter } };
             };
-            const hit = (try self.bi.lookup(self.a.slab, fa, hash, .whole, span, &s, fb)) orelse {
+            // What JSON gets instead, since `sharedTail` cannot promise it an
+            // offset. Through the byte that closes the last value either file
+            // wants -- whichever it turns out to be, since two objects need not
+            // list their names in the same order. Every wanted field and not only
+            // the compared ones: the keys have to be inside the run for it to
+            // stand in for the key comparison, which is what lets it run before
+            // the mate is parsed.
+            const proof: ?Span = span orelse blk: {
+                if (!self.json_proof) break :blk null;
+                if (refused >= PROOF_BACKOFF and at & (PROOF_BACKOFF - 1) != 0) break :blk null;
+                const data = self.a.slab.data;
+                const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
+                const end = self.ai.rowEnd(row);
+                var t = from;
+                for (fa[0..self.width]) |f| {
+                    if (!fld.isReal(f)) continue;
+                    const e = fld.offsetOf(f) + fld.lenOf(f);
+                    if (e > t) t = e;
+                }
+                if (t >= end or t < from) break :blk null;
+                break :blk .{ .json = .{ .bytes = data[from .. t + 1] } };
+            };
+            const hit = (try self.bi.lookup(self.a.slab, fa, hash, .whole, proof, &s, fb)) orelse {
                 out.removed += 1;
                 continue;
             };
             out.matched += 1;
+            // `same_bytes` is the proof's own verdict, so it is what the backoff
+            // counts. A run of failures means two files whose rows really do
+            // differ, and scanning them is work for nothing.
+            if (self.json_proof and proof != null) {
+                if (hit.same_bytes) {
+                    refused = 0;
+                } else if (refused < PROOF_BACKOFF) {
+                    refused += 1;
+                }
+            }
             // The two rows carry the same bytes across every column either file
             // wants, so no column differs and the mate was never read.
             if (hit.same_bytes) continue;
@@ -1610,6 +1702,7 @@ pub fn compare(
         .width = width,
         .parts = parts,
         .span_tail = if (a.parser()) |pa| (if (b.parser()) |pb| text.sharedTail(pa, pb) else null) else null,
+        .json_proof = nc > 0 and a.slab.dialect == .json and b.slab.dialect == .json,
         .next = std.atomic.Value(usize).init(0),
     };
     var phases = Phases.start("");
