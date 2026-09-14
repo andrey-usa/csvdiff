@@ -73,6 +73,65 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (scale) — the 50M rung, with repeats, and the 1.04x is gone
+
+Dispatched to settle the one number three rounds of work rested on: Rust's 1.04x
+cores at 50M of Parquet, recorded at `--repeats 1`. Same rung, `--repeats 3`,
+`--first Rust`, no matrix, 13,941 MB cap.
+
+| Build | Compare |    Rows/s |   CPU | Cores |  Peak RSS | Above the input |   Budget |
+|-------|--------:|----------:|------:|------:|----------:|----------------:|---------:|
+| C     |   8.65s | 5,779,353 | 25.2s | 2.92x | 14,578 MB |        6,905 MB | 7,972 MB |
+| C++   |  13.83s | 3,616,663 | 44.4s | 3.21x | 14,607 MB |        6,934 MB | 7,941 MB |
+| Rust  |  11.97s | 4,178,617 | 40.6s | **3.39x** | 14,842 MB |    7,169 MB | 7,916 MB |
+| Zig   |  12.56s | 3,982,747 | 44.2s | 3.52x | 14,337 MB |        6,663 MB | **9,217 MB** |
+
+`counts: identical everywhere`. Beside the run it replaces:
+
+| Build | then (repeats 1) | now (repeats 3) |
+|-------|-----------------:|----------------:|
+| Zig   | 12.13s, 3.05x | 12.56s, 3.52x |
+| C     | 16.60s, 1.42x | **8.65s, 2.92x** |
+| C++   | 19.08s, 2.19x | 13.83s, 3.21x |
+| Rust  | 29.70s, 1.04x | **11.97s, 3.39x** |
+
+**Read the C row first.** C's Parquet path has not changed between the two runs,
+and it went 16.60s to 8.65s: 1.9x, on identical code. Three of the four rows
+improved by more than any change that landed in between could explain. The
+previous table was a slow sitting, and the Rust row was the extreme of it rather
+than a separate phenomenon.
+
+Rust's reader did gain the key-column fan-out in between, worth 1.08x wall on an
+8M pair locally. That is not 29.70s becoming 11.97s, and it does not touch the C
+row at all.
+
+So **README item 2 is withdrawn**, and with it the question it posed. Nothing
+about how the Rust reader walks its mapping needs explaining, because it does not
+wait: at 3.39x it is the second most parallel of the four.
+
+What the investigation produced is worth more than the claim that started it, and
+all of it stands on its own: the columnar path had no phase timings and now has
+them; its key read was two jobs whatever the key and is now a queue; `--threads`
+did nothing on that path and now does; and the memory cap turned out to bound a
+quantity the table was not reporting. A wrong number can still be a useful thing
+to have chased. It is a cheaper one to check first.
+
+### The third time
+
+This file has now withdrawn three claims for the same reason: the Rust B-side
+index insert asymmetry, the C++ sweep at 2.3x, and this. Each was one observation
+on a shared runner, each survived long enough to be built on, and each dissolved
+on re-measurement. `--repeats` costs minutes.
+
+### One row that is about a port
+
+Zig's budget is **9,217 MB** against the other three at about 7,940, while it
+holds the *least* above the input at 6,663 MB. That is the `VmData` gap the
+memory entry two below found, reproducing at 50M on Parquet, on a different host
+and a different format from where it was found -- and it is the only number in this table that is
+about a port rather than about a runner. The `Budget` column earned its place on
+its first ladder rung.
+
 ## 2026-09-14 (zig) — the index reserved four lists it should have let grow
 
 The previous entry found Zig reserving 61% more `VmData` than it touches, in a
