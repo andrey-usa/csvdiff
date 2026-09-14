@@ -634,9 +634,18 @@ tests/fixtures/          every shape that has broken an engine here
    what the first Rust attempt measured. Theirs had to move inside the lookup,
    and to cover the keys as well (`width`, not `nc`) to be allowed to.
 
-   What is left on ndjson is not the proof. **C++ is still 2.4x Rust** at 4.35s
-   against 1.84s, and 2.65 cores against 3.27 — the proof took 15% off a row that
-   needs more than that.
+   What is left on ndjson is not the proof, and it is now located rather than
+   guessed at. **C++'s JSON sweep costs 2.3x Rust's** — 1.95s and 2.03s a side
+   against 0.82s and 0.89s at 4M rows — which is the largest phase in both ports
+   and most of the gap. The join is second at 1.8x. Its `assemble` is 5.2x but too
+   small to feel. C++ has phase timings on the text path now, under the same
+   `CSVDIFF_PHASES` switch the other three use, which is what made that readable;
+   before this it was the only port that could not be profiled on the format where
+   it was slowest.
+
+   One row of that table runs the other way and is a Rust question, not a C++ one:
+   Rust's serial index insert takes **0.668s on the B side against 0.267s on A**,
+   where C++ spends 0.27s on both.
 
 2. **At fifty million rows the Rust Parquet reader waits instead of working, and
    it is the only port that does.** The 50M rung, all four finishing and agreeing
