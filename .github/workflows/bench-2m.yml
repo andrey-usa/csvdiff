@@ -53,9 +53,10 @@ on:
 
 # This one is deliberately *not* in the `benchmark-host` group the two
 # dispatch-only benchmarks share. It used to be, and a pull request's 2M run
-# then queued behind whatever ladder somebody had dispatched -- twenty minutes
-# of waiting before the measurement a reviewer is actually looking at even
-# starts.
+# then queued behind whatever ladder somebody had dispatched. The run that
+# settled it waited 10m 46s to start and then took 3m 27s -- three times the
+# measurement, spent waiting for it -- while the change it measures sat
+# unreviewed.
 #
 # The lock rested on two timing jobs sharing a host and measuring each other's
 # contention. `bench-contention.yml` was written to check that and, when it was

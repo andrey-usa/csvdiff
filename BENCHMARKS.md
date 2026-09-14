@@ -386,8 +386,10 @@ runs last seconds, raise the crowd, and look again.
 Nothing at the time: every benchmark still named `benchmark-host`, so a pull
 request's 2M run still queued behind a dispatched ladder. Acting on a number is a
 separate decision from taking it, and that decision has now been taken — by
-watching a pull request's benchmark sit `pending` for twenty minutes behind a
-150M ladder rung while the thing it measured waited to be reviewed.
+watching a pull request's benchmark sit `pending` behind a 100M/150M ladder while
+the change it measured waited to be reviewed. Queued 12:33:35, started 12:44:21,
+finished 12:47:56: **10m 46s of waiting for a 3m 27s measurement**, and the ladder
+it waited on was running on its own separate runners the whole time.
 
 `bench-2m.yml` has a group of its own now, `benchmark-pr-<ref>`, so a pull
 request's benchmark waits for nothing but another run on its own branch. The two
