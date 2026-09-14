@@ -73,6 +73,126 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (memory) — the cap measures a quantity the table did not report
+
+The previous entry left Zig failing the 100M CSV rung while C, C++ and Rust
+finished, and read it as "Zig holds more per row". **It holds less than Rust.**
+The ceiling is decided by something the table was not printing.
+
+`--memory-cap` sets `RLIMIT_DATA`, and that limit is checked against `mm->data_vm`
+-- the *virtual* size of the private writable mappings: heap, anonymous mmap,
+thread stacks. Peak RSS is a different number in two directions at once. It counts
+resident pages of the mapped **input**, which the limit does not bound; and it
+does not count a mapping that is reserved and never touched, which the limit does.
+So a port that holds an old buffer while it fills a new one is charged for both by
+the cap and for neither by the column beside it.
+
+### Measured, 6M rows of CSV, local 4 vCPU container, input 2,105 MB
+
+`VmData` sampled from /proc at 5ms; the cap column is a sweep, coarse to 100 MB.
+
+| Port | peak VmData | peak RSS | above the input | VmData / above | refused below |
+|------|------------:|---------:|----------------:|---------------:|--------------:|
+| C    |   448 MB | 2,510 MB | 405 MB | 1.11x |   500 MB |
+| C++  |   747 MB | 2,616 MB | 511 MB | 1.46x |   700 MB |
+| Rust |   748 MB | 2,802 MB | 697 MB | 1.07x |   700 MB |
+| Zig  | **955 MB** | 2,697 MB | 592 MB | **1.61x** | **1,000 MB** |
+
+**The refusal threshold tracks `VmData`, not RSS**, in all four. Rust holds the
+most and needs the second smallest budget; Zig holds the second least and needs
+the largest. Reserving 61% more than it touches is what puts Zig first into the
+wall, and none of it is visible in the column the ladder printed.
+
+### Which predicts the whole ceiling table, from one 6M run
+
+Scaling `VmData` linearly and comparing against the ladder's 13,941 MB cap:
+
+| rows | C | C++ | Rust | Zig |
+|-----:|--:|----:|-----:|----:|
+| 100M (x16.7) |  7,467 MB ✓ | 12,450 MB ✓ | 12,467 MB ✓ | **15,917 MB ✗** |
+| 150M (x25)   | 11,200 MB ✓ | 18,675 MB ✗ | 18,700 MB ✗ | 23,875 MB ✗ |
+
+Eight cells, and the ladder agrees with all eight: three of four at 100M with Zig
+the one that fails, C alone at 150M. Read the yes/no and not the megabytes -- the
+hash table rounds to a power of two, so the true curve is a staircase around that
+line, and C++ and Rust land inside 11% of the cap at 100M, which is closer than
+this arithmetic deserves to be trusted for. What it does establish is that the
+ceilings are not mysterious: they are `VmData` against the cap, and one local run
+puts every port on the right side of it.
+
+### Where Zig's extra 363 MB goes
+
+`VmData` sampled every 5ms through one run, as the max in each 5% of it:
+
+```
+   0.00s      18 MB
+   0.26s      96 MB ####
+   0.53s     203 MB ########
+   0.79s     260 MB ##########
+   0.88s     409 MB #################
+   0.97s     749 MB ###############################
+   1.05s     955 MB ########################################
+   1.14s     955 MB ########################################
+   1.23s     821 MB ##################################
+   1.32s     719 MB ##############################
+   1.67s     719 MB ##############################
+```
+
+A **spike of 236 MB that is given back**: it climbs to 260 MB through the sweep,
+tops out at 955, and settles at 719 for the rest of the run. Rust's trace over the
+same pair has no comparable step -- it rises to 666 MB, falls to 539, and reaches
+its 700 MB peak at the end, in the report.
+
+The spike sits at the sweep-to-insert boundary, which the phase marks put at
+1.09s and 1.10s for the two sides. A reading of `RowIndex.init` in
+`zig/src/csvdiff.zig` that fits the size: it reserves `row_at` (u64), `row_hash`
+(u64), `first_row` (i32) and `occurrences` (u32) -- 24 bytes per row per side --
+and does so *before* the loop that consumes the sweep's chunks, which hold an
+address and a hash each, 16 bytes per row per side. At 6M that is 288 MB of index
+arrays reserved while 192 MB of chunks is still held, against a measured 236 MB.
+The code already anticipates the shape of this in a comment on that loop --
+*"Each chunk is released as soon as it has been inserted. Holding all of them to
+the end would keep two copies of every row's address and hash alive at once"* --
+and releasing them one at a time bounds the overlap without removing it.
+
+That is a reading consistent with the number, not a proven decomposition, and
+narrowing it is its own change: the chunks already hold exactly what two of those
+four arrays want, so the copy and the transient could both go if the index adopted
+the chunk memory instead of reserving beside it.
+
+### The harness prints it now
+
+`scripts/bench_formats_ports.py` gains a **Budget** column: peak `VmData`, sampled
+on the 50ms poll the timeout already runs, so it costs one open and one read per
+tick and no extra wakeups. Without it the table could not explain its own
+refusals -- every ladder rung that came back with "out of memory" was reporting
+the one memory figure that does not decide it.
+
+Polled and not from rusage, which has no equivalent, so it understates a short
+spike: three 50ms passes over that Zig run read 955, 888 and 888 against the 5ms
+poll's 955, an undershoot of up to 7% on a run lasting 1.6s. The rungs this column
+exists for run for minutes, where a phase boundary is sampled many times.
+
+### Confirmed on a different host, at a different size
+
+The first `bench-2m.yml` run carrying the column, 2M rows of CSV on a hosted
+runner -- another machine, a third of the rows, and the two columns side by side:
+
+| Build | above the input | budget | ratio |
+|-------|----------------:|-------:|------:|
+| C     | 126 MB | 176 MB | 1.40x |
+| C++   | 224 MB | 254 MB | 1.13x |
+| Rust  | 301 MB | 304 MB | **1.01x** |
+| Zig   | 206 MB | 290 MB | **1.41x** |
+
+Same ordering as the local 6M run: Rust holds the most and reserves almost nothing
+beyond it, Zig holds less and reserves half as much again. The ratios are not the
+same as the 6M ones and should not be -- the fixed costs are a larger share at 2M,
+and these runs last 0.4-0.5s, which is the regime where the note above says the
+poll undershoots. `Zig v64` reading 260 MB against `Zig` and `Zig v32` at 290 and
+300, for three builds that differ only in scanner width, is that undershoot on
+display. At 0.5s the column is indicative; at a ladder rung it is not.
+
 ## 2026-09-14 (parallelism) — the Rust Parquet key read was two jobs whatever the key
 
 Written down here because the change landed in #69 without an entry, and the

@@ -19,6 +19,15 @@ engines map their inputs, so resident pages include the file; the `above` column
 subtracts it, and for Parquet that number is the whole point, since the pages are
 decoded into an arena and the mapping is given back.
 
+The `Budget` column is a different quantity and is the one `--memory-cap` acts
+on: peak `VmData`, the virtual size of the private writable mappings, which is
+what `RLIMIT_DATA` is checked against. A port that holds an old buffer while it
+fills a new one is charged for both there and for neither in peak RSS, so the two
+columns can disagree by a lot -- on a 6M CSV pair the port with the second
+smallest `above` needs the largest budget. Without this column the table could
+not explain its own refusals. It is polled rather than taken from rusage, which
+has no equivalent, so it is a floor on the true peak.
+
 CPU seconds over wall seconds is the `cores` column: how many of this machine's
 cores were actually busy. It is the column that separates "slow" from "idle" --
 two ports at the same wall time and 1.2x against 3.6x cores are not the same
@@ -119,8 +128,8 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
 
 def run(argv: list[str], timeout: float,
         memory_cap_mb: int | None = None,
-        errors: Path | None = None) -> tuple[float, float, float, int, str]:
-    """Times one child: wall seconds, peak RSS in MB, CPU seconds, exit code, why.
+        errors: Path | None = None) -> tuple[float, float, float, int, str, float]:
+    """Times one child: wall, peak RSS in MB, CPU seconds, exit code, why, peak data.
 
     CPU is user plus system for that exact child, from the same `wait4` rusage
     the RSS comes from. Wall time says how long you waited; CPU divided by wall
@@ -133,6 +142,21 @@ def run(argv: list[str], timeout: float,
     worked and is the whole diagnosis on one that did not. It used to go to
     /dev/null with stdout, so a rung that ran out of memory reported `FAILED
     (exit 2)` and nothing else -- and the ports name what did not fit.
+
+    The last number is peak `VmData`, and it is here because **it is the quantity
+    the cap below actually bounds** and peak RSS is not. `RLIMIT_DATA` is checked
+    against `mm->data_vm`, the *virtual* size of the private writable mappings --
+    heap, anonymous mmap, thread stacks -- so a port that holds an old buffer
+    while it fills a new one is charged for both even though only one is ever
+    touched. Peak RSS cannot see that: it counts resident pages, and it counts
+    the mapped input among them.
+
+    Which made the table unable to explain its own refusals. Measured on a 6M CSV
+    pair, the four ports want 448, 747, 748 and 955 MB of `VmData` while holding
+    405, 511, 697 and 592 MB above the input -- so the port with the *second
+    smallest* footprint is the one that needs the largest budget, and it is the
+    one the 100M rung refused. Sampled from /proc rather than taken from `wait4`,
+    because rusage has no equivalent: `ru_maxrss` is the only memory figure there.
     """
     started = time.monotonic()
     pid = os.fork()
@@ -167,18 +191,50 @@ def run(argv: list[str], timeout: float,
             pass
         os._exit(127)
     deadline = started + timeout
+    peak_data = 0.0
+    status_path = f"/proc/{pid}/status"
     while True:
+        # Before the wait, so the last sample is as late as the poll allows.
+        peak_data = max(peak_data, vm_data_mb(status_path))
         done, status, usage = os.wait4(pid, os.WNOHANG)
         if done:
             return (time.monotonic() - started, usage.ru_maxrss / 1024,
                     usage.ru_utime + usage.ru_stime,
-                    os.waitstatus_to_exitcode(status), last_line(errors))
+                    os.waitstatus_to_exitcode(status), last_line(errors), peak_data)
         if time.monotonic() > deadline:
             os.kill(pid, 9)
             _, _, usage = os.wait4(pid, 0)
             return (time.monotonic() - started, 0.0,
-                    usage.ru_utime + usage.ru_stime, -1, last_line(errors))
+                    usage.ru_utime + usage.ru_stime, -1, last_line(errors), peak_data)
         time.sleep(0.05)
+
+
+def vm_data_mb(status_path: str) -> float:
+    """This process's current `VmData`, in MB, or 0 where it cannot be read.
+
+    Linux only -- /proc/<pid>/status. On anything else this returns 0 and the
+    column reads as a dash, which is honest: the cap is not applied there either,
+    since `RLIMIT_DATA` bounding anonymous mappings is a Linux behaviour.
+
+    Polled, so it is a floor on the true peak and not the peak itself: a spike
+    shorter than the 50ms between samples is invisible here. Measured against a
+    5ms poll of the same run, the Zig port's 955 MB peak reads 955, 888 and 888
+    on three 50ms passes -- an undershoot of up to 7% on a run lasting 1.6s. The
+    rungs this column exists for run for minutes, where a phase boundary lasts
+    long enough to be sampled many times, so treat it as exact at scale and as
+    approximate on a small pair.
+
+    It rides the poll the timeout already runs on, so the column costs one open
+    and one read per fifty milliseconds and no extra wakeups.
+    """
+    try:
+        with open(status_path) as handle:
+            for line in handle:
+                if line.startswith("VmData:"):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
 
 
 def last_line(path: Path | None) -> str:
@@ -227,15 +283,20 @@ def table_of(results: list[dict]) -> str:
     grid = []
     for row in results:
         if row.get("seconds") is None:
-            grid.append([row["port"], row["format"], "-", "-", "-", "-", "-", "-"])
+            grid.append([row["port"], row["format"], "-", "-", "-", "-", "-", "-", "-"])
             continue
         rate = row["rows"] / row["seconds"] if row["seconds"] else 0
+        data = row.get("data") or 0
         grid.append([row["port"], row["format"], f"{row['seconds']:.2f}s", f"{rate:,.0f}",
                      f"{row['cpu']:.1f}s", f"{row['cores']:.2f}x",
-                     f"{row['rss']:,.0f} MB", f"{row['above']:,.0f} MB"])
+                     f"{row['rss']:,.0f} MB", f"{row['above']:,.0f} MB",
+                     f"{data:,.0f} MB" if data else "-"])
+    # "Budget" and not a second memory column with a similar name: it is what
+    # `--memory-cap` has to be at least, which is a different question from what
+    # the run holds. See `run()` for why the two differ and by how much.
     return render(["Build", "Format", "Compare", "Rows/s", "CPU", "Cores", "Peak RSS",
-                   "Above the input"],
-                  ["l", "l", "r", "r", "r", "r", "r", "r"], grid)
+                   "Above the input", "Budget"],
+                  ["l", "l", "r", "r", "r", "r", "r", "r", "r"], grid)
 
 
 def main(argv: list[str]) -> int:
@@ -344,8 +405,8 @@ def main(argv: list[str]) -> int:
                 label = entry["label"]
                 argv_run = entry["prefix"] + ["compare", str(a), str(b)] + KEY + \
                     entry["flags"] + ["--json", str(summary)]
-                seconds, rss, cpu, code, why = run(argv_run, args.timeout,
-                                                   args.memory_cap, errors)
+                seconds, rss, cpu, code, why, vm_data = run(argv_run, args.timeout,
+                                                            args.memory_cap, errors)
                 if code not in (0, 1):
                     # A port that failed once has failed. A later round that
                     # happens to succeed does not withdraw the failure.
@@ -360,7 +421,7 @@ def main(argv: list[str]) -> int:
                 # pairing the fastest wall time with another run's CPU would
                 # make the utilisation a ratio of two different runs.
                 if label not in best or seconds < best[label][0]:
-                    best[label] = (seconds, rss, cpu)
+                    best[label] = (seconds, rss, cpu, vm_data)
 
         for entry in plan:
             label, state = entry["label"], entry["state"]
@@ -369,15 +430,18 @@ def main(argv: list[str]) -> int:
             if state == "unreadable" or label in failed or label not in best:
                 results.append({"format": fmt, "port": label, "seconds": None})
                 continue
-            seconds, rss, cpu = best[label]
+            seconds, rss, cpu, vm_data = best[label]
             results.append({
                 "format": fmt, "port": label, "seconds": seconds, "rss": rss,
                 "cpu": cpu, "cores": cpu / seconds if seconds > 0 else 0.0,
                 "input": size, "above": rss - size, "rows": rows_seen[label],
+                "data": vm_data,
             })
+            budget = f"{vm_data:8,.0f} MB budget" if vm_data else "   (no budget)"
             print(f"  {label:5s} {seconds:8.2f}s  {cpu:8.1f}s cpu  "
                   f"{cpu / seconds if seconds else 0:5.2f}x cores  "
-                  f"{rss:9,.0f} MB peak  {rss - size:8,.0f} MB above the input",
+                  f"{rss:9,.0f} MB peak  {rss - size:8,.0f} MB above the input  "
+                  f"{budget}",
                   flush=True)
 
         if not args.keep:
