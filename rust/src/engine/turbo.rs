@@ -43,7 +43,6 @@ mod thrift;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of};
@@ -58,6 +57,7 @@ use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section,
 use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::parallel;
+use crate::phases::Phases;
 use crate::rowstore::Joined;
 use crate::sections::assemble;
 
@@ -81,17 +81,6 @@ const PREFETCH_AHEAD: usize = 32;
 /// at ten million keys this is a couple of hundred chunks of a few hundredths
 /// of a second each.
 const JOIN_CHUNK: usize = 1 << 16;
-
-/// How many threads this comparison may use in total. Both files are read at
-/// once and each is split further, so this is the width of the whole run rather
-/// than of one file.
-fn budget(opt: &Options) -> usize {
-    opt.threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-    })
-}
 
 // ---------------------------------------------------------------------------
 // One file, read into the representation the join works on
@@ -321,40 +310,6 @@ fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u6
 // ---------------------------------------------------------------------------
 // The index
 // ---------------------------------------------------------------------------
-
-/// Phase timings, on stderr, when `CSVDIFF_PHASES` is set — the same switch and
-/// the same output shape the C++ columnar path uses.
-///
-/// A comparison has costs that move independently: sweeping and hashing every
-/// row, inserting them into the index, joining, and rendering. Knowing which one
-/// grew is the difference between tuning and guessing, and the cores-busy column
-/// says only *that* something is serial, never which thing.
-struct Phases {
-    on: bool,
-    tag: &'static str,
-    last: Instant,
-}
-
-impl Phases {
-    /// `tag` prefixes every line, because the two files are read on two threads
-    /// and their phases would otherwise interleave unattributed.
-    fn new(tag: &'static str) -> Self {
-        Phases {
-            on: std::env::var_os("CSVDIFF_PHASES").is_some(),
-            tag,
-            last: Instant::now(),
-        }
-    }
-
-    fn mark(&mut self, what: &str) {
-        let now = Instant::now();
-        if self.on {
-            let name = format!("{}{}", self.tag, what);
-            eprintln!("  {:<26} {:7.3}s", name, (now - self.last).as_secs_f64());
-        }
-        self.last = now;
-    }
-}
 
 /// What a caller offers as a byte proof that a candidate row needs no parsing.
 ///
@@ -1683,7 +1638,7 @@ impl Input {
 // ---------------------------------------------------------------------------
 
 pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResult> {
-    let total = budget(opt);
+    let total = opt.thread_budget();
     let a_input = Input::open(a_path, opt)?;
     let b_input = Input::open(b_path, opt)?;
     let resolved = resolve(a_input.header(), b_input.header(), opt)?;
@@ -1837,7 +1792,7 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
                 return Ok((header, Vec::new()));
             }
             let names: Vec<Option<&str>> = header.iter().map(|n| Some(n.as_str())).collect();
-            let (fields, arena) = reader.project(&names, budget(opt), want)?;
+            let (fields, arena) = reader.project(&names, opt.thread_budget(), want)?;
             drop(reader);
             let slab = Slab::owned(arena, Dialect::Raw);
             let mut out = Vec::with_capacity(rows);

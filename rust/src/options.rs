@@ -129,6 +129,27 @@ impl Options {
         }
     }
 
+    /// How many threads a comparison may use in total, `--threads` or the
+    /// machine.
+    ///
+    /// Both files are read at once and each is split further, so this is the
+    /// width of the whole run rather than of one file. It lives here rather
+    /// than in one engine because every path that spreads work has to agree
+    /// with the flag, and they did not: the text engine asked this, and the
+    /// columnar Parquet reader asked the machine, so `--threads 1` on a Parquet
+    /// pair ran on every core -- which is the one thing that flag is for.
+    ///
+    /// The report's gzip lanes are still the machine's, because [`crate::report::render`]
+    /// is handed a result and not the options that produced it. On `--threads 1`
+    /// that is the difference between 1.00x cores and the 1.19x measured.
+    pub fn thread_budget(&self) -> usize {
+        self.threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+    }
+
     /// Checks the options are usable and normalises the defaults.
     pub fn validate(&mut self) -> Result<()> {
         if self.key.is_empty() {

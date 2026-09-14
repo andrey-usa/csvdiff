@@ -30,6 +30,7 @@ pub mod gendata;
 pub mod options;
 pub mod parallel;
 pub mod parquet;
+pub mod phases;
 pub mod profiles;
 pub mod report;
 pub mod rowstore;

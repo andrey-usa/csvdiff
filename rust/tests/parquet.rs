@@ -224,6 +224,37 @@ fn a_dictionary_key_column() {
     same_report("20k", SNAPPY, ".parquet", &["currency", "status"], |_| {});
 }
 
+/// The key columns are read from a queue, `2 * key_size` jobs over as many
+/// lanes as `--threads` allows, so which lane decodes which column is not fixed
+/// and a job put away in the wrong slot would swap A's key column for B's. Three
+/// key columns is six jobs, more than the lanes any runner here has, so the
+/// lanes go round the queue more than once.
+#[test]
+fn a_key_wider_than_the_lanes() {
+    same_report(
+        "20k",
+        SNAPPY,
+        ".parquet",
+        &["account_id", "txn_id", "currency"],
+        |_| {},
+    );
+}
+
+/// One lane, which is the other end of that queue: every job on the calling
+/// thread, in order, with nothing spawned.
+#[test]
+fn one_thread_reads_every_key_column() {
+    same_report(
+        "20k",
+        SNAPPY,
+        ".parquet",
+        &["account_id", "txn_id", "currency"],
+        |o| {
+            o.threads = Some(1);
+        },
+    );
+}
+
 #[test]
 fn with_trim() {
     same_report("20k", SNAPPY, ".parquet", &["account_id", "txn_id"], |o| {
