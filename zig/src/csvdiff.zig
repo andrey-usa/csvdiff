@@ -835,12 +835,22 @@ const RowIndex = struct {
         };
         errdefer self.deinit();
 
-        try self.row_at.ensureTotalCapacity(gpa, total);
-        try self.row_hash.ensureTotalCapacity(gpa, total);
-        // One entry per distinct key, and every key is distinct until proven
-        // otherwise.
-        try self.first_row.ensureTotalCapacity(gpa, total);
-        try self.occurrences.ensureTotalCapacity(gpa, total);
+        // The four lists are *not* reserved to `total`, and used to be. Sizing
+        // the table once is measured and stays; sizing these was assumed from
+        // it, by an analogy that does not hold.
+        //
+        // A rehash is a full random-access pass over a table too big to cache,
+        // which is why the one above is worth avoiding. Growing an `ArrayList`
+        // is a linear copy, which is not the same thing at all -- and the
+        // copies happen *while the chunks below are being freed*, so the list
+        // grows into pages the loop has just given back instead of reserving
+        // fresh ones beside them. Removing all four reservations measured 12%
+        // less CPU and 22% less wall on a 6M pair, and 20% off peak `VmData`,
+        // which is the number that decides how many rows this port can do at
+        // all. Keeping the two row lists reserved and dropping only the other
+        // two is worse than dropping all four by a further 17% of CPU.
+        //
+        // `total` is still what sizes the table, a few lines up.
 
         var s = Scratch{};
         // Each chunk is released as soon as it has been inserted. Holding all of

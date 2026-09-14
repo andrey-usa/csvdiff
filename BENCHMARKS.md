@@ -73,6 +73,72 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (zig) — the index reserved four lists it should have let grow
+
+The previous entry found Zig reserving 61% more `VmData` than it touches, in a
+236 MB transient at the sweep-to-insert boundary, and named that as why it is the
+first port to refuse 100M rows of CSV. This is the change, and it is not the one
+that entry predicted.
+
+### Two candidates, and the first was wrong
+
+The sweep's chunks grow by `append` in the text branch, with no reservation,
+because the row count is not known in advance -- where the columnar branch beside
+it asks for `hi - lo` once. Doublings hold the old buffer while they fill the new
+one, which is exactly the shape `RLIMIT_DATA` punishes, so this looked like the
+answer.
+
+Reserving them from the first row's length (chunk bytes over that length, plus an
+eighth) made it **worse**: 955 MB against 955 MB baseline, three interleaved
+rounds each, 997 every time. The slack is reserved and the doublings were never
+the peak -- the trace already said so, climbing smoothly through the sweep and
+stepping only at the insert. Reverted, and recorded here so nobody spends the
+afternoon on it again.
+
+It also ruled out the allocator: `--threads 1` peaks at 888 MB against four
+threads' 955, so per-thread arenas are not what this is.
+
+### What it is: four lists reserved beside the chunks they copy from
+
+`RowIndex.init` reserved `row_at` (u64), `row_hash` (u64), `first_row` (i32) and
+`occurrences` (u32) to `total` before the loop that inserts the chunks and frees
+them one at a time. Peak `VmData` on a 6M CSV pair, interleaved, three rounds:
+
+| reserved | peak VmData |
+|----------|------------:|
+| all four (baseline) | 955, 955, 955 MB |
+| row_at + row_hash only | 885, 869, 885 MB |
+| first_row + occurrences only | 790, 815, 804 MB |
+| **none** | **752, 735, 761 MB** |
+
+Monotonic, and additive within noise: the two row lists cost about 150 MB and the
+two key lists about 75, which is the 16 and 8 bytes a row they hold.
+
+**The sizing above them is measured and stays.** The table is sized once because a
+rehash is a full random-access pass over something too big to cache, twelve of
+them at ten million rows. These four reservations were added from that argument by
+analogy, and the analogy does not hold: growing an `ArrayList` is a linear copy,
+not a random-access pass -- and the copies happen *while the chunks are being
+freed*, so the lists grow into pages the loop has just given back instead of
+reserving fresh ones beside them.
+
+### Which is faster as well as narrower
+
+`scripts/bench_ab.sh`, 6M CSV pair, paired and interleaved:
+
+| against | rounds | wall [mid half] | CPU [mid half] |
+|---------|-------:|----------------:|---------------:|
+| all four reserved | 9 | **1.22x** 1.18-1.24 | **1.12x** 1.06-1.16 |
+| row lists still reserved | 7 | 1.18x 1.15-1.30 | 1.20x 1.11-1.23 |
+
+12% less CPU than the baseline, and a further 17% less than the half-measure, so
+dropping all four is both the simplest version and the best one. 40 of the Zig
+port's own tests pass and the counts match C, C++ and Rust on the same 6M pair.
+
+A reservation that costs time as well as address space is an unusual result and
+worth stating plainly: the memory it hands back is memory the insert loop was
+about to reuse, and taking it fresh instead is what the extra 12% was buying.
+
 ## 2026-09-14 (memory) — the cap measures a quantity the table did not report
 
 The previous entry left Zig failing the 100M CSV rung while C, C++ and Rust
