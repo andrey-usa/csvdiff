@@ -73,6 +73,203 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (parallelism) — the Rust Parquet key read was two jobs whatever the key
+
+Written down here because the change landed in #69 without an entry, and the
+numbers belong in this file rather than only in a commit message.
+
+The columnar Parquet reader read every key column of A on one thread and every
+key column of B on the caller's. Two jobs however wide the key is, for a phase
+that decodes pages for every row in the file, in a tool whose subject is a
+*composite* key. Zig's reader has fanned this out to `2 * key_size` since its
+columnar path was threaded.
+
+Finding it needed instrumentation the path did not have: `Phases` lived inside
+`engine/turbo.rs`, so the one path in any of the four ports that could not be
+asked where its time went was this one. It is `rust/src/phases.rs` now and the
+Parquet reader marks the same six phases C++ and Zig mark. 8M rows,
+`account_id,txn_id`, local 4 vCPU container, warm:
+
+```
+  key columns (2 ways)         0.637s
+  intern dicts (serial)        0.000s
+  index build (2 ways)         0.468s
+  match sweep (par)            0.514s
+  compared columns (par)       2.563s
+  assemble                     0.155s
+```
+
+`intern dicts` is zero because neither key column is dictionary-coded at this
+width — the generator gives up on a dictionary past its per-row-group limit — so
+the shared-id path is skipped outright.
+
+### The phase, five interleaved rounds of each build
+
+| build | key columns phase |
+|-------|-------------------|
+| two jobs | 0.726s 0.623s 0.636s 0.662s 0.733s |
+| queue    | 0.378s 0.348s 0.354s 0.360s 0.345s |
+
+Non-overlapping bands, about **1.9x**, which is what 2 jobs going to 4 on four
+cores should be. A three-column key — six jobs over four lanes, so the lanes go
+round the queue more than once — gives 0.678-0.818s against 0.347-0.371s, about
+2.0x.
+
+### The whole run, 11 paired rounds through `scripts/bench_ab.sh`
+
+| | best | median | paired ratio [mid half] |
+|---|-----:|-------:|------------------------:|
+| wall, two jobs | 3.873s | 3.926s | |
+| wall, queue    | 3.570s | 3.622s | **1.08x** [1.06-1.09] |
+| CPU, two jobs  | 10.77s | 10.94s | |
+| CPU, queue     | 10.57s | 10.79s | 1.01x [0.99-1.02] |
+
+Cores-busy 2.79x to 2.97x over five interleaved runs each; peak RSS unchanged at
+about 3.2 GB, since both sides' key columns were already in flight together.
+
+**`bench_ab.sh` calls this "no result", and it is right to.** It judges on CPU,
+deliberately, because wall mixes work with how well a design spreads it. CPU is
+exactly what this change does not move: the same work, on more cores. The wall
+column, whose middle half is 1.06-1.09 and does not straddle 1.00, is the one to
+read, and the phase table above is the direct measurement. A harness built to
+answer "did this do less work" cannot answer "did this spread it better", and
+saying so is cheaper than rebuilding it.
+
+### `--threads` did nothing at all on this path
+
+The columnar reader asked `available_parallelism()` directly. Same 8M pair:
+
+| | before | after |
+|---|-------:|------:|
+| `--threads 1` | 2.74x cores | **1.19x** |
+| `--threads 2` | 2.81x cores | **2.02x** |
+
+The budget is `Options::thread_budget()` now, read by both engines. The residual
+0.19x at one thread is the report's gzip lanes, which still ask the machine
+because `render` is handed a result and not the options that produced it.
+
+Worth carrying to any table that used the flag: `bench-contention.yml` passes
+`--threads`, so its Rust Parquet rows were never actually constrained.
+
+### And the hypothesis it killed
+
+`parallel::spawn` degrades to running the work inline when the OS refuses a
+thread, and under `RLIMIT_DATA` a refused thread is exactly what a tight cap
+produces — a stack is a private anonymous mapping. That is a clean explanation
+for the 50M rung's 1.04x, and it is wrong. The same 8M pair with the cap walked
+down to the refusal point:
+
+| cap | wall | cores | outcome |
+|-----|-----:|------:|---------|
+| none     | 6.41s | 2.77x | ok |
+| 4,096 MB | 4.89s | 2.47x | ok |
+| 3,000 MB | 5.66s | 2.41x | ok |
+| 2,800 MB | 4.87s | 2.59x | ok |
+| 2,700 MB | 4.41s | 2.74x | ok |
+| 2,600 MB | 3.63s | 2.75x | refused: `one handle per row needs 61 MB` |
+| 2,500 MB | 4.14s | 2.55x | refused: `the uncompressed column needs 99 MB` |
+
+Cores hold to the edge and then it refuses cleanly. The cap does not serialise
+this reader.
+
+## 2026-09-14 (scale) — the CSV ceiling is not one number, it is four
+
+Two rungs, one job each, `100m` and `150m` of CSV, `--repeats 1`, `--matrix`,
+`--first Rust`, on separate 16 GB runners with each port capped at **13,941 MB**
+through `RLIMIT_DATA`.
+
+README item 3 said "CSV finishes at 150M and dies at 200M". That is a claim about
+the fleet, and the fleet does not behave that way. **Each port has its own
+ceiling, and they are two rungs apart.**
+
+### 100M — three of four, and the one that fails is the one that wins at Parquet
+
+Input 35,088 MB, generated in 131.9s.
+
+| Build       | Compare |  Rows/s |    CPU | Cores |  Peak RSS |
+|-------------|--------:|--------:|-------:|------:|----------:|
+| C           | 214.75s | 465,703 | 110.6s | 0.51x | 13,439 MB |
+| C++         | 246.09s | 406,401 | 219.2s | 0.89x | 13,415 MB |
+| Rust        | 239.54s | 417,514 | 106.9s | 0.45x | 13,507 MB |
+| Zig         |       — |       — |      — |     — | refused: `out of memory` |
+| Rust engine | 216.34s | 462,279 | 106.2s | 0.49x | 13,450 MB |
+| C++ swar    | 200.88s | 497,867 | 222.6s | 1.11x | 15,025 MB |
+| C++ avx2    | 205.64s | 486,331 | 209.5s | 1.02x | 15,016 MB |
+| Rust avx2   | 240.31s | 416,167 | 121.2s | 0.50x | 13,458 MB |
+| Zig v32     |       — |       — |      — |     — | refused: `out of memory` |
+
+`counts: identical everywhere` across the seven that finished.
+
+**Zig is the first to run out, and that is the interesting part.** At 50M of
+Parquet Zig is the fastest of the four and the most parallel, at 3.05x cores. On
+CSV it is the only one of the four that cannot do 100M at all. Whatever its text
+path holds per row, it holds more of it than the other three.
+
+### 150M — C, alone
+
+Input 52,632 MB, generated in 197.7s.
+
+| Build | Compare |  Rows/s |    CPU | Cores |  Peak RSS |
+|-------|--------:|--------:|-------:|------:|----------:|
+| C     | 335.07s | 447,715 | 165.9s | 0.50x | 13,357 MB |
+
+Everything else refused, each naming what it could not fit:
+
+| Build | Refusal |
+|-------|---------|
+| Rust | `out of memory: one hash per row needs 1144 MB` |
+| Rust engine | `out of memory: the key index needs 2048 MB` |
+| Rust avx2 | `out of memory: one offset per row needs 1144 MB` |
+| C++, C++ swar, C++ avx2 | `std::bad_alloc` |
+| Zig, Zig v32 | `out of memory` |
+
+1144 MB is 150,015,000 × 8 bytes, so those two Rust messages are the same
+structure size under two names — which of the per-row arrays reaches the cap
+first is not a property worth reading into. `the key index needs 2048 MB` is the
+power-of-two table sizing, one rung above.
+
+So, measured rather than asserted:
+
+| rows | C | C++ | Rust | Zig |
+|-----:|:-:|:---:|:----:|:---:|
+| 100M | yes | yes | yes | **no** |
+| 150M | yes | no | no | no |
+
+The old line was true of the C port and of nothing else. Where 200M comes into it
+is untested here and stays untested: C is the only port with a rung left to find,
+and one port's ceiling is not the tool's.
+
+### Everything is waiting, and that is what the cores column is for
+
+0.45x to 1.11x, against roughly 3x for the same ports on a 2M pair. A 35 GB input
+cannot stay in a 16 GB page cache, so every port spends most of its wall clock on
+reads. Nothing here is a comparison of engines; it is a comparison of how well
+each one tolerates a file it cannot hold.
+
+Worth setting beside the 50M Parquet table, which was read as the same effect.
+There, **one** port collapsed to 1.04x while another held 3.05x on the same input.
+Here, where the input genuinely cannot be cached, they collapse *together* —
+0.45x, 0.50x, 0.51x, 0.89x. That is what page-cache pressure looks like when it is
+the explanation, and it is not the shape the 50M Parquet table has. It does not
+say what that table is; it does say the two are not obviously the same thing.
+
+### The "Above the input" column stops meaning anything here
+
+It is peak RSS minus the input's size, and it read **-21,649 MB** at 100M and
+**-39,276 MB** at 150M. A negative memory overhead is not a finding, it is the
+column being asked a question it was not built for: it measures what a port holds
+*beyond* an input it can keep resident, and past 16 GB of input there is no such
+quantity.
+
+The same size explains a figure that otherwise looks like a cap violation: C++
+swar peaks at 15,025 MB against a 13,941 MB cap. `RLIMIT_DATA` bounds the heap and
+private anonymous mappings, not the file-backed one, and peak RSS counts resident
+pages of the mapping. So at these sizes the RSS column is mostly reporting how much
+of the *input* happened to be resident at the peak, not how much the port
+allocated. Both columns want suppressing, or relabelling, once the input passes
+the host's memory. Not done here — this entry is the measurement, and changing
+what the harness prints is its own change.
+
 ## 2026-09-14 (ndjson) — two explanations for the C++ sweep, both wrong
 
 The phase timings put C++'s JSON sweep at about 1.9x Rust's and made it the
