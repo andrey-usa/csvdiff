@@ -713,15 +713,25 @@ tests/fixtures/          every shape that has broken an engine here
    | 150M | yes | no  | no   | no  |
 
    **Zig is the first to run out on CSV**, and it is the port that wins Parquet at
-   50M — fastest of the four and the most parallel, at 3.05x cores. Whatever its
-   text path holds per row, it holds more of it than the other three do, and that
-   is the next thing to look at on this item. At 150M only C is left, at 335.07s
-   and 13,357 MB.
+   50M — fastest of the four and the most parallel, at 3.05x cores. At 150M only C
+   is left, at 335.07s and 13,357 MB. Each refusal names what did not fit: Rust's
+   `one hash per row needs 1144 MB` is 150,015,000 × 8 bytes. Where C's own ceiling
+   sits is untested and stays that way here — one port's ceiling is not the tool's,
+   which is the mistake this item is correcting.
 
-   Each refusal names what did not fit: Rust's `one hash per row needs 1144 MB` is
-   150,015,000 × 8 bytes. Where C's own ceiling sits is untested and stays that
-   way here — one port's ceiling is not the tool's, which is the mistake this item
-   is correcting.
+   **Why Zig goes first is settled, and it is not that it holds more.** It holds
+   less than Rust. `--memory-cap` sets `RLIMIT_DATA`, which bounds `VmData` — the
+   *virtual* size of the private writable mappings — while the table reported peak
+   RSS, which counts the mapped input and misses a reservation never touched. On a
+   6M CSV pair the four want 448, 747, 748 and 955 MB of `VmData` while holding
+   405, 511, 697 and 592 MB above the input, and each one's refusal threshold
+   tracks the first number. Zig reserves 61% more than it touches, against Rust's
+   7%, in a 236 MB transient at the sweep-to-index boundary that is then given
+   back. Scaling those four figures to the rungs puts every port on the right side
+   of the cap in all eight cells. The harness prints a `Budget` column now, because
+   without it the table could not explain its own refusals. Narrowing that
+   transient — the index reserves its per-row arrays beside the sweep chunks that
+   already hold two of them — is the next thing to do on this item.
 
    **Parquet finishes at 50M for all four ports and at 100M for none of them**,
    and 150M is none of them too. Rust's 100M refusal says `one dictionary index
