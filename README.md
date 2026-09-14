@@ -635,17 +635,19 @@ tests/fixtures/          every shape that has broken an engine here
    and to cover the keys as well (`width`, not `nc`) to be allowed to.
 
    What is left on ndjson is not the proof, and it is now located rather than
-   guessed at. **C++'s JSON sweep costs 2.3x Rust's** — 1.95s and 2.03s a side
-   against 0.82s and 0.89s at 4M rows — which is the largest phase in both ports
-   and most of the gap. The join is second at 1.8x. Its `assemble` is 5.2x but too
-   small to feel. C++ has phase timings on the text path now, under the same
-   `CSVDIFF_PHASES` switch the other three use, which is what made that readable;
-   before this it was the only port that could not be profiled on the format where
-   it was slowest.
+   guessed at. **C++'s JSON sweep costs about 1.9x Rust's** — eight runs of each
+   at 4M rows, C++ 2.20-2.29s a side against Rust's 1.12-1.19s — which is the
+   largest phase in both ports and most of the gap. The join is second. C++ has
+   phase timings on the text path now, under the same `CSVDIFF_PHASES` switch the
+   other three use, which is what made that readable; before it, the only port
+   that could not be profiled was the one slowest on this format.
 
-   One row of that table runs the other way and is a Rust question, not a C++ one:
-   Rust's serial index insert takes **0.668s on the B side against 0.267s on A**,
-   where C++ spends 0.27s on both.
+   Take the *sweep* ratio and not the other rows of that table. A first reading
+   of it also reported Rust's serial index insert at 0.668s on the B side against
+   0.267s on A, and that was noise: repeated, the two sides come out 0.778/0.812,
+   then 0.161/0.158, then 0.601/0.319 with A the slower one. The insert is small
+   and scheduling-bound, and which side loses flips. The sweep gap is the one that
+   reproduces.
 
 2. **At fifty million rows the Rust Parquet reader waits instead of working, and
    it is the only port that does.** The 50M rung, all four finishing and agreeing

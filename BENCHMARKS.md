@@ -93,15 +93,32 @@ warm, the two are directly comparable:
 | join and compare | 0.943s | 1.743s | 1.8x |
 | assemble | 0.070s | 0.365s | 5.2x |
 
-**The sweep is the answer.** Parsing and hashing every row of JSON costs C++ about
-2.3x what it costs Rust, it is the largest phase in both ports, and it is where
-most of the gap lives. The join is 1.8x and second. `assemble` is 5.2x but small
-enough that closing it entirely would not be felt.
+**The sweep is the answer.** Parsing and hashing every row of JSON is the largest
+phase in both ports and where most of the gap lives.
 
-Worth noting the one row where C++ wins outright: its serial index insert is
-**2.5x faster** than Rust's on the B side, 0.272s against 0.668s. Rust's own B
-insert is also 2.5x its A insert, which is a Rust question this table happens to
-expose and not a C++ one.
+**One sitting is not enough to price it, though, and the first version of this
+entry proved that twice over.** Repeated -- four runs per port, both sides, same
+pair, same host:
+
+| Port | Eight sweep readings | Median |
+|------|---------------------|-------:|
+| Rust | 1.119-1.193s | 1.156s |
+| C++ | 2.199-2.285s | 2.238s |
+
+So the sweep gap is about **1.9x**, not the 2.3x the single sitting above showed.
+Both ports read slower in this sitting than in that one; the ratio is what
+survives, and it is the ratio that is tight -- sixteen readings, no overlap
+between the two bands.
+
+The index insert row is worse: it was published here as "Rust's B insert is 2.5x
+its A insert, which is a Rust question". It is not. Repeated, the same pair gives
+0.778/0.812, then 0.161/0.158, then 0.601/0.319 with **A** the slower side. The
+insert is a few tenths of a second, it runs while the other side's parallel sweep
+is still going, and which side loses depends on how that lands. The claim is
+withdrawn.
+
+What that leaves: the sweep gap reproduces and is worth working on. Nothing else
+in the table above has been shown to.
 
 ### A second thing the instrumentation bought immediately
 
