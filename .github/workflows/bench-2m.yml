@@ -51,12 +51,31 @@ on:
         type: boolean
         default: true
 
-# One benchmark *workflow* at a time in this repository, and this one spreads
-# its formats across jobs inside that. A second benchmark workflow still queues
-# rather than racing, and `cancel-in-progress: false` because the run already
-# going is a measurement somebody is waiting for.
+# This one is deliberately *not* in the `benchmark-host` group the two
+# dispatch-only benchmarks share. It used to be, and a pull request's 2M run
+# then queued behind whatever ladder somebody had dispatched -- twenty minutes
+# of waiting before the measurement a reviewer is actually looking at even
+# starts.
+#
+# The lock rested on two timing jobs sharing a host and measuring each other's
+# contention. `bench-contention.yml` was written to check that and, when it was
+# finally dispatched, found six identical 10M jobs started together
+# indistinguishable from one alone -- median 0.98x, not one build slower than
+# 1.00x. BENCHMARKS.md has both that table and the 2M one that said otherwise
+# and was wrong. Separate hosted runners are separate machines.
+#
+# So a pull request's benchmark no longer waits on anything. It keeps a group of
+# its own, per ref, so that two runs of *this* workflow on one branch still
+# queue rather than race -- and `cancel-in-progress: false` because the run
+# already going is a measurement somebody is waiting for.
+#
+# What this gives up: a dispatched `bench-contention.yml` can now overlap a pull
+# request's 2M run. That workflow is the one measurement here whose validity
+# needs a quiet repository, and it is dispatched by hand -- so the remedy is to
+# dispatch it when nothing is in flight, not to make every pull request wait for
+# a case that arises a few times a year.
 concurrency:
-  group: benchmark-host
+  group: benchmark-pr-${{ github.ref }}
   cancel-in-progress: false
 
 env:

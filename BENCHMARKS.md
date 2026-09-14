@@ -336,9 +336,9 @@ fail when the tail scan is stubbed out.
 because two documents in this repository contradicted each other — CLAUDE.md's
 benchmark rule said two timing jobs "share a host and measure each other's
 contention", `scale-ceiling.yml`'s header said "these are separate hosted runners
-so they do not contend" — and the `benchmark-host` group, which makes a pull
-request's benchmark queue behind anybody's dispatched ladder, rests on the first
-being true.
+so they do not contend" — and the `benchmark-host` group, which at the time made
+a pull request's benchmark queue behind anybody's dispatched ladder, rested on the
+first being true.
 
 It is A/A: the same benchmark alone, then the identical benchmark as one of N jobs
 started together.
@@ -381,16 +381,26 @@ hedged correctly in its own last line while its headline did not. The remedy was
 the one it recommends itself for an unclear result: raise the row count until the
 runs last seconds, raise the crowd, and look again.
 
-### What this does not change, yet
+### What this changed, a day later
 
-Nothing in `.github/workflows/` — every benchmark still names `benchmark-host`, so
-a pull request's 2M run still queues behind a dispatched ladder. The measurement
-says that lock is not buying what it was put there for; acting on it is a separate
-decision from taking the number, and it has not been taken. What *would* argue for
-keeping a lock on the dispatch-only benchmarks even after this: a deliberate
-measurement wants a quiet repository, and `bench-contention.yml` in particular
-needs to stay isolated for its own result to mean anything — an experiment has to
-be valid whether or not it finds an effect.
+Nothing at the time: every benchmark still named `benchmark-host`, so a pull
+request's 2M run still queued behind a dispatched ladder. Acting on a number is a
+separate decision from taking it, and that decision has now been taken — by
+watching a pull request's benchmark sit `pending` for twenty minutes behind a
+150M ladder rung while the thing it measured waited to be reviewed.
+
+`bench-2m.yml` has a group of its own now, `benchmark-pr-<ref>`, so a pull
+request's benchmark waits for nothing but another run on its own branch. The two
+**dispatch-only** benchmarks keep `benchmark-host` and so keep serialising against
+each other, which is the part of the lock this table did not argue against: a
+deliberate measurement wants a quiet repository, and `bench-contention.yml` in
+particular needs to stay isolated for its own result to mean anything — an
+experiment has to be valid whether or not it finds an effect.
+
+What that gives up is one case: a dispatched contention run can now overlap a pull
+request's 2M run. It is dispatched by hand a few times a year, and the remedy is
+to dispatch it when nothing is in flight rather than to make every pull request
+pay for the case. Both workflow headers say so.
 
 ## 2026-09-14 (parallelism) — the Rust Parquet reader gets *better* with size, so 50M is something else
 
