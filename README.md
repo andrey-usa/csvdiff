@@ -687,19 +687,55 @@ tests/fixtures/          every shape that has broken an engine here
    is the smallest of the four.
 
    C at 1.42x is worth the same look: second fastest on a third of Zig's CPU.
-3. **Where the ceiling sits, now measured rather than predicted.** On a 16 GB
-   runner: **CSV finishes at 150M and dies at 200M**, and **Parquet finishes at
-   50M for all four ports and at 100M for none of them**. The 100M rung generated
-   15,347 MB cleanly and came back with four refusals, each naming what it could
-   not fit — Rust's says `one dictionary index per row needs 381 MB`, which is
-   exactly 100,005,000 × 4 bytes. So the Parquet ceiling is somewhere between 50M
-   and 100M, and closing on it is a matter of dispatching rungs between, not of
-   arithmetic. That is also where `sortmerge` stops being the conservative choice
-   and becomes the only one.
 
-   Note what the CSV numbers say about the old version of this line: the input has
-   not needed to fit in RAM for a long time, because the ports map it and stream —
-   200M rows of CSV is 70 GB of input and the run got as far as the comparison.
+   Two things have happened to this item since. **One candidate is eliminated:**
+   `parallel::spawn` runs the work inline when the OS refuses a thread, and under
+   `RLIMIT_DATA` a tight cap is exactly when it would — so a capped run could be
+   silently serial. It is not. Walking the cap down on an 8M pair to the point of
+   refusal held 2.4–2.8x cores the whole way and then refused cleanly. **And one
+   real defect was found on the way:** the key-column read was two jobs however
+   wide the key, which cost about 1.9x on that phase and 1.08x on the whole run —
+   a queue now, and the reader carries phase timings for the first time. Neither
+   touches the 50M number, which is still one observation at `--repeats 1` and
+   wants re-measuring with repeats before anything is built for it.
+
+   One more thing not to carry over from the 100M CSV rungs: those show every port
+   collapsing *together* when the input truly cannot be cached — 0.45x, 0.50x,
+   0.51x, 0.89x. That is page-cache pressure when it is the explanation, and it is
+   not the shape of the table above, where one port collapsed and another did not.
+3. **The ceiling is not one number, it is four.** This line used to say "CSV
+   finishes at 150M and dies at 200M", as a fact about the tool. It is a fact
+   about the C port. On a 16 GB runner with each port capped at 13,941 MB:
+
+   | rows |  C  | C++ | Rust | Zig |
+   |-----:|:---:|:---:|:----:|:---:|
+   | 100M | yes | yes | yes  | **no** |
+   | 150M | yes | no  | no   | no  |
+
+   **Zig is the first to run out on CSV**, and it is the port that wins Parquet at
+   50M — fastest of the four and the most parallel, at 3.05x cores. Whatever its
+   text path holds per row, it holds more of it than the other three do, and that
+   is the next thing to look at on this item. At 150M only C is left, at 335.07s
+   and 13,357 MB.
+
+   Each refusal names what did not fit: Rust's `one hash per row needs 1144 MB` is
+   150,015,000 × 8 bytes. Where C's own ceiling sits is untested and stays that
+   way here — one port's ceiling is not the tool's, which is the mistake this item
+   is correcting.
+
+   **Parquet finishes at 50M for all four ports and at 100M for none of them**,
+   and 150M is none of them too. Rust's 100M refusal says `one dictionary index
+   per row needs 381 MB`, exactly 100,005,000 × 4 bytes. So the Parquet ceiling is
+   between 50M and 100M and the rungs between are still undispatched. That is also
+   where `sortmerge` stops being the conservative choice and becomes the only one.
+
+   Two things these rungs expose about the harness rather than the ports. Cores
+   collapse to 0.45–1.11x, because a 35 GB input cannot stay in a 16 GB page cache
+   and every port spends most of its wall clock reading — so nothing in those
+   tables compares engines. And "Above the input" goes **negative** (-21,649 MB at
+   100M), because it is peak RSS minus the input size and there is no such
+   quantity once the input passes the host's memory. Both columns want suppressing
+   past that point; BENCHMARKS.md has the detail.
 4. **What compression saves in bytes read is still unmeasured**, though what it
    *costs* now is. The container these numbers come from cannot answer the other
    half: `drop_caches` leaves the hypervisor's copy warm, and the one genuine
