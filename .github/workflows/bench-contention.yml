@@ -22,6 +22,12 @@ name: Do parallel benchmark jobs contend?
 # CLAUDE.md warns about, and one runner in the crowd landing on a slow machine
 # is not the same finding as all of them landing slow. The spread across the
 # crowd is printed for that reason.
+#
+# It has been run, and the answer was 0.98x on a crowd of six at 10M -- the
+# paragraphs above are kept as the question they were. What it settled has since
+# been acted on: `bench-2m.yml` left `benchmark-host`, so a pull request's
+# benchmark no longer waits on a dispatched ladder. What still holds the group is
+# this workflow and `bench-ladder.yml`, the two that are dispatched by hand.
 
 on:
   workflow_dispatch:
@@ -41,7 +47,14 @@ on:
 
 # It has to hold the benchmark lock: a run of this measuring contention while
 # another benchmark contends with it would be measuring the thing it is trying
-# to isolate.
+# to isolate. `bench-ladder.yml` is the other holder, so the two dispatch-only
+# benchmarks still serialise against each other.
+#
+# `bench-2m.yml` left the group -- see the note there, and the 0.98x crowd-of-six
+# table in BENCHMARKS.md that let it. That means a pull request's 2M run can now
+# start while this one is measuring. Dispatch this when the repository is quiet:
+# an experiment has to be valid whether or not it finds an effect, and this is
+# the one workflow here that cannot check its own precondition.
 concurrency:
   group: benchmark-host
   cancel-in-progress: false
@@ -197,8 +210,9 @@ jobs:
               print("The crowd is within 3% of the lone run, which is inside what "
                     "`bench_ab.sh --self-test` reports for a build against itself "
                     "on this class of runner. On this evidence separate hosted "
-                    "runners do not contend, and the repository-wide group is "
-                    "costing pull requests latency for nothing.")
+                    "runners do not contend. That is what took `bench-2m.yml` "
+                    "out of `benchmark-host`; what is left in the group is the "
+                    "two benchmarks dispatched by hand, including this one.")
           else:
               print("Between 3% and 10%: not clean either way. Raise the crowd "
                     "size or the row count and run it again before concluding.")
