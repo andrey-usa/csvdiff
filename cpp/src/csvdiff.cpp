@@ -822,6 +822,38 @@ class RowParser {
         return skip_json_nested(d, pos, end);
     }
 
+    /// Does the mate's tail name a column this run tracks?
+    ///
+    /// The CSV proof rests on a column sitting at a fixed offset. JSON makes no
+    /// such promise: a value is found by name, and a name repeated in one object
+    /// takes its *last* value for a compared column -- which the C, Rust and Zig
+    /// ports do too, and `test.sh` cross-checks -- so a second `"amount"` past
+    /// the diverging byte would carry a value the prefix never saw.
+    ///
+    /// It cannot be ruled out in general, but it can be ruled out *here*, because
+    /// the proof only reaches this point when the two rows agree all the way
+    /// through the last compared value. What is left is the trailing ignored
+    /// columns, a few bytes. A name is a quoted string, so every quote in them is
+    /// a candidate. Mistaking a closing quote for an opening one costs a lookup
+    /// that fails, which is a fallback and not a wrong answer -- and an escaped
+    /// name counts as a hit for the same reason, since the wanted names are held
+    /// unescaped.
+    bool json_tail_is_clean(std::string_view d, std::size_t at, std::size_t end) const {
+        while (at < end) {
+            const std::size_t q = next_of1(d, at, end, '"');
+            if (q >= end) return true;
+            bool escaped = false;
+            const std::size_t close = skip_json_string(d, q, end, &escaped);
+            if (escaped) return false;
+            const std::size_t from = q + 1;
+            const std::size_t to = close > q + 1 ? close - 1 : q + 1;
+            if (to > from && slot_for(d.substr(from, to - from)) >= 0) return false;
+            if (close <= q) return false;
+            at = close;
+        }
+        return true;
+    }
+
   private:
     static std::size_t skip_json_nested(std::string_view d, std::size_t pos, std::size_t end) {
         int depth = 0;
@@ -974,6 +1006,9 @@ class RowIndex {
         return next < row_start_.size() ? row_start_[next] : slab_.bytes().size();
     }
     std::size_t row_begin(int row) const { return row_start_[static_cast<std::size_t>(row)]; }
+
+    /// The parser that read this side, so a caller can ask what it tracks.
+    const RowParser& parser() const { return parser_; }
 
     /// This row's key fields, for a caller that compares nothing else.
     void keys_of(int row, Field* out) const {
@@ -1474,6 +1509,11 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // this one has not caught up yet.
     const std::vector<int>& a_src = ap.source();
     const std::vector<int>& b_src = bp.source();
+    // What JSON gets instead of `aligned`: no fixed offset to promise, so the run
+    // is built per row and the mate's tail is scanned. See
+    // `RowParser::json_tail_is_clean`.
+    const bool json_proof =
+        a.dialect() == Dialect::Json && b.dialect() == Dialect::Json && nc > 0;
     bool aligned = a.dialect() != Dialect::Json && b.dialect() != Dialect::Json &&
                    a_delim == b_delim && nc > 0 && a_src.size() == width &&
                    b_src.size() == width;
@@ -1568,6 +1608,39 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
                 continue;
             }
             ++out.matched;
+            // The JSON form. It sits here rather than inside `lookup` because
+            // this port's `lookup` compares only the keys -- `keys_of`, not
+            // `fields_of` -- so the mate's row is still unparsed at this point
+            // and the proof saves the whole of it. The Rust and Zig ports had to
+            // put theirs *inside* the lookup for that reason: theirs materialise
+            // the mate's whole row to compare its keys, and a proof after that
+            // saves only the column comparison. Same proof, different place,
+            // because the surrounding code differs.
+            if (json_proof && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+                const char* d = a.bytes().data();
+                const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+                const std::size_t b_lo = bi.row_begin(mate);
+                const std::size_t b_n = bi.row_end(mate) - b_lo;
+                // Through the byte that closes the last compared value --
+                // whichever it turns out to be, since two objects need not list
+                // their names in the same order. The keys are not in the run and
+                // do not need to be: `lookup` has already compared them.
+                std::size_t t = a_lo;
+                for (std::size_t i = 0; i < nc; ++i) {
+                    const Field x = fa[key_size + i];
+                    if (!is_real(x)) continue;
+                    const std::size_t e = offset_of(x) + len_of(x);
+                    if (e > t) t = e;
+                }
+                const std::size_t need = t + 1 - a_lo;
+                if (t < a_end && need <= b_n &&
+                    common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need &&
+                    bi.parser().json_tail_is_clean(b.bytes(), b_lo + need, b_lo + b_n)) {
+                    refused = 0;
+                    continue;
+                }
+                if (refused < kProofBackoff) ++refused;
+            }
             // A proof that keeps failing is a scan for nothing -- two files
             // where every row really has changed pay for it on every row -- so
             // after kProofBackoff failures in a row it is only attempted every

@@ -61,6 +61,34 @@ case "$out" in
   *"matched 3 (changed 1)"*) echo "  ok    a CSV file compared against a JSON file" ;;
   *) echo "  FAIL  mixed csv/json: $out"; fail=1 ;;
 esac
+# The ndjson byte proof, and the ways a prefix cannot be taken on trust.
+#
+# A value is found by name, the two files need not list the names in the same
+# order, and a name repeated in one object takes its *last* value -- so a second
+# `v` past the diverging byte carries a value the proven prefix never saw. Each
+# case is one row, cross-checked against the C, Rust and Zig ports on the same
+# bytes.
+echo "the ndjson byte proof:"
+proof() { # name, a-row, b-row, expected "changed N"
+  printf '%s\n' "$2" > "$tmpj/pa.ndjson"
+  printf '%s\n' "$3" > "$tmpj/pb.ndjson"
+  got=$(./build/csvdiff compare "$tmpj/pa.ndjson" "$tmpj/pb.ndjson" -k k -i w 2>&1 | head -1) || true
+  case "$got" in
+    *"$4"*) echo "  ok    $1" ;;
+    *) echo "  FAIL  $1: wanted $4 -- $got"; fail=1 ;;
+  esac
+}
+proof "a compared name repeated in the mate's tail" \
+  '{"k":"1","v":"5","w":"x"}' '{"k":"1","v":"5","w":"x","v":"9"}' "changed 1"
+proof "the same values written in a different order" \
+  '{"k":"1","v":"7","w":"y"}' '{"k":"1","w":"y","v":"7"}' "changed 0"
+proof "a value that is a prefix of the mate's longer one" \
+  '{"k":"1","v":"12","w":"z"}' '{"k":"1","v":"123","w":"z"}' "changed 1"
+proof "a difference confined to an ignored column" \
+  '{"k":"1","v":"5","w":"one"}' '{"k":"1","v":"5","w":"two"}' "changed 0"
+proof "the key written after the last compared value" \
+  '{"v":"5","w":"x","k":"1"}' '{"v":"6","w":"x","k":"1"}' "changed 1"
+
 rm -rf "$tmpj"
 
 echo "the threaded csv sweep, over quoted newlines and chunk boundaries:"
