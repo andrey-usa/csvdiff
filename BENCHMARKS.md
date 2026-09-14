@@ -73,6 +73,48 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (instrumentation) — where C++'s ndjson time actually goes
+
+The byte proof took 15% off the C++ ndjson row and left it 2.4x Rust, which said
+the row comparison was not the problem and nothing about what was. C, Rust and Zig
+all print phase timings under `CSVDIFF_PHASES`; C++ had them only in `pqdiff.cpp`,
+for the columnar Parquet path. So the one port that needed profiling was the one
+that could not be profiled.
+
+With the same switch and the same shape added to the text path, 4M rows a side,
+warm, the two are directly comparable:
+
+| Phase | Rust | C++ | C++ / Rust |
+|-------|-----:|----:|-----------:|
+| A sweep (parallel) | 0.822s | 1.945s | 2.4x |
+| B sweep (parallel) | 0.887s | 2.027s | 2.3x |
+| A index insert (serial) | 0.267s | 0.269s | 1.0x |
+| B index insert (serial) | 0.668s | 0.272s | **0.4x** |
+| join and compare | 0.943s | 1.743s | 1.8x |
+| assemble | 0.070s | 0.365s | 5.2x |
+
+**The sweep is the answer.** Parsing and hashing every row of JSON costs C++ about
+2.3x what it costs Rust, it is the largest phase in both ports, and it is where
+most of the gap lives. The join is 1.8x and second. `assemble` is 5.2x but small
+enough that closing it entirely would not be felt.
+
+Worth noting the one row where C++ wins outright: its serial index insert is
+**2.5x faster** than Rust's on the B side, 0.272s against 0.668s. Rust's own B
+insert is also 2.5x its A insert, which is a Rust question this table happens to
+expose and not a C++ one.
+
+### A second thing the instrumentation bought immediately
+
+The first CSV run through the new timer reported a **30.5s sweep** on a 2M pair.
+It is 0.2s warm. Those files had not been touched in hours and the page cache had
+been churned by several GB of Parquet fixtures, so that is a cold read at about
+25 MB/s, not a finding.
+
+That is the same trap that produced a nonsensical Rust reading earlier the same
+day -- a first phases run whose sweep exceeded the process's own wall time -- and
+in both cases the timer is what made it obvious rather than something to be
+puzzled over. Any number from this file's phase output is worth taking twice.
+
 ## 2026-09-14 (ndjson) — the fourth port, and the placement is a property of the port
 
 C++ was the last port without the ndjson byte proof. It is also the one where the

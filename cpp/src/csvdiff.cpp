@@ -929,9 +929,38 @@ class RowIndex {
     // while the table depends on the order rows arrive -- first occurrence of a
     // key wins, and duplicate counts follow from that. Doing the second half in
     // parallel would make the answer depend on thread scheduling.
+    /// Phase timings, on stderr, when CSVDIFF_PHASES is set -- the same switch,
+    /// the same shape and the same column widths the C, Rust and Zig ports use,
+    /// so four runs can be read side by side.
+    ///
+    /// `pqdiff.cpp` has its own copy of this for the columnar path. Fifteen lines
+    /// duplicated across two translation units, against moving it into the public
+    /// header to share it: the duplication is the cheaper of the two, and the
+    /// output format is what has to agree, not the class.
+    class Phases {
+      public:
+        explicit Phases(const char* tag) : on_(std::getenv("CSVDIFF_PHASES") != nullptr), tag_(tag) {}
+        void mark(const char* what) {
+            if (!on_) return;
+            const auto now = clock::now();
+            char label[48];
+            std::snprintf(label, sizeof label, "%s%s", tag_, what);
+            std::fprintf(stderr, "  %-26s %7.3fs\n", label,
+                         std::chrono::duration<double>(now - last_).count());
+            last_ = now;
+        }
+
+      private:
+        using clock = std::chrono::steady_clock;
+        bool on_;
+        const char* tag_;
+        clock::time_point last_ = clock::now();
+    };
+
     RowIndex(const Slab& slab, const RowParser& parser, std::size_t from, std::size_t key_size,
-             const Options& opt, unsigned threads = 1)
+             const Options& opt, unsigned threads = 1, const char* tag = "")
         : slab_(slab), parser_(parser), key_size_(key_size), opt_(opt) {
+        Phases phase(tag);
         // A placeholder until the sweep says how many rows there are; an empty
         // file returns before that and needs a valid mask.
         table_.assign(1 << 12, kEmpty);
@@ -967,6 +996,7 @@ class RowIndex {
         for (auto& w : workers) w.join();
         for (const auto& f : failures)
             if (f) std::rethrow_exception(f);
+        phase.mark("sweep (parallel)");
 
         std::size_t total = 0;
         for (const auto& c : chunks) total += c.starts.size();
@@ -983,6 +1013,10 @@ class RowIndex {
         mask_ = cap - 1;
         first_row_.reserve(total);
         occurrences_.reserve(total);
+        struct AtExit {
+            Phases& p;
+            ~AtExit() { p.mark("index insert (serial)"); }
+        } mark_insert{phase};
         // Each chunk is released as soon as it has been inserted. Holding all of
         // them until the end would keep two copies of every row's start and hash
         // alive at once -- the chunks and the arrays being filled from them --
@@ -1502,11 +1536,11 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // that order the same columns differently would put the same bytes under
     // different names, which is exactly what this refuses.
     //
-    // JSON is excluded here. A value there is found by name, and a name
-    // repeated in one object takes its last value for a compared column, so a
-    // duplicate past the diverging byte could carry a value the prefix never
-    // saw. The C port rules that out with a bounded scan of the mate's tail;
-    // this one has not caught up yet.
+    // JSON is excluded from `aligned` -- it has no fixed offset to be aligned
+    // about -- and gets `json_proof` below instead. A value there is found by
+    // name, and a name repeated in one object takes its last value for a
+    // compared column, so a duplicate past the diverging byte could carry a
+    // value the prefix never saw; the bounded tail scan is what rules that out.
     const std::vector<int>& a_src = ap.source();
     const std::vector<int>& b_src = bp.source();
     // What JSON gets instead of `aligned`: no fixed offset to promise, so the run
@@ -1535,13 +1569,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     {
         std::thread worker([&] {
             try {
-                bi_slot.emplace(b, bp, b_start, key_size, opt, per_file);
+                bi_slot.emplace(b, bp, b_start, key_size, opt, per_file, "B ");
             } catch (...) {
                 worker_failure = std::current_exception();
             }
         });
         try {
-            ai_slot.emplace(a, ap, a_start, key_size, opt, per_file);
+            ai_slot.emplace(a, ap, a_start, key_size, opt, per_file, "A ");
         } catch (...) {
             worker.join();
             throw;
@@ -1551,6 +1585,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     if (worker_failure) std::rethrow_exception(worker_failure);
     const RowIndex& ai = *ai_slot;
     const RowIndex& bi = *bi_slot;
+    // From here on there is one thread again, so one timer covers it.
+    RowIndex::Phases whole("");
 
     Result r;
     r.key = opt.key;
@@ -1710,6 +1746,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         for (auto& w : workers) w.join();
         for (const auto& f : failures)
             if (f) std::rethrow_exception(f);
+        whole.mark("join and compare");
 
         // Merged in range order, so the rows kept under the cap are the same
         // rows one thread would have kept.
@@ -1897,6 +1934,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     r.removed.resize(std::min(r.removed.size(), opt.max_rows));
 
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - started;
+    whole.mark("assemble");
     r.seconds = std::round(elapsed.count() * 1000.0) / 1000.0;
     return r;
 }
