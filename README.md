@@ -610,11 +610,9 @@ tests/fixtures/          every shape that has broken an engine here
    a prefix cannot see that; C rules it out with a bounded scan of the mate's
    tail. That is the gap behind C's 1.9x on ndjson, and porting the tail scan is
    the largest thing left here.
-2. **The Rust Parquet reader runs on one core at fifty million rows.** At 50M
-   under a 13,941 MB cap all four ports finish and agree, and the Rust row is
-   **1.04x cores** against Zig's 3.05x — which is the whole of 29.70s against
-   12.13s. The same reader manages 2.18x at 500k, so it parallelises at small
-   sizes and stops somewhere before this one. Find where.
+2. **At fifty million rows the Rust Parquet reader waits instead of working, and
+   it is the only port that does.** The 50M rung, all four finishing and agreeing
+   under a 13,941 MB cap:
 
    | Build | Compare |   CPU | Cores | Above the input |
    |-------|--------:|------:|------:|----------------:|
@@ -623,12 +621,27 @@ tests/fixtures/          every shape that has broken an engine here
    | C++   |  19.08s | 41.8s | 2.19x |        6,515 MB |
    | Rust  |  29.70s | 30.9s | 1.04x |    **6,064 MB** |
 
-   This replaces an item that claimed the Rust reader held about three times what
-   the others hold. It does not: it holds the **least** of the four. That number
-   came from a benchmark passing `--engine turbo`, which `engine.rs` says is the
-   one flag that retires the columnar reader — so every Rust Parquet figure this
-   project published was of the reader `auto` does not pick and a user never gets.
-   C at 1.42x is worth a look on the same grounds.
+   **Not a size effect**, which is what the first version of this item said. Swept
+   locally on a 4-core host, the same reader gets *better* with size, not worse —
+   2.30x at 500k, 2.58x at 2M, 2.97x at 8M, **3.18x at 20M**. Whatever happens at
+   50M happens between 20M and 50M, and it is not the reader running out of
+   parallelism to find.
+
+   What is different at 50M is the ceiling. The run wants 13.7 GB of heap beside a
+   7,673 MB mapped input on a 15,989 MB host, so the input cannot stay in the page
+   cache and every miss is a read. 1.04x cores with 30.9s of CPU means roughly
+   twenty of those thirty seconds were spent waiting, which is what that looks
+   like. Dropping the page cache locally moves 20M from 3.16x to 2.82x — the right
+   direction and nowhere near far enough, though `drop_caches` cannot give this
+   container a genuinely cold disk (see the note in AGENTS.md).
+
+   And the hole in that story, which is the actual question: **Zig manages 3.05x at
+   the same size with a larger peak.** If the ceiling alone explained it, Zig would
+   stall too. So something about how the columnar reader walks its mapping differs
+   from how Zig's does, and that is what to look at — not the reader's width, which
+   is the smallest of the four.
+
+   C at 1.42x is worth the same look: second fastest on a third of Zig's CPU.
 3. **Where the ceiling sits, now measured rather than predicted.** On a 16 GB
    runner: **CSV finishes at 150M and dies at 200M**, and **Parquet finishes at
    50M for all four ports and at 100M for none of them**. The 100M rung generated
