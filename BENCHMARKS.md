@@ -173,6 +173,26 @@ spike: three 50ms passes over that Zig run read 955, 888 and 888 against the 5ms
 poll's 955, an undershoot of up to 7% on a run lasting 1.6s. The rungs this column
 exists for run for minutes, where a phase boundary is sampled many times.
 
+### Confirmed on a different host, at a different size
+
+The first `bench-2m.yml` run carrying the column, 2M rows of CSV on a hosted
+runner -- another machine, a third of the rows, and the two columns side by side:
+
+| Build | above the input | budget | ratio |
+|-------|----------------:|-------:|------:|
+| C     | 126 MB | 176 MB | 1.40x |
+| C++   | 224 MB | 254 MB | 1.13x |
+| Rust  | 301 MB | 304 MB | **1.01x** |
+| Zig   | 206 MB | 290 MB | **1.41x** |
+
+Same ordering as the local 6M run: Rust holds the most and reserves almost nothing
+beyond it, Zig holds less and reserves half as much again. The ratios are not the
+same as the 6M ones and should not be -- the fixed costs are a larger share at 2M,
+and these runs last 0.4-0.5s, which is the regime where the note above says the
+poll undershoots. `Zig v64` reading 260 MB against `Zig` and `Zig v32` at 290 and
+300, for three builds that differ only in scanner width, is that undershoot on
+display. At 0.5s the column is indicative; at a ladder rung it is not.
+
 ## 2026-09-14 (parallelism) — the Rust Parquet key read was two jobs whatever the key
 
 Written down here because the change landed in #69 without an entry, and the
