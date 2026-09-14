@@ -73,6 +73,61 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (ndjson) — two explanations for the C++ sweep, both wrong
+
+The phase timings put C++'s JSON sweep at about 1.9x Rust's and made it the
+largest thing left on ndjson. Two candidates suggested themselves from reading the
+code. Neither survived measurement, and both are recorded here so the next person
+does not spend the afternoon on them again.
+
+### Not the vector scanner
+
+C++'s `next_of1` / `next_of2` have AVX2 and AVX-512 paths behind
+`CSVDIFF_SCAN_AVX2` / `CSVDIFF_SCAN_AVX512`, which **only the scanner-variant
+builds define** -- `make` alone produces a binary that takes the SWAR path.
+Rust's equivalent is behind `target_feature = "avx2"`, which its
+`-C target-cpu=x86-64-v3` build does enable. So the published C++ ndjson figures
+looked like they came from an unvectorised build being compared against a
+vectorised one, which would have been the same kind of unfair default as the
+`--engine turbo` flag.
+
+It is not. The AVX2 build is *slower* on this workload:
+
+| Build | sweep readings, 4M rows |
+|-------|-------------------------|
+| default (SWAR) | 2.18s 2.21s 2.21s 2.23s 2.45s 2.46s |
+| `-DCSVDIFF_SCAN_AVX2` | 2.57s 2.59s 2.60s 2.62s 2.63s 2.64s |
+
+Which makes sense once measured rather than assumed. The scanner variants were
+built to find *delimiters* -- long runs between one and the next, where a 32-byte
+load pays. JSON scanning is short hops: the next quote, the next backslash, a few
+bytes away. The vector setup costs more than the bytes it skips. The default build
+is the right one here, and `--matrix` will show AVX2 losing on ndjson.
+
+### Not the early exit either
+
+`parse_json` stops walking the object as soon as every key slot is filled. Since
+`end_of_json_row` then still has to walk the rest of the line quote-aware to find
+the newline, the saving looked illusory -- the tail gets scanned anyway, twice
+over for the string skips.
+
+Removing the `break` (safe: first-wins for key columns is enforced by the
+`out[slot] == kAbsent` test, not by the exit) changes nothing:
+
+| Build | sweep readings |
+|-------|----------------|
+| with the early exit | 2.27s 2.29s 2.29s 2.31s 2.37s 2.43s |
+| without it | 2.25s 2.29s 2.29s 2.34s 2.37s 2.29s |
+
+Overlapping bands, no signal either way.
+
+### What that leaves
+
+The gap is real and reproduces; the two structural explanations available from
+reading the code are not it. Whatever C++ spends the extra time on is inside the
+per-row work itself, and finding it wants a profiler rather than another
+hypothesis -- which is where this stops rather than guessing a third time.
+
 ## 2026-09-14 (instrumentation) — where C++'s ndjson time actually goes
 
 The byte proof took 15% off the C++ ndjson row and left it 2.4x Rust, which said
