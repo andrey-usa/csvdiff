@@ -73,6 +73,53 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (parallelism) — the Rust Parquet reader gets *better* with size, so 50M is something else
+
+Written to check a claim made in yesterday's README item 2, which said the reader
+"parallelises at small sizes and stops somewhere before" 50M. It does not stop.
+
+Local, 4 vCPU / 16 GB container, the columnar Parquet path (`auto`), report on,
+best of three by wall with that run's CPU:
+
+| Rows | Wall | CPU | Cores | Peak RSS |
+|-----:|-----:|----:|------:|---------:|
+| 500k | 0.20s | 0.45s | 2.30x |   192 MB |
+|   2M | 0.62s | 1.61s | 2.58x |   700 MB |
+|   8M | 2.08s | 6.18s | 2.97x | 2,446 MB |
+|  20M | 5.58s | 17.76s | **3.18x** | 5,753 MB |
+
+Monotonically up. So the 1.04x in the 50M rung is not the reader running out of
+work to spread, and the item that said so was wrong on one data point.
+
+What is different at 50M is that it is at the ceiling: 13.7 GB of heap beside a
+7,673 MB mapped input on a 15,989 MB host. The input cannot stay in the page
+cache, so every miss is a read, and 1.04x with 30.9s of CPU means about twenty of
+those thirty seconds went on waiting.
+
+A weak test of that, and its limits. Same 20M pair, warm and then after
+`echo 3 > /proc/sys/vm/drop_caches`:
+
+| 20M | Wall | CPU | Cores |
+|-----|-----:|----:|------:|
+| warm | 5.64s | 17.81s | 3.16x |
+| caches dropped | 6.18s | 17.45s | 2.82x |
+
+The right direction, and nothing like far enough. It also cannot be pushed
+further here: this file already records that `drop_caches` leaves the hypervisor's
+copy warm, so a genuinely cold read is not available in this container. And 20M
+does not reach the ceiling anyway — 5.7 GB of heap and 3.2 GB of input on 16 GB
+has room to spare, which is the whole difference from the 50M rung.
+
+**The hole in the explanation is the interesting part.** Zig hits 3.05x at 50M with
+a *larger* peak than Rust's. If the ceiling alone did this, Zig would stall too. So
+the question is not why a run at the ceiling waits, it is why this one reader waits
+where another does not — how each walks its mapping, not how much either holds.
+Rust's is the narrowest of the four.
+
+Two tables here, and neither is comparable with the other: the sweep is this
+container and the 50M row is a hosted runner. What the sweep establishes is a
+*direction* within one host, which is all it is used for.
+
 ## 2026-09-13 (scale) — Parquet's ceiling is between 50M and 100M, for all four ports
 
 Two rungs, dispatched together, one job each: `50m` and `100m`, parquet,
