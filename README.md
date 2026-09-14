@@ -655,54 +655,42 @@ tests/fixtures/          every shape that has broken an engine here
    and scheduling-bound, and which side loses flips. The sweep gap is the one that
    reproduces.
 
-2. **At fifty million rows the Rust Parquet reader waits instead of working, and
-   it is the only port that does.** The 50M rung, all four finishing and agreeing
-   under a 13,941 MB cap:
+2. **Withdrawn: the Rust Parquet reader does not wait at fifty million rows.**
+   This item ran for three rounds on one observation. Re-measured with
+   `--repeats 3`, the 50M Parquet rung is:
 
-   | Build | Compare |   CPU | Cores | Above the input |
-   |-------|--------:|------:|------:|----------------:|
-   | Zig   |  12.13s | 37.0s | 3.05x |        6,558 MB |
-   | C     |  16.60s | 23.6s | 1.42x |        6,138 MB |
-   | C++   |  19.08s | 41.8s | 2.19x |        6,515 MB |
-   | Rust  |  29.70s | 30.9s | 1.04x |    **6,064 MB** |
+   | Build | Compare |   CPU | Cores | Above the input |  Budget |
+   |-------|--------:|------:|------:|----------------:|--------:|
+   | C     |   8.65s | 25.2s | 2.92x |        6,905 MB | 7,972 MB |
+   | C++   |  13.83s | 44.4s | 3.21x |        6,934 MB | 7,941 MB |
+   | Rust  |  11.97s | 40.6s | **3.39x** |    7,169 MB | 7,916 MB |
+   | Zig   |  12.56s | 44.2s | 3.52x |        6,663 MB | **9,217 MB** |
 
-   **Not a size effect**, which is what the first version of this item said. Swept
-   locally on a 4-core host, the same reader gets *better* with size, not worse —
-   2.30x at 500k, 2.58x at 2M, 2.97x at 8M, **3.18x at 20M**. Whatever happens at
-   50M happens between 20M and 50M, and it is not the reader running out of
-   parallelism to find.
+   Rust at **3.39x cores and 11.97s**, against the 1.04x and 29.70s this item was
+   built on. It is the second most parallel of the four, not the least.
 
-   What is different at 50M is the ceiling. The run wants 13.7 GB of heap beside a
-   7,673 MB mapped input on a 15,989 MB host, so the input cannot stay in the page
-   cache and every miss is a read. 1.04x cores with 30.9s of CPU means roughly
-   twenty of those thirty seconds were spent waiting, which is what that looks
-   like. Dropping the page cache locally moves 20M from 3.16x to 2.82x — the right
-   direction and nowhere near far enough, though `drop_caches` cannot give this
-   container a genuinely cold disk (see the note in AGENTS.md).
+   The giveaway is the C column. C's Parquet path has not changed between the two
+   runs, and it went from 16.60s to 8.65s — 1.9x, on identical code. The whole
+   table was slow, not the Rust row in it, and one run at `--repeats 1` on a
+   hosted runner is what recorded it. Rust's own reader did gain the key-column
+   fan-out in between, but that measured 1.08x on an 8M pair and cannot account
+   for 29.70s becoming 11.97s.
 
-   And the hole in that story, which is the actual question: **Zig manages 3.05x at
-   the same size with a larger peak.** If the ceiling alone explained it, Zig would
-   stall too. So something about how the columnar reader walks its mapping differs
-   from how Zig's does, and that is what to look at — not the reader's width, which
-   is the smallest of the four.
+   So there is nothing here to explain. What the three rounds produced instead is
+   worth keeping, and is elsewhere: the columnar path had no phase timings and now
+   has them, its key read was two jobs whatever the key and is now a queue,
+   `--threads` did nothing on that path and now does, and the memory cap turned
+   out to bound a quantity the table was not reporting — which is item 3.
 
-   C at 1.42x is worth the same look: second fastest on a third of Zig's CPU.
+   The lesson is the one this file has now learnt three times. A single
+   observation on a shared runner is not a finding, and the cost of treating one
+   as a finding is measured in afternoons. `--repeats` is cheap.
 
-   Two things have happened to this item since. **One candidate is eliminated:**
-   `parallel::spawn` runs the work inline when the OS refuses a thread, and under
-   `RLIMIT_DATA` a tight cap is exactly when it would — so a capped run could be
-   silently serial. It is not. Walking the cap down on an 8M pair to the point of
-   refusal held 2.4–2.8x cores the whole way and then refused cleanly. **And one
-   real defect was found on the way:** the key-column read was two jobs however
-   wide the key, which cost about 1.9x on that phase and 1.08x on the whole run —
-   a queue now, and the reader carries phase timings for the first time. Neither
-   touches the 50M number, which is still one observation at `--repeats 1` and
-   wants re-measuring with repeats before anything is built for it.
+   One row of that table does still say something: **Zig's budget is 9,217 MB
+   against the other three at about 7,940**, while holding the *least* above the
+   input. That is the `VmData` gap of item 3, reproducing at 50M on Parquet, and
+   it is the one number in this table that is about a port rather than a runner.
 
-   One more thing not to carry over from the 100M CSV rungs: those show every port
-   collapsing *together* when the input truly cannot be cached — 0.45x, 0.50x,
-   0.51x, 0.89x. That is page-cache pressure when it is the explanation, and it is
-   not the shape of the table above, where one port collapsed and another did not.
 3. **The ceiling is not one number, it is four.** This line used to say "CSV
    finishes at 150M and dies at 200M", as a fact about the tool. It is a fact
    about the C port. On a 16 GB runner with each port capped at 13,941 MB:
