@@ -198,6 +198,25 @@ A reservation that costs time as well as address space is an unusual result and
 worth stating plainly: the memory it hands back is memory the insert loop was
 about to reuse, and taking it fresh instead is what the extra 12% was buying.
 
+### Confirmed by CI, on a runner, at a third of the rows
+
+The `bench-2m.yml` run on the pull request, against the one on the pull request
+before it -- 2M rows of CSV, same workflow, same size, the change the only
+difference:
+
+| Build | before: above / budget / wall | after: above / budget / wall |
+|-------|------------------------------:|-----------------------------:|
+| Zig     | 206 MB / 290 MB / 0.51s | **186 MB / 243 MB / 0.41s** |
+| Zig v32 | 210 MB / 300 MB / 0.45s | **201 MB / 243 MB / 0.36s** |
+
+Budget down 16%, wall down 20%, on a hosted runner at a third of the rows the
+local measurement used. Both halves of the claim reproduce somewhere other than
+where they were found, which is the bar this file asks of a number before it
+counts -- and the two rows are the same change seen through two scanner builds.
+
+The other ports are unchanged in that table, as they should be: C++ 224/254,
+Rust 301/304, both within a megabyte of where they were.
+
 ## 2026-09-14 (memory) — the cap measures a quantity the table did not report
 
 The previous entry left Zig failing the 100M CSV rung while C, C++ and Rust
