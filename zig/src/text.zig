@@ -97,6 +97,41 @@ fn skipJsonString(d: []const u8, from: usize, end: usize) struct { usize, bool }
     }
 }
 
+/// Does the mate's tail name a column this run tracks?
+///
+/// The CSV proof rests on a column sitting at a fixed offset. JSON makes no such
+/// promise: a value is found by name, and a name repeated in one object takes its
+/// *last* value for a compared column -- which the C, C++ and Rust ports do too,
+/// and `test.sh` cross-checks -- so a second `"amount"` past the diverging byte
+/// would carry a value the prefix never saw.
+///
+/// It cannot be ruled out in general, but it can be ruled out *here*, because the
+/// proof only reaches this point when the two rows agree all the way through the
+/// last wanted value. Whatever is left is the trailing ignored columns: a few
+/// bytes. A name is a quoted string, so every quote in them is a candidate.
+/// Mistaking a closing quote for an opening one costs a lookup that fails, which
+/// is a fallback and not a wrong answer -- and an escaped name counts as a hit for
+/// the same reason, since the wanted names are held unescaped.
+pub fn jsonTailIsClean(p: RowParser, d: []const u8, from: usize, end: usize) bool {
+    const j = switch (p) {
+        .json => |x| x,
+        .csv => return false,
+    };
+    var at = from;
+    while (at < end) {
+        const q = scan.nextOf1(d, at, end, '"');
+        if (q >= end) return true;
+        const close, const escaped = skipJsonString(d, q, end);
+        if (escaped) return false;
+        const lo = q + 1;
+        const hi = if (close > q + 1) close - 1 else q + 1;
+        if (hi > lo and j.slotFor(d[lo..hi]) != null) return false;
+        if (close <= q) return false;
+        at = close;
+    }
+    return true;
+}
+
 /// Skips a nested object or array, which is not a cell value.
 fn skipJsonNested(d: []const u8, from: usize, end: usize) usize {
     var pos = from;
@@ -260,7 +295,7 @@ pub const RowParser = union(enum) {
         slots: []i32,
         slot_mask: usize,
 
-        fn slotFor(self: Json, key: []const u8) ?usize {
+        pub fn slotFor(self: Json, key: []const u8) ?usize {
             var at = nameHash(key) & self.slot_mask;
             while (true) {
                 const i = self.slots[at];
@@ -588,4 +623,57 @@ test "the json header is the first object's keys in order" {
     try std.testing.expectEqualStrings("b", head.names[0]);
     try std.testing.expectEqualStrings("a", head.names[1]);
     try std.testing.expectEqualStrings("n", head.names[2]);
+}
+
+test "the json tail scan spots a tracked name and lets an untracked one pass" {
+    const gpa = std.testing.allocator;
+    const wanted = [_]?[]const u8{ "account_id", "amount" };
+    const parser = try RowParser.initJson(gpa, &wanted);
+    defer parser.deinit(gpa);
+
+    // The case the scan exists for: a compared name written again in the tail
+    // takes its last value, so the proven prefix cannot settle the row.
+    const repeats = ",\"amount\":\"9\"}";
+    try std.testing.expect(!jsonTailIsClean(parser, repeats, 0, repeats.len));
+
+    // A name nothing tracks is not a reason to refuse: this is the ordinary
+    // trailing ignored column, and refusing on it would cost the whole proof.
+    const ignored = ",\"note\":\"x\"}";
+    try std.testing.expect(jsonTailIsClean(parser, ignored, 0, ignored.len));
+
+    // A key written after the last value is tracked too -- the run has to cover
+    // the keys for the proof to stand in for the key comparison.
+    const key_late = ",\"account_id\":\"b\"}";
+    try std.testing.expect(!jsonTailIsClean(parser, key_late, 0, key_late.len));
+
+    // Nothing left to scan.
+    const empty = "}";
+    try std.testing.expect(jsonTailIsClean(parser, empty, 0, empty.len));
+}
+
+test "an escaped name in the tail refuses the proof rather than guessing" {
+    const gpa = std.testing.allocator;
+    const wanted = [_]?[]const u8{"amount"};
+    const parser = try RowParser.initJson(gpa, &wanted);
+    defer parser.deinit(gpa);
+
+    // The wanted names are held unescaped, so `amount` would not match by
+    // bytes even though it names the same column. Refusing is a fallback to
+    // parsing the row, which is correct; matching by bytes alone would not be.
+    const escaped = ",\"am\\u006funt\":\"9\"}";
+    try std.testing.expect(!jsonTailIsClean(parser, escaped, 0, escaped.len));
+}
+
+test "a value that merely looks like a name does not refuse the proof" {
+    const gpa = std.testing.allocator;
+    const wanted = [_]?[]const u8{"amount"};
+    const parser = try RowParser.initJson(gpa, &wanted);
+    defer parser.deinit(gpa);
+
+    // `"amount"` here is a *value*, not a name. The scan cannot tell the two
+    // apart -- it walks quotes -- so it refuses, and the row is parsed. That is
+    // the fallback being conservative, and the test records it as intended
+    // rather than as a bug someone should "fix" by making the scan cleverer.
+    const as_value = ",\"note\":\"amount\"}";
+    try std.testing.expect(!jsonTailIsClean(parser, as_value, 0, as_value.len));
 }

@@ -73,6 +73,43 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (ndjson) — and a third port, where the placement was known in advance
+
+The same port into Zig, done second, with the lesson from the Rust one applied
+before writing any code: check where this port's lookup parses the mate.
+
+Zig's `lookup` has the same shape as Rust's — the span check, then `fieldsOf` or
+`keysOf` depending on a `Want` — so the proof goes beside the span check, before
+the parse, and there was no slow first version to discard this time.
+
+4M rows a side, 9 rounds, paired and interleaved, against the same build without
+the proof:
+
+| Build | wall best | median | cpu best | median | Verdict |
+|-------|----------:|-------:|---------:|-------:|---------|
+| Zig | 2.396s | 2.498s | 9.02s | 9.45s | — |
+| Zig + proof | 1.969s | 2.042s | 7.31s | 7.60s | **19% less work** |
+
+Counts and per-column figures identical, and identical to C, C++ and Rust on the
+adversarial fixture.
+
+Where the ndjson column stands with three of the four ports carrying it, same 4M
+pair, best of three:
+
+| Port | Wall | CPU | Cores |
+|------|-----:|----:|------:|
+| **Zig (now)** | **2.02s** | 7.50s | 3.71x |
+| **Rust (now)** | 2.07s | 7.13s | 3.44x |
+| C | 2.26s | 6.69s | 2.96x |
+| Zig (before) | 2.38s | 8.74s | 3.67x |
+| C++ | 4.75s | 13.43s | 2.83x |
+
+C is now third on wall while still doing the least CPU work of the four: 6.69s
+against Zig's 7.50s, at 2.96 cores against 3.71. The remaining ndjson question is
+that ratio, not the proof.
+
+Read within this table only — one host, one size, one sitting.
+
 ## 2026-09-14 (ndjson) — the byte proof reaches a second port, and where it has to sit
 
 README item 1 had called porting C's ndjson tail scan "the largest thing left
