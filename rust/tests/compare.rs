@@ -267,6 +267,21 @@ fn a_missing_file_is_an_error() {
     assert!(compare(&f.a, Path::new("/nonexistent/nope.csv"), &mut opt).is_err());
 }
 
+/// `--threads` is the width of the whole run, and every path that spreads work
+/// reads it from here. It used to be read in one engine only.
+#[test]
+fn the_thread_budget_is_the_flag_when_the_flag_is_set() {
+    let mut opt = Options::with_key(["k"]);
+    assert_eq!(
+        opt.thread_budget(),
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    );
+    opt.threads = Some(3);
+    assert_eq!(opt.thread_budget(), 3);
+}
+
 #[test]
 fn bad_options_are_rejected() {
     type Mutate = fn(&mut Options);

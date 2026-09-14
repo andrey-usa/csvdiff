@@ -37,6 +37,7 @@ use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::parallel;
 use crate::parquet;
+use crate::phases::Phases;
 use crate::rowstore::Joined;
 use crate::sections::assemble;
 
@@ -661,6 +662,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         ));
     }
 
+    let mut phases = Phases::new("");
     let a_map = map(a_path)?;
     let b_map = map(b_path)?;
     let a_name = a_path.display().to_string();
@@ -675,32 +677,83 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
 
     let slot_of = |names: &[String], n: &str| names.iter().position(|c| c == n).unwrap();
 
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let threads = opt.thread_budget();
 
     // --- keys -------------------------------------------------------------
     //
-    // Both files' key columns are read at once, then any column both sides
-    // store as a dictionary is reduced to one shared id per row.
-    let read_b_keys = || -> Result<Vec<parquet::Column>> {
-        opt.key
-            .iter()
-            .map(|k| parquet::read_column(&b_map, slot_of(&b_meta.names, k), &b_name))
-            .collect()
+    // Every key column of both files at once, one job each, then any column
+    // both sides store as a dictionary is reduced to one shared id per row.
+    //
+    // One job per column and not one per side. These reads decode pages for
+    // every row in the file and share nothing -- different files, different
+    // columns, separate outputs -- so a side at a time is two jobs however wide
+    // the key is, and the composite key this tool exists for is rarely one
+    // column. Two jobs on a four-core machine is half of it idle for the whole
+    // phase, and this phase reads as many bytes as any.
+    //
+    // Taken from a queue rather than one thread per job, the same way the
+    // compared columns below are: the jobs are not the same size -- a
+    // dictionary column and a plain one decode at different rates -- and
+    // `--threads` has to mean something here too.
+    let jobs: Vec<(bool, usize)> = (0..key_size)
+        .flat_map(|j| [(false, j), (true, j)])
+        .collect();
+    let next = AtomicUsize::new(0);
+    let read_keys = || -> Vec<(usize, Result<parquet::Column>)> {
+        let mut mine = Vec::new();
+        loop {
+            let at = next.fetch_add(1, AtomicOrdering::Relaxed);
+            if at >= jobs.len() {
+                return mine;
+            }
+            let (from_b, j) = jobs[at];
+            let (data, meta, name) = if from_b {
+                (&b_map, &b_meta, &b_name)
+            } else {
+                (&a_map, &a_meta, &a_name)
+            };
+            mine.push((
+                at,
+                parquet::read_column(data, slot_of(&meta.names, &opt.key[j]), name),
+            ));
+        }
     };
-    let (a_key_cols, b_key_cols) = std::thread::scope(|scope| {
-        let bh = parallel::spawn(scope, &read_b_keys);
-        let a: Result<Vec<parquet::Column>> = opt
-            .key
-            .iter()
-            .map(|k| parquet::read_column(&a_map, slot_of(&a_meta.names, k), &a_name))
-            .collect();
-        (a, bh.join().unwrap_or_else(|_| Err(panicked())))
-    });
+    let mut read: Vec<Option<Result<parquet::Column>>> = (0..jobs.len()).map(|_| None).collect();
+    {
+        let lanes = threads.clamp(1, jobs.len().max(1));
+        let gathered: Vec<Vec<(usize, Result<parquet::Column>)>> = std::thread::scope(|scope| {
+            // One lane runs here rather than waiting on a thread of its own.
+            let rest: Vec<_> = (1..lanes)
+                .map(|_| parallel::spawn(scope, &read_keys))
+                .collect();
+            let mut all = vec![read_keys()];
+            // A lane that panicked returns nothing, which leaves its jobs
+            // `None` below -- so a panic is raised as an error rather than
+            // silently dropping a column.
+            all.extend(rest.into_iter().map(|h| h.join().unwrap_or_default()));
+            all
+        });
+        for got in gathered {
+            for (at, col) in got {
+                read[at] = Some(col);
+            }
+        }
+    }
+    let mut a_key_cols: Vec<parquet::Column> = Vec::with_capacity(key_size);
+    let mut b_key_cols: Vec<parquet::Column> = Vec::with_capacity(key_size);
+    for (&(from_b, _), got) in jobs.iter().zip(read) {
+        let col = got.unwrap_or_else(|| Err(panicked()))?;
+        if from_b {
+            b_key_cols.push(col);
+        } else {
+            a_key_cols.push(col);
+        }
+    }
+
+    phases.mark("key columns (par)");
 
     let mut a_keys = KeySide {
-        col: a_key_cols?
+        col: a_key_cols
             .into_iter()
             .map(|c| Col::new(c, &a_map))
             .collect(),
@@ -708,7 +761,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         rows: 0,
     };
     let mut b_keys = KeySide {
-        col: b_key_cols?
+        col: b_key_cols
             .into_iter()
             .map(|c| Col::new(c, &b_map))
             .collect(),
@@ -748,6 +801,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         b_keys.id[j] = apply(&b_keys.col[j], &b_map_j)?;
     }
 
+    phases.mark("intern dicts (serial)");
+
     // --- the join ---------------------------------------------------------
     let per_side = (threads / 2).max(1);
     let build_b = || build_index(&as_id, &b_keys, opt, per_side);
@@ -757,6 +812,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         (a, bh.join().unwrap_or_else(|_| Err(panicked())))
     });
     let (ai, bi) = (ai?, bi?);
+    phases.mark("index build (2 ways)");
 
     // Both directions split over contiguous ranges of one side's distinct keys.
     // Each range accumulates into its own lists, and the ranges merge in order,
@@ -857,6 +913,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         )
     });
     let (a_parts, b_parts) = (a_parts?, b_parts?);
+
+    phases.mark("match sweep (par)");
 
     let mut added = Capped::default();
     for p in &b_parts {
@@ -1027,6 +1085,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         }
     }
 
+    phases.mark("compared columns (par)");
+
     let columns: Vec<ColumnStat> = compared
         .iter()
         .zip(&cols)
@@ -1178,6 +1238,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         changed_a: Vec::new(),
         changed_b: Vec::new(),
     };
+    phases.mark("assemble");
     let meta = resolved.meta(&opt.key, a_meta.names.len(), b_meta.names.len());
     assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared)
 }
