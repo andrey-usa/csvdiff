@@ -73,6 +73,61 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (ndjson) — the fourth port, and the placement is a property of the port
+
+C++ was the last port without the ndjson byte proof. It is also the one where the
+placement question, which cost the Rust port a first attempt, answers itself:
+C++'s `lookup` calls `keys_of`, not `fields_of`, so the mate's row is still
+unparsed when the lookup returns and the proof belongs exactly where C puts it --
+after the lookup, before `fields_of`, beside the CSV proof already there.
+
+4M rows a side, 9 rounds, paired and interleaved, against the same build without
+it:
+
+| Build | wall best | median | cpu best | median | Verdict |
+|-------|----------:|-------:|---------:|-------:|---------|
+| C++ | 4.877s | 5.225s | 13.15s | 13.93s | — |
+| C++ + proof | 4.145s | 4.389s | 11.55s | 11.75s | **15% less work** |
+
+Counts and per-column figures identical, and identical to C, Rust and Zig on the
+adversarial fixture.
+
+### What the four ports say about placement
+
+Three ports, three days, one proof, and the right place for it differs by port:
+
+| Port | What its lookup parses | Where the proof goes | Cost of the other choice |
+|------|------------------------|----------------------|--------------------------|
+| C | keys only | after the lookup | — |
+| C++ | keys only (`keys_of`) | after the lookup | — |
+| Rust | the mate's whole row | *inside* the lookup | 2% lost instead of 14% gained |
+| Zig | the mate's whole row | *inside* the lookup | not paid: known in advance |
+
+The proof is the same in all four. What differs is what the surrounding code has
+already done by the time it runs, and that is not visible from the proof itself --
+which is why the Rust attempt had to be measured twice to find it. The ports that
+parse the mate inside the lookup also had to widen the run to cover the keys
+(`width`, not `nc`), because a proof running before the key comparison has to
+stand in for it.
+
+### Where ndjson stands with all four carrying it
+
+Same 4M pair, best of three, one sitting, so these rows are comparable with each
+other and with nothing else:
+
+| Port | Wall | CPU | Cores |
+|------|-----:|----:|------:|
+| Rust | **1.84s** | 6.02s | 3.27x |
+| Zig | 2.05s | 7.38s | 3.60x |
+| C | 2.42s | 6.70s | 2.77x |
+| C++ (now) | 4.35s | 11.54s | 2.65x |
+| C++ (before) | 5.03s | 13.68s | 2.72x |
+
+C led this column at the start of the week and is third now, without having got
+slower: Rust and Zig gained the proof it already had. C++ is still **2.4x Rust**
+with the proof in place, on nearly twice the CPU at fewer cores, so whatever is
+slow there is not the row comparison and 15% was never going to close it.
+
 ## 2026-09-14 (ndjson) — and a third port, where the placement was known in advance
 
 The same port into Zig, done second, with the lesson from the Rust one applied

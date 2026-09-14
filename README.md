@@ -602,33 +602,42 @@ tests/fixtures/          every shape that has broken an engine here
 
 ## What's open
 
-1. **The byte proof reaches ndjson in three ports out of four — only C++ is
-   left.** Settling a matched row from its raw bytes is not C's alone: all four do
-   it for CSV, each with the same guard that two headers ordering the same columns
-   differently would break it. The JSON form was C-only, because a name repeated
-   in one object takes its last value and a prefix cannot see that; C rules it out
-   with a bounded scan of the mate's tail, and Rust and Zig now do too.
+1. **All four ports settle an ndjson row from its bytes now.** Settling a matched
+   row without parsing it is not C's alone for CSV, and since today it is not
+   C's alone for JSON either. The JSON form is harder: a value is found by name,
+   the two files need not list the names in the same order, and a name repeated
+   in one object takes its *last* value — so a second `"amount"` past the
+   diverging byte carries a value the proven prefix never saw. A bounded scan of
+   the mate's tail rules that out, and it is cheap because by then only the
+   trailing ignored columns are left.
 
-   One table, 4M rows a side on a 4-core host, best of three:
+   One table, 4M rows a side on a 4-core host, best of three, all five rows from
+   one sitting:
 
    | Port | Wall | CPU | Cores |
    |------|-----:|----:|------:|
-   | Zig  | **2.02s** (was 2.38s) | 7.50s (was 8.74s) | 3.71x |
-   | Rust | **2.07s** (was 2.51s) | 7.13s (was 8.85s) | 3.44x |
-   | C    | 2.26s | 6.69s | 2.96x |
-   | C++  | 4.75s | 13.43s | 2.83x |
+   | Rust | **1.84s** | 6.02s | 3.27x |
+   | Zig | 2.05s | 7.38s | 3.60x |
+   | C | 2.42s | 6.70s | 2.77x |
+   | C++ (now) | 4.35s | 11.54s | 2.65x |
+   | C++ (before) | 5.03s | 13.68s | 2.72x |
 
-   Both ports went from behind C to in front of it, by 19% and 14% of CPU
-   respectively, with counts identical to the other ports and to the same build
-   with the proof absent. C still does the least CPU work of the four and gets
-   least out of four cores, which is its own question.
+   Rust gained 14% of CPU, Zig 19%, C++ 15%; C had it already. Counts identical
+   across all four ports on a fixture built for the ways this goes wrong.
 
-   **C++ is the one left, and the thing to get right is placement, not the scan.**
-   The proof pays only if it runs *before* the mate's row is parsed. Put after the
-   key lookup — where C puts it, correctly, because C's lookup compares only the
-   keys — it cost Rust 2% instead of saving 14%, since Rust's lookup had already
-   materialised the whole mate row. Check what `cpp/src/csvdiff.cpp` does before
-   copying either placement.
+   **Where it goes is not the same in every port, and that is the finding worth
+   keeping.** The proof only pays if it runs before the mate's row is parsed. C
+   and C++ compare keys with a key-only parse, so their proof sits after the
+   lookup and saves the full parse that follows. Rust and Zig materialise the
+   mate's whole row *inside* the lookup to compare its keys, so a proof placed
+   there saves nothing — put after it, it cost 2% instead of saving 14%, which is
+   what the first Rust attempt measured. Theirs had to move inside the lookup,
+   and to cover the keys as well (`width`, not `nc`) to be allowed to.
+
+   What is left on ndjson is not the proof. **C++ is still 2.4x Rust** at 4.35s
+   against 1.84s, and 2.65 cores against 3.27 — the proof took 15% off a row that
+   needs more than that.
+
 2. **At fifty million rows the Rust Parquet reader waits instead of working, and
    it is the only port that does.** The 50M rung, all four finishing and agreeing
    under a 13,941 MB cap:
