@@ -642,6 +642,12 @@ tests/fixtures/          every shape that has broken an engine here
    other three use, which is what made that readable; before it, the only port
    that could not be profiled was the one slowest on this format.
 
+   Two explanations for that sweep gap have been tested and are wrong: it is not
+   the vector scanner (C++'s AVX2 build is *slower* on ndjson — vectors pay for
+   delimiter runs, not for JSON's short hops between quotes) and it is not the
+   early exit in `parse_json` (removing it changes nothing). BENCHMARKS.md has
+   both. Finding the rest wants a profiler, not a third hypothesis.
+
    Take the *sweep* ratio and not the other rows of that table. A first reading
    of it also reported Rust's serial index insert at 0.668s on the B side against
    0.267s on A, and that was noise: repeated, the two sides come out 0.778/0.812,
