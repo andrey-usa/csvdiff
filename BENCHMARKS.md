@@ -73,6 +73,68 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-14 (contention) — separate hosted runners do not contend, and the first run said otherwise
+
+`bench-contention.yml` had never been dispatched since it was written. It exists
+because two documents in this repository contradicted each other — CLAUDE.md's
+benchmark rule said two timing jobs "share a host and measure each other's
+contention", `scale-ceiling.yml`'s header said "these are separate hosted runners
+so they do not contend" — and the `benchmark-host` group, which makes a pull
+request's benchmark queue behind anybody's dispatched ladder, rests on the first
+being true.
+
+It is A/A: the same benchmark alone, then the identical benchmark as one of N jobs
+started together.
+
+### The run to believe: 10M rows, crowd of six
+
+| Build | Alone | Crowd median | Ratio | Crowd spread |
+|-------|------:|-------------:|------:|-------------:|
+| C     | 1.808s | 1.808s | 1.00x | 1.604-2.211s |
+| C++   | 4.571s | 4.347s | 0.95x | 3.613-4.573s |
+| Rust  | 2.061s | 2.007s | 0.97x | 1.855-2.411s |
+| Zig   | 1.814s | 1.784s | 0.98x | 1.755-2.156s |
+
+**Median 0.98x**, and not one build slower than 1.00x. Six jobs at once are
+indistinguishable from one alone. `scale-ceiling.yml` was right.
+
+### The run not to believe: 2M rows, crowd of four
+
+| Build | Alone | Crowd median | Ratio | Crowd spread |
+|-------|------:|-------------:|------:|-------------:|
+| C     | 0.351s | 0.402s | 1.14x | 0.301-0.403s |
+| C++   | 0.805s | 1.184s | 1.47x | 0.958-1.210s |
+| Rust  | 0.504s | 0.678s | 1.35x | 0.553-0.704s |
+| Zig   | 0.402s | 0.379s | 0.94x | 0.302-0.403s |
+
+**Median 1.24x**, and the workflow duly printed "that is what contention looks
+like, and `benchmark-host` is earning its keep".
+
+It is wrong, and the table says so if you read the column the workflow's own
+closing line points at. **C's fastest crowd run is 0.301s against 0.351s alone,
+and Zig's is 0.302s against 0.402s.** Contention does not make a job finish
+sooner. What that pattern is, is runner-to-runner variation dominating a
+measurement whose runs last a third of a second, compared across two separate
+sittings — the failure mode `scripts/bench_ab.sh` was built to defeat, and the
+reason it interleaves and pairs instead of running all of A and then all of B.
+
+Both tables are here because the pair is the lesson. A workflow that prints a
+verdict will print one whether the measurement can support it or not, and this one
+hedged correctly in its own last line while its headline did not. The remedy was
+the one it recommends itself for an unclear result: raise the row count until the
+runs last seconds, raise the crowd, and look again.
+
+### What this does not change, yet
+
+Nothing in `.github/workflows/` — every benchmark still names `benchmark-host`, so
+a pull request's 2M run still queues behind a dispatched ladder. The measurement
+says that lock is not buying what it was put there for; acting on it is a separate
+decision from taking the number, and it has not been taken. What *would* argue for
+keeping a lock on the dispatch-only benchmarks even after this: a deliberate
+measurement wants a quiet repository, and `bench-contention.yml` in particular
+needs to stay isolated for its own result to mean anything — an experiment has to
+be valid whether or not it finds an effect.
+
 ## 2026-09-14 (parallelism) — the Rust Parquet reader gets *better* with size, so 50M is something else
 
 Written to check a claim made in yesterday's README item 2, which said the reader
