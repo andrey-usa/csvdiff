@@ -478,3 +478,144 @@ fn chunk_boundaries_land_between_rows_in_a_quoted_file() {
         }
     }
 }
+
+/// One pair of newline-delimited JSON files, since `Fixture` writes `.csv`.
+fn json_fixture(a_body: &str, b_body: &str) -> Fixture {
+    let dir = std::env::temp_dir().join(format!(
+        "csvdiff-json-proof-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let a = dir.join("a.ndjson");
+    let b = dir.join("b.ndjson");
+    fs::write(&a, a_body).expect("write a");
+    fs::write(&b, b_body).expect("write b");
+    Fixture { dir, a, b }
+}
+
+/// `changed` for one pair, at every thread count, so a proof that fires on one
+/// chunking and not another shows up.
+fn changed_json(a_body: &str, b_body: &str) -> i64 {
+    let f = json_fixture(a_body, b_body);
+    let mut answer = None;
+    for threads in [1usize, 2, 4] {
+        let mut opt = Options::with_key(["account_id", "txn_id"]);
+        opt.ignore = vec!["note".to_string()];
+        opt.threads = Some(threads);
+        let r = compare(&f.a, &f.b, &mut opt).expect("compare");
+        match answer {
+            None => answer = Some(r.counts.changed),
+            Some(first) => assert_eq!(
+                r.counts.changed, first,
+                "threads {threads} disagrees: {} against {first}",
+                r.counts.changed
+            ),
+        }
+    }
+    answer.expect("a count")
+}
+
+/// The byte proof for JSON cannot take a prefix on trust the way CSV's can, and
+/// these are the ways that bites. Each case is one row, so `changed` is 0 or 1.
+///
+/// Cross-checked against the C, C++ and Zig ports on the same fixtures: all four
+/// agree on every line of this test.
+#[test]
+fn the_json_byte_proof_does_not_take_a_prefix_on_trust() {
+    // A name repeated in one object takes its *last* value, so the mate's tail
+    // can carry a value the proven prefix never saw. This is the case the whole
+    // tail scan exists for, and the one a CSV-shaped proof gets wrong.
+    assert_eq!(
+        changed_json(
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"amount\":\"5\",\"note\":\"x\"}\n",
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"amount\":\"5\",\"note\":\"x\",\"amount\":\"9\"}\n",
+        ),
+        1,
+        "a compared name repeated in the mate's tail was missed"
+    );
+
+    // Two objects need not list their names in the same order, so the run has to
+    // reach the value that ends *last*, not the one belonging to the last column.
+    assert_eq!(
+        changed_json(
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"amount\":\"7\",\"note\":\"y\"}\n",
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"note\":\"y\",\"amount\":\"7\"}\n",
+        ),
+        0,
+        "the same values in a different order were called a change"
+    );
+
+    // The run ends one byte past the last value -- its closing quote -- so a
+    // value cannot stand in for a longer one that begins with it.
+    assert_eq!(
+        changed_json(
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"amount\":\"12\",\"note\":\"z\"}\n",
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"amount\":\"123\",\"note\":\"z\"}\n",
+        ),
+        1,
+        "a value that is a prefix of the mate's was called equal"
+    );
+
+    // An ignored column is not tracked, so a difference there is not a change --
+    // and the tail scan must not refuse the proof over it either way.
+    assert_eq!(
+        changed_json(
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"amount\":\"5\",\"note\":\"one\"}\n",
+            "{\"account_id\":\"a\",\"txn_id\":\"t\",\"amount\":\"5\",\"note\":\"two\"}\n",
+        ),
+        0,
+        "a difference in an ignored column was called a change"
+    );
+
+    // The keys can be written *after* the last compared value, which is why the
+    // run covers every wanted field and not only the compared ones: without the
+    // keys inside it, a byte-equal prefix would not prove the rows are a pair.
+    assert_eq!(
+        changed_json(
+            "{\"amount\":\"5\",\"note\":\"x\",\"account_id\":\"a\",\"txn_id\":\"t\"}\n",
+            "{\"amount\":\"6\",\"note\":\"x\",\"account_id\":\"a\",\"txn_id\":\"t\"}\n",
+        ),
+        1,
+        "a change before the keys was missed"
+    );
+    assert_eq!(
+        changed_json(
+            "{\"amount\":\"5\",\"note\":\"x\",\"account_id\":\"a\",\"txn_id\":\"t\"}\n",
+            "{\"amount\":\"5\",\"note\":\"x\",\"account_id\":\"a\",\"txn_id\":\"t\"}\n",
+        ),
+        0,
+        "keys after the compared value broke the proof"
+    );
+}
+
+/// Enough identical rows to cross `PROOF_BACKOFF` both ways, then a run of
+/// changed ones, so the backoff cannot lose a difference by skipping it.
+#[test]
+fn the_backoff_never_skips_a_difference() {
+    let mut a = String::new();
+    let mut b = String::new();
+    // 200 identical rows: the proof succeeds and the counter stays at zero.
+    for i in 0..200 {
+        let row = format!(
+            "{{\"account_id\":\"a{i}\",\"txn_id\":\"t{i}\",\"amount\":\"{}\",\"note\":\"n\"}}\n",
+            i % 7
+        );
+        a.push_str(&row);
+        b.push_str(&row);
+    }
+    // 200 where every row differs: the proof fails often enough to back off.
+    for i in 200..400 {
+        a.push_str(&format!(
+            "{{\"account_id\":\"a{i}\",\"txn_id\":\"t{i}\",\"amount\":\"1\",\"note\":\"n\"}}\n"
+        ));
+        b.push_str(&format!(
+            "{{\"account_id\":\"a{i}\",\"txn_id\":\"t{i}\",\"amount\":\"2\",\"note\":\"n\"}}\n"
+        ));
+    }
+    assert_eq!(
+        changed_json(&a, &b),
+        200,
+        "the backoff skipped rows instead of parsing them"
+    );
+}

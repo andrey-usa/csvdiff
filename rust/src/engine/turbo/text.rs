@@ -575,7 +575,7 @@ impl RowParser {
         end_of_json_row(data, pos, end)
     }
 
-    fn slot_for(&self, key: &[u8]) -> Option<usize> {
+    pub(super) fn slot_for(&self, key: &[u8]) -> Option<usize> {
         let RowParser::Json {
             wanted,
             slots,
@@ -596,6 +596,44 @@ impl RowParser {
             at = (at + 1) & slot_mask;
         }
     }
+}
+
+/// Does the mate's tail name a column this run tracks?
+///
+/// The CSV proof rests on a column sitting at a fixed offset. JSON makes no such
+/// promise: a value is found by name, and a name repeated in one object takes its
+/// *last* value for a compared column — which the C and C++ ports do too, and
+/// `test.sh` cross-checks — so a second `"amount"` past the diverging byte would
+/// carry a value the prefix never saw.
+///
+/// It cannot be ruled out in general, but it can be ruled out *here*, because the
+/// proof only reaches this point when the two rows agree all the way through the
+/// last compared value. Whatever is left is the trailing ignored columns: a few
+/// bytes. A name is a quoted string, so every quote in them is a candidate.
+/// Mistaking a closing quote for an opening one costs a lookup that fails, which
+/// is a fallback and not a wrong answer — and an escaped name counts as a hit for
+/// the same reason, since the wanted names are held unescaped.
+pub(super) fn json_tail_is_clean(p: &RowParser, d: &[u8], mut at: usize, end: usize) -> bool {
+    while at < end {
+        let q = next_of1(d, at, end, b'"');
+        if q >= end {
+            return true;
+        }
+        let (close, escaped) = skip_json_string(d, q, end);
+        if escaped {
+            return false;
+        }
+        let from = q + 1;
+        let to = if close > q + 1 { close - 1 } else { q + 1 };
+        if to > from && p.slot_for(&d[from..to]).is_some() {
+            return false;
+        }
+        if close <= q {
+            return false;
+        }
+        at = close;
+    }
+    true
 }
 
 /// Past the end of this object's line. Records are newline-delimited, so a
