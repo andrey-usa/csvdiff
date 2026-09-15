@@ -774,7 +774,19 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
         return w;
     };
     const unsigned ways = split(ai.firsts.size());
-    const unsigned b_ways = split(bi.firsts.size());
+    // `added` does not need a pass of its own to be *counted*. Every distinct
+    // key of A finds at most one distinct key of B, distinct keys of A cannot
+    // find the same key of B, and the comparison behind the lookup is
+    // symmetric -- so the number of B's keys with an A counterpart is exactly
+    // the pair count the A pass produces, and `added` is B's distinct keys
+    // minus it.
+    //
+    // What the pass is still for is the *sample*: the report's added section
+    // names rows. So it runs when something will print them and not otherwise,
+    // which is the rule `csvdiff.cpp` has followed since it was measured there.
+    // This path never asked -- it walked B whether or not anything would read
+    // the result, which is a full random-probed pass over a second table.
+    const unsigned b_ways = opt.row_lists ? split(bi.firsts.size()) : 0u;
     std::vector<Part> parts(ways), b_parts(b_ways);
     std::vector<std::exception_ptr> failures(ways + b_ways);
 
@@ -864,6 +876,11 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
             std::vector<std::int32_t>().swap(p.pb);
         }
     }
+    // Derived rather than counted when B was not walked. `held` stays empty,
+    // which is what `row_lists` being false means: the count is exact either
+    // way, and nothing will print the sample.
+    if (!opt.row_lists)
+        added.total = bi.unique() - static_cast<std::int64_t>(pair_a.size());
     phase.mark("join");
     const std::size_t npairs = pair_a.size();
     const std::size_t words = (npairs + 63) / 64;
