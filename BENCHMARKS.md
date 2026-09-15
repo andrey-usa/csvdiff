@@ -73,6 +73,60 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-15 (method) — the C and C++ rows are not answering the same question
+
+Every table here that puts C against C++ compares a run that emits counts with a
+run that emits counts *and* a sample of the rows behind them. The harness asks
+both for `--json` and checks that the counts agree, which they do. What it
+cannot see is that producing that JSON is a different amount of work in the two
+ports.
+
+| port | JSON top-level keys |
+|------|---------------------|
+| C    | `columns`, `counts` |
+| C++  | `added`, `changed`, `columns`, `counts`, `dup_a`, `dup_b`, `meta`, `removed` |
+
+C's columnar path derives `added` as a number and never collects a row for it --
+`b_ways` is zero unless `CSVDIFF_VERIFY_ADDED` is set. It does not collect
+`removed`, `changed`, or the duplicate lists either, on Parquet or on CSV. Asked
+for a 50k pair, C reports 0 added rows and 0 removed rows beside its exact
+`counts.added` of 50; C++ reports three of each.
+
+### What the gap is when both are asked for the same output
+
+8M Parquet pair, eleven rounds, alternating which port goes first.
+
+| | C median | C++ median | C++ / C |
+|---|---:|---:|---:|
+| summary only, no `--json` | 1.96s | 2.21s | **1.12x** |
+| with `--json` | 1.85s | 2.48s | 1.34x |
+
+**C costs the same either way** -- 1.96s against 1.85s, the difference inside
+this host's noise -- because it does not collect samples in either mode. C++
+goes 2.21s to 2.48s, which is the collection. So the 1.34x that a table reports
+is 1.12x of engine and the rest of a report C is not writing.
+
+CPU says it more plainly: C 4.89s and 4.46s, unchanged by the flag; C++ 6.17s
+and 7.44s.
+
+### What to do about it
+
+Nothing in the ports. The C++ report is a feature and the C port not having one
+is a choice, and neither is a bug to be fixed by making the other match. What is
+wrong is reading a single ratio as "how much faster is C at comparing files",
+because at the sizes these tables cover about two thirds of the reported
+difference on Parquet is output.
+
+The honest comparisons are the two rows above, and they answer different
+questions: 1.12x is the engines, 1.34x is the tools. A future table that wants
+the first should pass no `--json` and read the summary line, which every port
+prints and which costs the same to produce in all four.
+
+One more thing is visible in the same run and belongs to the entry below rather
+than this one: C's median with `--json` is 1.85s, and its median over the rounds
+where it *ran first* is 1.32s. That is the huge-page compaction effect, not the
+report.
+
 ## 2026-09-15 (measurement) — the C port's time depends on what ran before it
 
 `alloc_huge` is worth more than its own note claims and costs more than anyone
