@@ -73,6 +73,100 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-15 (week over week) — 20M of Parquet, against the tree from seven days ago
+
+There was no 20M baseline to compare against: `BENCHMARKS.md` at `20aa3fe`
+(2026-09-08 23:43, the last commit of that day) records 2M and 10M and nothing
+else. So the baseline is built here rather than quoted — the week-ago tree
+checked out beside this one, built on this host, and run against the same pair
+in the same sitting.
+
+Local 4 vCPU / 16 GB container, one uncompressed 20M Parquet pair (3,069 MB for
+the two files), five interleaved rounds each, `--repeats 5` through
+`scripts/bench_ports.py`. `wk` rows are `20aa3fe`.
+
+| Port   |   Best | Median |  Worst |   CPU | Peak RSS | Above the input |
+| ------ | -----: | -----: | -----: | ----: | -------: | --------------: |
+| C      |  4.70s |  4.82s |  5.66s | 11.8s | 5,896 MB |        2,827 MB |
+| C++    |  7.55s |  7.87s |  8.46s | 24.0s | 5,771 MB |        2,701 MB |
+| Rust   |  6.03s |  6.31s |  6.53s | 19.2s | 5,719 MB |        2,650 MB |
+| Zig    |  5.69s |  5.86s |  6.13s | 19.5s | 5,653 MB |        2,584 MB |
+| wk C   |  4.44s |  4.96s |  5.58s | 12.3s | 5,912 MB |        2,843 MB |
+| wk C++ |  7.44s |  7.55s |  8.38s | 23.3s | 5,867 MB |        2,797 MB |
+| wk Zig | 19.14s | 19.90s | 20.34s | 26.4s | 5,535 MB |        2,465 MB |
+
+`counts: identical everywhere`, across all seven builds — a week-old binary and
+today's agree to the row on 20,002,000 of them.
+
+### Read the two controls first
+
+The 50M entry below is the reason this table has controls at all: C's Parquet
+path went 16.60s to 8.65s there on *identical code*, because the two runs were
+different sittings. Here both trees run in one sitting, and two of the three
+pairs are controls:
+
+| Port | week ago → today | ranges |
+|------|------------------|--------|
+| C   | 4.96s → 4.82s, **-3%** | 4.44-5.58 against 4.70-5.66, overlapping |
+| C++ | 7.55s → 7.87s, **+4%** | 7.44-8.38 against 7.55-8.46, overlapping |
+
+No C++ commit this week touches the columnar Parquet path -- its changes are the
+ndjson byte proof and the text-path phase timings. C's Parquet commits are the
+memory-ceiling work and the snappy/LZ4 codecs, and this pair is uncompressed, so
+the codec path is not entered. Both move a few per cent, in *opposite*
+directions, with ranges that overlap. That is the sitting holding still, and it
+is what licenses the row below.
+
+### Zig: 19.90s to 5.86s
+
+**3.4x**, and the ranges do not come close to touching: 19.14-20.34 against
+5.69-6.13. Nothing about this one is subtle.
+
+CPU tells you what kind of change it was. Wall fell 3.4x; CPU fell from 26.4s to
+19.5s, which is 26%. A change that did 3.4x less work would have taken CPU down
+with it. This one mostly stopped waiting: cores-busy goes from about 1.3x to
+about 3.3x on a four-core box. (The harness reports the minimum CPU of the five
+runs, so these ratios divide it by the median wall; against the best wall they
+read 1.4x and 3.4x, which is the same story.)
+
+**Not bisected.** Two commits from 2026-09-09 fit the shape -- `4949283` "derive
+`added` instead of walking B for it", which removes a pass, and `ed276df` "the
+same, where the counting was not even threaded", which is a serial phase becoming
+parallel and is the one that matches a wall-without-CPU gain. `1f2b070` (#73)
+lands in the same window and is worth 12% of CPU on CSV. Which of the three owns
+how much is a question this table does not answer, and the attribution is offered
+as inspection rather than measurement.
+
+### The Rust row has no partner, and why
+
+The week-ago Rust port cannot be built in this container. On 2026-09-08 `duckdb`
+(bundled) and `polars` were unconditional dependencies -- `rust/Cargo.toml` had no
+`[features]` section at all, so `--no-default-features` removes neither -- and that
+file's own comment puts a debug build of the pair at tens of gigabytes. There
+were 7.5 GB free. Today's Rust row is recorded for the standings, not as half of
+a comparison.
+
+For the same reason of size, this is Parquet and not CSV: a 20M CSV pair is about
+7 GB against 3.1 GB for Parquet, and the CSV pair does not fit beside two trees'
+builds.
+
+### Where 20M of Parquet stands now
+
+| Port | Median |   CPU | Cores (CPU over median) |
+|------|-------:|------:|------------------------:|
+| C    | 4.82s  | 11.8s |                    2.4x |
+| Zig  | 5.86s  | 19.5s |                    3.3x |
+| Rust | 6.31s  | 19.2s |                    3.0x |
+| C++  | 7.87s  | 24.0s |                    3.0x |
+
+C leads on wall with by far the least CPU -- 11.8s against everyone else's 19-24s
+-- while spreading it the least. Zig passed Rust and C++ this week. C++ is last
+and is the only port here whose Parquet path nobody has touched.
+
+One sitting, one host, one pair. The ratios within the table are what it
+supports; none of these numbers compares with a hosted-runner row elsewhere in
+this file.
+
 ## 2026-09-14 (scale) — the 50M rung, with repeats, and the 1.04x is gone
 
 Dispatched to settle the one number three rounds of work rested on: Rust's 1.04x
