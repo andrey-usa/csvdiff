@@ -358,6 +358,15 @@ bool row_eq(const Keys& k, const KeySide& x, std::size_t rx, const KeySide& y, s
 // it already loaded, where a table of bare positions would have to follow each
 // one into a separate array of hashes and take a second cache miss to reject
 // it. At ten million keys those second misses were the join.
+//
+// How many rows ahead to start the load for. Measured in the C port, not
+// reasoned: at ten million rows the index build is flat within noise from 8 to
+// 64, but the join is not -- best at 8 to 24, decaying past 32, because a probe
+// touches a second table and reaching too far ahead evicts what the current one
+// is still using. The same 24 is used here so the two ports differ in language
+// and not in tuning.
+inline constexpr std::size_t kPrefetchAhead = 24;
+
 struct Index {
     std::vector<std::uint64_t> slots;
     std::uint64_t mask = 0;
@@ -427,6 +436,11 @@ Index build_index(const Keys& k, const KeySide& s, const Options& o, unsigned th
     ix.hashes.reserve(s.rows);
 
     for (std::size_t r = 0; r < s.rows; ++r) {
+        // The slot this row will land in is a random word of a table far larger
+        // than the cache, and the hash that picks it is already in hand rows
+        // ahead of where it is needed.
+        if (r + kPrefetchAhead < s.rows)
+            __builtin_prefetch(&ix.slots[hs[r + kPrefetchAhead] & ix.mask], 1, 0);
         const std::uint64_t h = hs[r];
         std::size_t at = h & ix.mask;
         for (;;) {
@@ -771,6 +785,10 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
         out.pa.reserve(hi - lo);
         out.pb.reserve(hi - lo);
         for (std::size_t at = lo; at < hi; ++at) {
+            // The same stall as the insert above, in the other side's table:
+            // the hash this row will probe with is already in hand.
+            if (at + kPrefetchAhead < hi)
+                __builtin_prefetch(&bi.slots[ai.hashes[at + kPrefetchAhead] & bi.mask], 0, 0);
             const std::int32_t row = ai.firsts[at];
             const std::int32_t mate = lookup(keys, bi, keys.b, keys.a,
                                              static_cast<std::size_t>(row), ai.hashes[at], opt);
@@ -788,6 +806,8 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
         const std::size_t lo = bi.firsts.size() * p / b_ways;
         const std::size_t hi = bi.firsts.size() * (p + 1) / b_ways;
         for (std::size_t at = lo; at < hi; ++at) {
+            if (at + kPrefetchAhead < hi)
+                __builtin_prefetch(&ai.slots[bi.hashes[at + kPrefetchAhead] & ai.mask], 0, 0);
             const std::int32_t row = bi.firsts[at];
             if (lookup(keys, ai, keys.a, keys.b, static_cast<std::size_t>(row), bi.hashes[at],
                        opt) >= 0)
