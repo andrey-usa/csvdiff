@@ -73,6 +73,86 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-15 (measurement) — the C port's time depends on what ran before it
+
+`alloc_huge` is worth more than its own note claims and costs more than anyone
+has been charging it. On this host the C port runs a 8M Parquet pair in 1.34s or
+in 2.10s, on one binary, decided by nothing but whether another large process
+ran immediately before it.
+
+Found while porting `alloc_huge` to C++ -- a change that is **not** in this
+commit and should not be made without reading what follows.
+
+### The signature
+
+Two binaries, nothing else running, alternating which goes first each round.
+`cpp` here is the C++ port without huge pages, as a reference that does not use
+them; `C` is `c/csvdiff` as it ships.
+
+| round | order | cpp wall | C wall | C cpu |
+|------:|-------|---------:|-------:|------:|
+| 1 | cpp, C | 2.24s | 1.98s | 4.97s |
+| 2 | C, cpp | 2.42s | **1.30s** | **3.65s** |
+| 3 | cpp, C | 2.50s | 2.03s | 5.11s |
+| 4 | C, cpp | 2.40s | **1.33s** | **3.71s** |
+| 5 | cpp, C | 2.36s | 2.13s | 5.29s |
+| 6 | C, cpp | 2.41s | **1.34s** | **3.79s** |
+| 7 | cpp, C | 2.37s | 2.10s | 5.26s |
+| 8 | C, cpp | 2.41s | **1.45s** | **3.96s** |
+| 9 | cpp, C | 2.46s | 2.23s | 5.56s |
+| 10 | C, cpp | 2.50s | **1.38s** | **3.89s** |
+| 11 | cpp, C | 2.37s | 2.12s | 5.27s |
+
+C first: 1.30-1.45s. C second: 1.98-2.23s. **1.57x on the medians**, with no
+overlap between the two groups at all. The reference column has no such split --
+2.24 to 2.50 with the parity of the round making no difference to it.
+
+### Why
+
+This host reports `madvise` for both `/sys/kernel/mm/transparent_hugepage/enabled`
+and `.../defrag`. The second one is the part that matters: under `defrag=madvise`
+a range that asks for `MADV_HUGEPAGE` gets **direct compaction** -- the kernel
+assembles 2 MB pages while the calling thread waits. How long that takes depends
+on how fragmented memory is at that instant, and a 2.4 GB process that exited a
+moment ago is what fragments it.
+
+So the cost is not a property of the run. It is a property of what the machine
+was doing beforehand.
+
+**And it is charged as the process's own CPU.** 3.65-3.96s when C goes first,
+4.97-5.56s when it goes second, for identical work. This file says above that
+"CPU is the honest measure of work" because wall mixes work with how well a
+design spreads it. That holds against threading and does not hold against this:
+the extra seconds are the kernel compacting memory on the process's behalf, and
+they land in the process's system time either way.
+
+### What it means for the tables
+
+Rotation spreads this rather than removing it. With four builds each is first
+once every four rounds, so a port using huge pages is measured mostly in its
+contended state, and its `Best` column is the one round where it was not. That
+is a reading of C's own spread rather than a claim about a particular table --
+in three runs of the same 8M pair today C's median came out 2.06s, 1.35s and
+2.12s, and its 50M rung moved 16.60s to 8.65s on unchanged code.
+
+A user running `csvdiff` once on a quiet machine gets the 1.34s behaviour. A
+ladder running four ports back to back mostly gets the 2.10s one. Both are real;
+they are answers to different questions, and this file has been reporting one of
+them while sounding like the other.
+
+### The C++ change this came from is not being made
+
+Porting `alloc_huge` to the C++ columnar index reproduces all of it: 2.03-2.55s
+when the process goes first, beating the same build without huge pages at its
+best of 2.17s, and 2.73-3.10s when it goes second. Median over mixed positions
+is **1.16x slower**, so on the evidence available it does not pay here.
+
+The case for it is not dead -- it wins outright on a quiet machine, and the two
+ports would then differ in language rather than in allocator. But it is a change
+whose sign depends on the environment, and that is a decision to take
+deliberately rather than to inherit from a benchmark run on one container. The
+patch is not in this commit.
+
 ## 2026-09-15 (week over week) — 20M of Parquet, against the tree from seven days ago
 
 There was no 20M baseline to compare against: `BENCHMARKS.md` at `20aa3fe`
