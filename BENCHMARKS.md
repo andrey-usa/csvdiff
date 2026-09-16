@@ -73,6 +73,41 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-16 (zig scan) — the same rung, and it does not transfer
+
+The entry below gave the C++ scan a sixteen-byte rung and got 4% on ndjson for
+it. Zig's scan reads the same bytes and looks like it has the same hole -- one
+width, chosen at build time, `orelse 8`, with 32 and 64 as opt-ins and sixteen
+not even offered. So it was tried, and it is not there.
+
+`zig build --release=fast` against `-Dscan=16`, same 4M pairs, eleven paired
+rounds each, alternating which binary goes first:
+
+| format | scan 8 | scan 16 | paired ratio | rounds won |
+|--------|-------:|--------:|--------------|-----------:|
+| ndjson | 2.27s | 2.23s | 1.001 [0.964-1.018] | 5 of 11 |
+| csv    | 1.14s | 1.14s | 0.993 [0.867-1.156] | 7 of 11 |
+
+Both bands straddle one and both win counts are coin flips. CPU leans the same
+way in both, 0.973 and 0.980, which is the only hint of anything and is not
+enough on its own.
+
+**The likely reason is that it is not the same change.** C's ladder and now
+C++'s put sixteen bytes *above* an eight-byte step: a field too short for the
+wide loop still gets the narrow one. Zig has a single width, so `-Dscan=16`
+*replaces* the eight-byte step, and a field shorter than sixteen bytes falls
+past it to the byte-at-a-time tail. On ten-byte CSV fields that is the whole
+field, which is the shape of the result.
+
+So the untested variant is a ladder rather than a wider single step, and that is
+a change to how `scan.zig` is built rather than a flag -- its width is one
+constant threaded through the module, deliberately, so "a benchmark of an
+instruction set should not be measuring a function pointer". A ladder would be
+compile-time nested loops and would not break that, but it is a refactor on the
+strength of two CPU medians a couple of per cent apart, and that is not a reason
+this file accepts. Recorded so the next person reaching for `-Dscan=16` knows it
+was measured and what the measurement missed.
+
 ## 2026-09-16 (scanners) — the rung C++ was missing, and it pays where C says it should not
 
 The entry below turned the wide step on by default and measured it slower on
