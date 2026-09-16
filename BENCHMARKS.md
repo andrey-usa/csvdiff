@@ -73,6 +73,71 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-16 (C++ columnar) — what two changes were worth, and a ranking this host cannot give
+
+Two changes landed in the C++ Parquet path: the prefetch of #77 and the derived
+`added` of #79. Measured together against the tree before either, on one host in
+one sitting, 8M Parquet pair, eleven paired rounds, alternating which binary goes
+first.
+
+| | before | after | wall | CPU |
+|---|------:|------:|-----:|----:|
+| with `--json` (report wanted) | 2.50s | **1.99s** | **0.796x** | 0.767x |
+| no `--json` (summary only)    | 2.40s | **1.69s** | **0.703x** | 0.652x |
+
+Faster in 11 of 11 rounds in both modes. The two figures differ because the two
+changes have different reach: the prefetch helps every run, and deriving `added`
+only helps the runs that were not going to print the sample.
+
+The parts add up, which is the check worth having. 0.796x is 1.26x, which is what
+the prefetch measured on its own; 1.26x against the derived pass's own 1.10x is
+1.39x, against 1.42x measured for the pair. Nothing here is the sum of two
+numbers taken at different times -- the cumulative row is its own measurement and
+agrees with the parts.
+
+### `compared columns` is not the scaling problem it looked like
+
+An earlier reading of this phase had C scaling 4.2x against C++'s 3.0x. That came
+from two single runs taken under different conditions and does not survive being
+measured properly:
+
+| threads | C | C++ | ratio |
+|--------:|--:|----:|------:|
+| 1 | 1.708s | 2.075s | 1.21x |
+| 2 | 0.882s | 1.157s | 1.31x |
+| 4 | 0.532s | 0.655s | 1.23x |
+
+C scales 3.21x over four cores and C++ 3.17x. The gap is flat at about 1.2x
+whatever the thread count, so it is per-core efficiency on structurally identical
+code -- both ports block the same way, take the same dictionary fast path, and
+run the same number of lanes. That is micro-optimisation with an uncertain
+payoff, not the structural win the join turned out to be, and it is left alone.
+
+### The ranking against C is host-dependent, so it is not recorded
+
+Two sittings, the same two sources, opposite answers:
+
+| host | C++ / C, `--json` | C++ / C, summary |
+|------|------------------:|-----------------:|
+| `emeraldrapids` (2026-09-15) | 1.34x | 1.12x |
+| `cascadelake` (2026-09-16)   | **0.80x** | **0.72x** |
+
+Both are same-sitting, interleaved, alternating-order measurements, and neither
+is wrong. The container moved between them: `rustc --print target-cpus` resolved
+`emeraldrapids` yesterday and `cascadelake` today, on a machine eight minutes old.
+Both ports compile with `-march=native`, so the hardware changing changed the
+binaries too, and two variables moved at once.
+
+It is not the huge-page term from the entry below, which was the first suspicion:
+C is granted its 262,144 kB of `AnonHugePages` on every run today, on a host with
+14 GB free and nothing to compact.
+
+So this file gets no "C++ has overtaken C on Parquet" row, because one host says
+it has and another says it has not. What can be said is narrower and holds: on
+the host that ran them, the C++ columnar path costs 0.70 to 0.80 of what it cost
+before these two changes, and the ports are now close enough on Parquet that
+which one leads depends on the machine.
+
 ## 2026-09-15 (method) — the C and C++ rows are not answering the same question
 
 Every table here that puts C against C++ compares a run that emits counts with a
