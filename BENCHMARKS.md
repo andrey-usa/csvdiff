@@ -506,6 +506,16 @@ whose sign depends on the environment, and that is a decision to take
 deliberately rather than to inherit from a benchmark run on one container. The
 patch is not in this commit.
 
+**Decided, 2026-09-16: not shipped.** The win is real and so is the cost, and the
+cost is paid where this project does its measuring. Benchmarks run the ports back
+to back, which is the contended case, so the 1.16x would land on every table C++
+appears in -- and it would give C++ the same position-dependent term this entry
+documents in C, where an identical binary reads 1.34s or 2.10s depending on what
+ran before it. One port carrying that is a finding; two is a measurement problem.
+A user comparing two files once on a quiet machine is the case that gains, and
+that case is not what these tables measure. Reopening it would want a host where
+`defrag` is not `madvise`, or a threshold measured rather than guessed.
+
 ## 2026-09-15 (week over week) — 20M of Parquet, against the tree from seven days ago
 
 There was no 20M baseline to compare against: `BENCHMARKS.md` at `20aa3fe`
