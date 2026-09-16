@@ -73,6 +73,54 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-16 (rust scan) — the rung again, and what three ports say about it
+
+Rust's scan has the same hole the C++ one had, and this time with none of Zig's
+excuses. `field.rs` is a real ladder -- `VECTOR_WIDTH` where the build has AVX2
+or AVX-512BW, then eight bytes of SWAR, then bytewise -- with nothing at sixteen.
+And `build_ports.sh` sets `-C target-cpu=x86-64-v3`, so the thirty-two byte step
+is live in every benchmark build: a twenty-two byte ndjson field fails its first
+bounds test and falls to three eight-byte steps. That is the case the C++ entry
+fixed, in the port that leads ndjson.
+
+A `sse2_hits` beside the existing `vector_hits`, gated on `target_arch` alone
+because SSE2 is in the x86-64 baseline, stacked between the wide step and the
+word. Thirteen paired rounds each, 4M pairs, alternating who goes first:
+
+| format | base | with the rung | paired ratio | rounds won |
+|--------|-----:|--------------:|--------------|-----------:|
+| ndjson | 2.10s | 2.08s | 1.000 [0.963-1.009] | 7 of 13 |
+| csv    | 1.00s | 1.00s | 1.005 [0.981-1.013] | 6 of 13 |
+
+Nothing. Both bands straddle one, both win counts are coin flips, and CPU
+disagrees with itself between the two formats (0.996 and 1.017). Reverted.
+
+### Three ports, one rung, one winner
+
+| port | ladder | sixteen-byte rung | worth |
+|------|--------|-------------------|-------|
+| C | 32 / 16 / 8 / 1 | had it already | 0.934 on CSV, nothing on ndjson |
+| C++ | 32 opt-in / 8 / 1 | **added** | **0.958 on ndjson**, nothing on CSV |
+| Zig | one width, `orelse 8` | replaced, not stacked | nothing either format |
+| Rust | 32 / 8 / 1 | added, stacked | nothing either format |
+
+The Zig result had an explanation -- a single width replaces the narrow step
+instead of standing above it, so short fields fall past to the tail. Rust has no
+such excuse and still shows nothing, so that explanation does not cover this.
+
+What is left is how much of each port's run the scan actually is. C++ reads the
+same ndjson in 4.8s where Rust reads it in 2.1s, and a rung that removes a fixed
+number of steps per field is worth a larger share of the slower run. C's own
+profile is the only direct evidence any of these ports has on the question -- 43%
+of CSV instructions in `next_of2`, 27% above it in `parse_csv_row` -- and nothing
+equivalent has been measured for the other three. That is the measurement this
+seam actually wanted, and it was never taken; four scan experiments were run
+against an assumption about where the time goes rather than a profile of it.
+
+So the rung is not a portable win, it is a win in the port where the scan is a
+big enough share to matter, and which ports those are is unmeasured. Recorded to
+close the seam: the next person should profile before adding a rung, not after.
+
 ## 2026-09-16 (zig scan) — the same rung, and it does not transfer
 
 The entry below gave the C++ scan a sixteen-byte rung and got 4% on ndjson for
