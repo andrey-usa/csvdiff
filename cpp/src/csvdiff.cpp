@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#if defined(CSVDIFF_SCAN_AVX2) || defined(CSVDIFF_SCAN_AVX512)
+#if defined(__SSE2__) || defined(CSVDIFF_SCAN_AVX2) || defined(CSVDIFF_SCAN_AVX512)
 #include <immintrin.h>
 #endif
 
@@ -137,6 +137,27 @@ std::size_t next_of2(std::string_view d, std::size_t from, std::size_t end, char
                 _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
             const unsigned hits = static_cast<unsigned>(_mm256_movemask_epi8(
                 _mm256_or_si256(_mm256_cmpeq_epi8(chunk, va), _mm256_cmpeq_epi8(chunk, vb))));
+            if (hits) return at + static_cast<std::size_t>(__builtin_ctz(hits));
+        }
+    }
+#endif
+    // Sixteen bytes, and it is a rung this port did not have. The ladder above
+    // is opt-in and the one below is eight bytes, so a field shorter than the
+    // wide step fell straight from 32 to 8 -- which is why turning the wide step
+    // on by default measured *slower* on ndjson and did nothing on CSV. The C
+    // port has had this rung all along and its note is the argument for it:
+    // fields here average about ten bytes, "an eight-byte step needs two
+    // iterations for a typical field and a sixteen-byte one needs a single
+    // iteration". SSE2 is not a target question on x86-64 -- the architecture
+    // always has it -- so this needs no `-march=` and no define, and anything
+    // that is not x86 falls through to the same SWAR loop it always did.
+#if defined(__SSE2__)
+    {
+        const __m128i va = _mm_set1_epi8(a), vb = _mm_set1_epi8(b);
+        for (; at + 16 <= end; at += 16) {
+            const __m128i w = _mm_loadu_si128(reinterpret_cast<const __m128i*>(d.data() + at));
+            const unsigned hits = static_cast<unsigned>(
+                _mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(w, va), _mm_cmpeq_epi8(w, vb))));
             if (hits) return at + static_cast<std::size_t>(__builtin_ctz(hits));
         }
     }
