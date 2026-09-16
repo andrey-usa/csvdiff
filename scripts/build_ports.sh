@@ -36,7 +36,7 @@ command_for() {
         # Not the `scanners` target: that also builds `build/csvdiff-avx512`,
         # which does not start on a runner without AVX-512 -- the caller asks
         # for `cpp-avx512` separately when the host has the instructions.
-        cpp-scanners) echo 'make -C cpp build/csvdiff-swar build/csvdiff-avx2' ;;
+        cpp-scanners) echo 'make -C cpp build/csvdiff-avx2' ;;
         cpp-avx512)   echo 'make -C cpp build/csvdiff-avx512' ;;
         rust)         echo 'cd rust && cargo build --release --no-default-features' ;;
         # With DuckDB and polars, for the workflows that still ask for them.

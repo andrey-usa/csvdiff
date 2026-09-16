@@ -110,8 +110,9 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     rows.append(("Rust engine", [str(RUST)], report + ["--max-rows", "1"] + thread_flag, ALL))
     for label, path, flags, formats in [
         # The scanner builds differ only in how they find a delimiter, so they
-        # are asked only about the formats that have delimiters to find.
-        ("C++ swar", CPP.with_name("csvdiff-swar"), thread_flag, TEXT),
+        # are asked only about the formats that have delimiters to find. The
+        # SWAR row is the plain `C++` build above: it takes the eight-byte step,
+        # so a separate `csvdiff-swar` was the same binary under a second name.
         ("C++ avx2", CPP.with_name("csvdiff-avx2"), thread_flag, TEXT),
         ("C++ avx512", CPP.with_name("csvdiff-avx512"), thread_flag, TEXT),
         ("Rust avx2", ROOT / "rust/target-avx2/release/csvdiff", report + thread_flag, ALL),
