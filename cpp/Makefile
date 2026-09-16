@@ -44,11 +44,12 @@ $(BIN): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 # instruction set should not be measuring a function pointer, and each of these
 # is what you would ship for that target. `scanners` needs a CPU that has the
 # instructions; the AVX-512 build will not start on one that does not.
-scanners: build/csvdiff-swar$(EXE) build/csvdiff-avx2$(EXE) build/csvdiff-avx512$(EXE)
-
-build/csvdiff-swar$(EXE): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
+# No `csvdiff-swar` here. It was built from the same sources with the same flags
+# and no define, which is exactly how `build/csvdiff` is built -- the two came
+# out byte for byte identical, so the matrix row it fed was a build measured
+# against itself. The plain build takes the eight-byte step and is the SWAR
+# baseline these two are compared against.
+scanners: build/csvdiff-avx2$(EXE) build/csvdiff-avx512$(EXE)
 
 build/csvdiff-avx2$(EXE): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
 	@mkdir -p build

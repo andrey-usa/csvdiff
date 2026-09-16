@@ -73,6 +73,70 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-16 (scanners) — a row that measured itself, and a wider step that does not pay
+
+Chasing the ndjson gap of the entry below into the scanner turned up one defect
+and one negative result. The defect is real and is fixed here. The wider step is
+not, and is not.
+
+### The two ports choose their step differently
+
+```c
+/* c/csvdiff.c   */  #if defined(__AVX2__)            /* predefined by -march=native */
+// cpp/src/csvdiff.cpp  #if defined(CSVDIFF_SCAN_AVX2)   // set only by the variant builds
+```
+
+C selects on the macro the compiler predefines, and its own note says so:
+"chosen at compile time from what the build targets... the Makefile builds with
+`-march=native`, which defines these where the CPU has them". C++ selects on a
+macro only `make scanners` passes. So the ordinary `make` binary -- the one every
+table in this file calls "C++" -- compiles the eight-byte SWAR loop and nothing
+else, on any machine.
+
+### Which made one row a build measured against itself
+
+`build/csvdiff-swar` was built from the same sources with the same flags and no
+define. That is the recipe for `build/csvdiff`. Rebuilt clean from `main`, the
+two come out **byte for byte identical** -- same size, same SHA-256. Every matrix
+table's `C++ swar` row has been the `C++` row under a second name, which is
+visible in the tables once you look: the 2M CSV table reads 1.21s and 925 MB for
+both.
+
+The target is gone and so is the row. The plain build takes the eight-byte step,
+so it *is* the SWAR baseline that `C++ avx2` and `C++ avx512` are compared
+against; a fourth build was never needed to say so.
+
+### And the wider step does not pay here
+
+The obvious fix -- have C++ choose on `__AVX2__` like C -- was built and
+measured. 4M pairs, nine rounds, alternating which binary goes first, the two
+builds differing only in that define:
+
+| format | SWAR | AVX2 | |
+|--------|-----:|-----:|---|
+| ndjson | 5.12s | 5.42s | **1.059x slower, faster in 0 of 9** |
+| csv    | 2.10s | 2.07s | 0.986x, faster in 5 of 9 |
+
+A clear loss on ndjson and a coin flip on CSV. CPU agrees: 13.91s against 14.76s
+on ndjson.
+
+The shape fits the work. These scans stop at the next quote, backslash or
+delimiter, and in this data that is ten to forty bytes away -- so a 32-byte step
+often cannot run its loop at all, `at + 32 <= end` failing on the first test,
+and the broadcasts are set up for a scan the SWAR loop would have finished in one
+load. A wide step needs a long way to run.
+
+So the default keeps the eight-byte step and the wide ones stay the explicit
+opt-in they already were. Reverted, and recorded here so nobody spends the
+afternoon on it again.
+
+**What this does not claim.** C reaches the same decision the other way and its
+own entry credits the wider step with a gain. Whether that step earns its place
+in C on ndjson is not measured here -- testing it needs a C build at a baseline
+target, which changes more than the scan -- and nothing above is evidence that it
+does not. The two ports differing on this is worth someone's attention; this
+entry only establishes which way it falls in C++.
+
 ## 2026-09-16 (ndjson) — where C++'s time goes, and what it is not
 
 The 2026-09-14 entry left C++ at 2.4x Rust on ndjson with the byte proof in
