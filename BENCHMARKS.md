@@ -73,6 +73,64 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-16 (profiles) — where ndjson time goes, and why instruction counts were the wrong thing to count
+
+The entry below closed the scan seam by saying the measurement it wanted was a
+profile, and that four experiments had been run without one. This is the profile.
+
+`valgrind --tool=callgrind`, 200k ndjson pair, one thread, instruction counts.
+There is no `perf` on this host; callgrind counts instructions rather than
+sampling cycles, which turns out to be the point. The binaries are built
+`-march=x86-64-v3` because valgrind 3.22 cannot execute the AVX-512 that
+`-march=native` emits here -- that matches what the Rust benchmark build already
+uses and differs from what C and C++ normally ship, so these are shares within a
+v3 build.
+
+### The three ports
+
+| | C | C++ | Rust |
+|---|---:|---:|---:|
+| total instructions | 2.63 B | 4.59 B | **5.38 B** |
+| row parse | `parse_json_row` 27.0% | `parse_json` 34.7% | `RowParser::parse` 25.8% |
+| string skip / scan | `next_of2` 13.2%, `next_of1` 12.4% | **`next_of2` 38.6%** | `skip_json_string` 27.6% |
+| key name to slot | `parser_slot_for` 22.0% | inlined into `parse_json` | `slot_for` 25.6% |
+
+Two things fall out, and the second undoes the first.
+
+**C++ really does scan more.** 38.6% of its instructions are in `next_of2`,
+against C's 13.2% -- 1.77 B instructions against 0.35 B, a factor of five for the
+same bytes. C splits the work, leaning on the single-target `next_of1` for 12.4%
+where C++ asks `next_of2` for two targets every time. That is a real difference
+and a place to look.
+
+**And instruction count does not predict the time.** Rust executes *more*
+instructions than either -- 5.38 B against C++'s 4.59 B -- and is the fastest
+port on this format by a wide margin: 2.05s against C's 2.79s and C++'s 5.07s at
+four million rows. Even allowing that the Rust run renders a report the others do
+not (`miniz_oxide::deflate` is 2.9% of it), the ordering does not come close to
+reversing.
+
+So the currency is not instructions. It is what those instructions do to the
+memory system and the branch predictor, and this host has no `perf` to measure
+that with.
+
+### Which is the honest end of the scan seam
+
+Four scan experiments were run against the assumption that fewer steps per field
+means less time. That assumption is what the table above refutes: the port
+executing the most instructions per row is the one finishing first. The rung paid
+in C++ and nowhere else, and the reading in the entry below -- that it pays where
+the scan is a big enough share -- survives, because C++'s scan share is 38.6%
+where C's is 13.2%. What does not survive is any expectation that shaving
+instructions is generally the lever here.
+
+All three ports concentrate in the same three places: parse the row, skip the
+strings, turn a key name into a slot. Between a fifth and a quarter of ndjson
+work is that last one in the two ports where it is not inlined away, which is
+more than the scan costs C. None of that is a change; it is the map the next
+change should be chosen from, and it is the first one this project has for any
+port but C.
+
 ## 2026-09-16 (rust scan) — the rung again, and what three ports say about it
 
 Rust's scan has the same hole the C++ one had, and this time with none of Zig's
