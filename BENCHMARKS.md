@@ -73,6 +73,91 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-16 (ndjson) — where C++'s time goes, and what it is not
+
+The 2026-09-14 entry left C++ at 2.4x Rust on ndjson with the byte proof in
+place, and said that whatever is slow there is not the row comparison. This is
+the profile it asked for. Local 4 vCPU container (`cascadelake`), 4M ndjson pair,
+1,780 MB a side, warm.
+
+### First, the ports are not being asked for the same thing
+
+| port | JSON top-level keys | added rows in the report |
+|------|---------------------|-------------------------:|
+| C    | `columns`, `counts` | 0 |
+| Rust | `columns`, `counts`, `meta` | 0 |
+| Zig  | `columns`, `counts` | 0 |
+| C++  | `added`, `changed`, `columns`, `counts`, `dup_a`, `dup_b`, `meta`, `removed` | 3 |
+
+The entry below found this between C and C++ on Parquet. It is wider than that:
+**C++ is the only port of the four that collects row samples at all**, on any
+format. Every cross-port row in this file has been comparing one tool that writes
+a report against three that write counts.
+
+Seven rounds, rotating which port goes first:
+
+| port | with `--json` | summary only | CPU, with | CPU, without |
+|------|-------------:|-------------:|----------:|-------------:|
+| Rust |  2.12s |  2.05s |  6.86s |  6.81s |
+| Zig  |  2.23s |  2.27s |  7.77s |  8.03s |
+| C    |  2.68s |  2.79s |  7.74s |  7.80s |
+| C++  |  6.18s |  5.07s | 19.36s | 13.89s |
+
+Only C++ moves. The report costs it 1.11s of wall and 5.47s of CPU -- more than a
+quarter of its CPU (28%) is output the other three do not produce.
+
+**And the gap survives it.** 2.92x Rust with the report, **2.47x without**. On
+Parquet about two thirds of the reported difference turned out to be output; here
+it is about a sixth. The 2.4x is real.
+
+### Where it is
+
+Warm, four threads, the phases each port marks:
+
+| phase | C | Rust | Zig | C++ |
+|-------|--:|-----:|----:|----:|
+| A sweep | 0.543s | 0.865s | 1.303s | **2.282s** |
+| index insert (A) | 0.112s | 0.182s | 0.209s | 0.762s |
+| join and compare | 0.879s | 0.822s | 0.670s | **3.056s** |
+
+Two gaps, not one, and the larger in absolute terms is the join.
+
+### What it is not
+
+**Not threading.** The sweep at one thread against four:
+
+| port | 1 thread | 4 threads |
+|------|---------:|----------:|
+| C    | 0.536s | 0.554s |
+| Rust | 1.651s | 0.831s |
+| C++  | 2.097s | 2.279s |
+
+C++'s sweep does not scale -- and neither does C's, which is four times faster in
+absolute terms. `per_file` is `budget / 2`, so one thread a side becomes two, and
+that doubling buys nothing in either port. What is left is per-byte cost: C++
+sweeps 1,780 MB at about 0.85 GB/s where C does it at 3.3 GB/s.
+
+The join does scale, and still trails: C 3.063s to 0.917s (3.3x), Rust 2.765s to
+0.732s (3.8x), C++ 5.994s to 2.118s (2.8x). C++ is roughly twice C's cost per
+core there as well.
+
+**Not work thrown away.** The columnar path had a pass it ran and discarded, and
+that was worth 1.10x when gated. There is no equivalent here: `csvdiff.cpp`
+already gates B's pass on `row_lists`, and the per-partition `changed` and
+`removed` lists are capped at `max_rows` where they are filled, so nothing
+unbounded is collected for a report nobody asked for. This was checked before
+looking for anything cleverer, because it is the shape that paid twice on
+Parquet.
+
+So the remaining gap is the cost of parsing an ndjson row and of comparing two,
+in both phases, at roughly 2x to 4x the sibling port written in C. That is a
+question about the JSON field parser rather than about structure, and it is
+recorded here rather than guessed at.
+
+These rows are one host and one sitting. They do not compare with the 4M table of
+2026-09-14, which ran elsewhere -- C++ reads 4.35s there and 5.07s here for the
+same work, which is the hardware and not a regression.
+
 ## 2026-09-16 (C++ columnar) — what two changes were worth, and a ranking this host cannot give
 
 Two changes landed in the C++ Parquet path: the prefetch of #77 and the derived
