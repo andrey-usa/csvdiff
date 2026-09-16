@@ -73,6 +73,54 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-16 (scanners) — the rung C++ was missing, and it pays where C says it should not
+
+The entry below turned the wide step on by default and measured it slower on
+ndjson. That was the wrong end of the ladder. C's scan has three rungs and this
+port has two:
+
+| step | C | C++ before | C++ now |
+|------|---|------------|---------|
+| 32 bytes, AVX2 | from `__AVX2__` | opt-in only | opt-in only |
+| **16 bytes, SSE2** | **always on x86-64** | **absent** | **always on x86-64** |
+| 8 bytes, SWAR | yes | yes | yes |
+| one byte | yes | yes | yes |
+
+With no middle rung a field shorter than the wide step fell from 32 straight to
+8, which is why turning the wide step on cost time rather than saving it: the
+broadcasts were set up for a loop whose first bounds test failed. SSE2 is not a
+question about the target -- x86-64 always has it -- so this rung needs no
+`-march=`, no define, and no per-host variation, and anything that is not x86
+falls through to the same SWAR loop as before. `next_of1` is left alone, as C
+leaves its own: it is not in the profile.
+
+Eleven and fifteen paired rounds, 4M pairs, alternating which binary goes first,
+the two differing only in this rung:
+
+| format | 8-byte | with 16-byte | paired ratio | rounds won |
+|--------|-------:|-------------:|--------------|-----------:|
+| ndjson | 5.01s | **4.82s** | **0.958** [0.949-0.975] | **11 of 11** |
+| csv    | 2.06s | 2.07s | 1.009 [0.983-1.025] | 5 of 15 |
+
+CPU agrees: 13.63s to 12.99s on ndjson, and 4.95s to 4.90s on CSV. So ndjson
+gains about 4% and CSV is unchanged -- a band that straddles one, on the format
+where the first eleven rounds had suggested a 4% loss that fifteen did not
+reproduce.
+
+**Which is the opposite of where C finds it.** C claims 0.934 on CSV and nothing
+on ndjson; this port gets nothing on CSV and 0.958 on ndjson. Both measurements
+stand -- they are different code reading the same bytes -- and the readable
+difference is how long a field is. C's note prices its CSV fields at about ten
+bytes, where eight needs two steps and sixteen needs one. The ndjson here is
+1,780 MB over 4M rows of twenty fields, so about twenty-two bytes a field: three
+eight-byte steps against two sixteen-byte ones. Why C++ does not collect the CSV
+win that C does is not established here, and the likeliest reading is that this
+port's CSV path leans on `next_of2` less than the 43% of instructions C's profile
+attributes to it. That is a reading, not a measurement.
+
+Counts identical across all four ports on both formats, 240,031 changed and
+4,000 added, and the 36 tests of the C++ suite pass.
+
 ## 2026-09-16 (scanners) — a row that measured itself, and a wider step that does not pay
 
 Chasing the ndjson gap of the entry below into the scanner turned up one defect
@@ -131,11 +179,13 @@ opt-in they already were. Reverted, and recorded here so nobody spends the
 afternoon on it again.
 
 **What this does not claim.** C reaches the same decision the other way and its
-own entry credits the wider step with a gain. Whether that step earns its place
-in C on ndjson is not measured here -- testing it needs a C build at a baseline
-target, which changes more than the scan -- and nothing above is evidence that it
-does not. The two ports differing on this is worth someone's attention; this
-entry only establishes which way it falls in C++.
+own entry credits the wider step with a gain. That entry turns out to agree with
+this one about ndjson: it measured the wider step at 0.984 there with a middle
+half of 0.942-1.057, "crossing one, so nothing is claimed", and puts the reason
+as "ndjson's fields are longer, so the scan was already finding hits in one
+step". Only the CSV win, 0.934, is claimed for it. So the two ports agree that a
+wider step buys nothing on ndjson; what they disagree about is CSV, and the entry
+above this one is where that goes.
 
 ## 2026-09-16 (ndjson) — where C++'s time goes, and what it is not
 
