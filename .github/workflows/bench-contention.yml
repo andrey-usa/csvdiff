@@ -100,7 +100,7 @@ jobs:
             --formats "${{ github.event.inputs.format || 'csv' }}" \
             --repeats "${{ github.event.inputs.repeats || '3' }}" \
             --json-out /tmp/alone.json
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: aa-alone-${{ github.run_id }}
           path: /tmp/alone.json
@@ -133,7 +133,7 @@ jobs:
             --formats "${{ github.event.inputs.format || 'csv' }}" \
             --repeats "${{ github.event.inputs.repeats || '3' }}" \
             --json-out /tmp/crowd.json
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: aa-crowd-${{ matrix.n }}-${{ github.run_id }}
           path: /tmp/crowd.json
@@ -144,7 +144,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v6
         with:
           pattern: aa-*-${{ github.run_id }}
           path: aa

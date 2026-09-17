@@ -84,7 +84,7 @@ jobs:
           print(f"{path}: {len(html) // 1024} KB, no external references")
           PY
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: report-rust-10k
           path: |

@@ -45,6 +45,7 @@ import sys
 import time
 from pathlib import Path
 
+from bench_formats_ports import host
 from mdtable import render
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -207,7 +208,14 @@ def main() -> int:
             times[label].append((secs, rss, cpu))
             answers[label] = counts(out)
 
-    print(f"\ninput {size:,.0f} MB total, {args.repeats} interleaved runs each\n")
+    # The CPU, on the line above the table. This harness runs every format in
+    # one job, so unlike the ladder its rows really are one machine -- but the
+    # table is still only comparable with another table from the same CPU, and
+    # on a hosted fleet that is not the same thing as the same runner label.
+    h = host()
+    print(f"\nhost: {h['key']}"
+          + (f"  (runner {h['runner']})" if h["runner"] else ""))
+    print(f"input {size:,.0f} MB total, {args.repeats} interleaved runs each\n")
     grid = []
     for label, _, _ in builds:
         if not times[label]:

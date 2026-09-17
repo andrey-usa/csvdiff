@@ -178,7 +178,7 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: ceiling-${{ matrix.port }}-${{ matrix.size }}
@@ -248,7 +248,7 @@ jobs:
               --size "${{ inputs.floor_size }}" \
               --out "out/floor-${{ matrix.port }}.json"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: floor-${{ matrix.port }}
@@ -261,7 +261,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v6
         with:
           path: results
 
@@ -274,7 +274,7 @@ jobs:
               --out scale-report.md
           cat scale-report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: scale-report
           path: scale-report.md
