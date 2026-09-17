@@ -652,11 +652,7 @@ pub(super) fn json_tail_is_clean(p: &RowParser, d: &[u8], mut at: usize, end: us
 /// format has no other way to say where a row ends.
 fn end_of_json_row(data: &[u8], pos: usize, end: usize) -> usize {
     let stop = next_of1(data, pos, end, b'\n');
-    if stop >= end {
-        end
-    } else {
-        stop + 1
-    }
+    if stop >= end { end } else { stop + 1 }
 }
 
 #[cfg(test)]
