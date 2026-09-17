@@ -107,9 +107,11 @@ unexplained. What is ruled out: it is not the thread count (1.88x on a single
 thread, before any thread is started), not the instruction count (1.34x), not
 cache pressure at scale (1.68x at 200k too), and not misses or mispredictions —
 per instruction C++ takes fewer trips to main memory for reads than C does and
-mispredicts a smaller share of its branches. The one surviving lead is writes:
-C++ issues 1.09x the stores per instruction and misses the last level on 2.96x
-as many of them.
+mispredicts a smaller share of its branches. The one surviving lead was writes, and it has since been traced: 54% of C++'s
+last-level write misses are in `row_values`, which allocates a `std::string` per
+cell of every *reported* row where C slices the mapped bytes. The hot path is
+fine — on scan and parse, 55% of C++'s instructions, it is 1.15x C's work and
+writes fewer bytes. Nothing found so far explains the 1.88x.
 
 **Memory is the flattest ranking and C's clearest win.** 716 MB above the mapped
 input on *both* text formats — the same number whether the input is 3.5 GB or
