@@ -22,6 +22,13 @@ states wearing the labels of two builds.
 Everything below comes from a single invocation of
 `scripts/bench_formats_ports.py`, which enforces exactly that.
 
+**On CI the rule needs help.** GitHub's hosted fleet puts several processor
+generations behind one `ubuntu-latest` label, so a workflow that fans sizes or
+formats out across jobs gets its pieces from different machines. The harness
+records the CPU in its JSON and `scripts/bench_group.py` groups on it, printing
+one table per processor and naming what is missing from each. A CI summary
+showing two CPUs is showing two tables.
+
 ---
 
 ## The workload

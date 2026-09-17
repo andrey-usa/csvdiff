@@ -33,7 +33,7 @@ gone. Do not reintroduce them; their measured verdicts are the point of `ARCHIVE
 | `cpp/` | the C++ port (SWAR text + columnar + snappy); own suite `test.sh`; generator included |
 | `rust/` | the port that carries the HTML report; engines `turbo` (default), `sortmerge`, `native`; `cargo test` |
 | `zig/` | the port with the *enforced* `--max-memory` budget; `zig build --release=fast` + `test.sh` |
-| `scripts/` | the measurement harnesses in Python and bash — see the commands below |
+| `scripts/` | the measurement harnesses in Python and bash — see the commands below. `bench_group.py` groups CI results by the CPU that produced them, because a hosted fleet gives different jobs different processors |
 | `.github/workflows/` | the CI and benchmark workflows, listed in `README.md`; `parity.yml` and `formats.yml` are the repository-wide gates |
 | `.github/actions/` | composite actions the workflows share. `setup-zig` is the **only** place the Zig version is pinned — it was in ten |
 | `tests/fixtures/` | the awkward-input and multi-format fixtures every suite is held to |

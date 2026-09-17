@@ -10,6 +10,19 @@ Terse verdicts on things the project no longer carries are in
 
 ## How to read these
 
+**One CPU per table, and CI does not give you that for free.** Every number is
+only comparable with another taken on the same processor. On GitHub's hosted
+fleet that is not a formality: one `ubuntu-latest` label covers several
+generations, so two jobs in one workflow run can land on a Xeon Platinum 8370C
+and an EPYC 7763 — different cache, different core layout, a different AVX-512
+story. A ladder that runs one size per job, or a matrix that runs one format per
+job, produces pieces measured on *different machines*; read as a single curve
+they measure the fleet as much as the code. So `bench_formats_ports.py` records
+the CPU in its JSON beside the numbers, and `scripts/bench_group.py` groups on it
+and prints one table per processor, naming any rung that is missing from a group
+rather than filling it in from another. A run whose summary shows two CPUs has
+produced two tables, whatever it looks like.
+
 **Interleaved, not one build at a time.** A machine's speed drifts under the
 runs themselves — the page cache fills, the kernel's supply of free 2 MB pages
 is picked over. Every build runs once per round and the rounds repeat. A number

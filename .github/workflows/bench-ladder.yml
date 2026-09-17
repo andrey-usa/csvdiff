@@ -232,6 +232,7 @@ jobs:
             --first "$FIRST" \
             --memory-cap "$cap" \
             --md-out /tmp/bench.md \
+            --json-out /tmp/bench.json \
             | tee /tmp/bench.txt
 
       # The table outside the code fence and the log inside it. They used to go
@@ -270,6 +271,7 @@ jobs:
           path: |
             /tmp/bench.txt
             /tmp/bench.md
+            /tmp/bench.json
           retention-days: 30
 
   collect:
@@ -327,6 +329,20 @@ jobs:
         env:
           SIZES: ${{ needs.plan.outputs.sizes }}
           FORMATS: ${{ needs.plan.outputs.formats }}
+
+      # Every rung is a separate job and therefore a separate machine, and
+      # GitHub's hosted fleet mixes processor generations behind one
+      # `ubuntu-latest` label. Two rungs of one ladder can land on a Xeon
+      # Platinum 8370C and an EPYC 7763. Read as a single curve those rungs
+      # measure the fleet as much as the code, so this groups them by the CPU
+      # that produced them and says out loud when the ladder is split.
+      - name: The ladder, grouped by the CPU that measured it
+        run: |
+          {
+            echo "## By CPU"
+            echo
+            python3 scripts/bench_group.py rungs/ || echo "_no rung JSON to group_"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Every rung's table, in full
         run: |

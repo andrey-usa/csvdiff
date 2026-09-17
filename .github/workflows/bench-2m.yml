@@ -171,6 +171,7 @@ jobs:
             --rows "$ROWS" --formats "${{ matrix.format }}" --repeats "$REPEATS" $scanners \
             --memory-cap "$cap" \
             --md-out /tmp/bench.md \
+            --json-out /tmp/bench.json \
             | tee /tmp/bench.txt
 
       # The table outside the fence so it renders, the log inside it. Both
@@ -181,6 +182,11 @@ jobs:
         run: |
           {
             echo "## $ROWS rows — ${{ matrix.format }}"
+            echo
+            # Each format is its own job and so its own machine. The three
+            # summaries are read as one table by anybody scrolling this page,
+            # and they are not one table unless this line matches.
+            echo "Measured on: \`$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)\`, $(nproc) cores."
             echo
             if [ -s /tmp/bench.md ]; then
               cat /tmp/bench.md
@@ -204,4 +210,5 @@ jobs:
           path: |
             /tmp/bench.txt
             /tmp/bench.md
+            /tmp/bench.json
           retention-days: 30
