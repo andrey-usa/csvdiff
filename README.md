@@ -66,13 +66,16 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > [BENCHMARKS.md](BENCHMARKS.md) above or below it: this runner's ndjson
 > numbers moved 20% between two runs one morning with no code change at all.
 >
-> **This table is the GitHub-runner reference point and it is no longer the
-> latest measurement.** It is kept because it is the one taken on hardware
-> anybody can rent. The current numbers, taken 2026-09-17 on a 4-core container
-> after the C++ columnar work and the ndjson row-end fix, are in
-> [RESULTS.md](RESULTS.md) — where C no longer leads every format, because Rust
-> leads ndjson. Different host, so the two are not comparable row for row;
-> RESULTS.md says what can and cannot be read across them.
+> **This table is a 2026-09-09 reference point and is no longer the latest
+> measurement.** The current numbers, measured on CI on 2026-09-17 after the
+> C++ columnar work and the ndjson row-end fix, are in
+> [RESULTS.md](RESULTS.md).
+>
+> That page also carries a result this one cannot: the same tree, measured at
+> 10M on three machines inside an hour, produces **three different ndjson
+> winners** — Rust first on one, last on another. A published ordering for
+> ndjson is only meaningful with its CPU printed next to it, which is why
+> benchmark results here are now grouped by processor.
 ---
 
 ## Building and running

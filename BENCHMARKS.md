@@ -86,79 +86,64 @@ other branch's agent that pointed this out.
 
 ---
 
-## 2026-09-17 (10M) — all four ports, all three formats, after the row-end fix
+## 2026-09-17 (10M, on CI) — three machines, three different ndjson winners
 
-The first full-size table since the C++ columnar work and the ndjson row-end fix
-below. Ten million rows, one host, one sitting, three repeats, running order
-rotated between rounds, counts gated. `scripts/bench_formats_ports.py --rows 10m`.
+Ten million rows on GitHub's runners, which is where this table belongs: the
+container numbers first written here were one machine nobody else can rent.
+Running it properly turned up something bigger than the table.
 
-Host: 4 cores, 15 GB, Linux 6.18 — a container, not the GitHub runner the
-README table was taken on. The two are **not** comparable; see the last section
-here for what can be said across them and how weakly.
+### One CPU, all three formats
 
-| Build | Format | Wall | Rows/s | CPU | Cores | Peak RSS | Above | Budget |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| C | csv | **1.92s** | 5,217,931 | 5.9s | 3.10x | 4,225 MB | **716 MB** | **792 MB** |
-| C++ | csv | 4.13s | 2,421,448 | 12.9s | 3.13x | 4,373 MB | 865 MB | 1,253 MB |
-| Rust | csv | 2.32s | 4,308,836 | 6.4s | 2.77x | 4,409 MB | 900 MB | 977 MB |
-| Zig | csv | 2.47s | 4,047,906 | 7.4s | 3.00x | 4,351 MB | 842 MB | 955 MB |
-| C | ndjson | 6.13s | 1,630,636 | 18.1s | 2.95x | 9,203 MB | **716 MB** | **792 MB** |
-| C++ | ndjson | 8.76s | 1,141,972 | 25.6s | 2.92x | 9,348 MB | 861 MB | 1,251 MB |
-| Rust | ndjson | **5.08s** | 1,967,398 | 18.1s | 3.57x | 9,387 MB | 900 MB | 1,233 MB |
-| Zig | ndjson | 5.48s | 1,823,473 | 20.1s | **3.67x** | 9,344 MB | 857 MB | 973 MB |
-| C | parquet | **1.67s** | 6,003,366 | **4.7s** | 2.83x | 2,956 MB | 1,421 MB | 1,516 MB |
-| C++ | parquet | 2.47s | 4,045,579 | 7.3s | 2.94x | 2,841 MB | 1,307 MB | 1,491 MB |
-| Rust | parquet | 2.53s | 3,949,412 | 7.8s | 3.07x | 2,895 MB | 1,360 MB | 1,466 MB |
-| Zig | parquet | 2.12s | 4,723,672 | 7.0s | 3.32x | 2,735 MB | **1,200 MB** | 1,700 MB |
+`benchmark-native.yml` runs every format in a single job, which is the only
+arrangement that gets one processor across all three.
+[Run 35181504756](https://github.com/andrey-usa/csvdiff/actions/runs/35181504756),
+**AMD EPYC 9V74, 4 cores, AVX2**, three interleaved runs each, counts gated.
 
-Counts identical everywhere, both runs: matched 9,990,000, changed 599,320,
-added 10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B.
-
-### The single-winner table is gone
-
-C leads CSV and Parquet. **Rust leads ndjson.** No port leads all three, which
-has not been true of any table this project has published, and it is not because
-C got slower.
-
-The ndjson row is the one to read twice. C and Rust spend the *same* 18.1 CPU
-seconds there; Rust is 1.21x faster in wall time entirely by running 3.57 cores
-against C's 2.95. On that format C is not doing more work, it is doing the same
-work less parallel — a different problem from the one the last four entries were
-about, and one no scanner change touches.
-
-C++ is last on both text formats: 2.15x behind C on CSV, 1.72x behind Rust on
-ndjson. Its Parquet column is mid-table, so what is behind is the text path
-specifically, which is where the profile two entries down already pointed.
-
-Memory is unchanged in character and is C's clearest win: 716 MB above the
-mapped input on *both* text formats — the same number whether the input is
-3.5 GB or 8.5 GB. Parquet inverts the whole column, because the pages are
-decoded into an arena rather than mapped, and there Zig pays least.
-
-### Against the 2026-09-09 table, and why this is weak
-
-The README's 10M table was taken on a GitHub Actions runner. Different host, so
-the rule at the top of this file forbids reading the two against each other.
-What is left is an inference: C changed least in the window, so its movement is
-a rough host term.
-
-| ndjson, 10M | 2026-09-09 (CI) | 2026-09-17 (here) | moved |
+| Port | csv 3,509 MB | ndjson 8,487 MB | parquet 2,074 MB |
 |---|---:|---:|---:|
-| C | 7.40s | 6.13s | 1.21x |
-| C++ | 20.53s | 8.76s | 2.34x |
-| Rust | 14.32s | 5.08s | 2.82x |
-| Zig | 13.88s | 5.48s | 2.53x |
+| C | **1.83s** (6.4s cpu) | 7.41s (**24.4s cpu**) | **1.53s** (4.9s cpu) |
+| C++ | 4.51s (13.9s) | 10.39s (30.7s) | 2.59s (8.4s) |
+| Rust | 2.10s (6.8s) | 8.04s (30.4s) | 2.79s (9.2s) |
+| Zig | 2.15s (7.1s) | **7.20s** (27.6s) | 2.93s (10.3s) |
 
-Net of C's 1.21x that is about 1.94x for C++, 2.33x for Rust, 2.10x for Zig.
-**These are an order of magnitude, not a measurement.** One port is a poor
-control, the two runs are eight days and one machine apart, and the Parquet
-input is not even the same size in the two (2,074 MB then, 1,535 MB now), so
-the Parquet rows cannot be read across at all. The paired A/B runs below are
-the evidence for any individual change; this is orientation.
+C leads CSV by 1.15x over Rust and Parquet by 1.69x over C++. Zig takes ndjson
+by 1.03x over C, which is inside what a ratio of bests can resolve here — a tie,
+and C reaches it on 24.4 CPU-seconds against Zig's 27.6. C++ is last on both
+text formats, 2.46x behind C on CSV.
 
-A structured snapshot of where the ports stand today, rather than this
-chronological record of how they got there, is now in
-[RESULTS.md](RESULTS.md).
+### The finding: the ndjson ranking is not a property of the code
+
+Three machines measured this same tree at 10M inside one hour:
+
+| ndjson, 10M | container Xeon @2.10GHz avx512 | CI Xeon Platinum 8370C avx512 | CI EPYC 9V74 avx2 |
+|---|---|---|---|
+| 1st | **Rust** 5.08s | **C** 7.95s | **Zig** 7.20s |
+| 2nd | Zig 5.48s | Zig 8.26s | C 7.41s |
+| 3rd | C 6.13s | C++ 8.96s | Rust 8.04s |
+| 4th | C++ 8.76s | **Rust** 9.96s | C++ 10.39s |
+
+Rust is first on one and last on another with nothing changed between them. This
+file already said never to compare across tables; what it did not say, because
+nothing here had been arranged to notice, is that **one CI workflow run is not
+one table**. The ladder fans a size or a format out per job to get parallelism,
+and those jobs land on different hardware — the run above put csv and parquet on
+an EPYC 7763 and ndjson on a Xeon Platinum 8370C, in one dispatch.
+
+So the harness now records the CPU in its JSON and `scripts/bench_group.py`
+groups on it, printing one table per processor and naming what is missing from
+each. The first grouped run caught the split immediately.
+
+What survives all three columns: C++ is last or second-to-last on ndjson
+everywhere, and C is never worse than third. Those are the claims worth acting
+on. "Rust leads ndjson", published here earlier today on the strength of the
+container column, is not one of them.
+
+### Also not comparable, and it looks like it should be
+
+The two harnesses generate different Parquet. `bench_formats_ports.py` uses the
+Rust generator and `bench_ports.py` the C one, and for the same ten million rows
+they emit 1,535 MB and 2,074 MB. Their Parquet rows cannot be read against each
+other even on one CPU. CSV and ndjson are byte-identical between the two.
 
 ## 2026-09-17 (json row end) — the fix C wrote down and three ports never took
 

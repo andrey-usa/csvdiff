@@ -1,8 +1,7 @@
 # Where the four ports stand
 
-**Ten million rows, all three formats, all four ports, one host, one sitting.**
-Measured 2026-09-17. This is the current-state document: what the ports do
-today, and which of the differences are real.
+**Ten million rows, all three formats, all four ports, measured on CI.**
+Run 2026-09-17.
 
 [BENCHMARKS.md](BENCHMARKS.md) is the record of *how it got here* — every run,
 newest first, with the reasoning and the dead ends. [ARCHIVE.md](ARCHIVE.md) is
@@ -10,24 +9,23 @@ what was tried and removed. This file is the snapshot.
 
 ---
 
-## The one rule
+## The one rule, and what CI does to it
 
 **Compare rows within a table. Never across tables.** This project has measured
-the same code 20% apart on one machine in one morning with nothing changed, and
-a port's time swing 1.57x by nothing but where it sat in the running order. Two
-numbers are comparable when they were taken on one host, in one sitting,
-interleaved, with the running order rotated. Otherwise they are two machine
-states wearing the labels of two builds.
+the same code 20% apart on one machine in one morning, and a port's time swing
+1.57x by nothing but where it sat in the running order.
 
-Everything below comes from a single invocation of
-`scripts/bench_formats_ports.py`, which enforces exactly that.
+**On hosted CI a "table" is smaller than it looks.** GitHub puts several
+processor generations behind one `ubuntu-latest` label. A workflow that fans
+sizes or formats out across jobs — which is how the ladder gets parallelism —
+collects its pieces from *different machines*. Read as one curve they measure
+the fleet as much as the code.
 
-**On CI the rule needs help.** GitHub's hosted fleet puts several processor
-generations behind one `ubuntu-latest` label, so a workflow that fans sizes or
-formats out across jobs gets its pieces from different machines. The harness
-records the CPU in its JSON and `scripts/bench_group.py` groups on it, printing
-one table per processor and naming what is missing from each. A CI summary
-showing two CPUs is showing two tables.
+So the harness records the CPU in its JSON beside the numbers, and
+`scripts/bench_group.py` groups on it and prints one table per processor. A CI
+summary showing two CPUs is showing two tables. The section below on
+[the ndjson ranking](#the-ndjson-ranking-is-not-a-property-of-the-code) is what
+happens when you ignore this.
 
 ---
 
@@ -39,11 +37,9 @@ showing two CPUs is showing two tables.
 | Key | `(account_id, txn_id)` |
 | Ignored | `updated_at` |
 | Compared | a per-cell diff over the remaining 17 columns |
-| Generator | this project's own, so all three formats hold the same values spelled the same way |
 
-Every port returned identical counts. That is the run's gate, not a footnote —
-a port that disagrees fails the run and is named, so no number below belongs to
-a build that was fast because it answered a different question.
+Every port returned identical counts on every format. That is the run's gate,
+not a footnote — a port that disagrees fails the run and is named.
 
 ```
 matched 9,990,000 · changed 599,320 · unchanged 9,390,680
@@ -51,80 +47,94 @@ added 10,000 · removed 10,000
 duplicate keys 1,000 in A / 500 in B
 ```
 
-**Host:** 4 cores, 15 GB, Linux 6.18. Every port compiled for it —
-`-march=native` for C and C++, `-C target-cpu=x86-64-v3` for Rust (capped at the
-fleet's executable floor; resolving the host CPU picked `znver4` and a
-build-time tool died with SIGILL), `-Dcpu=native` for Zig.
-
 ---
 
-## Results
+## Results — AMD EPYC 9V74, 4 cores, AVX2
 
-`Above` is peak RSS minus the mapped input, which is the number that carries
-information — these engines map their files, so resident pages include the file
-itself. `Cores` is CPU seconds over wall seconds: how many of the four were
-actually busy. It separates *slow* from *idle*.
+One job, one runner, one sitting, all three formats, three interleaved runs
+each, ports rotated. `benchmark-native.yml` at 10m.
+[Run 35181504756](https://github.com/andrey-usa/csvdiff/actions/runs/35181504756).
+
+Every port compiled for that machine: `-march=native` for C and C++,
+`-C target-cpu=x86-64-v3` for Rust (capped at the fleet's executable floor —
+resolving the host CPU picked `znver4` and a build-time tool died with SIGILL),
+`-Dcpu=native` for Zig.
 
 ### CSV — 3,509 MB
 
-| Port | Wall | Rows/s | CPU | Cores | Above | Budget |
+| Port | Best | Median | Worst | CPU | Above the input | vs best |
 |---|---:|---:|---:|---:|---:|---:|
-| **C** | **1.92s** | 5,217,931 | 5.9s | 3.10x | **716 MB** | **792 MB** |
-| Rust | 2.32s | 4,308,836 | 6.4s | 2.77x | 900 MB | 977 MB |
-| Zig | 2.47s | 4,047,906 | 7.4s | 3.00x | 842 MB | 955 MB |
-| C++ | 4.13s | 2,421,448 | 12.9s | 3.13x | 865 MB | 1,253 MB |
+| **C** | **1.83s** | 1.83s | 1.83s | 6.4s | **716 MB** | — |
+| Rust | 2.10s | 2.12s | 2.13s | 6.8s | 901 MB | 1.15x |
+| Zig | 2.15s | 2.23s | 2.29s | 7.1s | 874 MB | 1.17x |
+| C++ | 4.51s | 4.74s | 4.74s | 13.9s | 879 MB | 2.46x |
 
 ### ndjson — 8,487 MB
 
-| Port | Wall | Rows/s | CPU | Cores | Above | Budget |
+| Port | Best | Median | Worst | CPU | Above the input | vs best |
 |---|---:|---:|---:|---:|---:|---:|
-| **Rust** | **5.08s** | 1,967,398 | 18.1s | 3.57x | 900 MB | 1,233 MB |
-| Zig | 5.48s | 1,823,473 | 20.1s | **3.67x** | 857 MB | 973 MB |
-| C | 6.13s | 1,630,636 | **18.1s** | 2.95x | **716 MB** | **792 MB** |
-| C++ | 8.76s | 1,141,972 | 25.6s | 2.92x | 861 MB | 1,251 MB |
+| **Zig** | **7.20s** | 7.35s | 7.37s | 27.6s | 879 MB | — |
+| C | 7.41s | 7.45s | 7.48s | **24.4s** | **716 MB** | 1.03x |
+| Rust | 8.04s | 8.05s | 8.06s | 30.4s | 901 MB | 1.12x |
+| C++ | 10.39s | 10.63s | 10.88s | 30.7s | 879 MB | 1.44x |
 
-### Parquet — 1,535 MB
+### Parquet — 2,074 MB
 
-| Port | Wall | Rows/s | CPU | Cores | Above | Budget |
+| Port | Best | Median | Worst | CPU | Above the input | vs best |
 |---|---:|---:|---:|---:|---:|---:|
-| **C** | **1.67s** | 6,003,366 | **4.7s** | 2.83x | 1,421 MB | 1,516 MB |
-| Zig | 2.12s | 4,723,672 | 7.0s | 3.32x | **1,200 MB** | 1,700 MB |
-| C++ | 2.47s | 4,045,579 | 7.3s | 2.94x | 1,307 MB | 1,491 MB |
-| Rust | 2.53s | 3,949,412 | 7.8s | 3.07x | 1,360 MB | 1,466 MB |
+| **C** | **1.53s** | 1.54s | 1.74s | **4.9s** | 1,297 MB | — |
+| C++ | 2.59s | 2.61s | 2.66s | 8.4s | 1,483 MB | 1.69x |
+| Rust | 2.79s | 2.80s | 2.82s | 9.2s | 1,365 MB | 1.82x |
+| Zig | 2.93s | 2.93s | 2.95s | 10.3s | **1,264 MB** | 1.92x |
 
 ---
 
-## What the tables say
+## What this table says
 
-**No port leads on all three formats any more.** C leads CSV and Parquet; Rust
-leads ndjson; Zig leads Parquet on memory. The single-winner table this project
-published for most of its life is gone, and it went because the other three
-ports closed on the text path rather than because C got slower.
+**C leads two formats of three and is never worse than second.** It also spends
+the least CPU on every format it leads, so it is not winning on threading.
 
-**ndjson is still where the ports differ most, but the ordering has inverted.**
-C leads CSV by 1.21x over Rust and *trails* Rust by 1.21x on ndjson. It is also
-the flattest on CPU: C and Rust spend the same 18.1 CPU seconds on ndjson, and
-Rust is 1.21x faster in wall time entirely by using 3.57 cores where C uses 2.95.
-On this format C is not slower, it is less parallel — which is a different
-problem with a different fix.
+**Zig takes ndjson, narrowly** — 1.03x over C, which is inside the noise this
+host can resolve for a ratio of bests. Call it a tie and note that C gets there
+on 24.4 CPU-seconds against Zig's 27.6: C does less work, Zig uses more cores.
 
-**C++ is last on every text format and by a wide margin**, 2.15x behind C on CSV
-and 1.72x behind Rust on ndjson. It is the port with the most headroom and the
-one worth working on. Its Parquet column is competitive, so what is behind is
-the text path specifically: the profile says the time is in the row parse and in
-turning a key name into a slot.
+**C++ is last on both text formats and by a long way on CSV** — 2.46x behind C
+there, 1.44x behind Zig on ndjson. It is the port with the most headroom. Its
+Parquet column is second, so what is behind is the text path specifically,
+which is where the profile in BENCHMARKS.md already pointed.
 
 **Memory is the flattest ranking and C's clearest win.** 716 MB above the mapped
-input on both text formats against 842 and up, and the same 716 MB whether the
-input is 3.5 GB or 8.5 GB — a field there is one 64-bit word and never becomes a
-string. Parquet inverts it: the pages are decoded into an arena rather than
-mapped, so every port pays over a gigabyte and Zig pays least.
+input on *both* text formats — the same number whether the input is 3.5 GB or
+8.5 GB, because a field there is one 64-bit word and never becomes a string.
+Parquet inverts the column: pages are decoded into an arena rather than mapped,
+so every port pays over a gigabyte and Zig pays least.
 
-**Budget is not peak RSS and the two disagree.** `Budget` is peak `VmData`, the
-virtual size of the private writable mappings, and it is what `--max-memory` is
-checked against. A port that holds an old buffer while it fills a new one is
-charged for both there and neither in peak RSS. Zig's Parquet row is the
-example: the lowest `Above` in the table and the highest `Budget` in it.
+---
+
+## The ndjson ranking is not a property of the code
+
+Three machines measured this same tree at 10M within one hour. The ndjson
+ordering came out differently on all three:
+
+| ndjson, 10M | container<br>Xeon @2.10GHz, avx512 | CI ladder<br>Xeon Platinum 8370C, avx512 | CI<br>EPYC 9V74, avx2 |
+|---|---|---|---|
+| 1st | **Rust** 5.08s | **C** 7.95s | **Zig** 7.20s |
+| 2nd | Zig 5.48s | Zig 8.26s | C 7.41s |
+| 3rd | C 6.13s | C++ 8.96s | Rust 8.04s |
+| 4th | C++ 8.76s | **Rust** 9.96s | C++ 10.39s |
+
+Rust is first on one machine and last on another. Nothing about the code changed
+between those two columns.
+
+**Do not read this table across its columns for anything but this point.** Three
+different CPUs, and the first is not even a CI runner. What it establishes is
+negative and worth more than a ranking: *"Rust leads ndjson"* is not a fact about
+this repository, it is a fact about one machine, and any published ordering for
+ndjson needs its CPU printed next to it.
+
+What survives all three columns: **C++ is last or second-to-last on ndjson
+everywhere**, and C is never worse than third. Those are the claims worth acting
+on.
 
 ---
 
@@ -132,57 +142,54 @@ example: the lowest `Above` in the table and the highest `Budget` in it.
 
 | Claim | Evidence |
 |---|---|
-| C leads on CSV and Parquet wall time | this table, counts-gated |
-| Rust leads on ndjson wall time | this table, counts-gated |
+| C leads CSV and Parquet on the EPYC 9V74 | the table above, counts-gated |
 | C++ is last on both text formats | this table, and every table before it |
-| C uses the least memory above its input on text | this table, and it has never not been true |
+| C uses the least memory above its input on text | every table this project has published |
+| Zig leads ndjson on the EPYC 9V74 | the table above — but by 1.03x, inside the noise floor |
+| Any port "leads ndjson" in general | **refuted** — three CPUs, three different winners |
 | The ndjson row-end fix is worth 1.26x on C++, 1.04x on Rust | [paired A/B, 11 rounds, CSV as control](BENCHMARKS.md) |
 | The same fix is worth anything on Zig | **not established** — the band crosses 1.00x |
-| Instruction count predicts wall time across ports | **refuted** — Rust executes the most and is fastest on ndjson |
+| Instruction count predicts wall time across ports | **refuted** |
 | Instruction count tracks wall time within one port | [0.790 against 0.792 measured](BENCHMARKS.md) |
 
 ---
 
-## Against the older published table
+## Two things that are not comparable, and look like they should be
 
-[README.md](README.md) carries a 10M table from 2026-09-09 taken on a GitHub
-Actions runner. **It is a different host, so the rule above forbids comparing
-the two directly.** What can be said is weaker and still worth saying: C is the
-port that changed least in that window, so its movement is a rough proxy for the
-host difference, and the other three moved much further than it did.
+**The two harnesses generate different Parquet.** `bench_formats_ports.py` uses
+the Rust generator and `bench_ports.py` uses the C one, and for the same ten
+million rows they emit 1,535 MB and 2,074 MB respectively. The Parquet rows from
+the two harnesses are therefore not comparable even on one CPU. The CSV and
+ndjson inputs are byte-identical between them (3,509 MB and 8,487 MB either way).
 
-| ndjson, 10M | 2026-09-09 (CI runner) | 2026-09-17 (this host) | moved |
-|---|---:|---:|---:|
-| C | 7.40s | 6.13s | 1.21x |
-| C++ | 20.53s | 8.76s | 2.34x |
-| Rust | 14.32s | 5.08s | 2.82x |
-| Zig | 13.88s | 5.48s | 2.53x |
-
-Taking C's 1.21x as the host term leaves roughly 1.94x for C++, 2.33x for Rust
-and 2.10x for Zig on ndjson from the work in between. **Treat those as an
-order of magnitude, not a measurement** — one port is a poor control, and the
-Parquet input is not even the same size in the two runs (2,074 MB then,
-1,535 MB now), so the Parquet rows are not comparable at all. The paired A/B
-runs in BENCHMARKS.md are the real evidence for any single change.
+**The README's headline table is a different host.** It is kept as the
+GitHub-runner reference point from 2026-09-09 and is not the latest measurement.
 
 ---
 
 ## Reproducing this
 
 ```sh
-# every port, every format, interleaved, with the counts gate
+# All three formats in ONE job, which is the only way to get one CPU
+# across formats. This is what the table above came from.
+gh workflow run benchmark-native.yml -f rows=10m -f formats=csv,json,parquet -f repeats=3
+
+# The ladder: one job per size and format, so FASTER but several CPUs.
+# Its collect job groups by processor and says so.
+gh workflow run bench-ladder.yml -f sizes=10m,20m -f formats=csv,ndjson,parquet
+
+# Locally, one host by construction
 python3 scripts/bench_formats_ports.py --rows 10m --repeats 3
 
-# one format at a time if the disk is tight -- 10M of all three is about 14 GB
-python3 scripts/bench_formats_ports.py --rows 10m --formats csv,parquet
-python3 scripts/bench_formats_ports.py --rows 10m --formats ndjson
+# Merge any collection of result JSON, grouped by the CPU that produced it
+python3 scripts/bench_group.py rungs/
 
-# two builds of one port, which is the only way to price a single change
+# Two builds of one port -- the only way to price a single change
 bash scripts/bench_ab.sh
 ```
 
-`bench_ab.sh` is the one to reach for when asking *did my change help*. It
-prints the middle half of the per-round paired ratios beside the median, and
-where that half straddles 1.00x there is no result to report. On this class of
-machine about 10% is invisible to a ratio of bests and about 3% is the floor
-for the paired one.
+`bench_ab.sh` is the one to reach for when asking *did my change help*. It prints
+the middle half of the per-round paired ratios beside the median, and where that
+half straddles 1.00x there is no result to report. On this class of machine about
+10% is invisible to a ratio of bests and about 3% is the floor for the paired
+one — which is why the 1.03x above is called a tie.
