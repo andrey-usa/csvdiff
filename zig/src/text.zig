@@ -156,19 +156,23 @@ fn skipJsonNested(d: []const u8, from: usize, end: usize) usize {
     return end;
 }
 
-/// Past the end of this object's line. Records are newline-delimited, so a
-/// newline outside a string ends the row.
+/// The end of a row, which for newline-delimited JSON is the next newline byte
+/// and nothing subtler.
+///
+/// This used to alternate a scan for `\n` or `"` with a walk over each string it
+/// landed on, to avoid mistaking a newline inside a quoted value for the end of
+/// the row. That cannot happen: RFC 8259 forbids the raw control characters
+/// U+0000 to U+001F inside a string, and a newline is U+000A, so a valid JSON
+/// string cannot contain one -- it must be written `\n`. The framing of ndjson
+/// depends on exactly that.
+///
+/// The C port made this change first and its note carries the argument. Input
+/// that does put a raw newline inside a string is not JSON, and this reader will
+/// split the row there -- which is what every ndjson reader does, because the
+/// format has no other way to say where a row ends.
 fn endOfJsonRow(d: []const u8, from: usize, end: usize) usize {
-    var pos = from;
-    while (pos < end) {
-        const stop = scan.nextOf2(d, pos, end, '\n', '"');
-        if (stop >= end) return end;
-        if (d[stop] == '\n') return stop + 1;
-        const next = skipJsonString(d, stop, end)[0];
-        if (next <= stop) return end;
-        pos = next;
-    }
-    return end;
+    const stop = scan.nextOf1(d, from, end, '\n');
+    return if (stop >= end) end else stop + 1;
 }
 
 fn nameHash(s: []const u8) u64 {

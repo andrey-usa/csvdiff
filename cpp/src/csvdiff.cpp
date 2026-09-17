@@ -824,18 +824,27 @@ class RowParser {
         }
     }
 
-    // Past the end of this object's line. Records are newline-delimited, so a
-    // newline outside a string ends the row.
+    // The end of a row, which for newline-delimited JSON is the next newline
+    // byte and nothing subtler.
+    //
+    // This used to alternate a scan for `\n` or `"` with a walk over each string
+    // it landed on, to avoid mistaking a newline inside a quoted value for the
+    // end of the row. That cannot happen: RFC 8259 forbids the raw control
+    // characters U+0000 to U+001F inside a string, and a newline is U+000A, so a
+    // valid JSON string cannot contain one -- it must be written `\n`. The
+    // framing of ndjson depends on exactly that.
+    //
+    // The C port made this change first and its note carries the argument. The
+    // profile says what it is worth here: of this port's 56.3M calls into
+    // `next_of2` on a 200k ndjson pair, 22.4M came from this function, and the
+    // string walks it launched account for much of the 27.5M charged to
+    // `skip_json_string` besides. Input that does put a raw newline inside a
+    // string is not JSON, and this reader will split the row there -- which is
+    // what every ndjson reader does, because the format has no other way to say
+    // where a row ends.
     static std::size_t end_of_json_row(std::string_view d, std::size_t pos, std::size_t end) {
-        while (pos < end) {
-            const std::size_t stop = next_of2(d, pos, end, '\n', '"');
-            if (stop >= end) return end;
-            if (d[stop] == '\n') return stop + 1;
-            bool ignored = false;
-            pos = skip_json_string(d, stop, end, &ignored);
-            if (pos <= stop) return end;
-        }
-        return end;
+        const std::size_t stop = next_of1(d, pos, end, '\n');
+        return stop >= end ? end : stop + 1;
     }
 
   public:

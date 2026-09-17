@@ -73,6 +73,92 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-17 (json row end) — the fix C wrote down and three ports never took
+
+The profile below ended without a change, on the grounds that it was a map and
+not a move. This is the move it pointed at, and it is not new work: C made it
+already, and left the argument in a comment.
+
+### What the call counts said
+
+The profile reported C++ spending 38.6% of its instructions in `next_of2`
+against C's 13.2%. Counting calls rather than shares says why, and it is not
+that the scanner is worse:
+
+| on a 200k ndjson pair | C | C++ |
+|---|---:|---:|
+| `next_of2` calls | 11.3 M | 56.3 M |
+| instructions per call | 34.9 | 31.4 |
+
+Same cost per call, five times as many calls. Two call sites account for it:
+
+| C++ call site | calls |
+|---|---:|
+| `skip_json_string`, inlined into `parse_json` | 27.5 M |
+| **`end_of_json_row`** | 22.4 M |
+
+C's `parse_json_row` has one site and no second: 10.9 M, all of it string
+skipping. Its `end_of_json_row` does not call `next_of2` at all.
+
+### The change
+
+C++, Rust and Zig all walked the tail of a row by alternating a scan for `\n`
+or `"` with a full walk over every string they landed on -- to avoid mistaking a
+newline inside a quoted value for the end of the row. That cannot happen. RFC
+8259 forbids the raw control characters U+0000 to U+001F inside a string, and a
+newline is U+000A, so a valid JSON string cannot contain one; it must be written
+`\n`. The framing of ndjson depends on exactly that. C rewrote the function to a
+single scan for one byte on those grounds some time ago. The other three never
+took it.
+
+They have it now. It matters more than it sounds because of the early exit: the
+key-only parse stops as soon as it has the key columns, so on a twenty-column
+row keyed on two, *most of every row* is tail -- and the tail was being walked
+string by string.
+
+### What it is worth
+
+Paired and interleaved, arms rotated each round, eleven rounds on a 4M-row pair,
+CSV alongside as the control the change should not touch:
+
+| ndjson | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| C++ | 5.70s | 4.51s | **0.792** | 0.777-0.805 | 11/11 |
+| Rust | 2.60s | 2.52s | **0.964** | 0.946-0.976 | 9/11 |
+| Zig | 2.92s | 2.86s | 0.976 | 0.949-1.016 | 7/11 |
+
+| csv (control) | paired median | middle half | faster in |
+|---|---|---|---|
+| C++ | 1.006 | 0.975-1.010 | 4/11 |
+| Rust | 0.995 | 0.986-1.010 | 7/11 |
+| Zig | 0.993 | 0.971-1.015 | 6/11 |
+
+C++ is 1.26x on ndjson, and its band does not come near one. Rust's is smaller
+but its band clears one too, so it is a result. **Zig's crosses one and nothing
+is claimed for it** -- the change is kept there because it is the same function
+in four ports and it removes work, not because this host could measure it. Every
+CSV band crosses one, which is what a control is for.
+
+### And the profile says the same thing twice
+
+Re-profiled against the *same* command as the baseline:
+
+| C++, 200k pair | base | new |
+|---|---:|---:|
+| total instructions | 8.254 B | 6.520 B |
+| `next_of2` calls | 66.7 M | 22.4 M |
+| `next_of1` calls | 16.0 M | 17.1 M |
+| out-of-line `skip_json_string` calls | 11.2 M | 0 |
+
+0.790 on instructions against 0.792 measured on the clock. Worth sitting with
+next to the entry below, which found instruction counts useless for ranking the
+*ports* against each other: within one port, one change, same binary and same
+input, they tracked the wall to a thousandth. The currency is fine. It just
+does not convert between ports.
+
+Output is byte-identical to each port's own baseline at 4M rows on both formats,
+and the C suite's cross-port oracle passes at 89 checks.
+
 ## 2026-09-16 (profiles) — where ndjson time goes, and why instruction counts were the wrong thing to count
 
 The entry below closed the scan seam by saying the measurement it wanted was a

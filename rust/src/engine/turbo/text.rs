@@ -636,24 +636,27 @@ pub(super) fn json_tail_is_clean(p: &RowParser, d: &[u8], mut at: usize, end: us
     true
 }
 
-/// Past the end of this object's line. Records are newline-delimited, so a
-/// newline outside a string ends the row.
-fn end_of_json_row(data: &[u8], mut pos: usize, end: usize) -> usize {
-    while pos < end {
-        let stop = next_of2(data, pos, end, b'\n', b'"');
-        if stop >= end {
-            return end;
-        }
-        if data[stop] == b'\n' {
-            return stop + 1;
-        }
-        let (next, _) = skip_json_string(data, stop, end);
-        if next <= stop {
-            return end;
-        }
-        pos = next;
+/// The end of a row, which for newline-delimited JSON is the next newline byte
+/// and nothing subtler.
+///
+/// This used to alternate a scan for `\n` or `"` with a walk over each string it
+/// landed on, to avoid mistaking a newline inside a quoted value for the end of
+/// the row. That cannot happen: RFC 8259 forbids the raw control characters
+/// U+0000 to U+001F inside a string, and a newline is U+000A, so a valid JSON
+/// string cannot contain one -- it must be written `\n`. The framing of ndjson
+/// depends on exactly that.
+///
+/// The C port made this change first and its note carries the argument. Input
+/// that does put a raw newline inside a string is not JSON, and this reader will
+/// split the row there -- which is what every ndjson reader does, because the
+/// format has no other way to say where a row ends.
+fn end_of_json_row(data: &[u8], pos: usize, end: usize) -> usize {
+    let stop = next_of1(data, pos, end, b'\n');
+    if stop >= end {
+        end
+    } else {
+        stop + 1
     }
-    end
 }
 
 #[cfg(test)]
