@@ -132,12 +132,23 @@ universal, and any published one needs its CPU printed beside it. But "three
 machines, three winners" was too strong a reading of the first three columns: the
 orderings are not arbitrary, they are just not portable.
 
-**The 8370C column carries a confound and should be discounted until it is
-resolved.** It is the only one measured by the ladder harness
-(`bench_formats_ports.py`, which also passes `--memory-cap`) rather than
-`bench_ports.py`. The flags are otherwise the same and the generated inputs are
-the same size, but that difference has not been ruled out, and it is the column
-where Rust looks worst by a wide margin.
+**The 8370C column was suspected of a harness confound. It is not.** It is the
+only one measured by the ladder harness, which additionally passes
+`--memory-cap`, and it is the column where Rust looks worst — so the cap was
+tested directly: one machine, one binary, one input, the cap set to exactly what
+the ladder computes, twenty-one paired rounds with the arms rotated.
+
+| ndjson 4M, capped / free | median | middle half | slower in |
+|---|---:|---|---|
+| Rust | 1.002 | 0.980–1.017 | 11/21 |
+| C | 1.002 | 0.971–1.018 | 11/21 |
+
+A coin flip for both. The cap costs nothing, so it does not explain that column,
+which therefore stands as an ordinary result from an ordinary CPU.
+
+(Nine rounds of the same experiment had given Rust 1.034, slower in 6 of 9, which
+looked like a finding. It was not. That is the noise floor at the top of this
+file doing exactly what it says it does.)
 
 What survives every column: **C++ is last or second-to-last on ndjson
 everywhere**, and C is never worse than third. Those are the claims worth acting

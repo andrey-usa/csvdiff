@@ -86,6 +86,48 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-17 (memory cap) — the confound that was not one, and nine rounds that lied
+
+The entry below marked one column of the ndjson table as suspect. The ladder run
+on a Xeon Platinum 8370C is the only one where Rust came last, and it is also the
+only one measured by the ladder harness, which passes `--memory-cap` where the
+other does not. Two differences, one result: that is a confound, and the column
+was discounted pending a test.
+
+This is the test. One machine, one binary, one input, the cap set to exactly what
+`bench-ladder.yml` computes (`MemTotal - 2048 MB`, here 14,047 MB), applied with
+`RLIMIT_DATA` in the child. Arms rotated each round. Twenty-one paired rounds on a
+4M ndjson pair:
+
+| capped / free | median | middle half | slower in |
+|---|---:|---|---|
+| Rust | 1.002 | 0.980-1.017 | 11/21 |
+| C | 1.002 | 0.971-1.018 | 11/21 |
+
+Nothing, for either port. **The cap is ruled out**, the 8370C column is an
+ordinary result from an ordinary CPU, and the reading that the ndjson ordering
+varies by processor survives with one fewer caveat.
+
+### The part worth keeping
+
+The first attempt ran nine rounds, and said this:
+
+| capped / free | median | middle half | slower in |
+|---|---:|---|---|
+| Rust | **1.034** | 0.952-1.093 | 6/9 |
+| C | 0.989 | 0.979-1.024 | 3/9 |
+
+Rust 3.4% slower under the cap, slower in two thirds of the rounds, and C
+untouched. That is a tidy story, it is the story the confound predicted, and it
+is false: twelve more rounds took the median from 1.034 to 1.002 and the count
+from 6/9 to 11/21.
+
+The middle half said so at the time — 0.952-1.093 straddles one, and the rule at
+the top of this file is that a straddling band is not a result. The median and
+the win count were the tempting numbers and both were noise. This is the cheapest
+possible reminder that the band is the part to read, and that a ratio which
+agrees with the hypothesis you already have is the one to re-run.
+
 ## 2026-09-17 (C++ predicates) — one inline pays, the next one costs, and a fourth CPU
 
 C++ is 2.46x behind C on CSV in the table below, which is the widest gap in it —
@@ -191,8 +233,9 @@ CI runs agree on.
 The one that disagrees most (Xeon Platinum 8370C, where Rust came last) is also
 the only one measured by the *other* harness, `bench_formats_ports.py` under the
 ladder, which additionally passes `--memory-cap`. Same flags otherwise, same
-generator output size. That is a confound this project has not ruled out, and it
-should be ruled out before anything is concluded about Rust on that CPU.
+generator output size. **That confound was tested and ruled out** — see the entry
+above this one. The cap costs neither port measurable time, so the 8370C column
+is an ordinary CPU result and stands.
 
 ## 2026-09-17 (10M, on CI) — the ndjson ranking is not portable
 
