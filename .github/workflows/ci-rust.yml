@@ -35,11 +35,11 @@ jobs:
     name: test rust stable
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Pinned so every workflow here runs the same interpreter; the runner's
       # own python3 drifts with the image. Keep this in step with the others:
       #   grep -rn python-version .github/workflows
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
 
@@ -84,7 +84,7 @@ jobs:
           print(f"{path}: {len(html) // 1024} KB, no external references")
           PY
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: report-rust-10k
           path: |
@@ -96,11 +96,11 @@ jobs:
     name: all engines produce identical counts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Pinned so every workflow here runs the same interpreter; the runner's
       # own python3 drifts with the image. Keep this in step with the others:
       #   grep -rn python-version .github/workflows
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@stable
@@ -137,7 +137,7 @@ jobs:
     name: build rust on windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

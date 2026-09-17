@@ -9,9 +9,10 @@ It is **four byte-level ports to one result contract** — C, C++, Rust and Zig.
 They read the same files, return the same counts and the same exit codes, which
 is what makes a number from one directly comparable with a number from another.
 
-- [AGENTS.md](AGENTS.md) — the entry point for AI coding tools; `CLAUDE.md` adds the Claude Code specifics
-- [BENCHMARKS.md](BENCHMARKS.md) — every run, with CPU and memory
+- [RESULTS.md](RESULTS.md) — **where the ports stand today**: 10M rows, three formats, one host
+- [BENCHMARKS.md](BENCHMARKS.md) — how they got there: every run, newest first, with CPU and memory
 - [ARCHIVE.md](ARCHIVE.md) — what was tried, what it was worth, what was removed
+- [AGENTS.md](AGENTS.md) — the entry point for AI coding tools; `CLAUDE.md` adds the Claude Code specifics
 
 ---
 
@@ -64,6 +65,14 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > Compare rows within this table. Not with the tables in
 > [BENCHMARKS.md](BENCHMARKS.md) above or below it: this runner's ndjson
 > numbers moved 20% between two runs one morning with no code change at all.
+>
+> **This table is the GitHub-runner reference point and it is no longer the
+> latest measurement.** It is kept because it is the one taken on hardware
+> anybody can rent. The current numbers, taken 2026-09-17 on a 4-core container
+> after the C++ columnar work and the ndjson row-end fix, are in
+> [RESULTS.md](RESULTS.md) — where C no longer leads every format, because Rust
+> leads ndjson. Different host, so the two are not comparable row for row;
+> RESULTS.md says what can and cannot be read across them.
 ---
 
 ## Building and running

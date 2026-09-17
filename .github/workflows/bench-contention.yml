@@ -83,17 +83,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
           key: contention-alone
       - name: Install Zig
-        run: |
-          pip install ziglang==0.16.0
-          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
-          sudo chmod +x /usr/local/bin/zig
+        uses: ./.github/actions/setup-zig
       - run: CXX=clang++ scripts/build_ports.sh c rust zig cpp cpp-gen
       - name: Measure, with nothing else running
         run: |
@@ -103,7 +100,7 @@ jobs:
             --formats "${{ github.event.inputs.format || 'csv' }}" \
             --repeats "${{ github.event.inputs.repeats || '3' }}" \
             --json-out /tmp/alone.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: aa-alone-${{ github.run_id }}
           path: /tmp/alone.json
@@ -119,17 +116,14 @@ jobs:
       matrix:
         n: ${{ fromJSON(needs.plan.outputs.crowd) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
           key: contention-crowd-${{ matrix.n }}
       - name: Install Zig
-        run: |
-          pip install ziglang==0.16.0
-          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
-          sudo chmod +x /usr/local/bin/zig
+        uses: ./.github/actions/setup-zig
       - run: CXX=clang++ scripts/build_ports.sh c rust zig cpp cpp-gen
       - name: Measure, with the rest of the crowd running
         run: |
@@ -139,7 +133,7 @@ jobs:
             --formats "${{ github.event.inputs.format || 'csv' }}" \
             --repeats "${{ github.event.inputs.repeats || '3' }}" \
             --json-out /tmp/crowd.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: aa-crowd-${{ matrix.n }}-${{ github.run_id }}
           path: /tmp/crowd.json
@@ -150,7 +144,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           pattern: aa-*-${{ github.run_id }}
           path: aa

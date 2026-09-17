@@ -44,7 +44,7 @@ jobs:
     name: every port reads every format the same way
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -54,11 +54,7 @@ jobs:
       # Zig comes from PyPI rather than ziglang.org: it is the same release,
       # and it needs no network beyond the one the runner already trusts.
       - name: Install Zig
-        run: |
-          pip install ziglang==0.16.0
-          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
-          sudo chmod +x /usr/local/bin/zig
-          zig version
+        uses: ./.github/actions/setup-zig
 
       # gen-data as well as the engine: the Zig suite's columnar Parquet checks
       # write their fixtures with `cpp/build/gen-data --format parquet`, and

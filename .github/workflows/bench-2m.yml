@@ -98,7 +98,7 @@ jobs:
       matrix:
         format: [csv, ndjson, parquet]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: What this runner is
         run: |
@@ -125,11 +125,7 @@ jobs:
           key: bench2m-${{ matrix.format }}
 
       - name: Install Zig
-        run: |
-          pip install ziglang==0.16.0
-          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
-          sudo chmod +x /usr/local/bin/zig
-          zig version
+        uses: ./.github/actions/setup-zig
 
       # No disk cleanup here, unlike the ladder: two million rows of ndjson is
       # about 1.7 GB for the pair and the runner has room for it as it ships.
@@ -201,7 +197,7 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: bench-2m-${{ matrix.format }}-${{ github.run_id }}

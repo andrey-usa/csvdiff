@@ -26,7 +26,8 @@ gone. Do not reintroduce them; their measured verdicts are the point of `ARCHIVE
 | `README.md` | the full user guide. Every command runs from the repository root, as written, on a fresh clone — keep it that way |
 | `AGENTS.md` | this file |
 | `CLAUDE.md` | the Claude Code layer: slash commands, the report skill, settings |
-| `BENCHMARKS.md` | every kept benchmark run, newest first. Compare rows within a table, never across tables |
+| `RESULTS.md` | where the ports stand **today**: one full-size table per format, one host, one sitting. The snapshot |
+| `BENCHMARKS.md` | every kept benchmark run, newest first. Compare rows within a table, never across tables. The record |
 | `ARCHIVE.md` | what was tried, what it was worth, what was removed |
 | `c/` | the leading port on every format measured — `csvdiff.c` (CSV/ndjson), `parquet.c` + `pqdiff.c` (columnar), `parallel.c`, `gen-data.c` + `pqwrite.c`; own suite `test.sh` |
 | `cpp/` | the C++ port (SWAR text + columnar + snappy); own suite `test.sh`; generator included |
@@ -34,6 +35,7 @@ gone. Do not reintroduce them; their measured verdicts are the point of `ARCHIVE
 | `zig/` | the port with the *enforced* `--max-memory` budget; `zig build --release=fast` + `test.sh` |
 | `scripts/` | the measurement harnesses in Python and bash — see the commands below |
 | `.github/workflows/` | the CI and benchmark workflows, listed in `README.md`; `parity.yml` and `formats.yml` are the repository-wide gates |
+| `.github/actions/` | composite actions the workflows share. `setup-zig` is the **only** place the Zig version is pinned — it was in ten |
 | `tests/fixtures/` | the awkward-input and multi-format fixtures every suite is held to |
 | `.claude/` | Claude Code only: slash commands, a report skill, `settings.json` |
 
@@ -201,6 +203,7 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
 
 - `README.md` — the whole contract and every command, the per-port matrix, the PowerShell rules.
 - `c/README.md`, `cpp/README.md`, `rust/README.md`, `zig/README.md` — per-port design and layout.
+- `RESULTS.md` — where the four ports stand today, and which differences are established.
 - `BENCHMARKS.md` — what this machine can and cannot resolve.
 - `ARCHIVE.md` — everything removed, with the number that earned the verdict.
 - `CLAUDE.md` — Claude Code specifics.
