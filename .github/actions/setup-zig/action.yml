@@ -46,6 +46,27 @@ runs:
         # makes the two identical by construction, and baking the absolute path
         # into the shim keeps it true however PATH changes afterwards.
         py=$(command -v python3)
+        # ...but not an interpreter that is about to be deleted.
+        #
+        # Several jobs here free disk before generating tens of gigabytes of
+        # rows, and what they delete includes `$AGENT_TOOLSDIRECTORY` --
+        # /opt/hostedtoolcache, which is exactly where actions/setup-python
+        # puts its interpreter. Install into that one and the shim dies later
+        # with `exec: /opt/hostedtoolcache/Python/3.14.7/x64/bin/python3: not
+        # found`, which is how benchmark-native.yml failed on the second
+        # attempt at this. The tarball install it replaced was immune because a
+        # zig binary needs no interpreter at all.
+        #
+        # So: if the resolved python3 lives under the tool cache and a system
+        # python3 exists, take the system one. It is the interpreter that is
+        # still there after the cleanup.
+        if [ -n "${AGENT_TOOLSDIRECTORY:-}" ] \
+           && [ -x /usr/bin/python3 ] \
+           && case "$py" in "$AGENT_TOOLSDIRECTORY"/*) true ;; *) false ;; esac
+        then
+          echo "$py is under the deletable tool cache; using /usr/bin/python3"
+          py=/usr/bin/python3
+        fi
         echo "using $py"
         # --break-system-packages for the runners whose python is marked
         # externally managed (PEP 668); the fallback covers the ones where the
