@@ -86,6 +86,88 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-17 (C++ CSV gap) — what it is not, and the one lead that survived
+
+No change here. C++ is the slowest port on CSV by a wide margin and the entry
+below took the first bite out of it; this is the attempt to find the rest, and
+most of it is a list of explanations that turned out to be wrong. That list is
+the useful part, because each one is a day somebody else now does not spend.
+
+### It is not the parallel path
+
+The published table is four-threaded and the profile is single-threaded, which
+is two different claims about one gap. Measured on a 4M CSV pair, seven paired
+rounds, ports rotated:
+
+| | wall | cpu | cores |
+|---|---:|---:|---:|
+| C, 1 thread | 1.41s | 1.76s | 1.25x |
+| C, 4 threads | 0.79s | 2.36s | 2.99x |
+| C++, 1 thread | 2.65s | 3.19s | 1.20x |
+| C++, 4 threads | 1.59s | 3.82s | 2.40x |
+
+C++/C is **1.883x on one thread** and 2.013x on four. The gap is already there
+before any thread is started, so threading is not where to look. (Both ports
+scale poorly — 1.78x and 1.67x from one core to four, on three cores' worth of
+CPU. That is its own finding and not this one.)
+
+### It is not the instruction count
+
+Instructions, same 200k pair, single-threaded: C 853M, C++ 1,139M, **1.336x**.
+Wall at that same size: **1.680x**. A third of the gap is work; the rest is not.
+
+### It is not size or cache pressure at scale
+
+The obvious objection to profiling 200k and measuring 4M is that the working
+sets differ. They do, and it does not rescue the count:
+
+| C++/C, one thread | 200k | 4M |
+|---|---:|---:|
+| wall | 1.680x | 1.868x |
+
+The gap grows with size, so there is *some* scale component, but the bulk of it
+is present at 200k where the profile was taken.
+
+### It is not cache misses or branch mispredictions — per instruction, C++ is better
+
+`--cache-sim=yes --branch-sim=yes`, 200k pair, one thread:
+
+| | C | C++ | ratio |
+|---|---:|---:|---:|
+| instructions | 852,809,297 | 1,139,272,760 | 1.34x |
+| data reads | 201,163,763 | 283,073,026 | 1.41x |
+| data writes | 77,417,513 | 113,068,563 | 1.46x |
+| L1 read misses | 3,185,854 | 5,009,893 | 1.57x |
+| **last-level read misses** | **1,208,062** | **1,157,321** | **0.96x** |
+| last-level write misses | 219,142 | 649,350 | 2.96x |
+| branch mispredicts | 4,131,063 | 4,971,806 | 1.20x |
+| mispredict rate | 3.05% | 2.68% | — |
+
+C++ takes **fewer** trips to main memory for reads than C does, in absolute
+terms, and mispredicts a *smaller* fraction of its branches. Normalised per
+instruction it is ahead on both: 1.59 last-level misses per 1k instructions
+against C's 1.67. Whatever costs C++ its 1.68x, this model does not see it.
+
+The caveat that keeps this from being conclusive: callgrind simulates a generic
+two-level cache, not this processor's. A model that says "no difference" is
+weaker evidence than a model that finds one.
+
+### The lead that survived
+
+Two numbers in that table do not fit the pattern. C++ issues **1.05x the data
+reads and 1.09x the data writes per instruction**, and its last-level *write*
+misses are **2.96x** C's — 430k extra, where its read misses are fewer.
+
+Writes that miss are not free: the line has to be fetched for ownership before
+the store retires. A back-of-envelope on 430k extra misses, at 60 to 150 cycles
+and 2.1 to 2.8 GHz, lands between 8% and 26% of a 120 ms run. That is a wide
+band from assumed constants and it is **not a measurement** — but it is the only
+quantity found here that is both large enough to matter and worse in C++.
+
+So: the next person to pick this up should go after the writes, not the reads,
+not the branches, and not the thread count. Where C++ stores and C does not is
+the question, and this host has no `perf` to answer it directly.
+
 ## 2026-09-17 (memory cap) — the confound that was not one, and nine rounds that lied
 
 The entry below marked one column of the ndjson table as suspect. The ladder run

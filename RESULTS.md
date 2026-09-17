@@ -100,8 +100,16 @@ on 24.4 CPU-seconds against Zig's 27.6: C does less work, Zig uses more cores.
 
 **C++ is last on both text formats and by a long way on CSV** — 2.46x behind C
 there, 1.44x behind Zig on ndjson. It is the port with the most headroom. Its
-Parquet column is second, so what is behind is the text path specifically,
-which is where the profile in BENCHMARKS.md already pointed.
+Parquet column is second, so what is behind is the text path specifically.
+
+That gap has been taken apart in BENCHMARKS.md and most of it is still
+unexplained. What is ruled out: it is not the thread count (1.88x on a single
+thread, before any thread is started), not the instruction count (1.34x), not
+cache pressure at scale (1.68x at 200k too), and not misses or mispredictions —
+per instruction C++ takes fewer trips to main memory for reads than C does and
+mispredicts a smaller share of its branches. The one surviving lead is writes:
+C++ issues 1.09x the stores per instruction and misses the last level on 2.96x
+as many of them.
 
 **Memory is the flattest ranking and C's clearest win.** 716 MB above the mapped
 input on *both* text formats — the same number whether the input is 3.5 GB or
