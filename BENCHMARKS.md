@@ -86,6 +86,94 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-17 (scaling) — every port is half serial, and it is the same half
+
+The C++ gap work kept turning up a number beside the one it was chasing: on four
+cores, C++ got 1.70x. So did the others, roughly, and nobody had asked why. This
+is that question, and the answer is the largest single opportunity this project
+has measured — it is shared by all four ports, it is not language-specific, and
+it is worth more than every port-level change in this file put together.
+
+### The curve
+
+4M CSV pair, five rounds, ports rotated. Cell is wall / cores busy.
+
+| port | 1 thread | 2 | 3 | 4 | 1→4 | implied serial |
+|---|---|---|---|---|---:|---:|
+| C | 1.52s / 1.27x | 1.02s / 1.87x | 0.89s / 2.25x | 0.82s / 2.91x | 1.86x | 38% |
+| C++ | 2.74s / 1.20x | **2.78s** / 1.19x | 1.91s / 1.72x | 1.61s / 2.42x | 1.70x | 45% |
+| Rust | 2.00s / 1.30x | 1.36s / 1.89x | 1.13s / 2.25x | 1.10s / 2.70x | 1.81x | 40% |
+| Zig | 1.48s / 1.32x | 1.02s / 1.95x | 0.89s / 2.24x | **0.97s** / 3.11x | 1.53x | 54% |
+
+Four independent implementations, all between 1.53x and 1.86x on four cores, all
+implying a serial fraction between 38% and 54%. Two of them get *worse* somewhere:
+C++ gains nothing from its second thread, Zig loses time going from three to four
+while burning 3.11 cores.
+
+Four ports of one design landing on one number is the design, not the code.
+
+### Where the serial half is
+
+`CSVDIFF_PHASES=1` says it outright, and the ports label it themselves. At four
+threads on the same pair:
+
+| port | serial index insert | % of wall | parallel join | 1→4 |
+|---|---:|---:|---:|---:|
+| C | 0.394s | **48%** | 0.275s | 1.86x |
+| C++ | 0.692s | **43%** | 0.756s | 1.70x |
+| Rust | 0.315s | **29%** | 0.247s | 1.81x |
+| Zig | 0.324s | **33%** | 0.268s | 1.53x |
+
+The phase is *named* `index insert (serial)` in three of the four and
+`insert in order` in C. The shape is the same everywhere: sweep the rows in
+parallel, **insert them into the hash index on one thread**, then join in
+parallel.
+
+In C the serial insert is now *longer than the parallel join it feeds* — 0.394s
+against 0.275s. The port has optimised the parallel half until the serial half
+is the bigger one.
+
+C++'s own phase timings show it directly, 1 thread against 4:
+
+| phase | 1 thread | 4 threads | scales |
+|---|---:|---:|---|
+| sweep (parallel) | 0.576s | 0.722s | — |
+| **index insert (serial)** | **0.538s** | **0.515s** | **no** |
+| join and compare | 1.883s | 0.756s | 2.49x |
+| **assemble** | **0.177s** | **0.177s** | **no** |
+
+The join scales 2.49x. The insert does not move at all, and neither does
+assemble. 0.692s of a 1.61s run, which is the 43% above and within a point of the
+45% Amdahl implied by the speedup — two independent routes to the same number.
+
+### What it would be worth
+
+If the insert parallelised perfectly on these four cores:
+
+| port | now | insert at 4x | gain |
+|---|---:|---:|---:|
+| C | 0.82s | 0.52s | **1.56x** |
+| C++ | 1.61s | 1.09s | 1.48x |
+| Rust | 1.10s | 0.86s | 1.27x |
+| Zig | 0.97s | 0.73s | 1.33x |
+
+Perfect parallelisation is not on offer and this is an upper bound, not a
+forecast. But even half of it is larger than anything else measured in this file,
+it applies to every format rather than one, and it applies to all four ports at
+once.
+
+### What it does not say
+
+This is one host, four cores, one format, one size. The serial fraction is a
+*fraction*, so it should hold shape at other sizes, but that is an argument and
+not a measurement. Nothing here says the insert *can* be parallelised — a hash
+index built in a deterministic order is not trivially shardable, and the ports
+agree on counts partly because they insert in one order. Whatever replaces it has
+to keep the cross-port oracle green, which is the constraint that makes this
+interesting rather than obvious.
+
+The harness is `scripts/scaling_curve.py`.
+
 ## 2026-09-17 (C++ writes) — the write misses are the report path, not the join
 
 The entry below ended by saying the next person should go after C++'s writes,

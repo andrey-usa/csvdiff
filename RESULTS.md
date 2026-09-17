@@ -121,6 +121,32 @@ so every port pays over a gigabyte and Zig pays least.
 
 ---
 
+## The biggest number here is one no port owns
+
+Every port scales badly from one core to four, and by nearly the same amount:
+
+| port | 1 thread | 4 threads | 1→4 | serial index insert | % of the 4-thread run |
+|---|---:|---:|---:|---:|---:|
+| C | 1.52s | 0.82s | 1.86x | 0.394s | **48%** |
+| C++ | 2.74s | 1.61s | 1.70x | 0.692s | **43%** |
+| Rust | 2.00s | 1.10s | 1.81x | 0.315s | **29%** |
+| Zig | 1.48s | 0.97s | 1.53x | 0.324s | **33%** |
+
+(4M CSV pair, this host, `scripts/scaling_curve.py`.)
+
+All four sweep the rows in parallel, **insert them into the hash index on one
+thread**, then join in parallel. Three of them name the phase
+`index insert (serial)` themselves. In C that serial insert is now longer than
+the parallel join it feeds — 0.394s against 0.275s.
+
+Parallelising it is worth an upper bound of 1.27x to 1.56x depending on the port,
+on every format rather than one. That is larger than any port-level change this
+project has made. It is also not obviously possible: the ports agree on counts
+partly because they insert in a deterministic order, so whatever replaces it has
+to keep the cross-port oracle green. See [BENCHMARKS.md](BENCHMARKS.md).
+
+---
+
 ## The ndjson ranking is not a property of the code
 
 Four machines have measured this same tree at 10M. The ndjson ordering is not
