@@ -86,6 +86,69 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-17 (C++ writes) — the write misses are the report path, not the join
+
+The entry below ended by saying the next person should go after C++'s writes,
+since its last-level write misses are 2.96x C's where its read misses are fewer.
+This is that, one level down, and it lands somewhere the entry did not predict.
+
+Last-level write misses by function, 200k CSV pair, one thread:
+
+| C — 219,142 total | | C++ — 649,350 total | |
+|---|---:|---|---:|
+| `sweep_part` | 79,716 | **`row_values`** | **209,251 (32%)** |
+| `__memcpy` | 75,084 | `RowIndex::RowIndex` | 107,191 (17%) |
+| `build_part` | 47,951 | `__memcpy` | 99,748 (15%) |
+| `__memset` | 15,623 | `RowIndex::sweep` | 76,476 (12%) |
+| | | `vector<int>::_M_fill_assign` | 66,046 (10%) |
+| | | `_int_malloc` | 43,141 (7%) |
+
+`row_values` with its `memcpy` and its `malloc` is **54% of C++'s write misses**.
+That is the *report* path: for every row that is reported — changed, added or
+removed — it builds a `std::vector<Val>` where `Val` is
+`std::optional<std::string>`, so every reported cell is an allocation and a copy.
+C renders the same rows by slicing the mapped bytes and allocates nothing.
+
+By subsystem, with the groups matched between the ports:
+
+| | C | C++ | ratio |
+|---|---:|---:|---:|
+| scan + parse, instructions | 539.3 M | 621.1 M | 1.15x |
+| scan + parse, writes | 49.6 M | 45.9 M | **0.92x** |
+| index build + sweep, instructions | 73.8 M | 148.1 M | 2.01x |
+| index build + sweep, writes | 7.8 M | 15.7 M | 2.03x |
+| string machinery, instructions | 1.1 M | 67.6 M | 61x |
+| string machinery, writes | 0.6 M | 17.2 M | 29x |
+
+The hot path is fine. On scan and parse — 55% of C++'s instructions — it is 1.15x
+on work and actually writes *fewer* bytes than C. The excess is the index (2.0x)
+and the strings (29x on writes, against a C path that has none).
+
+### What this is worth, and what it is not
+
+The string machinery is 68M of C++'s 1,139M instructions: **6%**. But it is 54%
+of the write misses, and the envelope in the entry below put the whole write-miss
+excess at 8-26% of the run. So this is plausibly worth more than its instruction
+share and certainly not worth 1.88x. **It does not explain the gap** — nothing
+found so far does, and scan+parse at 1.15x on 55% of the instructions says the
+gap is not concentrated anywhere obvious.
+
+It is also dataset-dependent in a way the rest is not: this pair has 6% of its
+rows changed, and `row_values` runs once per reported row. A diff where most rows
+changed would pay far more; one with no differences would pay none.
+
+### The change it implies, and why it is not made here
+
+`Val` is `std::optional<std::string>` in `cpp/src/csvdiff.hpp`, used across the
+text and columnar paths. Making it a view over the mapped bytes would remove the
+allocation and the copy, and it is a real cross-file change with a lifetime
+condition to prove: the `Slab` must outlive every report that borrows from it.
+That is a design decision and it should be made deliberately on these numbers
+rather than folded into a benchmark entry. The numbers are here so it can be.
+
+`vector<int>::_M_fill_assign` at 66k misses is `slots_.assign(n, -1)` rebuilding
+the parser's slot table; it is not investigated here and is the other loose end.
+
 ## 2026-09-17 (C++ CSV gap) — what it is not, and the one lead that survived
 
 No change here. C++ is the slowest port on CSV by a wide margin and the entry
