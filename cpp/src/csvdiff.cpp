@@ -446,17 +446,53 @@ Val value_of(const Slab& s, Field f, const Options& o) {
     return text;
 }
 
-bool is_absent(const Slab& s, Field f, const Options& o) {
+// The normalising tail lives out of line so `is_absent` can be inlined.
+//
+// `is_absent` answers the common case in about ten instructions -- two loads, a
+// shift and a compare -- and then falls back to `value_of`, which builds a
+// std::string. A body that can allocate is over the compiler's inlining
+// threshold, so the whole predicate was a real call, prologue and all, and the
+// ten instructions cost thirty-two. On a 200k CSV pair it is asked 2.45M times
+// (1.21M from `same`, 800k from the index sweep, 437k from `compare`) for 78M
+// instructions, 6.5% of the run. The C port spends none: it has no such
+// predicate, because its absent case is a sentinel the caller tests inline.
+//
+// Worth 0.978 on CSV, middle half 0.947-0.994 over eleven paired rounds on a 4M
+// pair, faster in nine of them. ndjson measured 0.984 with the middle half
+// 0.978-1.020, which crosses one, so nothing is claimed for that format.
+//
+// **`same` is deliberately not given the same treatment**, and the reason is
+// measured rather than aesthetic: inlining it too regressed ndjson to 1.034,
+// middle half 1.023-1.069, faster in one round of eleven. It also *added* 14M
+// instructions, because an inlined `same` duplicates the `is_absent` work at
+// each of its call sites. Fewer calls is not the same thing as less work, and
+// neither is the same thing as less time.
+//
+// The tail is not on a path the benchmark takes: `--trim`, `--ignore-case`,
+// `--empty-is-null` and `--tolerance` are all off by default, and
+// `needs_normalising` is what decides. Where one is on, the cost is the call it
+// always was.
+bool absent_normalised(const Slab& s, Field f, const Options& o) {
+    return !value_of(s, f, o).has_value();
+}
+
+inline bool is_absent(const Slab& s, Field f, const Options& o) {
     if (!is_real(f) || len_of(f) == 0) return true;
     if (!needs_normalising(o)) return false;
-    return !value_of(s, f, o).has_value();
+    return absent_normalised(s, f, o);
+}
+
+// Split out for the same reason, but `same` itself stays out of line -- see
+// above for the measurement that decided it.
+bool same_normalised(const Slab& a, Field x, const Slab& b, Field y, const Options& o) {
+    return value_of(a, x, o) == value_of(b, y, o);
 }
 
 bool same(const Slab& a, Field x, const Slab& b, Field y, const Options& o) {
     const bool xa = is_absent(a, x, o), yb = is_absent(b, y, o);
     if (xa || yb) return xa && yb;
     if (!needs_normalising(o)) return same_bytes(a, x, b, y);
-    return value_of(a, x, o) == value_of(b, y, o);
+    return same_normalised(a, x, b, y, o);
 }
 
 // Deliberately stricter than strtod: "inf" and "nan" are ordinary text in a CSV,

@@ -113,26 +113,33 @@ so every port pays over a gigabyte and Zig pays least.
 
 ## The ndjson ranking is not a property of the code
 
-Three machines measured this same tree at 10M within one hour. The ndjson
-ordering came out differently on all three:
+Four machines have measured this same tree at 10M. The ndjson ordering is not
+the same on all of them — but it is not arbitrary either:
 
-| ndjson, 10M | container<br>Xeon @2.10GHz, avx512 | CI ladder<br>Xeon Platinum 8370C, avx512 | CI<br>EPYC 9V74, avx2 |
-|---|---|---|---|
-| 1st | **Rust** 5.08s | **C** 7.95s | **Zig** 7.20s |
-| 2nd | Zig 5.48s | Zig 8.26s | C 7.41s |
-| 3rd | C 6.13s | C++ 8.96s | Rust 8.04s |
-| 4th | C++ 8.76s | **Rust** 9.96s | C++ 10.39s |
+| ndjson, 10M | container<br>Xeon @2.10GHz, avx512 | CI ladder<br>Xeon Plat. 8370C, avx512 | CI<br>EPYC 9V74, avx2 | CI<br>Xeon Plat. 8573C, avx512 |
+|---|---|---|---|---|
+| 1st | **Rust** 5.08s | **C** 7.95s | **Zig** 7.20s | **Zig** 5.47s |
+| 2nd | Zig 5.48s | Zig 8.26s | C 7.41s | C 5.68s |
+| 3rd | C 6.13s | C++ 8.96s | Rust 8.04s | Rust 6.34s |
+| 4th | C++ 8.76s | **Rust** 9.96s | C++ 10.39s | C++ 7.87s |
 
-Rust is first on one machine and last on another. Nothing about the code changed
-between those two columns.
+**The last two columns agree exactly** — different vendor, different vector
+width, same order. That is the first ndjson ordering this project has reproduced
+on independent hardware, and Zig-then-C is what the two clean CI runs say.
 
-**Do not read this table across its columns for anything but this point.** Three
-different CPUs, and the first is not even a CI runner. What it establishes is
-negative and worth more than a ranking: *"Rust leads ndjson"* is not a fact about
-this repository, it is a fact about one machine, and any published ordering for
-ndjson needs its CPU printed next to it.
+Rust is still first on one machine and last on another, so no ordering here is
+universal, and any published one needs its CPU printed beside it. But "three
+machines, three winners" was too strong a reading of the first three columns: the
+orderings are not arbitrary, they are just not portable.
 
-What survives all three columns: **C++ is last or second-to-last on ndjson
+**The 8370C column carries a confound and should be discounted until it is
+resolved.** It is the only one measured by the ladder harness
+(`bench_formats_ports.py`, which also passes `--memory-cap`) rather than
+`bench_ports.py`. The flags are otherwise the same and the generated inputs are
+the same size, but that difference has not been ruled out, and it is the column
+where Rust looks worst by a wide margin.
+
+What survives every column: **C++ is last or second-to-last on ndjson
 everywhere**, and C is never worse than third. Those are the claims worth acting
 on.
 
@@ -146,7 +153,8 @@ on.
 | C++ is last on both text formats | this table, and every table before it |
 | C uses the least memory above its input on text | every table this project has published |
 | Zig leads ndjson on the EPYC 9V74 | the table above — but by 1.03x, inside the noise floor |
-| Any port "leads ndjson" in general | **refuted** — three CPUs, three different winners |
+| Any port "leads ndjson" in general | **refuted** — Rust is first on one CPU and last on another |
+| Zig leads ndjson on CI hardware | **reproduced** on two CI CPUs (EPYC 9V74, Xeon Plat. 8573C), C ~1.03x behind |
 | The ndjson row-end fix is worth 1.26x on C++, 1.04x on Rust | [paired A/B, 11 rounds, CSV as control](BENCHMARKS.md) |
 | The same fix is worth anything on Zig | **not established** — the band crosses 1.00x |
 | Instruction count predicts wall time across ports | **refuted** |
