@@ -9,9 +9,10 @@ It is **four byte-level ports to one result contract** — C, C++, Rust and Zig.
 They read the same files, return the same counts and the same exit codes, which
 is what makes a number from one directly comparable with a number from another.
 
-- [AGENTS.md](AGENTS.md) — the entry point for AI coding tools; `CLAUDE.md` adds the Claude Code specifics
-- [BENCHMARKS.md](BENCHMARKS.md) — every run, with CPU and memory
+- [RESULTS.md](RESULTS.md) — **where the ports stand today**: 10M rows, three formats, one host
+- [BENCHMARKS.md](BENCHMARKS.md) — how they got there: every run, newest first, with CPU and memory
 - [ARCHIVE.md](ARCHIVE.md) — what was tried, what it was worth, what was removed
+- [AGENTS.md](AGENTS.md) — the entry point for AI coding tools; `CLAUDE.md` adds the Claude Code specifics
 
 ---
 
@@ -64,6 +65,17 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > Compare rows within this table. Not with the tables in
 > [BENCHMARKS.md](BENCHMARKS.md) above or below it: this runner's ndjson
 > numbers moved 20% between two runs one morning with no code change at all.
+>
+> **This table is a 2026-09-09 reference point and is no longer the latest
+> measurement.** The current numbers, measured on CI on 2026-09-17 after the
+> C++ columnar work and the ndjson row-end fix, are in
+> [RESULTS.md](RESULTS.md).
+>
+> That page also carries a result this one cannot: the same tree, measured at
+> 10M on three machines inside an hour, produces **three different ndjson
+> winners** — Rust first on one, last on another. A published ordering for
+> ndjson is only meaningful with its CPU printed next to it, which is why
+> benchmark results here are now grouped by processor.
 ---
 
 ## Building and running

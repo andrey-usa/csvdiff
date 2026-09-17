@@ -10,6 +10,19 @@ Terse verdicts on things the project no longer carries are in
 
 ## How to read these
 
+**One CPU per table, and CI does not give you that for free.** Every number is
+only comparable with another taken on the same processor. On GitHub's hosted
+fleet that is not a formality: one `ubuntu-latest` label covers several
+generations, so two jobs in one workflow run can land on a Xeon Platinum 8370C
+and an EPYC 7763 — different cache, different core layout, a different AVX-512
+story. A ladder that runs one size per job, or a matrix that runs one format per
+job, produces pieces measured on *different machines*; read as a single curve
+they measure the fleet as much as the code. So `bench_formats_ports.py` records
+the CPU in its JSON beside the numbers, and `scripts/bench_group.py` groups on it
+and prints one table per processor, naming any rung that is missing from a group
+rather than filling it in from another. A run whose summary shows two CPUs has
+produced two tables, whatever it looks like.
+
 **Interleaved, not one build at a time.** A machine's speed drifts under the
 runs themselves — the page cache fills, the kernel's supply of free 2 MB pages
 is picked over. Every build runs once per round and the rounds repeat. A number
@@ -72,6 +85,65 @@ Parquet. Every port is now built for the runner it is measured on. It was the
 other branch's agent that pointed this out.
 
 ---
+
+## 2026-09-17 (10M, on CI) — three machines, three different ndjson winners
+
+Ten million rows on GitHub's runners, which is where this table belongs: the
+container numbers first written here were one machine nobody else can rent.
+Running it properly turned up something bigger than the table.
+
+### One CPU, all three formats
+
+`benchmark-native.yml` runs every format in a single job, which is the only
+arrangement that gets one processor across all three.
+[Run 35181504756](https://github.com/andrey-usa/csvdiff/actions/runs/35181504756),
+**AMD EPYC 9V74, 4 cores, AVX2**, three interleaved runs each, counts gated.
+
+| Port | csv 3,509 MB | ndjson 8,487 MB | parquet 2,074 MB |
+|---|---:|---:|---:|
+| C | **1.83s** (6.4s cpu) | 7.41s (**24.4s cpu**) | **1.53s** (4.9s cpu) |
+| C++ | 4.51s (13.9s) | 10.39s (30.7s) | 2.59s (8.4s) |
+| Rust | 2.10s (6.8s) | 8.04s (30.4s) | 2.79s (9.2s) |
+| Zig | 2.15s (7.1s) | **7.20s** (27.6s) | 2.93s (10.3s) |
+
+C leads CSV by 1.15x over Rust and Parquet by 1.69x over C++. Zig takes ndjson
+by 1.03x over C, which is inside what a ratio of bests can resolve here — a tie,
+and C reaches it on 24.4 CPU-seconds against Zig's 27.6. C++ is last on both
+text formats, 2.46x behind C on CSV.
+
+### The finding: the ndjson ranking is not a property of the code
+
+Three machines measured this same tree at 10M inside one hour:
+
+| ndjson, 10M | container Xeon @2.10GHz avx512 | CI Xeon Platinum 8370C avx512 | CI EPYC 9V74 avx2 |
+|---|---|---|---|
+| 1st | **Rust** 5.08s | **C** 7.95s | **Zig** 7.20s |
+| 2nd | Zig 5.48s | Zig 8.26s | C 7.41s |
+| 3rd | C 6.13s | C++ 8.96s | Rust 8.04s |
+| 4th | C++ 8.76s | **Rust** 9.96s | C++ 10.39s |
+
+Rust is first on one and last on another with nothing changed between them. This
+file already said never to compare across tables; what it did not say, because
+nothing here had been arranged to notice, is that **one CI workflow run is not
+one table**. The ladder fans a size or a format out per job to get parallelism,
+and those jobs land on different hardware — the run above put csv and parquet on
+an EPYC 7763 and ndjson on a Xeon Platinum 8370C, in one dispatch.
+
+So the harness now records the CPU in its JSON and `scripts/bench_group.py`
+groups on it, printing one table per processor and naming what is missing from
+each. The first grouped run caught the split immediately.
+
+What survives all three columns: C++ is last or second-to-last on ndjson
+everywhere, and C is never worse than third. Those are the claims worth acting
+on. "Rust leads ndjson", published here earlier today on the strength of the
+container column, is not one of them.
+
+### Also not comparable, and it looks like it should be
+
+The two harnesses generate different Parquet. `bench_formats_ports.py` uses the
+Rust generator and `bench_ports.py` the C one, and for the same ten million rows
+they emit 1,535 MB and 2,074 MB. Their Parquet rows cannot be read against each
+other even on one CPU. CSV and ndjson are byte-identical between the two.
 
 ## 2026-09-17 (json row end) — the fix C wrote down and three ports never took
 

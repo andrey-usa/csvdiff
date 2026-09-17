@@ -98,7 +98,7 @@ jobs:
       matrix:
         format: [csv, ndjson, parquet]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: What this runner is
         run: |
@@ -125,11 +125,7 @@ jobs:
           key: bench2m-${{ matrix.format }}
 
       - name: Install Zig
-        run: |
-          pip install ziglang==0.16.0
-          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
-          sudo chmod +x /usr/local/bin/zig
-          zig version
+        uses: ./.github/actions/setup-zig
 
       # No disk cleanup here, unlike the ladder: two million rows of ndjson is
       # about 1.7 GB for the pair and the runner has room for it as it ships.
@@ -175,6 +171,7 @@ jobs:
             --rows "$ROWS" --formats "${{ matrix.format }}" --repeats "$REPEATS" $scanners \
             --memory-cap "$cap" \
             --md-out /tmp/bench.md \
+            --json-out /tmp/bench.json \
             | tee /tmp/bench.txt
 
       # The table outside the fence so it renders, the log inside it. Both
@@ -185,6 +182,11 @@ jobs:
         run: |
           {
             echo "## $ROWS rows — ${{ matrix.format }}"
+            echo
+            # Each format is its own job and so its own machine. The three
+            # summaries are read as one table by anybody scrolling this page,
+            # and they are not one table unless this line matches.
+            echo "Measured on: \`$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)\`, $(nproc) cores."
             echo
             if [ -s /tmp/bench.md ]; then
               cat /tmp/bench.md
@@ -201,11 +203,12 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: bench-2m-${{ matrix.format }}-${{ github.run_id }}
           path: |
             /tmp/bench.txt
             /tmp/bench.md
+            /tmp/bench.json
           retention-days: 30

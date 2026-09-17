@@ -1,0 +1,195 @@
+# Where the four ports stand
+
+**Ten million rows, all three formats, all four ports, measured on CI.**
+Run 2026-09-17.
+
+[BENCHMARKS.md](BENCHMARKS.md) is the record of *how it got here* — every run,
+newest first, with the reasoning and the dead ends. [ARCHIVE.md](ARCHIVE.md) is
+what was tried and removed. This file is the snapshot.
+
+---
+
+## The one rule, and what CI does to it
+
+**Compare rows within a table. Never across tables.** This project has measured
+the same code 20% apart on one machine in one morning, and a port's time swing
+1.57x by nothing but where it sat in the running order.
+
+**On hosted CI a "table" is smaller than it looks.** GitHub puts several
+processor generations behind one `ubuntu-latest` label. A workflow that fans
+sizes or formats out across jobs — which is how the ladder gets parallelism —
+collects its pieces from *different machines*. Read as one curve they measure
+the fleet as much as the code.
+
+So the harness records the CPU in its JSON beside the numbers, and
+`scripts/bench_group.py` groups on it and prints one table per processor. A CI
+summary showing two CPUs is showing two tables. The section below on
+[the ndjson ranking](#the-ndjson-ranking-is-not-a-property-of-the-code) is what
+happens when you ignore this.
+
+---
+
+## The workload
+
+| | |
+|---|---|
+| Rows | 10,001,000 in A, 10,000,500 in B, 20 columns |
+| Key | `(account_id, txn_id)` |
+| Ignored | `updated_at` |
+| Compared | a per-cell diff over the remaining 17 columns |
+
+Every port returned identical counts on every format. That is the run's gate,
+not a footnote — a port that disagrees fails the run and is named.
+
+```
+matched 9,990,000 · changed 599,320 · unchanged 9,390,680
+added 10,000 · removed 10,000
+duplicate keys 1,000 in A / 500 in B
+```
+
+---
+
+## Results — AMD EPYC 9V74, 4 cores, AVX2
+
+One job, one runner, one sitting, all three formats, three interleaved runs
+each, ports rotated. `benchmark-native.yml` at 10m.
+[Run 35181504756](https://github.com/andrey-usa/csvdiff/actions/runs/35181504756).
+
+Every port compiled for that machine: `-march=native` for C and C++,
+`-C target-cpu=x86-64-v3` for Rust (capped at the fleet's executable floor —
+resolving the host CPU picked `znver4` and a build-time tool died with SIGILL),
+`-Dcpu=native` for Zig.
+
+### CSV — 3,509 MB
+
+| Port | Best | Median | Worst | CPU | Above the input | vs best |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **1.83s** | 1.83s | 1.83s | 6.4s | **716 MB** | — |
+| Rust | 2.10s | 2.12s | 2.13s | 6.8s | 901 MB | 1.15x |
+| Zig | 2.15s | 2.23s | 2.29s | 7.1s | 874 MB | 1.17x |
+| C++ | 4.51s | 4.74s | 4.74s | 13.9s | 879 MB | 2.46x |
+
+### ndjson — 8,487 MB
+
+| Port | Best | Median | Worst | CPU | Above the input | vs best |
+|---|---:|---:|---:|---:|---:|---:|
+| **Zig** | **7.20s** | 7.35s | 7.37s | 27.6s | 879 MB | — |
+| C | 7.41s | 7.45s | 7.48s | **24.4s** | **716 MB** | 1.03x |
+| Rust | 8.04s | 8.05s | 8.06s | 30.4s | 901 MB | 1.12x |
+| C++ | 10.39s | 10.63s | 10.88s | 30.7s | 879 MB | 1.44x |
+
+### Parquet — 2,074 MB
+
+| Port | Best | Median | Worst | CPU | Above the input | vs best |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **1.53s** | 1.54s | 1.74s | **4.9s** | 1,297 MB | — |
+| C++ | 2.59s | 2.61s | 2.66s | 8.4s | 1,483 MB | 1.69x |
+| Rust | 2.79s | 2.80s | 2.82s | 9.2s | 1,365 MB | 1.82x |
+| Zig | 2.93s | 2.93s | 2.95s | 10.3s | **1,264 MB** | 1.92x |
+
+---
+
+## What this table says
+
+**C leads two formats of three and is never worse than second.** It also spends
+the least CPU on every format it leads, so it is not winning on threading.
+
+**Zig takes ndjson, narrowly** — 1.03x over C, which is inside the noise this
+host can resolve for a ratio of bests. Call it a tie and note that C gets there
+on 24.4 CPU-seconds against Zig's 27.6: C does less work, Zig uses more cores.
+
+**C++ is last on both text formats and by a long way on CSV** — 2.46x behind C
+there, 1.44x behind Zig on ndjson. It is the port with the most headroom. Its
+Parquet column is second, so what is behind is the text path specifically,
+which is where the profile in BENCHMARKS.md already pointed.
+
+**Memory is the flattest ranking and C's clearest win.** 716 MB above the mapped
+input on *both* text formats — the same number whether the input is 3.5 GB or
+8.5 GB, because a field there is one 64-bit word and never becomes a string.
+Parquet inverts the column: pages are decoded into an arena rather than mapped,
+so every port pays over a gigabyte and Zig pays least.
+
+---
+
+## The ndjson ranking is not a property of the code
+
+Three machines measured this same tree at 10M within one hour. The ndjson
+ordering came out differently on all three:
+
+| ndjson, 10M | container<br>Xeon @2.10GHz, avx512 | CI ladder<br>Xeon Platinum 8370C, avx512 | CI<br>EPYC 9V74, avx2 |
+|---|---|---|---|
+| 1st | **Rust** 5.08s | **C** 7.95s | **Zig** 7.20s |
+| 2nd | Zig 5.48s | Zig 8.26s | C 7.41s |
+| 3rd | C 6.13s | C++ 8.96s | Rust 8.04s |
+| 4th | C++ 8.76s | **Rust** 9.96s | C++ 10.39s |
+
+Rust is first on one machine and last on another. Nothing about the code changed
+between those two columns.
+
+**Do not read this table across its columns for anything but this point.** Three
+different CPUs, and the first is not even a CI runner. What it establishes is
+negative and worth more than a ranking: *"Rust leads ndjson"* is not a fact about
+this repository, it is a fact about one machine, and any published ordering for
+ndjson needs its CPU printed next to it.
+
+What survives all three columns: **C++ is last or second-to-last on ndjson
+everywhere**, and C is never worse than third. Those are the claims worth acting
+on.
+
+---
+
+## What is established, and what is not
+
+| Claim | Evidence |
+|---|---|
+| C leads CSV and Parquet on the EPYC 9V74 | the table above, counts-gated |
+| C++ is last on both text formats | this table, and every table before it |
+| C uses the least memory above its input on text | every table this project has published |
+| Zig leads ndjson on the EPYC 9V74 | the table above — but by 1.03x, inside the noise floor |
+| Any port "leads ndjson" in general | **refuted** — three CPUs, three different winners |
+| The ndjson row-end fix is worth 1.26x on C++, 1.04x on Rust | [paired A/B, 11 rounds, CSV as control](BENCHMARKS.md) |
+| The same fix is worth anything on Zig | **not established** — the band crosses 1.00x |
+| Instruction count predicts wall time across ports | **refuted** |
+| Instruction count tracks wall time within one port | [0.790 against 0.792 measured](BENCHMARKS.md) |
+
+---
+
+## Two things that are not comparable, and look like they should be
+
+**The two harnesses generate different Parquet.** `bench_formats_ports.py` uses
+the Rust generator and `bench_ports.py` uses the C one, and for the same ten
+million rows they emit 1,535 MB and 2,074 MB respectively. The Parquet rows from
+the two harnesses are therefore not comparable even on one CPU. The CSV and
+ndjson inputs are byte-identical between them (3,509 MB and 8,487 MB either way).
+
+**The README's headline table is a different host.** It is kept as the
+GitHub-runner reference point from 2026-09-09 and is not the latest measurement.
+
+---
+
+## Reproducing this
+
+```sh
+# All three formats in ONE job, which is the only way to get one CPU
+# across formats. This is what the table above came from.
+gh workflow run benchmark-native.yml -f rows=10m -f formats=csv,json,parquet -f repeats=3
+
+# The ladder: one job per size and format, so FASTER but several CPUs.
+# Its collect job groups by processor and says so.
+gh workflow run bench-ladder.yml -f sizes=10m,20m -f formats=csv,ndjson,parquet
+
+# Locally, one host by construction
+python3 scripts/bench_formats_ports.py --rows 10m --repeats 3
+
+# Merge any collection of result JSON, grouped by the CPU that produced it
+python3 scripts/bench_group.py rungs/
+
+# Two builds of one port -- the only way to price a single change
+bash scripts/bench_ab.sh
+```
+
+`bench_ab.sh` is the one to reach for when asking *did my change help*. It prints
+the middle half of the per-round paired ratios beside the median, and where that
+half straddles 1.00x there is no result to report. On this class of machine about
+10% is invisible to a ratio of bests and about 3% is the floor for the paired
+one — which is why the 1.03x above is called a tie.

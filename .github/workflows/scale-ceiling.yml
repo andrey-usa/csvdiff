@@ -97,7 +97,7 @@ jobs:
         port: [c, cpp, rust, zig]
         size: ${{ fromJSON(needs.plan.outputs.sizes) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The ladder needs every gigabyte: 60m rows of CSV is 22 GB for one pair,
       # and the runner ships with about 25 GB of toolchains this job never uses.
@@ -131,11 +131,7 @@ jobs:
 
       - name: Install Zig
         if: matrix.port == 'zig'
-        run: |
-          pip install ziglang==0.16.0
-          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
-          sudo chmod +x /usr/local/bin/zig
-          zig version
+        uses: ./.github/actions/setup-zig
 
       # The C generator regardless of which port is measured: every generator
       # emits byte-identical files, and this one is the fastest and needs only a
@@ -182,7 +178,7 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: ceiling-${{ matrix.port }}-${{ matrix.size }}
@@ -197,7 +193,7 @@ jobs:
       matrix:
         port: [c, cpp, rust, zig]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Free disk space
         run: |
@@ -214,10 +210,7 @@ jobs:
 
       - name: Install Zig
         if: matrix.port == 'zig'
-        run: |
-          pip install ziglang==0.16.0
-          printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' | sudo tee /usr/local/bin/zig >/dev/null
-          sudo chmod +x /usr/local/bin/zig
+        uses: ./.github/actions/setup-zig
 
       - name: Build
         run: |
@@ -255,7 +248,7 @@ jobs:
               --size "${{ inputs.floor_size }}" \
               --out "out/floor-${{ matrix.port }}.json"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: floor-${{ matrix.port }}
@@ -267,8 +260,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v6
         with:
           path: results
 
@@ -281,7 +274,7 @@ jobs:
               --out scale-report.md
           cat scale-report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: scale-report
           path: scale-report.md

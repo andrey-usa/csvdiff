@@ -89,8 +89,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
 
@@ -102,7 +102,7 @@ jobs:
       # reader independently, so reconciling them is somebody's afternoon; that
       # is no reason to wait to find out which one is faster. Two trees, one
       # host, one sitting, one set of rows.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: env.ALL_PORTS == '1' && github.event.inputs.alt_ref != ''
         with:
           ref: ${{ github.event.inputs.alt_ref }}
@@ -124,10 +124,7 @@ jobs:
             ${{ github.event.inputs.alt_ref != '' && 'alt/rust' || '' }}
       - name: Install Zig
         if: env.ALL_PORTS == '1'
-        run: |
-          curl -sSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz \
-            | tar -xJ -C /opt
-          echo "/opt/zig-x86_64-linux-0.16.0" >> "$GITHUB_PATH"
+        uses: ./.github/actions/setup-zig
 
       # Ten million rows of ndjson is 8.5 GB, and the runner ships with tens of
       # gigabytes of toolchains this job never opens.

@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import resource
 import shutil
 import subprocess
@@ -125,6 +126,52 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
         if path.exists():
             rows.append((label, [str(path)], flags, formats))
     return rows
+
+
+def host() -> dict[str, object]:
+    """What machine this is, in enough detail to refuse a bad comparison.
+
+    Every number this script produces is only comparable with another number
+    taken on the same CPU. That is not a general caution: GitHub's hosted fleet
+    mixes processor generations behind one label, so two jobs both saying
+    `ubuntu-latest` can be a Xeon Platinum 8370C and an EPYC 7763 -- different
+    core counts per socket, different cache, different AVX-512 story. A ladder
+    that fans one size out per job and merges the results is merging tables, and
+    this project's own rule says never to do that.
+
+    So the identity goes in the JSON beside the numbers rather than only into a
+    log line, and `scripts/bench_group.py` groups on `key` before it prints
+    anything. `key` is deliberately coarse -- model, core count and the widest
+    vector the CPU admits to -- because those are what change a result. Stepping
+    and microcode do not, and including them would split groups that belong
+    together.
+    """
+    model, flags = "unknown", set()
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name") and model == "unknown":
+                model = line.split(":", 1)[1].strip()
+            elif line.startswith("flags") and not flags:
+                flags = set(line.split(":", 1)[1].split())
+    except OSError:
+        pass  # not Linux; the fields below degrade to "unknown" rather than fail
+
+    if "avx512bw" in flags:  isa = "avx512"
+    elif "avx2" in flags:    isa = "avx2"
+    elif "sse2" in flags:    isa = "sse2"
+    else:                    isa = "baseline"
+
+    cores = os.cpu_count() or 1
+    return {
+        "cpu": model,
+        "cores": cores,
+        "isa": isa,
+        "arch": platform.machine(),
+        # One string to group on. Two runs that disagree here are two tables.
+        "key": f"{model} | {cores}c | {isa}",
+        "runner": os.environ.get("RUNNER_NAME", ""),
+        "os": platform.platform(),
+    }
 
 
 def run(argv: list[str], timeout: float,
@@ -475,9 +522,14 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"  {json.dumps(json.loads(distinct.pop()))}")
 
-    cores = os.cpu_count() or 1
+    h = host()
+    cores = h["cores"]
     print(f"\n{cores} cores; \"cores\" is CPU seconds over wall seconds -- how many "
           f"were busy, out of {cores}.")
+    # Named here and carried in the JSON because it is what decides whether this
+    # table may be read beside another one. See host().
+    print(f"host: {h['key']}"
+          + (f"  (runner {h['runner']})" if h["runner"] else ""))
     md = table_of(results)
     print("\n" + md, end="")
 
@@ -495,7 +547,7 @@ def main(argv: list[str]) -> int:
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(
-            {"rows_arg": args.rows, "cores": cores, "results": results},
+            {"rows_arg": args.rows, "cores": cores, "host": h, "results": results},
             indent=2, sort_keys=True))
         print(f"\nwrote {args.json_out}")
     return 0
