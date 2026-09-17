@@ -86,7 +86,115 @@ other branch's agent that pointed this out.
 
 ---
 
-## 2026-09-17 (10M, on CI) — three machines, three different ndjson winners
+## 2026-09-17 (C++ predicates) — one inline pays, the next one costs, and a fourth CPU
+
+C++ is 2.46x behind C on CSV in the table below, which is the widest gap in it —
+wider than anything on ndjson. This is the first cut at it, and the second half
+of the entry is the more useful half.
+
+### Where the gap is
+
+callgrind, 200k CSV pair, one thread, `-march=x86-64-v3 -g`:
+
+| | C | C++ |
+|---|---:|---:|
+| total instructions | 855 M | 1,198 M |
+| row parse | `parse_csv_row` 36.2% | `parse_csv` 30.0% |
+| scan | `next_of2` 26.9% | `next_of2` 21.8% |
+| hash | `hash_field` 12.2% | inlined |
+| **absent predicate** | **none** | **`is_absent` 6.5%** |
+
+1.40x on instructions against 2.46x on the clock, so most of the wall-time gap is
+still not explained by the count — the same thing the profile entry below found
+across ports, now inside one format.
+
+The line that stands out is `is_absent`. C++ asks it 2.45M times on a 200k pair —
+1.21M from `same`, 800k from the index sweep, 437k from `compare` — for 78M
+instructions, and **C has no equivalent at all**: its absent case is a sentinel
+the caller tests inline. The fast path is two loads, a shift and a compare, about
+ten instructions. It was costing thirty-two, because the function also calls
+`value_of`, which builds a `std::string`, and a body that can allocate is over
+the compiler's inlining threshold.
+
+### Splitting the cold tail out
+
+Move the normalising branch into its own function and mark the predicate
+`inline`. The 2.45M calls become zero and the count falls 1,198M to 1,139M
+(0.951x).
+
+Eleven paired rounds on a 4M pair, arms rotated, counts gated:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| csv | 1.64s | 1.58s | **0.978** | 0.947-0.994 | 9/11 |
+| ndjson | 3.48s | 3.50s | 0.984 | 0.978-1.020 | 7/11 |
+
+CSV is a result. ndjson crosses one and nothing is claimed for it.
+
+### The half that is worth more: the same trick on `same` is a regression
+
+`same` has the identical shape — a cheap common case in front of a `value_of`
+call — so it got the identical treatment in the first attempt. Measured:
+
+| both inlined | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| csv | 1.74s | 1.65s | 0.978 | 0.947-1.001 | 8/11 |
+| ndjson | 3.31s | 3.43s | **1.034** | **1.023-1.069** | **1/11** |
+
+ndjson's whole middle half sits above one, in one round of eleven was it faster.
+That is a real slowdown, and it took the CSV band with it: 0.947-1.001 straddles
+where 0.947-0.994 did not.
+
+And the instruction count *disagrees with the clock in both directions at once*:
+
+| | instructions | csv | ndjson |
+|---|---:|---|---|
+| base | 1,198 M | — | — |
+| `is_absent` inlined | **1,139 M** (0.951x) | 0.978 | 0.984 |
+| both inlined | 1,153 M (0.962x) | 0.978 | **1.034** |
+
+Inlining `same` *added* 14M instructions over inlining `is_absent` alone —
+an inlined `same` duplicates the `is_absent` work at each of its call sites —
+and it still executed fewer instructions than the base while running ndjson
+slower than the base. Fewer calls is not less work, and less work is not less
+time.
+
+This sharpens what the profile entry below concluded. That one found instruction
+counts useless for ranking *ports* and noted that within one port, one change,
+they tracked the wall to a thousandth. Both halves survive, with a condition: the
+row-end fix removed *work* — whole scans that stopped happening — and there the
+count tracked. This change removes *call overhead* and adds *code size*, and
+there it does not. The count is a good proxy for work removed and a bad one for
+work rearranged.
+
+Only `is_absent` is shipped.
+
+### A fourth CPU, and the ndjson order replicates
+
+The 10M CI run below was repeated on `main`. It landed on a processor none of the
+earlier runs used — **Intel Xeon Platinum 8573C, avx512** — and its ndjson
+ordering is the EPYC 9V74's, exactly:
+
+| ndjson, 10M | EPYC 9V74 avx2 | Xeon Platinum 8573C avx512 |
+|---|---|---|
+| 1st | Zig 7.20s | Zig 5.47s |
+| 2nd | C 7.41s | C 5.68s |
+| 3rd | Rust 8.04s | Rust 6.34s |
+| 4th | C++ 10.39s | C++ 7.87s |
+
+Two different vendors, two different vector widths, same order. That is the first
+ndjson ordering this project has reproduced on independent hardware, and it makes
+the entry below's "three machines, three winners" too strong a reading: the
+orderings are not arbitrary, they are just not universal. Zig-then-C is what two
+CI runs agree on.
+
+The one that disagrees most (Xeon Platinum 8370C, where Rust came last) is also
+the only one measured by the *other* harness, `bench_formats_ports.py` under the
+ladder, which additionally passes `--memory-cap`. Same flags otherwise, same
+generator output size. That is a confound this project has not ruled out, and it
+should be ruled out before anything is concluded about Rust on that CPU.
+
+## 2026-09-17 (10M, on CI) — the ndjson ranking is not portable
 
 Ten million rows on GitHub's runners, which is where this table belongs: the
 container numbers first written here were one machine nobody else can rent.
