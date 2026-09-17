@@ -32,13 +32,28 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        # One interpreter for both halves, resolved once and written into the
+        # shim by absolute path.
+        #
+        # `pip3 install` + `exec python3 -m ziglang` is the obvious spelling and
+        # it is wrong: those two names can resolve to different interpreters, so
+        # the module lands in one and the shim looks for it in the other. Where
+        # a workflow also runs `actions/setup-python` there are certainly two,
+        # and benchmark-native.yml failed exactly this way --
+        # `/usr/bin/python3: No module named ziglang` -- while the ladder, which
+        # has no setup-python step, passed because its two names happened to
+        # agree. Resolving `python3` once and using `$py -m pip` to install
+        # makes the two identical by construction, and baking the absolute path
+        # into the shim keeps it true however PATH changes afterwards.
+        py=$(command -v python3)
+        echo "using $py"
         # --break-system-packages for the runners whose python is marked
         # externally managed (PEP 668); the fallback covers the ones where the
         # flag itself is not recognised.
-        pip3 install --break-system-packages "ziglang==${{ inputs.version }}" \
-          || pip3 install "ziglang==${{ inputs.version }}"
+        "$py" -m pip install --break-system-packages "ziglang==${{ inputs.version }}" \
+          || "$py" -m pip install "ziglang==${{ inputs.version }}"
         mkdir -p "$HOME/.local/bin"
-        printf '#!/bin/sh\nexec python3 -m ziglang "$@"\n' > "$HOME/.local/bin/zig"
+        printf '#!/bin/sh\nexec "%s" -m ziglang "$@"\n' "$py" > "$HOME/.local/bin/zig"
         chmod +x "$HOME/.local/bin/zig"
         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
