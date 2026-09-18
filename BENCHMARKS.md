@@ -86,6 +86,79 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-18 (correction) — the insert is 15% of the run, not half of it
+
+The scaling entry below says every port spends 38-54% of a four-core run in a
+serial index insert, calls that the largest opportunity this project has
+measured, and puts an upper bound of 1.27x to 1.56x on parallelising it. **The
+attribution is wrong and the bound with it.** On the critical path the insert is
+14-16%.
+
+### The error
+
+Each port builds the two indexes *at the same time*, on two threads. The C++
+source says so where it starts them:
+
+    The two indexes share nothing, so they are built at the same time, and
+    each is split further into chunks.
+
+So `A index insert` and `B index insert` are two phases that **overlap**. That
+entry added them together and divided by wall, which counts a concurrent pair as
+if it were a sequence. What the critical path sees is the longer of the two, not
+their sum.
+
+The arithmetic said so at the time and was not checked: the phases of a C++
+four-thread run sum to 2.15s against a 1.62s wall. A phase breakdown that adds up
+to more than the run it came from has overlapping phases in it, and that is the
+whole of this correction.
+
+### The corrected numbers
+
+4M CSV pair, four threads, median of five runs. `scripts/serial_share.py`.
+
+| port | wall | insert, summed | insert, max of the two sides | published | **actual** |
+|---|---:|---:|---:|---:|---:|
+| C | 0.832s | 0.228s | 0.115s | 48% | **14%** |
+| C++ | 1.672s | 0.482s | 0.246s | 43% | **15%** |
+| Rust | 1.212s | 0.334s | 0.168s | 29% | **14%** |
+| Zig | 1.023s | 0.323s | 0.166s | 33% | **16%** |
+
+And the upper bound, recomputed. If the insert parallelised perfectly across four
+cores *within each side*:
+
+| port | now | insert at 4x | gain | published |
+|---|---:|---:|---:|---:|
+| C | 0.832s | 0.746s | 1.12x | 1.56x |
+| C++ | 1.672s | 1.487s | 1.12x | 1.48x |
+| Rust | 1.212s | 1.086s | 1.12x | 1.27x |
+| Zig | 1.023s | 0.898s | 1.14x | 1.33x |
+
+About 1.12x, not 1.27-1.56x. Still real, no longer the largest thing on the
+table, and no longer worth the design it would take -- sharding the index by hash
+would break the first-occurrence ordering that `first_rows()` guarantees and the
+truncated-report path depends on, and that is a lot of risk for a tenth.
+
+### What survives
+
+**The ports really are 38-54% serial.** That number came from the 1-to-4 speedup
+by Amdahl, independently of any phase breakdown, and nothing here touches it. C++
+still gains nothing from its second thread; Zig is still slower at four than at
+three.
+
+What is gone is the claim to know *where* that serial time goes. The insert is
+15% of it. The other 25-35% is unattributed: `assemble` does not scale and is
+11%, and the rest has not been measured. **The scaling curve was right and the
+explanation underneath it was wrong**, which is the more useful half to have
+lost, because it was the half being planned against.
+
+### The habit that would have caught it
+
+Both of the last two corrections in this file were arithmetic, not statistics. A
+0.7s phase saving that moves a 3.27s total by 0.1s is a phase measured once. A
+phase breakdown summing to 2.15s inside a 1.62s wall has concurrency in it.
+Neither needed a better instrument -- only adding the numbers up and asking
+whether the total was possible.
+
 ## 2026-09-18 (insert prefetch) — the first bite out of the serial half
 
 The entry below found every port spending 38-54% of a four-core run in a serial
