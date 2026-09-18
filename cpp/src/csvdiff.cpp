@@ -1107,6 +1107,10 @@ class RowIndex {
         // loop arrives. `pqdiff.cpp` does the same thing in its join for the same
         // reason; this is that, on the other side of the index.
         //
+        // C, Rust and Zig all already did this in their own text index inserts.
+        // This port was the only one that did not, which is why its insert was
+        // the worst of the four in absolute terms.
+        //
         // A prefetch of the wrong address is a wasted instruction and never a
         // wrong answer, so the rehash case below needs no special handling --
         // the table is sized from the sweep's row count and does not rehash
