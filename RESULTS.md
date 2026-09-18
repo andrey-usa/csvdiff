@@ -135,13 +135,24 @@ Every port scales badly from one core to four, and by nearly the same amount:
 (4M CSV pair, this host. `scripts/scaling_curve.py` and `scripts/serial_share.py`.)
 
 Every port is between a third and a half serial, measured from its own 1-to-4
-speedup. **Where that time goes is mostly unattributed.** All four sweep in
-parallel, insert into the hash index one thread per side, then join in parallel —
-and the insert, which looks like the obvious culprit and was published here as
-one, is only 14-16% of wall once you account for the two sides being built
-concurrently rather than in sequence. Parallelising it is worth about 1.12x, not
-the 1.27-1.56x this page claimed. `assemble` is another 11% and does not scale.
-The remaining quarter to third has not been measured.
+speedup. For C++ that time is now accounted for, and it is **three phases, not
+one**:
+
+| phase | share of the 4-thread wall | scales 1→4 |
+|---|---:|---:|
+| sweep | **23%** | **0.79x** |
+| index insert | 14% | 1.02x |
+| assemble | 11% | 0.99x |
+| join and compare | 48% | 2.58x |
+
+Only the join scales. The **sweep is the largest non-scaling phase and gets
+slower with more threads** — the signature of a phase limited by memory bandwidth
+rather than by cores, on a scan of 1.5 GB. The insert, which this page previously
+called the bottleneck, is second at 14%; parallelising it is worth about 1.12x.
+`assemble` has never been examined.
+
+Those three sum to 48% of wall against the 45% Amdahl implies from the speedup —
+two routes to one number.
 
 See [BENCHMARKS.md](BENCHMARKS.md) for the correction and how the error was
 made.

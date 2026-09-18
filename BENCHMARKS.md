@@ -86,6 +86,77 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-18 (where it goes) — the sweep is the phase that does not scale
+
+The correction below removed the wrong answer to "where does the serial time go"
+without supplying a right one. This supplies one, and it is not the phase anyone
+here has been chasing.
+
+Every phase scaled separately, 1 thread against 4, taking the max of the two
+concurrent index sides rather than their sum. 4M CSV pair, median of five runs.
+`scripts/phase_scaling.py`.
+
+| phase | 1 thread | 4 threads | scales | % of the 4-thread wall |
+|---|---:|---:|---:|---:|
+| wall | 2.923s | 1.679s | 1.74x | |
+| index region (max side) | 0.538s | 0.631s | **0.85x** | 38% |
+| &nbsp;&nbsp;of which **sweep** | 0.304s | 0.387s | **0.79x** | **23%** |
+| &nbsp;&nbsp;of which insert | 0.247s | 0.242s | 1.02x | 14% |
+| join and compare | 2.061s | 0.799s | **2.58x** | 48% |
+| assemble | 0.188s | 0.190s | 0.99x | 11% |
+
+The critical path sums to 1.620s against a 1.679s wall -- 96%, the rest being
+startup, the mapping and teardown. **This time the arithmetic closes**, which is
+the check the two entries below failed.
+
+### The sweep gets slower with more threads
+
+It is labelled `(parallel)`. It is the phase that is supposed to benefit. It goes
+from 0.304s to 0.387s when the thread count goes up, and at 23% of wall it is the
+**largest non-scaling phase in the run** -- larger than the insert that the last
+three entries were about.
+
+The thread arithmetic explains how that is possible, not why it happens.
+`per_file` is `threads / 2`, and the two sides run at once:
+
+| `--threads` | threads per side | total on four cores |
+|---|---:|---:|
+| 1 | 1 | 2 |
+| 4 | 2 | 4 |
+
+At one thread the two sweeps get a core each with two cores spare. At four they
+have four threads on four cores and nothing spare. Doing the same bytes with
+twice the threads in *more* wall time is the signature of a phase limited by
+something other than instruction issue -- memory bandwidth is the obvious
+candidate on a scan of 1.5 GB, and this host has no `perf` to name it.
+
+### What actually does not scale
+
+| | share of wall | scales |
+|---|---:|---:|
+| sweep | 23% | 0.79x |
+| insert | 14% | 1.02x |
+| assemble | 11% | 0.99x |
+| **total flat or worse** | **48%** | |
+
+Forty-eight per cent, against the 45% the 1-to-4 speedup implies by Amdahl. Two
+routes to one number -- which is the agreement the correction below believed it
+had and did not.
+
+So the serial half is real, and it is **three phases, not one**. In order: the
+sweep, then the insert, then assemble. Every entry in this file that treated the
+insert as the bottleneck was ranking the second-largest.
+
+### What this changes about what is worth doing
+
+Parallelising the insert is worth about 1.12x, as the correction below says. The
+sweep is bigger but a *worse* target, not a better one: it already has the
+threads and is losing on them, so more parallelism is the thing it is failing at.
+Its question is bandwidth and layout, not cores.
+
+`assemble` at 11% has still never been looked at, and is the only one of the three
+that nobody has explained.
+
 ## 2026-09-18 (correction) — the insert is 15% of the run, not half of it
 
 The scaling entry below says every port spends 38-54% of a four-core run in a
