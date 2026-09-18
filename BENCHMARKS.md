@@ -86,6 +86,86 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-18 (report gate) — C++ built the row samples nobody asked for
+
+`assemble` was the one phase in the entry below that nobody had looked at. It is
+11% of a four-thread run and does not scale. Looking at it found a whole phase of
+work done for output that is thrown away.
+
+### What it was doing
+
+`main.cpp` sets `row_lists = !json_path.empty()` and says why:
+
+    Nothing but the summary line is printed unless --json was given, and the
+    summary is counts. Collecting the row samples then costs a pass over B for
+    output nobody asked for.
+
+That flag already skipped the B-side pass. It did not skip the rest. Sub-marks
+inside `assemble` on a 4M pair, four threads:
+
+| | |
+|---|---:|
+| pairs / `row_values` | 0.119-0.139s |
+| the three sorts | 0.024-0.035s |
+| per-cell diff | 0.027-0.038s |
+| both duplicate sections | 0.009-0.013s |
+
+At the default `--max-rows` of 50,000 the first line is two `row_values` per kept
+changed row, each a `std::string` per cell -- about **two million allocations**,
+followed by sorting and diffing them, for a `Result` whose row lists are read
+only by `to_json`, which runs only when `--json` was given.
+
+So the whole tail from the first `row_values` to the duplicate sections is now
+inside `if (opt.row_lists)`. The counts, the column stats and the three
+truncation flags all come from the join and the indexes rather than from here, so
+they are unaffected.
+
+### What it is worth
+
+Eleven paired rounds on a 4M CSV pair, arms rotated, four threads, summary
+identical between arms in both modes before any timing:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| summary only, no `--json` | 1.65s | 1.45s | **0.874** | 0.849-0.888 | **11/11** |
+| with `--json` | 1.89s | 1.86s | 0.990 | 0.969-1.000 | 9/11 |
+
+1.14x on the default invocation. With `--json` the gate is open and nothing
+changes, which is the point.
+
+**The published tables will not move.** `bench_ports.py` and
+`bench_formats_ports.py` both pass `--json`, so every benchmark in this file
+measures the path this does not touch. What it speeds up is
+`csvdiff compare a b -k id`, which is what the tool does when you just want the
+counts.
+
+Verified beyond the counts gate: the `--json` payload is byte-identical between
+the two builds apart from `meta.seconds`.
+
+### The other three ports do not have this problem, and not because they gate it
+
+What `--json` costs each port on the same pair, measured rather than read --
+`scripts/json_sample_cost.py`:
+
+| port | no `--json` | `--json` | samples cost |
+|---|---:|---:|---:|
+| C | 0.822s | 0.848s | 3% |
+| C++ (after this change) | 1.467s | 1.990s | **36%** |
+| Rust | 1.230s | 1.235s | 0% |
+| Zig | 1.022s | 1.034s | 1% |
+
+Two readings fit 0-3%: those ports skip the samples too, or they build them so
+cheaply it does not show. The profile entry further down settles it -- C renders
+its rows by slicing the mapped bytes and allocates nothing, where C++ makes a
+`std::string` per cell. So there is no equivalent waste in them to remove, and
+this change does not port.
+
+It also prices the thing that entry pointed at. C++ is **1.78x C without the
+samples and 2.35x with them**: over half of what is left of its CSV gap in report
+mode is the row materialisation, which is the `Val`-as-a-view change that entry
+declined to make. The gate removes the cost when the output is unwanted; it does
+nothing about the cost when it is wanted.
+
 ## 2026-09-18 (where it goes) — the sweep is the phase that does not scale
 
 The correction below removed the wrong answer to "where does the serial time go"
