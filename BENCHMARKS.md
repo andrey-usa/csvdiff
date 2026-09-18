@@ -147,9 +147,31 @@ the entry below's headline stands: the insert is still the serial half, still 38
 of a four-core run, and still the largest thing on the table. A prefetch hides
 latency; it does not add cores.
 
-The other three ports have the same loop and have not been given the same
-treatment. C's insert is the largest share of any port's run (48%), so it is the
-obvious next one.
+### Correction: C++ was the only port without this
+
+This entry first closed by saying the other three ports had the same loop and
+had not been given the same treatment, and that C was the obvious next one. That
+is wrong, and it was wrong when written. All three already prefetch their text
+index insert:
+
+| port | site |
+|---|---|
+| C | `c/csvdiff.c`, `__builtin_prefetch` on `row_hash[r + PREFETCH_AHEAD]` |
+| Rust | `rust/src/engine/turbo.rs`, `idx.prefetch(soon)` on `chunk.hash[i + PREFETCH_AHEAD]` |
+| Zig | `zig/src/csvdiff.zig`, `self.prefetch(hashes[i + PREFETCH_AHEAD])` |
+
+C++ was the only one missing it, which is the same shape as the row-end fix
+further down this file: three ports carrying a technique and one that never got
+it. It also explains why C++'s insert was the worst of the four in absolute terms
+before this change.
+
+The error was a truncated search -- `grep prefetch rust/src | head -5` returned
+five hits from `pqdiff.rs` and stopped before `turbo.rs`, and "no hits in the
+text path" was concluded from a list that had been cut short. A `head` on a
+search whose *absence* is the finding is not a search.
+
+So there is no port left to apply this to, and C's insert being 48% of its run is
+what the technique leaves behind rather than what it would remove.
 
 ## 2026-09-17 (scaling) — every port is half serial, and it is the same half
 
