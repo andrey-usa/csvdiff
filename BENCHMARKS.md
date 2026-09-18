@@ -86,6 +86,71 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-18 (insert prefetch) — the first bite out of the serial half
+
+The entry below found every port spending 38-54% of a four-core run in a serial
+index insert, and named parallelising it as the largest opportunity measured
+here. This is not that. It is the cheap thing to try first, and it works.
+
+### Why a prefetch
+
+The insert is latency-bound rather than throughput-bound. Each row lands on a
+slot its hash chose, the table is 32 MB at ten million rows across both sides,
+and nothing about one row predicts the next one's cache line. Measured at about
+**90 ns a row** — 0.74s for the eight million rows of a 4M pair's two indexes —
+which is the shape of a trip to memory, not of the dozen instructions the probe
+runs.
+
+The hash of the row 24 ahead is already in hand when the loop starts, so the line
+it will want can be asked for now. `pqdiff.cpp` already does exactly this in its
+columnar join, with the same constant; this is that, on the other side of the
+index.
+
+### What it is worth
+
+The phase itself, median of seven runs each:
+
+| index insert | base | new | |
+|---|---:|---:|---:|
+| 1 thread | 0.769s | 0.615s | **0.800x** |
+| 4 threads | 0.740s | 0.572s | **0.773x** |
+
+End to end, eleven paired rounds on a 4M pair, arms rotated, counts gated:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| csv, 4 threads | 1.96s | 1.85s | **0.947** | 0.929-0.975 | 9/11 |
+| csv, 1 thread | 3.27s | 3.17s | 0.986 | 0.953-0.999 | 10/11 |
+| ndjson, 4 threads | 3.74s | 3.63s | **0.975** | 0.965-0.984 | **11/11** |
+| ndjson, 1 thread | 5.56s | 5.49s | 0.989 | 0.979-1.014 | 7/11 |
+
+Both formats gain at four threads, which is the default. Both single-thread bands
+sit at or across one, so nothing is claimed there. No format regressed, which is
+worth stating explicitly after the `same` inline two entries below did.
+
+### A correction, and why the phase number is smaller than it first looked
+
+The first reading of this was a single run of each arm and said the insert went
+from 1.315s to 0.599s — better than two to one. It was wrong. Across seven runs
+the baseline phase ranges 0.725-0.906s, and that 1.315s sits well outside it: a
+cold first run, measured once and believed.
+
+The tell was arithmetic rather than statistics. A 0.7s saving on a 3.27s
+single-threaded run should have moved the total to about 0.78, and the paired
+rounds said 0.986. When the phase and the total disagree by that much, the phase
+was measured once.
+
+### What is left
+
+This takes about a fifth off the serial insert. It does not make it parallel, and
+the entry below's headline stands: the insert is still the serial half, still 38-54%
+of a four-core run, and still the largest thing on the table. A prefetch hides
+latency; it does not add cores.
+
+The other three ports have the same loop and have not been given the same
+treatment. C's insert is the largest share of any port's run (48%), so it is the
+obvious next one.
+
 ## 2026-09-17 (scaling) — every port is half serial, and it is the same half
 
 The C++ gap work kept turning up a number beside the one it was chasing: on four
