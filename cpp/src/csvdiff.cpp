@@ -1023,6 +1023,10 @@ class RowIndex {
         clock::time_point last_ = clock::now();
     };
 
+    // How far ahead the insert loop asks for its cache line. Twenty-four is what
+    // the columnar join in pqdiff.cpp settled on for the same access pattern.
+    static constexpr std::size_t kInsertPrefetch = 24;
+
     RowIndex(const Slab& slab, const RowParser& parser, std::size_t from, std::size_t key_size,
              const Options& opt, unsigned threads = 1, const char* tag = "")
         : slab_(slab), parser_(parser), key_size_(key_size), opt_(opt) {
@@ -1089,8 +1093,37 @@ class RowIndex {
         // which is sixteen bytes a row of pure duplication, 320 MB at ten
         // million rows across both files. Freed as it goes, the two curves cross
         // instead of adding.
+        //
+        // The insert is latency-bound, not throughput-bound. Every row lands on
+        // a slot the hash chose, the table is 32 MB at ten million rows across
+        // both sides, and nothing about one row predicts the next one's line --
+        // so each probe is a cache miss the core waits out with nothing else to
+        // do. Measured at about 90 ns a row -- 0.74s for the eight million rows
+        // of a 4M pair's two indexes -- which is the shape of a trip to memory
+        // rather than of the dozen instructions the probe actually runs.
+        //
+        // The hash of the row `kInsertPrefetch` ahead is already in hand, so the
+        // line it will want can be asked for now and be resident by the time the
+        // loop arrives. `pqdiff.cpp` does the same thing in its join for the same
+        // reason; this is that, on the other side of the index.
+        //
+        // A prefetch of the wrong address is a wasted instruction and never a
+        // wrong answer, so the rehash case below needs no special handling --
+        // the table is sized from the sweep's row count and does not rehash
+        // anyway.
+        //
+        // Worth 0.800x on this phase at one thread and 0.773x at four, median of
+        // seven runs each. End to end over eleven paired rounds on a 4M pair,
+        // counts gated: csv 0.947 at four threads (middle half 0.929-0.975) and
+        // 0.986 at one (0.953-0.999); ndjson 0.975 at four (0.965-0.984, faster
+        // in all eleven) and 0.989 at one, which crosses one and is not claimed.
         for (auto& c : chunks) {
-            for (std::size_t i = 0; i < c.starts.size(); ++i) insert(c.starts[i], c.hashes[i]);
+            const std::size_t n = c.starts.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                if (i + kInsertPrefetch < n)
+                    __builtin_prefetch(&table_[slot_of(c.hashes[i + kInsertPrefetch])], 1, 0);
+                insert(c.starts[i], c.hashes[i]);
+            }
             std::vector<std::size_t>().swap(c.starts);
             std::vector<std::uint64_t>().swap(c.hashes);
         }
