@@ -1966,64 +1966,86 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         if (failure) std::rethrow_exception(failure);
     }
 
-    // Only now does anything become a string, and only for the rows kept.
-    for (const auto& [row, mate] : removed.held) r.removed.push_back(row_values(a, ai, row, width, opt));
-    for (const auto& [row, mate] : added.held) r.added.push_back(row_values(b, bi, row, width, opt));
+    // Only now does anything become a string, and only for the rows kept -- and
+    // only when something is going to read them.
+    //
+    // `row_lists` is false exactly when no `--json` was given, and then the only
+    // output is the summary line, which is counts. Everything from here to
+    // `r.counts` builds the row samples: two `row_values` per kept row, each one
+    // a `std::string` per cell, then three sorts over them, then the per-cell
+    // diff, then both duplicate sections. At the default `--max-rows` of 50,000
+    // that is about two million allocations for output nobody asked for.
+    //
+    // The B-side pass above is already gated on this flag for the same reason
+    // and with the same comment in main.cpp -- this is the other half of it,
+    // which was left running. Measured at 0.19s of a 1.68s four-thread run on a
+    // 4M CSV pair: 11%, all of it in the serial tail after the join.
+    //
+    // What still has to be right without the lists: `r.counts`, which comes from
+    // the join and the indexes and not from here, and the three `*_truncated`
+    // flags, which come from `Capped::truncated()` and are counts too. The
+    // duplicate-section flags stay false, which is what an uncollected section
+    // is; nothing reads them unless `to_json` runs, and `to_json` runs only when
+    // this branch did.
+    if (opt.row_lists) {
+        for (const auto& [row, mate] : removed.held) r.removed.push_back(row_values(a, ai, row, width, opt));
+        for (const auto& [row, mate] : added.held) r.added.push_back(row_values(b, bi, row, width, opt));
 
-    std::vector<std::pair<std::vector<Val>, std::vector<Val>>> pairs;
-    pairs.reserve(changed.held.size());
-    for (const auto& [row, mate] : changed.held)
-        pairs.emplace_back(row_values(a, ai, row, width, opt), row_values(b, bi, mate, width, opt));
+        std::vector<std::pair<std::vector<Val>, std::vector<Val>>> pairs;
+        pairs.reserve(changed.held.size());
+        for (const auto& [row, mate] : changed.held)
+            pairs.emplace_back(row_values(a, ai, row, width, opt), row_values(b, bi, mate, width, opt));
 
-    const auto by_key = [&](const std::vector<Val>& x, const std::vector<Val>& y) {
-        return compare_keys(x, y, key_size) < 0;
-    };
-    std::stable_sort(r.removed.begin(), r.removed.end(), by_key);
-    std::stable_sort(r.added.begin(), r.added.end(), by_key);
-    std::stable_sort(pairs.begin(), pairs.end(),
-                     [&](const auto& p, const auto& q) { return by_key(p.first, q.first); });
+        const auto by_key = [&](const std::vector<Val>& x, const std::vector<Val>& y) {
+            return compare_keys(x, y, key_size) < 0;
+        };
+        std::stable_sort(r.removed.begin(), r.removed.end(), by_key);
+        std::stable_sort(r.added.begin(), r.added.end(), by_key);
+        std::stable_sort(pairs.begin(), pairs.end(),
+                         [&](const auto& p, const auto& q) { return by_key(p.first, q.first); });
 
-    for (const auto& [ar, br] : pairs) {
-        ChangedRow out;
-        out.key.assign(ar.begin(), ar.begin() + static_cast<long>(key_size));
-        for (std::size_t i = 0; i < nc; ++i) {
-            const Val& x = ar[key_size + i];
-            const Val& y = br[key_size + i];
-            bool differs_here;
-            if (!x && !y) {
-                differs_here = false;
-            } else if (opt.tolerance > 0.0 && x && y) {
-                const auto nx = as_number(*x), ny = as_number(*y);
-                differs_here = (nx && ny) ? std::fabs(*nx - *ny) > opt.tolerance : x != y;
-            } else {
-                differs_here = x != y;
+        for (const auto& [ar, br] : pairs) {
+            ChangedRow out;
+            out.key.assign(ar.begin(), ar.begin() + static_cast<long>(key_size));
+            for (std::size_t i = 0; i < nc; ++i) {
+                const Val& x = ar[key_size + i];
+                const Val& y = br[key_size + i];
+                bool differs_here;
+                if (!x && !y) {
+                    differs_here = false;
+                } else if (opt.tolerance > 0.0 && x && y) {
+                    const auto nx = as_number(*x), ny = as_number(*y);
+                    differs_here = (nx && ny) ? std::fabs(*nx - *ny) > opt.tolerance : x != y;
+                } else {
+                    differs_here = x != y;
+                }
+                if (differs_here) out.cells.push_back({i, x, y});
             }
-            if (differs_here) out.cells.push_back({i, x, y});
+            r.changed.push_back(std::move(out));
         }
-        r.changed.push_back(std::move(out));
-    }
 
-    const auto dup_section = [&](const Slab& s, const RowIndex& idx, std::vector<DupRow>& out,
-                                 bool& truncated) {
-        std::vector<DupRow> all;
-        const auto& firsts = idx.first_rows();
-        const auto& counts = idx.occurrences();
-        for (std::size_t i = 0; i < firsts.size(); ++i) {
-            if (counts[i] < 2) continue;
-            auto values = row_values(s, idx, firsts[i], width, opt);
-            values.resize(key_size);
-            all.push_back({std::move(values), static_cast<std::int64_t>(counts[i])});
-        }
-        std::stable_sort(all.begin(), all.end(), [&](const DupRow& x, const DupRow& y) {
-            if (x.count != y.count) return x.count > y.count;
-            return compare_keys(x.key, y.key, key_size) < 0;
-        });
-        truncated = all.size() > opt.max_rows;
-        all.resize(std::min(all.size(), opt.max_rows));
-        out = std::move(all);
-    };
-    dup_section(a, ai, r.dup_a, r.dup_a_truncated);
-    dup_section(b, bi, r.dup_b, r.dup_b_truncated);
+        const auto dup_section = [&](const Slab& s, const RowIndex& idx, std::vector<DupRow>& out,
+                                     bool& truncated) {
+            std::vector<DupRow> all;
+            const auto& firsts = idx.first_rows();
+            const auto& counts = idx.occurrences();
+            for (std::size_t i = 0; i < firsts.size(); ++i) {
+                if (counts[i] < 2) continue;
+                auto values = row_values(s, idx, firsts[i], width, opt);
+                values.resize(key_size);
+                all.push_back({std::move(values), static_cast<std::int64_t>(counts[i])});
+            }
+            std::stable_sort(all.begin(), all.end(), [&](const DupRow& x, const DupRow& y) {
+                if (x.count != y.count) return x.count > y.count;
+                return compare_keys(x.key, y.key, key_size) < 0;
+            });
+            truncated = all.size() > opt.max_rows;
+            all.resize(std::min(all.size(), opt.max_rows));
+            out = std::move(all);
+        };
+        dup_section(a, ai, r.dup_a, r.dup_a_truncated);
+        dup_section(b, bi, r.dup_b, r.dup_b_truncated);
+    }  // opt.row_lists
 
     r.counts = {ai.rows(),      bi.rows(),        ai.unique_keys(), bi.unique_keys(),
                 matched,        matched - changed.total, changed.total,
