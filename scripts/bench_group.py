@@ -198,6 +198,22 @@ def main(argv: list[str]) -> int:
                            f"slope cannot be read as one curve.")
         out.append("")
 
+    # A port that peaked *below* its own input did not hold the file it mapped:
+    # the kernel took pages back while it was still using them. That is measured
+    # after the fact rather than predicted, and it is the tell that a rung ranks
+    # paging rather than parsing -- so it is said here, next to the numbers it
+    # disqualifies, and not left to a reader to spot a minus sign in one column.
+    paged = [r for r in runs if measured(r) and (r.get("above") or 0) < 0]
+    if paged:
+        where = sorted({f"{r.get('format','?')} at {r.get('_rows','?')}" for r in paged})
+        out.append(f"> **{len(paged)} rows peaked below their own input** ("
+                   + ", ".join(where) + "). These engines map their files, so a "
+                   "peak RSS under the mapped bytes means the kernel was taking "
+                   "pages back while the port still wanted them. Those times "
+                   "rank page-fault behaviour, not parsing, and do not belong "
+                   "beside a rung that fit.")
+        out.append("")
+
     if n_blank:
         names = sorted({f"{r.get('port','?')} on {r.get('format','?')}"
                         for r in runs if not measured(r)})

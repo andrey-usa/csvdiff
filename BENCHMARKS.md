@@ -49,6 +49,17 @@ loses on CPU, it is winning on threading.
 resident pages include the files themselves. The column that carries
 information is *above the input*, which subtracts them.
 
+**A negative *above the input* is not a benchmark.** It is the same column read
+the other way: a port that peaked *below* the bytes it mapped did not hold its
+own input, because the kernel was taking pages back while it was still using
+them. Every time in such a row is a page-fault ranking, not a parsing one, and
+does not belong beside a rung that fit. `bench_formats_ports.py` now says so
+before the rung runs -- it refuses to call a pair a benchmark once it passes
+80% of the machine's RAM, leaving room for the indexes the ports build on top
+-- and `bench_group.py` says so again afterwards, naming the rows that did it.
+The rung still runs either way: which port degrades worst under paging is its
+own kind of answer, and a number with a stated caveat beats no number.
+
 **Counts are gated, not assumed.** Every run below ends with every build
 returning identical counts. A build that disagrees fails the run and is named;
 none of the tables here contains a build that was fast because it was answering
