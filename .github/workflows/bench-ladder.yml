@@ -349,6 +349,14 @@ jobs:
       # traceback also exits 1, and telling those two apart is the entire
       # point. Any other non-zero exit is a bug in the script, and it fails
       # here with its traceback in the summary.
+      #
+      # `tee`, not `>>`, so the table is in the job log as well as the summary.
+      # The step summary is not readable through the API, so a table that goes
+      # only there cannot be checked afterwards from the run alone -- confirming
+      # that this step had published anything at all meant re-downloading the
+      # rung artifacts and running the script again by hand. The log costs
+      # nothing and answers it directly. The other summary steps in this
+      # workflow already tee for the same reason.
       - name: The ladder, grouped by the CPU that measured it
         run: |
           set +e
@@ -367,7 +375,7 @@ jobs:
               cat /tmp/group.err
               echo '```'
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$code" -eq 0 ] || [ "$code" -eq 3 ]
 
       - name: Every rung's table, in full
