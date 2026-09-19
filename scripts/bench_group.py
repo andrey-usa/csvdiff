@@ -38,6 +38,14 @@ from mdtable import render
 PORTS = ["C", "C++", "Rust", "Zig"]
 FORMATS = ["csv", "ndjson", "parquet"]
 
+# "There was nothing to group" is a thing a caller may legitimately tolerate --
+# a ladder every rung of which died reaches here with an empty directory. A
+# crash is not, and an uncaught exception also leaves Python with status 1, so
+# the two would be indistinguishable if this returned 1. They are the same
+# outcome on the summary page and opposite ones in what they mean, and CI once
+# read a crash as the tolerable one for a whole dispatched ladder.
+NOTHING_TO_GROUP = 3
+
 
 def load(paths: list[Path]) -> list[dict]:
     """Every JSON file under the given files or directories, newest schema only."""
@@ -73,24 +81,42 @@ def sort_key(r: dict) -> tuple:
             str(r.get("_rows", "")))
 
 
+def measured(r: dict) -> bool:
+    """Whether this row carries a number at all.
+
+    `bench_formats_ports.py` writes `{"format", "port", "seconds": None}` and
+    nothing else for a build that could not run the format -- the scanner
+    variants do not read parquet, for one -- and its own renderer prints that
+    as a row of dashes. This did not, and `.get("seconds", 0.0)` does not save
+    it: the key is present and its value is `None`, so the default never
+    applies and the format string raises. One such row from one rung took the
+    grouped table for a whole dispatched ladder with it.
+    """
+    return r.get("seconds") is not None
+
+
 def table(rows: list[dict], show_rows: bool) -> str:
     head = ["Build", "Format"] + (["Size"] if show_rows else []) + [
         "Compare", "Rows/s", "CPU", "Cores", "Peak RSS", "Above the input", "Budget"]
     align = ["l", "l"] + (["l"] if show_rows else []) + ["r"] * 7
     body = []
     for r in sorted(rows, key=sort_key):
-        sec = r.get("seconds", 0.0)
-        n = r.get("rows", 0)
+        lead = ([r.get("port", "?"), r.get("format", "?")]
+                + ([str(r.get("_rows", "?"))] if show_rows else []))
+        if not measured(r):
+            body.append(lead + ["-"] * 7)
+            continue
+        sec = r["seconds"]
+        n = r.get("rows") or 0
         body.append(
-            [r.get("port", "?"), r.get("format", "?")]
-            + ([str(r.get("_rows", "?"))] if show_rows else [])
+            lead
             + [f"{sec:.2f}s",
                f"{int(n / sec):,}" if sec > 0 else "-",
-               f"{r.get('cpu', 0):.1f}s",
-               f"{r.get('cores', 0):.2f}x",
-               f"{r.get('rss', 0):,.0f} MB",
-               f"{r.get('above', 0):,.0f} MB",
-               f"{r.get('data', 0):,.0f} MB"])
+               f"{r.get('cpu') or 0:.1f}s",
+               f"{r.get('cores') or 0:.2f}x",
+               f"{r.get('rss') or 0:,.0f} MB",
+               f"{r.get('above') or 0:,.0f} MB",
+               f"{r.get('data') or 0:,.0f} MB"])
     return render(head, align, body)
 
 
@@ -105,7 +131,7 @@ def main(argv: list[str]) -> int:
     runs = load(args.paths)
     if not runs:
         print("no benchmark JSON found", file=sys.stderr)
-        return 1
+        return NOTHING_TO_GROUP
 
     groups: dict[str, list[dict]] = defaultdict(list)
     for r in runs:
@@ -117,10 +143,16 @@ def main(argv: list[str]) -> int:
     ordered = sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))
     show_rows = len({r["_rows"] for r in runs}) > 1
 
+    # A build that reported nothing is shown, because "this build cannot read
+    # this format" is worth seeing, but it is not a measurement and is not
+    # counted as one.
+    n_measured = sum(1 for r in runs if measured(r))
+    n_blank = len(runs) - n_measured
+
     out = []
     if len(ordered) > 1:
         out.append(
-            f"**{len(ordered)} different CPUs produced these {len(runs)} measurements.** "
+            f"**{len(ordered)} different CPUs produced these {n_measured} measurements.** "
             "Each table below is one CPU. Rows may be compared inside a table and "
             "**not** between tables -- that is not a formality here, it is the "
             "difference between measuring a change and measuring which machine "
@@ -130,11 +162,11 @@ def main(argv: list[str]) -> int:
         for key, rows in ordered:
             h = rows[0]["_host"]
             out.append(f"| {h.get('cpu','?')} | {h.get('cores','?')} | "
-                       f"{h.get('isa','?')} | {len(rows)} |")
+                       f"{h.get('isa','?')} | {sum(1 for r in rows if measured(r))} |")
         out.append("")
     else:
         h = ordered[0][1][0]["_host"]
-        out.append(f"One CPU for all {len(runs)} measurements: "
+        out.append(f"One CPU for all {n_measured} measurements: "
                    f"**{h.get('cpu','?')}**, {h.get('cores','?')} cores, "
                    f"{h.get('isa','?')}. Rows below are comparable.\n")
 
@@ -145,8 +177,10 @@ def main(argv: list[str]) -> int:
                        f"{h.get('isa','?')}\n")
         sizes = sorted({str(r["_rows"]) for r in rows})
         fmts = sorted({r.get("format", "?") for r in rows})
-        out.append(f"*{len(rows)} measurements · sizes {', '.join(sizes)} · "
-                   f"formats {', '.join(fmts)}*\n")
+        blank = sum(1 for r in rows if not measured(r))
+        note = f" · {blank} reported nothing" if blank else ""
+        out.append(f"*{len(rows) - blank} measurements · sizes {', '.join(sizes)} · "
+                   f"formats {', '.join(fmts)}{note}*\n")
         out.append(table(rows, show_rows))
         out.append("")
 
@@ -162,6 +196,15 @@ def main(argv: list[str]) -> int:
                            f"{missing}.** Those rungs ran on other silicon and are "
                            f"in another table; this ladder is partial and its "
                            f"slope cannot be read as one curve.")
+        out.append("")
+
+    if n_blank:
+        names = sorted({f"{r.get('port','?')} on {r.get('format','?')}"
+                        for r in runs if not measured(r)})
+        out.append(f"> **{n_blank} of {len(runs)} rows carry no number:** "
+                   + ", ".join(names) + ". A build that cannot read a format "
+                   "reports one of these; it is a dash above, not a zero and "
+                   "not a slow result.")
         out.append("")
 
     md = "\n".join(out)
