@@ -161,10 +161,22 @@ def host() -> dict[str, object]:
     elif "sse2" in flags:    isa = "sse2"
     else:                    isa = "baseline"
 
+    # How much RAM, because a rung whose input does not fit in it is not
+    # measuring the engines. See `fits_in_ram` below.
+    ram_mb = 0
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                ram_mb = int(line.split()[1]) // 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+
     cores = os.cpu_count() or 1
     return {
         "cpu": model,
         "cores": cores,
+        "ram_mb": ram_mb,
         "isa": isa,
         "arch": platform.machine(),
         # One string to group on. Two runs that disagree here are two tables.
@@ -326,6 +338,23 @@ def generate(rows: str, fmt: str, data: Path) -> tuple[Path, Path, float]:
             time.monotonic() - started)
 
 
+# Where the input stops being a benchmark and starts being a page-cache test.
+# Not 1.0: the ports need room above the mapped bytes for their indexes, which
+# is the `above the input` column and runs to a gigabyte or two at these sizes.
+RAM_HEADROOM = 0.8
+
+
+def fits_in_ram(input_mb: float, h: dict) -> bool:
+    """Whether a pair this size leaves the machine room to work.
+
+    Unknown RAM answers True: this guards a reading of the numbers, and refusing
+    to report on a machine whose memory could not be read would lose more than
+    it protects.
+    """
+    ram = h.get("ram_mb") or 0
+    return not ram or input_mb <= ram * RAM_HEADROOM
+
+
 def table_of(results: list[dict]) -> str:
     """The results table as markdown, from whatever has been measured so far."""
     grid = []
@@ -397,10 +426,31 @@ def main(argv: list[str]) -> int:
                              f"pick from {', '.join(sorted(ALL))}")
         wanted.append(fmt)
 
+    # Resolved before the first rung rather than at the end: the paging warning
+    # below needs to know how much memory this machine has, and it is the same
+    # machine either way.
+    h = host()
+
     for fmt in wanted:
         a, b, generated = generate(args.rows, fmt, data)
         size = (a.stat().st_size + b.stat().st_size) / (1 << 20)
         print(f"\n{fmt}: {size:,.0f} MB, generated in {generated:.1f}s", flush=True)
+
+        # A pair that does not fit in RAM does not produce a benchmark. These
+        # engines map their inputs, so once the pair approaches the machine's
+        # memory the kernel starts evicting pages the port still wants and the
+        # times become a ranking of page-fault behaviour. It is not subtle when
+        # it happens: a 20m ndjson rung whose 16,975 MB pair ran on a 15,989 MB
+        # host took 13m50s where the 20m csv rung took 1m37s, and every port
+        # reported a peak RSS *below* its own input.
+        #
+        # This still runs the rung -- a number with a stated caveat beats no
+        # number, and which port degrades worst under paging is its own kind of
+        # answer -- but it will not let the table be read as anything else.
+        if not fits_in_ram(size, h):
+            fitting = f"{h['ram_mb']:,} MB" if h.get("ram_mb") else "unknown"
+            print(f"  !! this pair is {size:,.0f} MB and the host has {fitting}. "
+                  f"The times below rank paging, not parsing.", flush=True)
         warm(a, b)
 
         # Ports keep their declared order in the table no matter what
@@ -522,7 +572,6 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"  {json.dumps(json.loads(distinct.pop()))}")
 
-    h = host()
     cores = h["cores"]
     print(f"\n{cores} cores; \"cores\" is CPU seconds over wall seconds -- how many "
           f"were busy, out of {cores}.")
