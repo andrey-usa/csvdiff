@@ -336,13 +336,39 @@ jobs:
       # Platinum 8370C and an EPYC 7763. Read as a single curve those rungs
       # measure the fleet as much as the code, so this groups them by the CPU
       # that produced them and says out loud when the ladder is split.
+      #
+      # Not `|| echo "_no rung JSON to group_"`. That is what this was, and it
+      # turned a TypeError inside bench_group.py into one calm line in the
+      # summary and a green job: six rungs, fifty-one measurements on three
+      # different processors, and the grouped table -- the whole reason this
+      # job exists -- reported as simply absent. A benchmark that silently
+      # publishes nothing is worse than one that fails.
+      #
+      # Exit 3 is the script saying it found nothing to group, which a ladder
+      # whose rungs all died legitimately is. It has its own code because a
+      # traceback also exits 1, and telling those two apart is the entire
+      # point. Any other non-zero exit is a bug in the script, and it fails
+      # here with its traceback in the summary.
       - name: The ladder, grouped by the CPU that measured it
         run: |
+          set +e
+          grouped=$(python3 scripts/bench_group.py rungs/ 2>/tmp/group.err)
+          code=$?
+          set -e
           {
             echo "## By CPU"
             echo
-            python3 scripts/bench_group.py rungs/ || echo "_no rung JSON to group_"
+            if [ "$code" -eq 0 ]; then
+              printf '%s\n' "$grouped"
+            else
+              echo "_grouping produced no table (exit $code)_"
+              echo
+              echo '```'
+              cat /tmp/group.err
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+          [ "$code" -eq 0 ] || [ "$code" -eq 3 ]
 
       - name: Every rung's table, in full
         run: |

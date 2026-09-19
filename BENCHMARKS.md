@@ -86,6 +86,169 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-19 (the ladder CI threw away) — six rungs, three CPUs, and a grouped table that never printed
+
+Run 35425371164 dispatched the ladder at 10m and 20m rows across csv, ndjson and
+parquet, with the scanner matrix on. All six rungs finished. The collect job
+reported **success**. It published no grouped table at all, and said so in one
+calm line:
+
+    _no rung JSON to group_
+
+There was rung JSON. Fifty-one measurements of it, on three different
+processors. What actually happened is in the log the summary did not show:
+
+    File "scripts/bench_group.py", line 87, in table
+        + [f"{sec:.2f}s",
+    TypeError: unsupported format string passed to NoneType.__format__
+
+### Two faults, and the second is the worse one
+
+**`bench_group.py` could not render what its own sibling writes.**
+`bench_formats_ports.py` emits `{"format", "port", "seconds": None}` and nothing
+else for a build that could not run a format -- here, `C++ avx2` and
+`C++ avx512`, which do not read parquet -- and its own `table_of` prints that as
+a row of dashes. The grouping script used `r.get("seconds", 0.0)`, which does
+not help: the key is *present* and its value is `None`, so the default never
+applies. Three such rows out of fifty-four, and the first one reached took the
+grouped table for the entire ladder with it.
+
+**The workflow masked it.** The step was
+
+    python3 scripts/bench_group.py rungs/ || echo "_no rung JSON to group_"
+
+so a crash and an empty directory produced the same line and the same green
+tick. Forty minutes of runner time, six rungs that all worked, and the one
+artefact the job exists to produce was absent with nothing anywhere saying why.
+
+A traceback also exits 1, so an exit code could not tell the two apart. "Nothing
+to group" now has its own code (3), the step prints the traceback into the
+summary, and any other non-zero exit fails the job. Verified against all three
+paths: the real six rungs print the table and pass; an empty directory prints
+the note and passes; an injected bad row prints its traceback and **fails**.
+
+### What the run actually measured
+
+**3 different CPUs produced these 51 measurements.** Each table below is one CPU. Rows may be compared inside a table and **not** between tables -- that is not a formality here, it is the difference between measuring a change and measuring which machine the job landed on.
+
+| CPU | cores | widest vector | measurements |
+| --- | ---: | --- | ---: |
+| AMD EPYC 7763 64-Core Processor | 4 | avx2 | 23 |
+| INTEL(R) XEON(R) PLATINUM 8573C | 4 | avx512 | 18 |
+| AMD EPYC 9V45 96-Core Processor | 4 | avx512 | 10 |
+
+### AMD EPYC 7763 64-Core Processor — 4 cores, avx2
+
+*23 measurements · sizes 10m, 20m · formats csv, ndjson, parquet · 1 reported nothing*
+
+| Build       | Format  | Size | Compare |    Rows/s |   CPU | Cores |  Peak RSS | Above the input |   Budget |
+| ----------- | ------- | ---- | ------: | --------: | ----: | ----: | --------: | --------------: | -------: |
+| C           | csv     | 20m  |   3.57s | 5,605,825 | 12.6s | 3.54x |  8,448 MB |        1,430 MB | 1,480 MB |
+| C           | ndjson  | 20m  |  38.16s |   524,102 | 50.7s | 1.33x | 15,054 MB |       -1,921 MB | 1,582 MB |
+| C           | parquet | 10m  |   1.31s | 7,634,570 |  4.2s | 3.19x |  2,903 MB |        1,369 MB | 1,503 MB |
+| C++         | csv     | 20m  |   6.66s | 3,005,460 | 21.3s | 3.20x |  8,754 MB |        1,736 MB | 2,501 MB |
+| C++         | ndjson  | 20m  |  36.52s |   547,750 | 56.7s | 1.55x | 15,039 MB |       -1,936 MB | 2,620 MB |
+| C++         | parquet | 10m  |   2.07s | 4,833,409 |  6.4s | 3.09x |  2,822 MB |        1,287 MB | 1,510 MB |
+| Rust        | csv     | 20m  |   3.83s | 5,221,203 | 12.6s | 3.29x |  8,752 MB |        1,734 MB | 2,458 MB |
+| Rust        | ndjson  | 20m  |  27.74s |   721,070 | 63.3s | 2.28x | 15,132 MB |       -1,843 MB | 2,458 MB |
+| Rust        | parquet | 10m  |   2.48s | 4,037,034 |  8.2s | 3.30x |  2,886 MB |        1,351 MB | 1,466 MB |
+| Zig         | csv     | 20m  |   3.57s | 5,596,034 | 11.9s | 3.33x |  8,755 MB |        1,738 MB | 2,101 MB |
+| Zig         | ndjson  | 20m  |  55.70s |   359,113 | 63.7s | 1.14x | 15,058 MB |       -1,917 MB | 2,101 MB |
+| Zig         | parquet | 10m  |   2.47s | 4,041,723 |  8.6s | 3.49x |  2,775 MB |        1,241 MB | 1,703 MB |
+| C++ avx2    | csv     | 20m  |   6.49s | 3,080,841 | 20.4s | 3.15x |  8,763 MB |        1,745 MB | 2,502 MB |
+| C++ avx2    | ndjson  | 20m  |  39.75s |   503,148 | 57.5s | 1.45x | 15,113 MB |       -1,862 MB | 2,575 MB |
+| C++ avx2    | parquet | 10m  |       - |         - |     - |     - |         - |               - |        - |
+| Rust avx2   | csv     | 20m  |   3.73s | 5,366,909 | 12.5s | 3.36x |  8,761 MB |        1,743 MB | 2,458 MB |
+| Rust avx2   | ndjson  | 20m  |  46.22s |   432,753 | 65.1s | 1.41x | 15,077 MB |       -1,898 MB | 2,458 MB |
+| Rust avx2   | parquet | 10m  |   2.52s | 3,963,931 |  8.4s | 3.33x |  2,886 MB |        1,352 MB | 1,466 MB |
+| Rust engine | csv     | 20m  |   3.17s | 6,307,378 | 10.8s | 3.40x |  8,728 MB |        1,710 MB | 2,458 MB |
+| Rust engine | ndjson  | 20m  |  41.28s |   484,559 | 62.0s | 1.50x | 13,468 MB |       -3,507 MB | 1,946 MB |
+| Rust engine | parquet | 10m  |   2.17s | 4,602,346 |  7.5s | 3.46x |  2,830 MB |        1,295 MB | 1,462 MB |
+| Zig v32     | csv     | 20m  |   3.47s | 5,762,032 | 12.1s | 3.48x |  8,767 MB |        1,749 MB | 2,101 MB |
+| Zig v32     | ndjson  | 20m  |  48.10s |   415,854 | 63.0s | 1.31x | 15,079 MB |       -1,896 MB | 2,028 MB |
+| Zig v32     | parquet | 10m  |   2.47s | 4,047,652 |  8.8s | 3.55x |  2,746 MB |        1,211 MB | 1,724 MB |
+
+
+### INTEL(R) XEON(R) PLATINUM 8573C — 4 cores, avx512
+
+*18 measurements · sizes 10m, 20m · formats ndjson, parquet · 2 reported nothing*
+
+| Build       | Format  | Size | Compare |    Rows/s |   CPU | Cores | Peak RSS | Above the input |   Budget |
+| ----------- | ------- | ---- | ------: | --------: | ----: | ----: | -------: | --------------: | -------: |
+| C           | ndjson  | 10m  |   5.93s | 1,687,352 | 19.0s | 3.21x | 9,204 MB |          716 MB |   766 MB |
+| C           | parquet | 20m  |   3.12s | 6,413,184 |  9.7s | 3.12x | 5,760 MB |        2,691 MB | 3,065 MB |
+| C++         | ndjson  | 10m  |   7.54s | 1,326,874 | 22.4s | 2.97x | 9,371 MB |          883 MB | 1,281 MB |
+| C++         | parquet | 20m  |   4.38s | 4,563,154 | 14.5s | 3.31x | 5,640 MB |        2,570 MB | 2,912 MB |
+| Rust        | ndjson  | 10m  |   6.48s | 1,543,208 | 24.0s | 3.70x | 9,388 MB |          901 MB | 1,233 MB |
+| Rust        | parquet | 20m  |   4.99s | 4,007,009 | 16.9s | 3.39x | 5,683 MB |        2,613 MB | 2,883 MB |
+| Zig         | ndjson  | 10m  |   6.07s | 1,646,855 | 23.0s | 3.78x | 9,343 MB |          856 MB |   955 MB |
+| Zig         | parquet | 20m  |   4.58s | 4,364,710 | 16.5s | 3.59x | 5,479 MB |        2,410 MB | 3,424 MB |
+| C++ avx2    | ndjson  | 10m  |   7.69s | 1,301,249 | 21.5s | 2.80x | 9,366 MB |          879 MB | 1,281 MB |
+| C++ avx2    | parquet | 20m  |       - |         - |     - |     - |        - |               - |        - |
+| C++ avx512  | ndjson  | 10m  |   8.29s | 1,206,070 | 23.6s | 2.84x | 9,362 MB |          874 MB | 1,285 MB |
+| C++ avx512  | parquet | 20m  |       - |         - |     - |     - |        - |               - |        - |
+| Rust avx2   | ndjson  | 10m  |   6.53s | 1,531,632 | 24.4s | 3.74x | 9,388 MB |          901 MB | 1,233 MB |
+| Rust avx2   | parquet | 20m  |   5.00s | 4,001,437 | 17.3s | 3.45x | 5,753 MB |        2,683 MB | 2,884 MB |
+| Rust engine | ndjson  | 10m  |   6.13s | 1,630,411 | 23.5s | 3.83x | 9,359 MB |          872 MB | 1,233 MB |
+| Rust engine | parquet | 20m  |   4.49s | 4,453,351 | 16.0s | 3.57x | 5,629 MB |        2,560 MB | 2,870 MB |
+| Zig v32     | ndjson  | 10m  |   5.58s | 1,793,841 | 20.8s | 3.73x | 9,319 MB |          831 MB |   955 MB |
+| Zig v32     | parquet | 20m  |   4.63s | 4,316,001 | 16.3s | 3.53x | 5,501 MB |        2,432 MB | 3,423 MB |
+| Zig v64     | ndjson  | 10m  |   5.58s | 1,793,566 | 21.3s | 3.82x | 9,356 MB |          869 MB | 1,023 MB |
+| Zig v64     | parquet | 20m  |   4.58s | 4,368,440 | 16.5s | 3.60x | 5,506 MB |        2,437 MB | 3,344 MB |
+
+
+### AMD EPYC 9V45 96-Core Processor — 4 cores, avx512
+
+*10 measurements · sizes 10m · formats csv*
+
+| Build       | Format | Size | Compare |    Rows/s |  CPU | Cores | Peak RSS | Above the input |   Budget |
+| ----------- | ------ | ---- | ------: | --------: | ---: | ----: | -------: | --------------: | -------: |
+| C           | csv    | 10m  |   1.11s | 9,010,413 | 3.7s | 3.30x | 4,225 MB |          716 MB |   766 MB |
+| C++         | csv    | 10m  |   2.93s | 3,418,677 | 8.7s | 2.98x | 4,384 MB |          875 MB | 1,275 MB |
+| Rust        | csv    | 10m  |   1.41s | 7,090,295 | 4.4s | 3.10x | 4,409 MB |          900 MB | 1,233 MB |
+| Zig         | csv    | 10m  |   1.26s | 7,940,846 | 4.0s | 3.16x | 4,387 MB |          878 MB |   973 MB |
+| C++ avx2    | csv    | 10m  |   2.88s | 3,478,114 | 8.7s | 3.01x | 4,385 MB |          876 MB | 1,275 MB |
+| C++ avx512  | csv    | 10m  |   2.92s | 3,422,224 | 9.0s | 3.08x | 4,385 MB |          876 MB | 1,275 MB |
+| Rust avx2   | csv    | 10m  |   1.36s | 7,333,594 | 4.3s | 3.14x | 4,410 MB |          901 MB | 1,233 MB |
+| Rust engine | csv    | 10m  |   1.06s | 9,452,704 | 3.3s | 3.15x | 4,351 MB |          842 MB | 1,105 MB |
+| Zig v32     | csv    | 10m  |   1.21s | 8,253,428 | 3.8s | 3.15x | 4,330 MB |          821 MB |   955 MB |
+| Zig v64     | csv    | 10m  |   1.21s | 8,260,922 | 4.1s | 3.41x | 4,389 MB |          880 MB |   972 MB |
+
+
+> **AMD EPYC 9V45 96-Core Processor is missing 20m.** Those rungs ran on other silicon and are in another table; this ladder is partial and its slope cannot be read as one curve.
+
+> **3 of 54 rows carry no number:** C++ avx2 on parquet, C++ avx512 on parquet. A build that cannot read a format reports one of these; it is a dash above, not a zero and not a slow result.
+
+### Read this before reading the ndjson rows
+
+**The 20m ndjson rung did not measure the engines.** Its input is 16,975 MB on a
+host with 15,989 MB of RAM. Every port reports a peak RSS of about 15,050 MB and
+an *above the input* of roughly **-1,900 MB** -- negative, which is the kernel
+evicting mapped pages that the port still wants. The rung took 13m50s where the
+20m csv rung took 1m37s.
+
+So 27.74s to 55.70s across the four ports there is a ranking of page-fault
+behaviour under a working set that does not fit, not of parsing. The 10m ndjson
+rung on the Xeon is a real measurement -- 9,204 MB peak, *+716 MB* above its
+input -- and its ordering is different: C 5.93s, Zig 6.07s, Rust 6.48s, C++
+7.54s, where at 20m Rust is first and Zig last. That is the same caution this
+file has recorded twice before, arriving a third time by a new route.
+
+### And the grouping earned its keep
+
+Three CPUs in one dispatch: **EPYC 7763** (avx2) took three rungs, **Xeon
+Platinum 8573C** (avx512) two, **EPYC 9V45** (avx512) one. A single merged table
+would have put 10m csv from the 9V45 next to 20m csv from the 7763 and called it
+a curve. The grouped output instead says, in the run's own words:
+
+> **AMD EPYC 9V45 96-Core Processor is missing 20m.** Those rungs ran on other
+> silicon and are in another table; this ladder is partial and its slope cannot
+> be read as one curve.
+
+Which is the whole point, and is exactly what the run could not print.
+
+---
+
 ## 2026-09-19 (lazy cells) — the changed-row report materialised nine values for every one it printed
 
 The entry below gated the whole report tail behind `--json`. That made the
