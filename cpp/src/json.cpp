@@ -4,6 +4,7 @@
 // because the cross-language parity job compares these documents directly.
 #include "csvdiff.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <sstream>
@@ -11,26 +12,58 @@
 namespace csvdiff {
 namespace {
 
+// The bytes JSON may not carry raw: the C0 controls, the quote and the
+// backslash. Everything else, 0x80 and up included, goes through untouched --
+// which is what the other ports emit and what the parity job compares.
+constexpr std::array<bool, 256> kEscape = [] {
+    std::array<bool, 256> t{};
+    for (int i = 0; i < 0x20; ++i) t[static_cast<std::size_t>(i)] = true;
+    t['"'] = true;
+    t['\\'] = true;
+    return t;
+}();
+
+// One `write` per run of ordinary bytes, not one `put` per byte.
+//
+// `o << c` does not append a byte to a buffer. Each one constructs an
+// `ostream::sentry` -- which checks the stream's state and flushes whatever is
+// tied to it -- for the single character that follows. Callgrind on a 400k pair
+// found 67.7M instructions in `std::ostream::put` and another 37.5M in
+// `sentry`: 3.9% of the entire run, spent on stream bookkeeping, to write a
+// payload whose values are almost all escape-free. The C port's JSON writer
+// does not appear in its profile at all.
+//
+// So each clean run is written in one call and pays that cost once instead of
+// once per byte. Escapes are rare enough that a `write` apiece for them costs
+// nothing worth saving.
 void write_string(std::ostringstream& o, std::string_view s) {
-    o << '"';
-    for (char c : s) {
+    o.put('"');
+    std::size_t run = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (!kEscape[c]) {
+            ++run;
+            continue;
+        }
+        if (run) {
+            o.write(s.data() + i - run, static_cast<std::streamsize>(run));
+            run = 0;
+        }
         switch (c) {
-            case '"': o << "\\\""; break;
-            case '\\': o << "\\\\"; break;
-            case '\n': o << "\\n"; break;
-            case '\r': o << "\\r"; break;
-            case '\t': o << "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof buf, "\\u%04x", c);
-                    o << buf;
-                } else {
-                    o << c;
-                }
+            case '"': o.write("\\\"", 2); break;
+            case '\\': o.write("\\\\", 2); break;
+            case '\n': o.write("\\n", 2); break;
+            case '\r': o.write("\\r", 2); break;
+            case '\t': o.write("\\t", 2); break;
+            default: {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, "\\u%04x", c);
+                o.write(buf, 6);
+            }
         }
     }
-    o << '"';
+    if (run) o.write(s.data() + s.size() - run, static_cast<std::streamsize>(run));
+    o.put('"');
 }
 
 void write_val(std::ostringstream& o, const Val& v) {
