@@ -97,6 +97,111 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-19 (run 35427804365) — the first ladder CI grouped by itself
+
+The entry below reconstructs a ladder whose grouped table CI crashed on and
+then reported as absent. This is the next dispatch, on `main` with that fixed:
+10m and 20m rows, csv and parquet, scanner matrix on. **CI produced this table
+itself.** It is the first one in this file that did.
+
+Checked rather than assumed, both scripts against this run's own rung artifacts:
+
+| `scripts/bench_group.py` at | exit | result |
+|---|---:|---|
+| `bc6dd61`, before the fix | 1 | `TypeError` -- would have published nothing again |
+| `22350ac`, what this run executed | **0** | the table below |
+
+The input that separates them is the same two `C++ avx2` parquet rows: that
+build does not read parquet, and saying so is all it takes.
+
+**2 different CPUs produced these 30 measurements.** Each table below is one CPU. Rows may be compared inside a table and **not** between tables -- that is not a formality here, it is the difference between measuring a change and measuring which machine the job landed on.
+
+| CPU | cores | widest vector | measurements |
+| --- | ---: | --- | ---: |
+| AMD EPYC 7763 64-Core Processor | 4 | avx2 | 22 |
+| AMD EPYC 9V74 80-Core Processor | 4 | avx2 | 8 |
+
+### AMD EPYC 7763 64-Core Processor — 4 cores, avx2
+
+*22 measurements · sizes 10m, 20m · formats csv, parquet · 2 reported nothing*
+
+| Build       | Format  | Size | Compare |    Rows/s |   CPU | Cores | Peak RSS | Above the input |   Budget |
+| ----------- | ------- | ---- | ------: | --------: | ----: | ----: | -------: | --------------: | -------: |
+| C           | csv     | 20m  |   3.58s | 5,593,912 | 12.7s | 3.54x | 8,448 MB |        1,430 MB | 1,480 MB |
+| C           | parquet | 10m  |   1.31s | 7,622,042 |  4.2s | 3.17x | 2,924 MB |        1,390 MB | 1,496 MB |
+| C           | parquet | 20m  |   2.92s | 6,847,166 |  8.9s | 3.04x | 5,760 MB |        2,691 MB | 3,065 MB |
+| C++         | csv     | 20m  |   6.81s | 2,939,003 | 21.8s | 3.21x | 8,758 MB |        1,740 MB | 2,501 MB |
+| C++         | parquet | 10m  |   2.02s | 4,951,311 |  6.4s | 3.15x | 2,853 MB |        1,318 MB | 1,505 MB |
+| C++         | parquet | 20m  |   3.88s | 5,155,681 | 12.5s | 3.23x | 5,662 MB |        2,593 MB | 2,928 MB |
+| Rust        | csv     | 20m  |   3.83s | 5,228,614 | 12.6s | 3.30x | 8,759 MB |        1,742 MB | 2,458 MB |
+| Rust        | parquet | 10m  |   2.42s | 4,131,195 |  8.1s | 3.37x | 2,871 MB |        1,337 MB | 1,464 MB |
+| Rust        | parquet | 20m  |   4.64s | 4,307,106 | 15.9s | 3.43x | 5,707 MB |        2,638 MB | 2,889 MB |
+| Zig         | csv     | 20m  |   3.58s | 5,585,027 | 11.9s | 3.33x | 8,762 MB |        1,744 MB | 2,101 MB |
+| Zig         | parquet | 10m  |   2.42s | 4,134,378 |  8.6s | 3.56x | 2,760 MB |        1,225 MB | 1,738 MB |
+| Zig         | parquet | 20m  |   4.84s | 4,136,384 | 17.2s | 3.55x | 5,491 MB |        2,422 MB | 3,424 MB |
+| C++ avx2    | csv     | 20m  |   6.51s | 3,073,689 | 21.4s | 3.29x | 8,763 MB |        1,746 MB | 2,502 MB |
+| C++ avx2    | parquet | 10m  |       - |         - |     - |     - |        - |               - |        - |
+| C++ avx2    | parquet | 20m  |       - |         - |     - |     - |        - |               - |        - |
+| Rust avx2   | csv     | 20m  |   3.78s | 5,293,589 | 12.7s | 3.35x | 8,760 MB |        1,742 MB | 2,458 MB |
+| Rust avx2   | parquet | 10m  |   2.53s | 3,946,760 |  8.5s | 3.36x | 2,889 MB |        1,355 MB | 1,464 MB |
+| Rust avx2   | parquet | 20m  |   4.85s | 4,128,055 | 16.5s | 3.41x | 5,707 MB |        2,638 MB | 2,881 MB |
+| Rust engine | csv     | 20m  |   3.22s | 6,202,945 | 10.8s | 3.35x | 8,741 MB |        1,723 MB | 2,458 MB |
+| Rust engine | parquet | 10m  |   2.17s | 4,605,960 |  7.4s | 3.42x | 2,800 MB |        1,265 MB | 1,462 MB |
+| Rust engine | parquet | 20m  |   4.19s | 4,769,273 | 15.0s | 3.58x | 5,651 MB |        2,582 MB | 2,878 MB |
+| Zig v32     | csv     | 20m  |   3.32s | 6,023,713 | 11.2s | 3.37x | 8,761 MB |        1,743 MB | 2,101 MB |
+| Zig v32     | parquet | 10m  |   2.47s | 4,048,223 |  8.7s | 3.54x | 2,745 MB |        1,210 MB | 1,724 MB |
+| Zig v32     | parquet | 20m  |   4.88s | 4,097,989 | 17.4s | 3.57x | 5,467 MB |        2,397 MB | 3,424 MB |
+
+
+### AMD EPYC 9V74 80-Core Processor — 4 cores, avx2
+
+*8 measurements · sizes 10m · formats csv*
+
+| Build       | Format | Size | Compare |    Rows/s |   CPU | Cores | Peak RSS | Above the input |   Budget |
+| ----------- | ------ | ---- | ------: | --------: | ----: | ----: | -------: | --------------: | -------: |
+| C           | csv    | 10m  |   1.81s | 5,515,241 |  6.3s | 3.48x | 4,225 MB |          716 MB |   766 MB |
+| C++         | csv    | 10m  |   3.58s | 2,792,076 | 11.6s | 3.24x | 4,386 MB |          877 MB | 1,275 MB |
+| Rust        | csv    | 10m  |   2.12s | 4,724,588 |  6.8s | 3.21x | 4,409 MB |          900 MB | 1,233 MB |
+| Zig         | csv    | 10m  |   2.02s | 4,954,220 |  6.5s | 3.24x | 4,389 MB |          880 MB |   973 MB |
+| C++ avx2    | csv    | 10m  |   3.68s | 2,716,618 | 11.0s | 2.99x | 4,387 MB |          878 MB | 1,275 MB |
+| Rust avx2   | csv    | 10m  |   2.12s | 4,726,242 |  6.7s | 3.19x | 4,409 MB |          900 MB | 1,233 MB |
+| Rust engine | csv    | 10m  |   1.67s | 6,001,401 |  5.5s | 3.30x | 4,372 MB |          863 MB | 1,233 MB |
+| Zig v32     | csv    | 10m  |   1.82s | 5,502,940 |  6.3s | 3.45x | 4,383 MB |          874 MB | 1,048 MB |
+
+
+> **AMD EPYC 9V74 80-Core Processor is missing 20m.** Those rungs ran on other silicon and are in another table; this ladder is partial and its slope cannot be read as one curve.
+
+> **2 of 32 rows carry no number:** C++ avx2 on parquet. A build that cannot read a format reports one of these; it is a dash above, not a zero and not a slow result.
+
+### What is in it
+
+**Two CPUs again, and one of them got a single rung.** The EPYC 7763 took three
+of the four, the 9V74 took 10m csv alone, and the ladder says so rather than
+drawing a curve through both. This is the fourth consecutive dispatch to land on
+more than one processor; it is the normal case on this fleet, not the unlucky
+one.
+
+**Rust engine is first on csv at both sizes** -- 1.67s at 10m and 3.22s at 20m,
+against C's 1.81s and 3.58s. Read it within its own table: the 10m and 20m rows
+are on different machines and are not two points on one line.
+
+**C++ is last on csv by a wide margin**, 3.58s against C's 1.81s at 10m and
+6.81s against 3.58s at 20m -- about 2x, and the same 2x the profile entries have
+been chasing. #101 landed between this run and the one below, and it does not
+close this: it takes 5% off the `--json` path, and the gap is 100%.
+
+**On parquet the order is different and C leads**: 1.31s at 10m and 2.92s at 20m
+against C++'s 2.02s and 3.88s, so C++ trails by 1.5x and 1.3x rather than 2x.
+Parquet hands the ports typed columns instead of bytes to scan, which removes
+most of what the csv gap is made of.
+
+**Nothing paged.** Every row reports a positive *above the input* -- 716 to
+2,691 MB -- so the check added in the entry above stays silent here, which is
+the behaviour it was built for. csv and parquet at 20m are 8.4 GB and 5.1 GB
+against roughly 16 GB of RAM; it was ndjson at 20m, at 17 GB, that did not fit.
+
+---
+
 ## 2026-09-19 (the ladder CI threw away) — six rungs, three CPUs, and a grouped table that never printed
 
 Run 35425371164 dispatched the ladder at 10m and 20m rows across csv, ndjson and
