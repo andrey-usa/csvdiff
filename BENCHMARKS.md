@@ -86,6 +86,116 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-19 (lazy cells) — the changed-row report materialised nine values for every one it printed
+
+The entry below gated the whole report tail behind `--json`. That made the
+default invocation 1.14x faster and, as it said at the time, left the `--json`
+path exactly where it was. This is that path.
+
+### The arithmetic
+
+`assemble` built both whole rows of every kept changed pair as `std::string`s,
+then walked them to find which cells differed. On the 4M pair at the default
+`--max-rows`:
+
+| | |
+|---|---:|
+| kept changed rows | 50,000 |
+| columns in a row | 19 |
+| `Val`s materialised | 50,000 x 2 sides x 19 = **1,900,000** |
+| differing cells found | 52,455 (1.05 per row) |
+| `Val`s the JSON actually carries | 50,000 x key(2) + 52,455 x 2 = **204,910** |
+
+A factor of **9.3**. `json.cpp` emits a changed row as its key plus the cells
+that differ -- added and removed rows do print every column, and still do -- so
+the other 1.7 million strings were allocated, sorted past, compared and freed
+without ever being looked at.
+
+### What it does now
+
+Only the key is materialised before the sort, because the sort is what needs it.
+After the sort each row is re-parsed and the differing cells are found from the
+`Field`s -- `cell_differs` reads mapped bytes and allocates nothing -- so a cell
+becomes a `std::string` only if it is going to be printed.
+
+Re-parsing rather than carrying the `Field`s through the sort is deliberate:
+parsing a row is field arithmetic over bytes already mapped, and holding them
+instead would have the sort move 16 MB to avoid it. The allocations were the
+cost, not the parse.
+
+One behavioural note: the report now names differing cells with `cell_differs`,
+the same predicate the join used to decide the row was changed. The old code
+re-derived the test at `Val` level and said the same thing by a different route.
+Agreeing with the join by construction is the better of the two.
+
+### The trap: a second call site cost 3% in a mode that never runs it
+
+The first measurement had `--json` at 0.979 and summary-only at **1.033 slower,
+0 rounds faster of 11** -- in a mode where `row_lists` is false and every line of
+the diff is gated off. Nothing changed on that path, and it got consistently
+slower.
+
+`nm -C` on the two binaries:
+
+    base:  (no cell_differs symbol -- inlined into the join, its only caller)
+    new:   t csvdiff::(anonymous namespace)::cell_differs(...)
+
+Calling `cell_differs` from the report gave it a second call site, and that was
+enough for GCC to stop inlining it and emit one shared copy. The join's inner
+loop lost its inlined body, and the join runs in **both** modes. Marking it
+`[[gnu::always_inline]] inline` put the symbol back to nothing; the report loop
+is cold, so a second inlined copy there is free.
+
+Worth stating plainly: a 3% regression from adding a call, on a path whose source
+was untouched. Only the paired harness caught it, and only because it measures
+both modes.
+
+### What it is worth
+
+Thirteen paired rounds on the 4M CSV pair, arms rotated, four threads, summary
+identical between arms in both modes before any timing:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| summary only, no `--json` | 2.06s | 2.08s | 1.004 | 0.988-1.012 | 4/13 |
+| with `--json` | 2.74s | 2.59s | **0.945** | 0.919-0.957 | **11/13** |
+
+Summary-only straddles 1.00, which is no result and is the right answer for code
+that mode does not execute. CPU seconds fall 7.62 to 7.43.
+
+Per-phase, seven interleaved rounds, medians:
+
+| phase | base | new | delta |
+|---|---:|---:|---:|
+| assemble | 0.333s | 0.210s | **-0.123s** |
+| join and compare | 1.458s | 1.403s | -0.055s |
+| A / B sweep, A / B insert | | | within noise |
+
+`assemble` is **37% cheaper**. The two sweeps run concurrently and trade places
+between runs; the join delta is inside the band that summary-only's 1.004 calls
+nothing.
+
+**Unlike the entry below, this one does move the published tables.**
+`bench_ports.py` and `bench_formats_ports.py` both pass `--json`, so every
+cross-port number in this file was measured on exactly this path.
+
+Verified beyond the counts gate: the `--json` payload is byte-identical to the
+previous build, apart from `meta.seconds`, across seven option combinations --
+none, `--trim`, `--ignore-case`, `--empty-is-null`, `--tolerance 0.5`,
+`--trim --ignore-case --empty-is-null`, and `--tolerance 1000 --trim`. Counts
+gates: cpp 36/36, cross-port 89/89.
+
+### What is still on the table
+
+Making `Val` a view instead of an owning string would remove the remaining
+allocations, and it is not blocked by a lifetime argument -- it is blocked by an
+API one. `Slab a(a_path), b(b_path)` are locals in `compare()` and `Result` is
+returned by value, so a view into the mapped bytes would dangle at the return.
+Changing that means changing what `compare()` hands back, which is a different
+change from this one.
+
+---
+
 ## 2026-09-18 (report gate) — C++ built the row samples nobody asked for
 
 `assemble` was the one phase in the entry below that nobody had looked at. It is
