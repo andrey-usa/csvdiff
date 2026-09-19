@@ -518,7 +518,13 @@ std::optional<double> as_number(std::string_view s) {
 }
 
 // SQL's IS DISTINCT FROM, with the tolerance applied where both sides parse.
-bool cell_differs(const Slab& a, Field x, const Slab& b, Field y, const Options& o) {
+//
+// Forced inline because the join's inner loop is the only caller that matters
+// and it wants this in its body. The report path calls it too, and two call
+// sites were enough for GCC to stop inlining it and emit one shared copy --
+// which cost the join 3%, in both `--json` and summary-only runs. The report
+// loop is cold; a second inlined copy there is free.
+[[gnu::always_inline]] inline bool cell_differs(const Slab& a, Field x, const Slab& b, Field y, const Options& o) {
     const bool xa = is_absent(a, x, o), yb = is_absent(b, y, o);
     if (xa && yb) return false;
     if (o.tolerance > 0.0 && !xa && !yb) {
@@ -1545,6 +1551,22 @@ struct Capped {
     bool truncated() const { return total > static_cast<std::int64_t>(cap); }
 };
 
+// A changed row's key, and nothing else.
+//
+// `fields_of` fills `width` fields however few the caller goes on to read, so
+// the Field buffer is full width here even though only `key_size` of them become
+// strings. Passing a shorter width to `row_values` instead would hand the parser
+// a buffer smaller than it writes.
+std::vector<Val> key_values(const Slab& s, const RowIndex& idx, int row, std::size_t width,
+                            std::size_t key_size, const Options& o) {
+    std::vector<Field> fields(width);
+    idx.fields_of(row, fields.data());
+    std::vector<Val> out;
+    out.reserve(key_size);
+    for (std::size_t i = 0; i < key_size; ++i) out.push_back(value_of(s, fields[i], o));
+    return out;
+}
+
 std::vector<Val> row_values(const Slab& s, const RowIndex& idx, int row, std::size_t width,
                             const Options& o) {
     std::vector<Field> fields(width);
@@ -1991,35 +2013,51 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         for (const auto& [row, mate] : removed.held) r.removed.push_back(row_values(a, ai, row, width, opt));
         for (const auto& [row, mate] : added.held) r.added.push_back(row_values(b, bi, row, width, opt));
 
-        std::vector<std::pair<std::vector<Val>, std::vector<Val>>> pairs;
-        pairs.reserve(changed.held.size());
+        // A changed row reports its key and the cells that differ -- and on this
+        // data that is 1.05 cells of nineteen columns. Materialising both whole
+        // rows to find them made 1,900,000 `Val`s to emit 204,910: a factor of
+        // 9.3, and 0.5s of a 1.9s run, which is where `--json` mode's time went.
+        //
+        // So the key is built for the sort, and the cells are found from the
+        // Fields -- `cell_differs` reads bytes and allocates nothing -- and only
+        // a cell that differs becomes a string.
+        //
+        // The rows are re-parsed in the second pass rather than carried through
+        // the sort. Parsing a row is field arithmetic over bytes already mapped;
+        // holding the Fields instead would be 16 MB moved by the sort to save
+        // that, and it is the allocations that cost, not the parse.
+        //
+        // `cell_differs` is the predicate the join itself uses, so the report now
+        // names cells by the same rule that decided the row was changed. The
+        // `Val`-level test here before it said the same thing by a different
+        // route; agreeing with the join by construction is the better of the two.
+        struct KeptChange {
+            std::vector<Val> key;
+            int row, mate;
+        };
+        std::vector<KeptChange> kept;
+        kept.reserve(changed.held.size());
         for (const auto& [row, mate] : changed.held)
-            pairs.emplace_back(row_values(a, ai, row, width, opt), row_values(b, bi, mate, width, opt));
+            kept.push_back({key_values(a, ai, row, width, key_size, opt), row, mate});
 
         const auto by_key = [&](const std::vector<Val>& x, const std::vector<Val>& y) {
             return compare_keys(x, y, key_size) < 0;
         };
         std::stable_sort(r.removed.begin(), r.removed.end(), by_key);
         std::stable_sort(r.added.begin(), r.added.end(), by_key);
-        std::stable_sort(pairs.begin(), pairs.end(),
-                         [&](const auto& p, const auto& q) { return by_key(p.first, q.first); });
+        std::stable_sort(kept.begin(), kept.end(),
+                         [&](const KeptChange& x, const KeptChange& y) { return by_key(x.key, y.key); });
 
-        for (const auto& [ar, br] : pairs) {
+        std::vector<Field> fa(width), fb(width);
+        for (KeptChange& k : kept) {
             ChangedRow out;
-            out.key.assign(ar.begin(), ar.begin() + static_cast<long>(key_size));
+            out.key = std::move(k.key);
+            ai.fields_of(k.row, fa.data());
+            bi.fields_of(k.mate, fb.data());
             for (std::size_t i = 0; i < nc; ++i) {
-                const Val& x = ar[key_size + i];
-                const Val& y = br[key_size + i];
-                bool differs_here;
-                if (!x && !y) {
-                    differs_here = false;
-                } else if (opt.tolerance > 0.0 && x && y) {
-                    const auto nx = as_number(*x), ny = as_number(*y);
-                    differs_here = (nx && ny) ? std::fabs(*nx - *ny) > opt.tolerance : x != y;
-                } else {
-                    differs_here = x != y;
-                }
-                if (differs_here) out.cells.push_back({i, x, y});
+                const Field x = fa[key_size + i], y = fb[key_size + i];
+                if (cell_differs(a, x, b, y, opt))
+                    out.cells.push_back({i, value_of(a, x, opt), value_of(b, y, opt)});
             }
             r.changed.push_back(std::move(out));
         }
