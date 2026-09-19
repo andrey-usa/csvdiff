@@ -97,6 +97,73 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-19 (json runs) — a sentry per character, and no wall time to show for removing it
+
+Callgrind on C and C++ over the same 400k CSV pair, one thread, to find where
+the C++ CSV gap actually is. It turned up something unrelated to the gap and
+worth fixing on its own: **C++ spent 3.9% of the entire run inside
+`std::ostream` bookkeeping**, writing JSON.
+
+| | instructions | share |
+|---|---:|---:|
+| `std::ostream::put(char)` | 67,721,944 | 2.50% |
+| `std::ostream::sentry::sentry` | 37,451,137 | 1.38% |
+| `write_string` itself | 18,368,272 | 0.68% |
+
+`write_string` did `o << c` per character. That is not a byte appended to a
+buffer: each one constructs an `ostream::sentry`, which checks the stream state
+and flushes whatever is tied to it, for the single character that follows. The
+C port's JSON writer does not appear in its profile at all.
+
+It now writes each run of ordinary bytes in one `write` and handles only the
+escapes individually.
+
+| | before | after |
+|---|---:|---:|
+| `std::ostream::put` | 67.7M | **19.0M** |
+| `ostream::sentry` | 37.5M | **13.8M** |
+| whole program | 2,710,450,723 | **2,629,295,945** |
+
+**-81.2M instructions, -3.0% of the program.**
+
+### And it buys no wall time, which is the point of writing it down
+
+Three paired measurements on the 4M CSV pair, arms rotated, four threads:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| `--json`, default `--max-rows` | 2.70s | 2.64s | 1.009 | 0.920-1.071 | 7/15 |
+| `--json`, default `--max-rows`, again | 2.61s | 2.60s | 0.989 | 0.968-1.040 | 7/13 |
+| `--json --max-rows 240000` | 3.71s | 3.63s | 0.985 | 0.915-1.024 | 8/13 |
+
+Every band straddles 1.00, so by the rule at the top of this file there is **no
+result** in any of them. The third row is the one that was supposed to show it:
+`--max-rows` caps the report at 50,000 rows however large the input, so at 4M the
+JSON payload is fixed at 4.9 MB while everything else scales with the file.
+Raising the cap to take all 240,031 changed rows makes the payload 17.3 MB,
+3.5x larger -- and it still does not clear the noise.
+
+CPU seconds fall 8.75 to 8.55 on that row, about 2.3% and in the right
+direction, but that is a median of each arm's runs rather than a paired
+statistic and it is not what this file gates on. It is mentioned, not claimed.
+
+So: 3.9% of a *profile* is 0% of a *run*, because the phase it lives in is a
+small and fixed part of a large one. Kept anyway -- it is strictly less work for
+byte-identical output, and it removes a real pathology rather than trading one
+cost for another -- but recorded as the null result it is.
+
+### The coverage check that nearly passed for the wrong reason
+
+The first escape-torture pair mutated only alternate rows, and the values
+carrying a backslash, a carriage return and the C0 controls happened to land on
+the unchanged ones. Unchanged rows are not in the report, so those three escape
+branches emitted **zero** occurrences and the byte-identity check passed without
+ever exercising them. Rebuilt so every row differs; all eight branches then fire
+-- quote 7, backslash 6, `\n` 6, `\r` 6, `\t` 8, `\u00XX` 62, raw 0x7f 2, raw
+UTF-8 8 -- and the twelve case/option comparisons pass on that.
+
+---
+
 ## 2026-09-19 (run 35427804365) — the first ladder CI grouped by itself
 
 The entry below reconstructs a ladder whose grouped table CI crashed on and
