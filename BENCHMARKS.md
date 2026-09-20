@@ -120,6 +120,52 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-20 (phases, corrected path) — the sweep is worse than this file said
+
+The phase split was last taken with `--json` passed, which is no longer what the
+benchmark times. Re-measured without it, 4M CSV pair, five rounds, medians, the
+two index sides taken as a critical path because they run concurrently:
+
+| phase | 1 thread | 4 threads | scales | share of the 4t wall |
+|---|---:|---:|---:|---:|
+| sweep | 0.306s | 0.419s | **0.73x** | **24.6%** |
+| index insert | 0.372s | 0.325s | 1.14x | 19.1% |
+| join and compare | 2.245s | 0.954s | 2.35x | 56.1% |
+| assemble | 0.001s | 0.001s | — | 0.1% |
+
+Wall 2.96s at one thread, 1.70s at four: **1.74x**.
+
+Two checks that this is a decomposition and not a fit. The critical path sums to
+**1.699s against a 1.70s wall**, 100%. And the non-scaling phases are 24.6% +
+19.1% = **43.7%** against the **43.3%** Amdahl implies from that speedup — two
+routes to one number, four-tenths of a point apart.
+
+### What changed from the last reading
+
+`assemble` was 11% when it was first measured and is **0.1%** now. Gating it
+behind `row_lists` and then building only the cells the report prints took it
+out of the timed path; with `--json` still passed on the same pair it is 7.8%,
+so the phase is not gone, it is simply no longer in what the benchmark measures.
+
+**The sweep got worse, not better: 0.79x → 0.73x.** Nothing changed it; the old
+number was measured with the report still running, and a wall inflated by 19%
+made every non-scaling share look smaller than it is. It is now the largest
+non-scaling phase by a wider margin, and it is the only phase in the run that
+is *slower* on four threads than on one.
+
+That is the whole of the remaining C++ gap, and it now has two independent
+statements of the same thing. From the CI table: C++ spends 7.3 CPU-seconds on
+10M CSV to C's 6.4 — 1.14x, matching the 1.07x instruction ratio — and takes
+1.56x the wall, at 2.61x cores against C's 3.53x. From the phases: 43.7% of a
+four-thread run does not scale, and the largest part of it runs backwards.
+
+On ndjson the same table makes it starker still. C++ spends **14.9 CPU-seconds
+against C's 16.7** — the least of any port — and loses, 5.88s to 5.24s, on 2.54x
+cores against 3.19x. At C's utilisation those same seconds finish in **4.67s**
+and lead the format. Nothing has to get cheaper for that.
+
+---
+
 ## 2026-09-20 (10M, before and after) — what the report was costing, on CI
 
 The change in the entry below, measured where it matters. Two dispatched 10M
