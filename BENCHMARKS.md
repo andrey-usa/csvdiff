@@ -190,6 +190,35 @@ chunking is never worth it.
 The `chunk bounds` mark stays. It is what made this visible, and it reads 0.000s
 for every budget that no longer splits.
 
+### On CI it also moved a memory column, and not the way it reads
+
+The 10M ladder that measured this (run 35525106448, EPYC 7763, same processor
+as the run before it) shows C++ on CSV going 2.82s to 2.77s and its CPU 7.3s to
+6.4s, **-12%**. It also shows *above the input* going 883 MB to 1,030 MB, and a
+reader would be right to stop at that.
+
+It is not a leak, and it is not the kind of memory that ends a rung. Measured on
+a 4M pair with both numbers taken from `/proc`:
+
+| per_file | RSS above the input | VmData (anonymous) |
+|---|---:|---:|
+| 1 | 372 MB | **384 MB** |
+| 2 | 311 MB | **400 MB** |
+
+The extra resident memory is **file-backed**: one thread streaming a mapped file
+end to end leaves more of it resident than two threads each covering half. Those
+pages are reclaimable. The anonymous memory -- the part that cannot be handed
+back, and the part `--memory-cap` bounds through `RLIMIT_DATA` -- went *down* by
+16 MB, because one chunk allocates one pair of growing vectors where two chunks
+allocate two.
+
+The ladder's own table says the same thing from the other side: the Budget
+column, which is peak `VmData`, fell 1,281 MB to 1,243 MB in the same run where
+*above the input* rose. Two columns, one cause, and the one that decides whether
+a 40m rung survives is the one that improved.
+
+This is also the reason this file keeps both columns rather than only peak RSS.
+
 ---
 
 ## 2026-09-20 (phases, corrected path) — the sweep is worse than this file said
