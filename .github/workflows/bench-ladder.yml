@@ -156,7 +156,7 @@ jobs:
       MATRIX: ${{ github.event.inputs.matrix || 'false' }}
       FIRST: ${{ github.event.inputs.first || 'Rust' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: What this runner is
         run: |
@@ -262,7 +262,7 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ladder-${{ matrix.size }}-${{ matrix.format }}-${{ github.run_id }}
@@ -284,9 +284,9 @@ jobs:
       # other order would delete the rungs it is here to read. This job needs
       # the tree at all because the table it prints comes from
       # scripts/mdtable.py, the same renderer every rung used.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           pattern: ladder-*-${{ github.run_id }}
           path: rungs
