@@ -120,6 +120,78 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-20 (per_file) — the sweep was split two ways, which is the worst width available
+
+The sweep is the phase that does not scale, and the reason turned out to be the
+number it was split into. `per_file = budget / 2` gives **two** on a four-core
+machine, which is every CI runner this project uses.
+
+Wall time on a 4M CSV pair at `--threads 4`, nine interleaved rounds, with the
+split forced to each width:
+
+| per_file | 1 | **2** | 3 | 4 | 6 | 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| vs two | 0.923 | **1.000** | 0.965 | 0.936 | 0.936 | 0.903 |
+
+Two is not a point on a curve. It is the worst value available, and every other
+width beats it.
+
+### Why
+
+Chunking costs a whole extra pass over the bytes before a single row is read.
+`chunk_bounds` has to count quotes to know whether a nominal split lands inside
+a quoted field, and a newline inside a quoted field is not a row boundary.
+
+Split four ways, that pass is a quarter of the file per thread and the sweep it
+enables is four times narrower. Split **two** ways it is half the file and
+**single-threaded** -- the counter loop runs `for i in 1..nominal.size()` and
+`nominal` has one entry, so it spawns nothing -- to make the sweep only twice as
+narrow, while running four concurrent read streams where there were two.
+
+Measured separately, with a `chunk bounds` phase mark added for the purpose:
+
+| per_file | chunk bounds | sweep | total |
+|---|---:|---:|---:|
+| 1 | 0.000s | 0.316s | 0.316s |
+| 2 | 0.054s | 0.358s | **0.412s** |
+| 4 | 0.064s | 0.248s | 0.312s |
+
+The bounds pass is only 0.054s of the 0.096s regression; the rest is the sweep
+itself getting slower when it is split in two. And note the totals: **one chunk
+and four chunks cost the same.** On this machine the split buys nothing at any
+width and pays for itself at none.
+
+### What changed
+
+`per_file = budget >= 8 ? budget / 2 : 1`. Machines with eight threads or more
+keep exactly what they had; the 4-to-7 range, where two and three were both
+measured as losses, stops splitting.
+
+Thirteen paired rounds, 4M CSV pair, `--threads 4`, summary identical between
+arms in both modes first:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| counts only | 1.72s | 1.61s | **0.956** | 0.924-0.974 | **12/13** |
+| with `--json` | 2.18s | 2.03s | 0.939 | 0.909-1.003 | 10/13 |
+
+The first row is the path the benchmark now times and it clears. The second
+straddles 1.00 at the top of its band and is therefore no result, median
+notwithstanding. CPU seconds fall 4.47 to 3.61 and 6.36 to 5.54.
+
+### What is not established
+
+That the sweep cannot scale anywhere. This is one four-core VM, and on it the
+phase costs the same at one chunk as at four. A machine with more memory
+channels may well split it profitably, which is why the change leaves
+eight-thread-and-wider budgets alone rather than concluding from four cores that
+chunking is never worth it.
+
+The `chunk bounds` mark stays. It is what made this visible, and it reads 0.000s
+for every budget that no longer splits.
+
+---
+
 ## 2026-09-20 (phases, corrected path) — the sweep is worse than this file said
 
 The phase split was last taken with `--json` passed, which is no longer what the

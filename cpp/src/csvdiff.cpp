@@ -1048,6 +1048,7 @@ class RowIndex {
         if (from >= end) return;
 
         const std::vector<std::size_t> bounds = chunk_bounds(d, from, threads);
+        phase.mark("chunk bounds");
         const std::size_t n = bounds.size() - 1;
         std::vector<Chunk> chunks(n);
         std::vector<std::exception_ptr> failures(n);
@@ -1687,7 +1688,29 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // error has to reach the caller as an error and not as a crash.
     unsigned budget = opt.threads;
     if (budget == 0) budget = std::max(1u, std::thread::hardware_concurrency());
-    const unsigned per_file = std::max(1u, budget / 2);
+    // ... but only where splitting a sweep pays for itself, which a two-way
+    // split does not.
+    //
+    // Chunking costs a whole extra pass over the bytes before any row is read:
+    // `chunk_bounds` has to count quotes to know whether a nominal split lands
+    // inside a quoted field. Split four ways that pass is a quarter of the file
+    // per thread and the sweep it enables is four times narrower. Split two
+    // ways it is half the file, single-threaded -- the counter loop has one
+    // entry and so spawns nothing -- to make the sweep only twice as narrow,
+    // and it runs four concurrent read streams instead of two.
+    //
+    // Measured, 4M CSV pair, `--threads 4`, nine interleaved rounds, wall time
+    // against the two-way split this used to pick:
+    //
+    //     per_file  1     2      3      4      6      8
+    //     vs two    0.923 1.000  0.965  0.936  0.936  0.903
+    //
+    // Two is not a point on a curve, it is the worst value available, and it
+    // was what every four-core runner got. Not splitting at all is 0.925 of it
+    // over eleven paired rounds, faster in all eleven, and the whole phase then
+    // costs what it cost on one thread -- the sweep does not scale on this
+    // machine at any width, so the split was buying nothing and paying for it.
+    const unsigned per_file = budget >= 8 ? budget / 2 : 1;
 
     std::optional<RowIndex> ai_slot, bi_slot;
     std::exception_ptr worker_failure;
