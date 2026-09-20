@@ -33,7 +33,7 @@ gone. Do not reintroduce them; their measured verdicts are the point of `ARCHIVE
 | `cpp/` | the C++ port (SWAR text + columnar + snappy); own suite `test.sh`; generator included |
 | `rust/` | the port that carries the HTML report; engines `turbo` (default), `sortmerge`, `native`; `cargo test` |
 | `zig/` | the port with the *enforced* `--max-memory` budget; `zig build --release=fast` + `test.sh` |
-| `scripts/` | the measurement harnesses in Python and bash — see the commands below. `bench_group.py` groups CI results by the CPU that produced them, because a hosted fleet gives different jobs different processors |
+| `scripts/` | the measurement harnesses in Python and bash — see the commands below. `bench_group.py` groups CI results by the CPU that produced them, because a hosted fleet gives different jobs different processors; `report_cost.py` shows what each port's `--json` document contains beside what producing it costs |
 | `.github/workflows/` | the CI and benchmark workflows, listed in `README.md`; `parity.yml` and `formats.yml` are the repository-wide gates |
 | `.github/actions/` | composite actions the workflows share. `setup-zig` is the **only** place the Zig version is pinned — it was in ten |
 | `tests/fixtures/` | the awkward-input and multi-format fixtures every suite is held to |
@@ -136,6 +136,13 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
   names the upper bound — ten minutes that has repeatedly replaced a day of implementation.
 - **Check a probe against the counts it still produces, not just the clock.** A probe that skipped
   the index insert measured 2.08x and meant nothing: `matched 0` said why.
+- **Agreeing on the counts is not doing the same job.** The gate proves the ports found the same
+  differences; it says nothing about what else each was asked to produce. Every harness passed
+  `--json` to all four ports for most of this project's life, and only C++ emits row samples — 4.9
+  MB naming 58,600 rows on a 4M pair, against about a kilobyte from the others, which have no such
+  feature. That was a third of the published CSV gap. Timed runs no longer pass `--json`; the gate
+  gets its own untimed run. `scripts/report_cost.py` prints what each port's document *contains*
+  before what it costs, because the shape is the reason for the cost.
 - **Rounds scale with how short the run is.** *No result* at nine rounds has become 1.29x at
   twenty-five.
 - **Peak RSS is not the memory answer for anything that maps its input.** `scripts/memory_floor.sh`

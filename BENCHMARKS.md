@@ -65,6 +65,29 @@ returning identical counts. A build that disagrees fails the run and is named;
 none of the tables here contains a build that was fast because it was answering
 a different question.
 
+**Same counts is not the same task.** The gate above proves the ports agree on
+*what changed*. It says nothing about what else they were asked to produce, and
+for most of this file's life they were not asked for the same thing. Every
+harness passed `--json` to all four ports, and only the C++ port emits row
+samples: C and Zig write `counts` and `columns` -- 1,196 bytes on a 4M pair --
+Rust adds a `meta` block for 3,057, and C++ writes **4,917,335 bytes naming
+58,600 rows**. C has no flag to turn samples on, because it has no such feature.
+
+So `--json` cost C 39,250 instructions on a 400k pair, 0.0%, and cost C++ 808
+million, 44%: it switches on a second full random-probed pass over B and then
+materialises, sorts and writes every sampled row. Measured on a 4M pair at four
+threads, warmed and with the two modes interleaved, **C++ is 1.81x C on the task
+all four ports perform and 2.25x once C++ alone is asked for a report** -- about
+a third of the published CSV gap was the report.
+
+The timed runs no longer pass `--json`. The counts gate still needs the
+document, so it gets its own untimed run first. `scripts/report_cost.py` prints
+what each port's document contains beside what producing it costs, in that
+order, because the shape is the reason for the cost. This is the same fault as
+the `-march=native` one below, and `ports()` already fixed the matching case for
+Rust by passing `-o /dev/null` so its HTML was not charged against ports that
+render none; C++'s samples were the half that was missed.
+
 **What this harness can and cannot resolve.** Measured, not assumed: running one
 build against a copy of itself, where the true answer is 1.00x.
 
@@ -94,6 +117,89 @@ C-versus-Rust and C-versus-Zig ratios in those tables are partly build flags,
 and correcting it cost about two thirds of the published C lead on CSV and on
 Parquet. Every port is now built for the runner it is measured on. It was the
 other branch's agent that pointed this out.
+
+---
+
+## 2026-09-20 (four tasks) — the cross-port tables were never measuring one job
+
+Profiling C against C++ to find the CSV gap, the call counts came out equal in
+one mode and not the other. Without `--json`, on the same 400k pair:
+
+| | C | C++ |
+|---|---:|---:|
+| `next_of2` calls | 12,078,700 | **12,078,700** |
+| row parses | 1,623,746 | **1,623,746** |
+| equality calls | 1,205,561 | **1,206,742** |
+
+Identical. With `--json`, C's counts do not move at all and C++'s become
+15,932,660 / 2,496,104 / 2,413,364.
+
+### Why
+
+Only the C++ port emits row samples. `scripts/report_cost.py`, on a 4M pair:
+
+| Port | top-level keys | rows named | bytes |
+| --- | --- | ---: | ---: |
+| C | columns, counts | 0 | 1,196 |
+| C++ | added, changed, columns, counts, dup_a, dup_b, meta, removed | **58,600** | **4,917,335** |
+| Rust | columns, counts, meta | 0 | 3,057 |
+| Zig | columns, counts | 0 | 1,196 |
+
+C has no flag to turn them on, because it has no such feature. Producing them
+switches on the B-side pass -- gated on `row_lists` and priced in this file at
+1.29x of wall -- and then materialises, sorts and writes every sampled row.
+
+| | C | C++ |
+|---|---:|---:|
+| instructions, counts only | 1,705,815,289 | 1,821,191,662 (**1.07x**) |
+| instructions, with `--json` | 1,705,854,539 | 2,629,295,857 (**1.54x**) |
+| what `--json` costs | +39,250 (0.0%) | +808,104,195 (**+44.4%**) |
+
+Wall, 4M pair, four threads, page cache warmed, the two modes interleaved and
+the arms rotated:
+
+| mode | C | C++ | ratio |
+|---|---:|---:|---:|
+| counts only | 1.02s | 1.84s | **1.81x** |
+| `--json` | 1.06s | 2.38s | **2.25x** |
+
+**About a third of the published CSV gap was the report.** Every harness passed
+`--json` to every port, so every cross-port table in this file compared three
+ports writing about a kilobyte against one writing five megabytes.
+
+### What changed
+
+The timed runs no longer pass `--json`. The counts gate still needs the
+document, so it runs once per port, untimed, before the rounds. Both harnesses,
+same reasoning, cross-referenced comments.
+
+This is the same fault as the `-march=native` one at the top of this file, and
+`ports()` had already fixed the matching case for Rust -- `-o /dev/null`, so its
+HTML is not charged against ports that render none, with a comment calling it
+"the only row here that is not comparing like with like". C++'s samples were the
+other half, and nobody had looked.
+
+`json_sample_cost.py` is replaced by `report_cost.py`, which prints the document
+shape *before* the cost. The old one printed only the cost, and the entry that
+used it read "C 3%, C++ 36%, Rust 0%, Zig 1%" as those ports skipping the
+samples or building them cheaply. They have no samples. Timing alone could not
+have said so, and the new one puts the reason above the number.
+
+### What this says about the remaining gap, which is the useful part
+
+On the task all four ports perform, C++ executes **1.07x** C's instructions and
+takes **1.81x** the wall. The gap is not instruction count. It is what those
+instructions do -- memory traffic and threading -- which agrees with the sweep
+measurement three entries down: 23% of a four-thread run, scaling **0.79x**,
+getting worse as threads go up.
+
+That retires a line of work. `#105` cut 81M instructions from the JSON writer
+and moved wall time not at all, and its entry recorded the null without knowing
+why. This is why. Enabling the AVX2 scanner rung in C++ -- which C gets
+automatically from `__AVX2__` where C++ gates it behind a hand-set
+`CSVDIFF_SCAN_AVX2` -- is worth 221M instructions, 8.4%, and should be expected
+to move wall time about as much as the last one did: not at all. It is left
+unmade pending a paired measurement rather than shipped on the instruction count.
 
 ---
 

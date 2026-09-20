@@ -3,6 +3,27 @@
 **Ten million rows, all three formats, all four ports, measured on CI.**
 Run 2026-09-17.
 
+> ### ⚠ The tables below timed four different tasks
+>
+> Every number in this file was taken with `--json` passed to all four ports,
+> and **only the C++ port emits row samples**. On a 4M pair C and Zig write
+> 1,196 bytes, Rust 3,057, and C++ **4,917,335 bytes naming 58,600 rows**. C has
+> no flag to turn samples on; it has no such feature. Producing them switches on
+> a second full random-probed pass over B, then materialises, sorts and writes
+> every sampled row -- 0.0% of C's instructions, 44% of C++'s.
+>
+> Measured like for like on a 4M pair at four threads, warmed and interleaved:
+> **C++ is 1.81x C on the task all four ports perform, against the 2.25x these
+> tables report.** Roughly a third of the C++ CSV gap here is the report, not
+> the engine. The Rust and Zig columns are affected only slightly, and C not at
+> all.
+>
+> The harnesses no longer pass `--json` to a timed run -- the counts gate gets
+> its own untimed one -- so the next CI ladder supersedes this file. It is kept
+> unedited until then rather than quietly rescaled, for the same reason the
+> `-march=native` tables were kept in BENCHMARKS.md: the numbers within each
+> port are still that port's.
+
 [BENCHMARKS.md](BENCHMARKS.md) is the record of *how it got here* — every run,
 newest first, with the reasoning and the dead ends. [ARCHIVE.md](ARCHIVE.md) is
 what was tried and removed. This file is the snapshot.
