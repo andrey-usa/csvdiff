@@ -160,8 +160,22 @@ def main() -> int:
     warm(args.a, args.b)
     size = (os.path.getsize(args.a) + os.path.getsize(args.b)) / 2**20
 
-    # One run each first, to find out who can read this pair at all.
+    # One run each first, to find out who can read this pair at all -- and, now,
+    # to collect the counts the gate below compares. The timed rounds do not
+    # pass `--json`.
+    #
+    # Passing it to every port was timing four different tasks. Only the C++
+    # port emits row samples; C, Rust and Zig write `counts` and `columns` and
+    # stop, and C has no flag to do otherwise because it has no such feature.
+    # On a 400k pair `--json` costs C 39,250 instructions (0.0%) and C++ 808
+    # million (44%): it turns on a second full random-probed pass over B, then
+    # materialises, sorts and writes every sampled row. On a 4M pair at four
+    # threads, warmed and interleaved, C++ is 1.81x C on the task all four
+    # perform and 2.25x once C++ alone is asked for a report.
+    #
+    # See bench_formats_ports.py for the same change and the same reasoning.
     reads: list[tuple[str, list[str], list[str]]] = []
+    answers: dict[str, dict | None] = {}
     for label, prefix, flags in builds:
         out = f"{args.tmp}/ports_{slug(label)}.json"
         _, _, _, code = run(prefix + ["compare", args.a, args.b, "-k", args.key,
@@ -169,6 +183,7 @@ def main() -> int:
                             f"{args.tmp}/ports_err.txt")
         if code in (0, 1) and counts(out) is not None:
             reads.append((label, prefix, flags))
+            answers[label] = counts(out)
         else:
             why = open(f"{args.tmp}/ports_err.txt").read().strip().splitlines()
             print(f"  {label:5s} -- does not read this pair"
@@ -178,7 +193,6 @@ def main() -> int:
     builds = reads
 
     times: dict[str, list[tuple[float, float, float]]] = {l: [] for l, _, _ in builds}
-    answers: dict[str, dict | None] = {}
     broken: dict[str, str] = {}
     # The starting port rotates between rounds. With a fixed order someone is
     # always first into a cold cache and someone always last, and position
@@ -188,10 +202,9 @@ def main() -> int:
         for label, prefix, flags in builds[turn:] + builds[:turn]:
             if label in broken:
                 continue
-            out = f"{args.tmp}/ports_{slug(label)}.json"
             secs, rss, cpu, code = run(
-                prefix + ["compare", args.a, args.b, "-k", args.key, "-i", args.ignore,
-                          "--json", out] + flags, f"{args.tmp}/ports_err.txt")
+                prefix + ["compare", args.a, args.b, "-k", args.key, "-i", args.ignore]
+                + flags, f"{args.tmp}/ports_err.txt")
             if code not in (0, 1):
                 # One port failing used to end the whole benchmark, which meant
                 # every port after it in the list produced no number at all --
@@ -206,7 +219,6 @@ def main() -> int:
                 answers.pop(label, None)
                 continue
             times[label].append((secs, rss, cpu))
-            answers[label] = counts(out)
 
     # The CPU, on the line above the table. This harness runs every format in
     # one job, so unlike the ladder its rows really are one machine -- but the

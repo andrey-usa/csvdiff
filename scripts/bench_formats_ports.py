@@ -484,6 +484,41 @@ def main(argv: list[str]) -> int:
         failed: set[str] = set()
         rows_seen: dict[str, int] = {}
 
+        # The counts gate runs once per port, untimed, and the timed rounds
+        # below do not pass `--json` at all.
+        #
+        # Passing it to everything was measuring four different tasks. Only the
+        # C++ port emits row samples: C, Rust and Zig write `counts` and
+        # `columns` and stop, and C has no flag to make it do otherwise because
+        # it has no such feature. So `--json` costs C 39,250 instructions on a
+        # 400k pair -- 0.0% -- and costs C++ 808 million, 44%, because it turns
+        # on a second full random-probed pass over B and then materialises,
+        # sorts and writes every sampled row.
+        #
+        # Measured on a 4M pair, four threads, page cache warmed and the two
+        # modes interleaved: C++ is 1.81x C on the task both actually do, and
+        # 2.25x once C++ alone is asked for a report. Roughly a third of the
+        # published CSV gap was the report.
+        #
+        # This is the same fault as the `-march=native` one at the top of
+        # BENCHMARKS.md, and `ports()` already fixes the matching case for Rust
+        # by passing `-o /dev/null` so its HTML is not charged against ports
+        # that render none. The gate itself still needs the document, so it gets
+        # its own run outside the timing.
+        for entry in runnable:
+            argv_gate = entry["prefix"] + ["compare", str(a), str(b)] + KEY + \
+                entry["flags"] + ["--json", str(summary)]
+            _, _, _, code, why, _ = run(argv_gate, args.timeout, args.memory_cap, errors)
+            if code not in (0, 1):
+                said = f": {why}" if why else ""
+                print(f"  {entry['label']:5s} FAILED the counts gate (exit {code}){said}",
+                      flush=True)
+                failed.add(entry["label"])
+                continue
+            got = counts(summary)
+            answers.setdefault(f"{entry['label']}/{fmt}", got)
+            rows_seen[entry["label"]] = got["a_rows"]
+
         # One run of every port per round, and the rounds repeat -- which is
         # what BENCHMARKS.md has always said this does and what it did not do.
         # It used to run every repeat of one port before starting the next, so
@@ -501,8 +536,13 @@ def main(argv: list[str]) -> int:
             turn = rnd % len(runnable) if runnable else 0
             for entry in runnable[turn:] + runnable[:turn]:
                 label = entry["label"]
+                if label in failed:
+                    continue
+                # No `--json`: see the counts gate above for why the timed run
+                # measures the task every port performs and not one port's
+                # report.
                 argv_run = entry["prefix"] + ["compare", str(a), str(b)] + KEY + \
-                    entry["flags"] + ["--json", str(summary)]
+                    entry["flags"]
                 seconds, rss, cpu, code, why, vm_data = run(argv_run, args.timeout,
                                                             args.memory_cap, errors)
                 if code not in (0, 1):
@@ -512,9 +552,6 @@ def main(argv: list[str]) -> int:
                     print(f"  {label:5s} FAILED (exit {code}){said}", flush=True)
                     failed.add(label)
                     continue
-                got = counts(summary)
-                answers.setdefault(f"{label}/{fmt}", got)
-                rows_seen[label] = got["a_rows"]
                 # The best run is the fastest one, and its CPU travels with it:
                 # pairing the fastest wall time with another run's CPU would
                 # make the utilisation a ratio of two different runs.
