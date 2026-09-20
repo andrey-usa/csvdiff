@@ -120,6 +120,66 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-20 (10M, before and after) — what the report was costing, on CI
+
+The change in the entry below, measured where it matters. Two dispatched 10M
+ladders, csv and parquet, scanner matrix on, three repeats — and **both landed
+on the same processor**, an EPYC 7763, so for once this is a before and an after
+and not two tables.
+
+| Build | Format | before (`--json` to every port) | after (the common task) | change |
+|---|---|---:|---:|---:|
+| **C++** | **csv** | **3.38s** | **2.87s** | **-15.1%** |
+| **C++** | **parquet** | **1.92s** | **1.76s** | **-8.3%** |
+| C | csv | 1.81s | 1.82s | +0.6% |
+| C | parquet | 1.26s | 1.31s | +4.0% |
+| Rust | csv | 2.06s | 2.07s | +0.5% |
+| Rust | parquet | 2.42s | 2.47s | +2.1% |
+| Zig | csv | 1.87s | 1.97s | +5.3% |
+| Zig | parquet | 2.41s | 2.42s | +0.4% |
+| C++ avx2 | csv | 3.34s | 2.87s | -14.1% |
+| Rust avx2 | csv | 2.07s | 2.08s | +0.5% |
+| Rust engine | csv | 1.61s | 1.67s | +3.7% |
+| Zig v32 | csv | 1.72s | 1.82s | +5.8% |
+
+**Only C++ moved.** Every other row is inside ±6%, which is what a best-of-three
+unpaired number does on one machine across two sittings — and is the reason this
+file says not to read a single such row as a result. The C++ rows are 15% and 8%,
+well outside it, and they are the only rows where the work changed.
+
+| | before | after |
+|---|---:|---:|
+| C++/C on csv | 1.87x | **1.58x** |
+| C++/C on parquet | 1.52x | **1.34x** |
+
+A third of the CSV gap above parity was the report, which is what the 4M
+measurement in the entry below predicted before the run was dispatched.
+
+C++'s CPU seconds fall 10.9 to 7.6, **-30%**, and its core utilisation with them,
+3.22x to 2.64x. That is the right direction and worth saying why: the work
+removed was the *parallel* B-side pass, so taking it away leaves a run that is
+less busy as well as shorter. Wall fell 15% while CPU fell 30%.
+
+### The AVX2 rung, answered
+
+`C++ avx2` csv is **2.87s** against plain `C++` at **2.87s**. Identical, on the
+clean task, on one machine, in one sitting.
+
+That settles a question this file has had two wrong answers to. The first read
+the old matrix rows (-1.7%, -4.4%, +2.8%, +2.0%) as a wash, which they could not
+establish — best-of-two unpaired cannot resolve anything under about 10%, as the
+methodology section says. The second, on finding the rung is worth 221M
+instructions (8.4%) and that C gets it automatically from `__AVX2__` where C++
+hides it behind a hand-set `CSVDIFF_SCAN_AVX2`, treated it as a live prospect.
+
+It is not. The instructions are real and the time is not, for the same reason
+`#105` cut 81M instructions from the JSON writer for no wall change: on the task
+both ports perform C++ already executes only 1.07x C's instructions while taking
+1.81x the wall. **The remaining gap is not instruction count**, and the rung
+stays off.
+
+---
+
 ## 2026-09-20 (four tasks) — the cross-port tables were never measuring one job
 
 Profiling C against C++ to find the CSV gap, the call counts came out equal in
