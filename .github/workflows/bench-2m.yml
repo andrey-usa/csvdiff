@@ -98,7 +98,7 @@ jobs:
       matrix:
         format: [csv, ndjson, parquet]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: What this runner is
         run: |
@@ -203,7 +203,7 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-2m-${{ matrix.format }}-${{ github.run_id }}

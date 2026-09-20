@@ -89,8 +89,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -102,7 +102,7 @@ jobs:
       # reader independently, so reconciling them is somebody's afternoon; that
       # is no reason to wait to find out which one is faster. Two trees, one
       # host, one sitting, one set of rows.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         if: env.ALL_PORTS == '1' && github.event.inputs.alt_ref != ''
         with:
           ref: ${{ github.event.inputs.alt_ref }}

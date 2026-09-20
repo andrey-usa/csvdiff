@@ -97,7 +97,7 @@ jobs:
         port: [c, cpp, rust, zig]
         size: ${{ fromJSON(needs.plan.outputs.sizes) }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The ladder needs every gigabyte: 60m rows of CSV is 22 GB for one pair,
       # and the runner ships with about 25 GB of toolchains this job never uses.
@@ -178,7 +178,7 @@ jobs:
             echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ceiling-${{ matrix.port }}-${{ matrix.size }}
@@ -193,7 +193,7 @@ jobs:
       matrix:
         port: [c, cpp, rust, zig]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Free disk space
         run: |
@@ -248,7 +248,7 @@ jobs:
               --size "${{ inputs.floor_size }}" \
               --out "out/floor-${{ matrix.port }}.json"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: floor-${{ matrix.port }}
@@ -260,8 +260,8 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: results
 
@@ -274,7 +274,7 @@ jobs:
               --out scale-report.md
           cat scale-report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: scale-report
           path: scale-report.md

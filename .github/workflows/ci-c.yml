@@ -45,11 +45,11 @@ jobs:
         # finding the port exists to show rather than an implementation detail.
         cc: [gcc, clang]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # Pinned so every workflow here runs the same interpreter; the runner's
       # own python3 drifts with the image. Keep this in step with the others:
       #   grep -rn python-version .github/workflows
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -138,8 +138,8 @@ jobs:
     name: against the other ports
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@stable
