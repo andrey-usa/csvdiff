@@ -120,6 +120,87 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
+
+The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242
+MB of Budget -- peak anonymous memory -- against C's 766 MB. That column is what
+`--memory-cap` bounds through `RLIMIT_DATA`, and it is what decides whether a 40m
+rung survives, so 476 MB of it is worth finding.
+
+Reproduced on a 4M pair: **C++ 384 MB against C's 276 MB.**
+
+### It is a spike, not a footprint
+
+Sampling `VmData` every 10 ms through the run:
+
+| | C | C++ |
+|---|---|---|
+| shape | climbs to 276 MB by t=0.28s, **flat for the rest** | **spikes to 384 MB** at t=0.28-0.56s, then **273 MB** |
+| steady state | 276 MB | 273 MB |
+
+The two ports end at the same footprint. Only the spike differed, and it sits
+exactly on the index insert.
+
+### The cause is which allocations are alive at once
+
+Both ports hold two copies of every row's start and hash for a while: the chunks
+the sweep filled and the flat arrays being filled from them. The note above this
+port's insert loop has always said so, and freed each chunk as it was taken so
+the mark would be *the flat arrays plus one chunk rather than plus all of them*.
+
+What it did not account for is what else is resident underneath that
+duplication. C++ allocated the table, `first_row_` and `occurrences_` **before**
+the transfer, so all three were alive through the whole of it -- 134 MB of table
+and 80 MB of the other two, a side, at ten million rows.
+
+C does it the other way round, and says so:
+
+    Copied chunk by chunk, and each chunk released as it is taken, so the
+    high-water mark is the flat arrays plus one chunk rather than plus all of
+    them.
+
+-- and then allocates the table *after* that loop has finished.
+
+### Ported
+
+The chunks are drained into `row_start_` and `row_hash_` and released first;
+only then is the table built, and `insert` now reads the row it is given from
+arrays already filled rather than pushing into them.
+
+| | RSS above the input | VmData |
+|---|---:|---:|
+| before | 366 MB | 384 MB |
+| **after** | **255 MB** | **275 MB** |
+| C | 249 MB | 276 MB |
+
+**-109 MB at 4M, and C++ now matches C to a megabyte.**
+
+This also retires the entry two above. The +147 MB of *above the input* that the
+`per_file` change showed on CI is more than reversed, and the reading there --
+that the extra was file-backed and reclaimable while anonymous fell -- was
+right about the mechanism and looking at a second, larger effect sitting beside
+it.
+
+### Time, for completeness
+
+Thirteen paired rounds, 4M CSV pair, `--threads 4`:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| counts only | 0.97s | 0.95s | 0.976 | 0.930-0.994 | 11/13 |
+| with `--json` | 1.54s | 1.51s | 0.967 | 0.943-1.047 | 8/13 |
+
+The first clears 1.00 and the second does not, so the honest summary is that the
+restructure costs no time and may save a little. It is a memory change; the
+clock is the control here, not the claim.
+
+Output byte-identical across ten case and option combinations, including the
+duplicate-key fixture -- the order rows enter the index is unchanged, chunks
+being concatenated in the same order they were before. cpp 36/36, cross-port
+89/89.
+
+---
+
 ## 2026-09-21 (sweep realloc) — a real cost with no room to pay it back
 
 The sweep is the widest remaining ratio against C, 1.28x, and one difference
