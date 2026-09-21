@@ -1768,7 +1768,29 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     };
 
     const std::vector<int>& a_keys = ai.first_rows();
-    unsigned join_ways = std::max(1u, budget > 1 ? budget - 1 : 1u);
+    // The whole budget, unless a B-side pass is going to run beside this one.
+    //
+    // `budget - 1` was unconditional, and with `--json` it is at least
+    // defensible: `b_side` runs concurrently and takes `b_ways` threads of its
+    // own, so the two together already oversubscribe the machine and holding one
+    // back trims it. Without `--json` there is no `b_side` at all -- it is gated
+    // on `row_lists` -- and the subtraction just left the join short of the
+    // machine for no one.
+    //
+    // At `--threads 2` that is the whole difference between a split join and a
+    // serial one, because `budget - 1` is 1. The phase is 56% of the wall, so
+    // the second thread bought nothing: measured, the run was **1.01x** of
+    // `--threads 1`, where C's second thread is worth 1.46x.
+    //
+    //     --threads   1       2       4
+    //     before      2.83s   2.79s   1.46s
+    //     after       2.81s   1.84s   1.31s
+    //
+    // The `--json` path keeps the old arithmetic. Whether `budget - 1` is the
+    // right reservation when `b_side` itself takes `b_ways` threads is a
+    // separate question this does not answer.
+    unsigned join_ways = opt.row_lists ? std::max(1u, budget > 1 ? budget - 1 : 1u)
+                                       : std::max(1u, budget);
     if (a_keys.size() < 1u << 14) join_ways = 1;  // too few keys to be worth splitting
     std::vector<Part> parts(join_ways);
     for (auto& part : parts) part.columns.resize(nc);

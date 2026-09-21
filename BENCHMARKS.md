@@ -120,6 +120,66 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-21 (join_ways) — the join reserved a thread for a pass that was not running
+
+With the report out of the timed path, C++ at `--threads 2` was **1.01x** of
+`--threads 1`. The second thread bought nothing at all. C's is worth 1.46x.
+
+| `--threads` | 1 | 2 | 4 |
+|---|---:|---:|---:|
+| C wall | 1.67s | 1.14s | 0.89s |
+| C speedup | — | **1.46x** | 1.89x |
+| C++ wall | 2.83s | **2.79s** | 1.46s |
+| C++ speedup | — | **1.01x** | 1.94x |
+
+`join_ways = budget - 1`, unconditionally. At a budget of two that is **one**, so
+the join -- 56% of the wall -- ran on a single core however many were free.
+
+The subtraction exists because `b_side` runs concurrently with the join. But
+`b_side` is gated on `row_lists`, which is false whenever `--json` was not given.
+The default invocation reserved a thread for a pass that was never going to
+start.
+
+    join_ways = row_lists ? max(1, budget - 1) : budget
+
+| `--threads` | 1 | 2 | 4 |
+|---|---:|---:|---:|
+| before | 2.83s | 2.79s | 1.46s |
+| after | 2.81s | **1.84s** | **1.31s** |
+| speedup 1→t, after | — | **1.53x** | 2.15x |
+
+Thirteen paired rounds, 4M CSV pair, `--threads 4`, summary identical between
+arms in both modes first:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| counts only | 1.48s | 1.28s | **0.861** | 0.843-0.882 | **13/13** |
+| with `--json` | 1.91s | 1.90s | 1.014 | 0.946-1.041 | 5/13 |
+
+**14% on the path the benchmark times.** CPU is 3.37s in both arms -- identical
+work, spread over more of the machine, which is what a scheduling fix looks like
+and what a work reduction does not. The `--json` row straddles 1.00 because that
+path's arithmetic is unchanged, which is the control this change happens to come
+with.
+
+Core utilisation at four threads goes 2.28x to 2.64x. C's is 3.06x, so this
+closes about half of what was left.
+
+### What this does not settle
+
+Whether `budget - 1` is right on the `--json` path either. `b_ways = join_ways`,
+so `b_side` does not take one thread, it takes as many as the join does: at four
+threads the two sides together ask for six. Subtracting one from the budget trims
+that by a sixth and no measurement here says it is the correct trim. The change
+leaves it exactly as it was and confines itself to the case where the second pass
+does not exist.
+
+A first draft of the comment on this line said the B-side pass takes one thread
+of the budget. It does not, and the line is worth reading twice before it is
+changed again.
+
+---
+
 ## 2026-09-20 (per_file) — the sweep was split two ways, which is the worst width available
 
 The sweep is the phase that does not scale, and the reason turned out to be the
