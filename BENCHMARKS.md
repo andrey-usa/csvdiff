@@ -120,6 +120,41 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-21 (sweep realloc) — a real cost with no room to pay it back
+
+The sweep is the widest remaining ratio against C, 1.28x, and one difference
+between the ports is how each accumulates what it finds. C's `chunk_push` grows
+with `realloc`, which the allocator can often extend in place. C++'s
+`std::vector::push_back` cannot: every growth allocates, copies and frees. At 4M
+rows a side that is roughly 128 MB of `memcpy` the C port does not do, and it
+would get worse with two chunks reallocating at once -- which matches the
+measurement that made the two-way split the worst width available.
+
+Bounded before building, per the rule in AGENTS.md, with a deliberately unsound
+build: an **oracle** reserve taken from a row count a real implementation would
+have to estimate.
+
+| | no reserve | oracle reserve | |
+|---|---:|---:|---|
+| sweep | 0.318s | 0.263s | **-17.3%** |
+| wall | 1.000s | 0.984s | **-1.5%** |
+
+The reasoning was right and the prize is not there. The reallocation genuinely
+costs 17% of the phase. The phase is a quarter of one side of a critical path
+that the join still dominates, so 17% of it is **1.5% of the run** -- below the
+3% floor this file gives the paired ratio, and that is the *ceiling*, measured
+with a row count no real implementation gets for free. Anything built here would
+capture less than a number already too small to report.
+
+Not built. Recorded because "reserve the sweep's vectors" is a reasonable idea
+that will occur to somebody else, and the useful part of this entry is that it
+has been priced: the cost is real, the room to recover it is not.
+
+Ten minutes of probing instead of a day of implementing, which is what that rule
+is for.
+
+---
+
 ## 2026-09-21 (slot tag) — C++ probed three cache lines deep to answer what one word can answer
 
 With the join's threading fixed, the phase comparison against C on the same 4M
