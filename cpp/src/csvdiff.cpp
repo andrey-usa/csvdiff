@@ -1080,6 +1080,35 @@ class RowIndex {
         for (const auto& c : chunks) total += c.starts.size();
         row_start_.reserve(total);
         row_hash_.reserve(total);
+
+        // The chunks are drained into the flat arrays and released *before* the
+        // table exists, which is the order the C port uses and the reason its
+        // high-water mark is lower.
+        //
+        // Both ports keep two copies of every row's start and hash for a while:
+        // the chunks the sweep filled and the arrays being filled from them.
+        // Releasing each chunk as it is taken means the high-water mark is the
+        // flat arrays plus one chunk rather than plus all of them, and the note
+        // below the loop has said so for a while. What it did not account for is
+        // *what else is alive at the same time*: the table, `first_row_` and
+        // `occurrences_` were allocated first and so were resident through the
+        // whole transfer. At ten million rows that is 134 MB of table and 80 MB
+        // of the other two, a side, sitting under the duplication instead of
+        // after it.
+        //
+        // Measured on a 4M pair, the anonymous high-water mark is a transient:
+        // this port peaked at 384 MB a third of the way in and settled at 273
+        // MB, where C stayed flat at 276 MB throughout. The steady states match;
+        // only the spike did not.
+        for (auto& c : chunks) {
+            row_start_.insert(row_start_.end(), c.starts.begin(), c.starts.end());
+            row_hash_.insert(row_hash_.end(), c.hashes.begin(), c.hashes.end());
+            std::vector<std::size_t>().swap(c.starts);
+            std::vector<std::uint64_t>().swap(c.hashes);
+        }
+        std::vector<Chunk>().swap(chunks);
+        rows_ = static_cast<std::int64_t>(total);
+
         // Sized once, from a row count the sweep has already produced. Growing
         // into it instead costs a rehash per doubling -- thirteen of them at ten
         // million rows, each one a full pass of random probes over a table far
@@ -1130,15 +1159,10 @@ class RowIndex {
         // counts gated: csv 0.947 at four threads (middle half 0.929-0.975) and
         // 0.986 at one (0.953-0.999); ndjson 0.975 at four (0.965-0.984, faster
         // in all eleven) and 0.989 at one, which crosses one and is not claimed.
-        for (auto& c : chunks) {
-            const std::size_t n = c.starts.size();
-            for (std::size_t i = 0; i < n; ++i) {
-                if (i + kInsertPrefetch < n)
-                    __builtin_prefetch(&table_[slot_of(c.hashes[i + kInsertPrefetch])], 1, 0);
-                insert(c.starts[i], c.hashes[i]);
-            }
-            std::vector<std::size_t>().swap(c.starts);
-            std::vector<std::uint64_t>().swap(c.hashes);
+        for (std::size_t i = 0; i < total; ++i) {
+            if (i + kInsertPrefetch < total)
+                __builtin_prefetch(&table_[slot_of(row_hash_[i + kInsertPrefetch])], 1, 0);
+            insert(static_cast<int>(i));
         }
     }
 
@@ -1342,11 +1366,11 @@ class RowIndex {
         }
     }
 
-    void insert(std::size_t start, std::uint64_t hash) {
-        ++rows_;
-        const int row = static_cast<int>(row_start_.size());
-        row_start_.push_back(start);
-        row_hash_.push_back(hash);
+    // `row` indexes `row_start_` and `row_hash_`, which the transfer above has
+    // already filled: this adds the row to the table and nothing else.
+    void insert(int row) {
+        const std::size_t start = row_start_[static_cast<std::size_t>(row)];
+        const std::uint64_t hash = row_hash_[static_cast<std::size_t>(row)];
 
         std::size_t slot = slot_of(hash);
         // Two buffers, both only touched here, and only on the one thread that
