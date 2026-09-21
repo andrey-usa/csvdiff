@@ -120,6 +120,78 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-21 (slot tag) — C++ probed three cache lines deep to answer what one word can answer
+
+With the join's threading fixed, the phase comparison against C on the same 4M
+pair at four threads read:
+
+| phase | C | C++ | ratio |
+|---|---:|---:|---:|
+| sweep, per side | 0.209s | 0.302s | 1.35x |
+| **index insert, per side** | **0.128s** | **0.301s** | **2.25x** |
+| **join and compare** | **0.357s** | **0.689s** | **1.93x** |
+| wall | 0.901s | 1.325s | 1.47x |
+
+Both of the wide ratios probe the same open-addressed table, which was the hint.
+
+### What C does and this port did not
+
+C's slot is a `uint32_t` carrying a key index in its low bits and the top bits of
+that key's hash above it. A probe that lands on the wrong key is rejected by the
+word it has already loaded. The comment beside it has been there all along:
+
+    Without it, rejecting a collision costs two more dependent loads --
+    `first_row[at]`, then `row_hash[candidate]` -- each a miss on an array far
+    too big to cache, and each waiting on the one before it.
+
+That is exactly what this port was doing, in `insert` and in `lookup` both:
+
+    at        = table_[slot]          // miss
+    candidate = first_row_[at]        // miss, waiting on the first
+    row_hash_[candidate]              // miss, waiting on the second
+
+Three dependent cache misses to reject a key, where one word decides it.
+
+### Ported
+
+The slot width is chosen from the row count rather than fixed, so the slot stays
+four bytes and the table stays the size it was -- at ten million rows the index
+needs 24 bits and the tag gets the other 8. A tag that runs out of bits degrades
+to **no tag, not to a wrong answer**, because the key comparison behind it is
+unchanged. `rehash()` recomputes the width and repacks, since a table that
+doubled is one expecting more keys.
+
+| phase | before | after | |
+|---|---:|---:|---|
+| index insert | 0.296s | **0.218s** | -26% |
+| join and compare | 0.670s | **0.478s** | -29% |
+| wall | 1.281s | **1.050s** | -18% |
+
+Thirteen paired rounds, 4M CSV pair, `--threads 4`, summary identical between
+arms in both modes first:
+
+| | base | new | paired median | middle half | faster in |
+|---|---:|---:|---|---|---|
+| counts only | 1.33s | 1.01s | **0.762** | 0.748-0.789 | **13/13** |
+| with `--json` | 1.97s | 1.52s | **0.779** | 0.744-0.818 | **13/13** |
+
+**Both modes, every round.** CPU falls 3.51s to 2.85s and 5.32s to 4.11s, so this
+is less work and not only a better spread of it -- which is what removing two
+dependent misses per collision should look like, and is the check that it is not
+a scheduling accident.
+
+Against C on the same pair, C++ goes from **1.47x** to **1.17x** of its wall.
+
+### Verified beyond the clock
+
+The counts gate is load-bearing here rather than a formality: a tag that rejected
+a key it should have kept would change `matched` and `dup keys`, and all four
+ports agree on both. cpp 36/36, cross-port 89/89. The `--json` payload is
+byte-identical to the previous build across eight case and option combinations,
+including the duplicate-key fixture.
+
+---
+
 ## 2026-09-21 (join_ways) — the join reserved a thread for a pass that was not running
 
 With the report out of the timed path, C++ at `--threads 2` was **1.01x** of

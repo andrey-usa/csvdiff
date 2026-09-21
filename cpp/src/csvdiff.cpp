@@ -1041,6 +1041,7 @@ class RowIndex {
         // file returns before that and needs a valid mask.
         table_.assign(1 << 12, kEmpty);
         mask_ = table_.size() - 1;
+        size_slots(table_.size());
         scratch_.assign(parser.width() * 2, kAbsent);  // probe, then this row's key
 
         const std::string_view d = slab.bytes();
@@ -1088,6 +1089,7 @@ class RowIndex {
         while (cap < total * 2 + 16) cap <<= 1;
         table_.assign(cap, kEmpty);
         mask_ = cap - 1;
+        size_slots(cap);
         first_row_.reserve(total);
         occurrences_.reserve(total);
         struct AtExit {
@@ -1166,9 +1168,15 @@ class RowIndex {
     int lookup(const Slab& other, const Field* fields, std::uint64_t hash, Field* probe) const {
         std::size_t slot = slot_of(hash);
         for (;;) {
-            const int at = table_[slot];
-            if (at == kEmpty) return -1;
-            const int candidate = first_row_[at];
+            const std::uint32_t v = table_[slot];
+            if (v == kEmpty) return -1;
+            // The tag rejects a foreign key from this word alone; only a tag
+            // that matches is worth two more misses to disprove.
+            if (!slot_tag_is(v, hash)) {
+                slot = (slot + 1) & mask_;
+                continue;
+            }
+            const int candidate = first_row_[slot_pos(v)];
             if (row_hash_[candidate] == hash) {
                 keys_of(candidate, probe);
                 bool ok = true;
@@ -1191,7 +1199,29 @@ class RowIndex {
     std::int64_t dup_rows() const { return dup_rows_; }
 
   private:
-    static constexpr int kEmpty = -1;
+    static constexpr std::uint32_t kEmpty = 0;
+
+    // `pos + 1` so that a packed slot is never zero, which is what marks empty.
+    void size_slots(std::size_t keys) {
+        pos_bits_ = 1;
+        while (pos_bits_ < 32 && (keys + 1) > ((std::size_t{1} << pos_bits_) - 1)) ++pos_bits_;
+        pos_mask_ = pos_bits_ >= 32 ? 0xFFFFFFFFu
+                                    : static_cast<std::uint32_t>((1u << pos_bits_) - 1);
+    }
+    std::uint32_t slot_pack(std::uint64_t hash, std::size_t pos) const {
+        const unsigned tag_bits = 32u - pos_bits_;
+        const std::uint32_t tag =
+            tag_bits ? static_cast<std::uint32_t>(hash >> (64u - tag_bits)) : 0u;
+        return (tag << pos_bits_) | static_cast<std::uint32_t>(pos + 1);
+    }
+    bool slot_tag_is(std::uint32_t v, std::uint64_t hash) const {
+        const unsigned tag_bits = 32u - pos_bits_;
+        if (!tag_bits) return true;
+        return (v >> pos_bits_) == static_cast<std::uint32_t>(hash >> (64u - tag_bits));
+    }
+    std::size_t slot_pos(std::uint32_t v) const {
+        return static_cast<std::size_t>(v & pos_mask_) - 1;
+    }
 
     // One chunk's rows, in the order they appear in it.
     struct Chunk {
@@ -1327,14 +1357,21 @@ class RowIndex {
         Field* mine = scratch_.data() + parser_.width();
         bool mine_parsed = false;
         for (;;) {
-            const int at = table_[slot];
-            if (at == kEmpty) {
-                table_[slot] = static_cast<int>(first_row_.size());
+            const std::uint32_t v = table_[slot];
+            if (v == kEmpty) {
+                table_[slot] = slot_pack(hash, first_row_.size());
                 first_row_.push_back(row);
                 occurrences_.push_back(1);
                 if (first_row_.size() * 2 > table_.size()) rehash();
                 return;
             }
+            // As in `lookup`: one word decides, or it does not and the two
+            // misses behind it are earned.
+            if (!slot_tag_is(v, hash)) {
+                slot = (slot + 1) & mask_;
+                continue;
+            }
+            const std::size_t at = slot_pos(v);
             const int candidate = first_row_[at];
             if (row_hash_[candidate] == hash) {
                 if (!mine_parsed) {
@@ -1367,10 +1404,15 @@ class RowIndex {
     void rehash() {
         table_.assign(table_.size() * 2, kEmpty);
         mask_ = table_.size() - 1;
+        // The slot width is a property of how many keys there are, so it is
+        // recomputed here rather than carried over: a table that doubled is a
+        // table that expects more of them.
+        size_slots(table_.size());
         for (std::size_t key = 0; key < first_row_.size(); ++key) {
-            std::size_t slot = slot_of(row_hash_[first_row_[key]]);
+            const std::uint64_t h = row_hash_[static_cast<std::size_t>(first_row_[key])];
+            std::size_t slot = slot_of(h);
             while (table_[slot] != kEmpty) slot = (slot + 1) & mask_;
-            table_[slot] = static_cast<int>(key);
+            table_[slot] = slot_pack(h, key);
         }
     }
 
@@ -1380,7 +1422,24 @@ class RowIndex {
     const Options& opt_;
     std::vector<std::size_t> row_start_;
     std::vector<std::uint64_t> row_hash_;
-    std::vector<int> table_;
+    // A slot is empty (0) or holds a key index in its low `pos_bits_` with the
+    // top bits of that key's hash above it, so a probe that lands on the wrong
+    // key is rejected by the word it has already loaded.
+    //
+    // Without it, rejecting a collision costs two more dependent loads --
+    // `first_row_[at]`, then `row_hash_[candidate]` -- each a miss on an array
+    // far too big to cache, and each waiting on the one before it. The C port
+    // has had this since its own insert was the slow one; this port was probing
+    // three cache lines deep to answer what one word can answer.
+    //
+    // The width is chosen from the row count rather than fixed, so the slot
+    // stays four bytes and the table stays the size it was: at ten million rows
+    // the index needs 24 bits and the tag gets the other 8. A tag that runs out
+    // of bits degrades to no tag, not to a wrong answer, because the key
+    // comparison behind it is unchanged.
+    std::vector<std::uint32_t> table_;
+    unsigned pos_bits_ = 32;
+    std::uint32_t pos_mask_ = 0xFFFFFFFFu;
     std::size_t mask_ = 0;
     std::vector<int> first_row_;
     std::vector<std::uint32_t> occurrences_;
