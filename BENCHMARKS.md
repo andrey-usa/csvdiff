@@ -120,6 +120,86 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-22 (summary only) — the same fault as #106, on the other side
+
+#106 found the cross-port tables timing four different tasks, because only the
+C++ port emitted row samples and every harness passed `--json` to all four. The
+fix was to stop passing it. The same fault was sitting on the other side of the
+table the whole time, and it is bigger.
+
+**The Rust port writes a report whether or not one is asked for.** Its `--out`
+defaults to `<a>__vs__<b>.html`; C, C++ and Zig write nothing without an output
+flag. Run the ladder's exact invocation in an empty directory:
+
+    C     compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    C++   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    Rust  compare a.csv b.csv -k account_id,txn_id  ->  a__vs__b.html
+    Zig   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+
+`ports()` knew about it and half-fixed it: `report = ["-o", "/dev/null"]`. That
+moves the *write*. The render still ran, the gzip still ran, and so did
+everything the engine does to feed them — up to `--max-rows` rows per section
+decoded into `String`s, sorted and cell-diffed, plus a walk of every duplicated
+key to build that section.
+
+### What it costs
+
+`--summary` turns all of it off: the CLI writes nothing and `opt.row_lists`
+tells the engine not to build what it would have written. Measured on this host
+(4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, against the unmodified binary:
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 4M CSV, 20 columns | **1.31x** 1.28-1.34 | **1.18x** 1.16-1.19 |
+| 2M Parquet, 20 columns | **1.27x** 1.24-1.29 | **1.11x** 1.09-1.12 |
+
+Counts are identical with and without, which is the thing that had to hold: a
+section records how many rows it dropped, so the totals never depended on any of
+them being kept.
+
+### The project already had the evidence
+
+`--matrix` carried a `Rust engine` row — the same binary with `--max-rows 1` —
+and the entry at 2026-09-19 says of it, in as many words:
+
+> **Rust engine is first on csv at both sizes** -- 1.67s at 10m and 3.22s at 20m
+
+That row existed *because* someone noticed the report was in the number. It was
+in the matrix, behind a flag, while the published table kept charging it. With
+`--summary` on the main row the two measure the same thing, so the extra row is
+gone — for the reason `ports()` already gives about `csvdiff-swar`, which was
+"the same binary under a second name".
+
+### A measurement that lied, and why
+
+The first paired run of this used two one-line `bash` wrappers around one binary
+— one appending `--summary`, one not — because that is the quick way to A/B a
+flag. It reported **1.08x [1.05-1.13]** where the binary-against-binary probe
+had said 1.28x, and the `--summary` arm was bimodal: best 1.092s against a
+median of 1.289s. Timing the same two invocations directly, alternating, gave a
+flat 1400ms against 1130ms every round. The wrappers were the artifact. Building
+a second binary and comparing binaries — which is what `bench_ab.sh` is for —
+put it back at 1.31x. **Do not put a shell script between this harness and the
+thing being measured.**
+
+### What changed
+
+* `--summary` on the Rust CLI: prints the counts line and writes nothing. It
+  refuses `--out`, `--json` and `--export-dir` rather than picking a winner,
+  because guessing which was meant is how a report silently stops appearing.
+* `Options::row_lists`, defaulting to `true`, so a library caller asking for a
+  `Diff` still gets its rows. Both engines honour it, `turbo` and `pqdiff`.
+* Every port-comparison script trades `-o /dev/null` for `--summary`;
+  `gate_flags` puts the report back for the counts gate, which needs the JSON
+  document and is not timed. `report_cost.py` keeps `-o /dev/null`, since
+  pricing the report is what it is for.
+
+Every Rust row in RESULTS.md was measured the old way and is an upper bound
+until the ladder runs again.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242

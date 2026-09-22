@@ -143,6 +143,15 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
   feature. That was a third of the published CSV gap. Timed runs no longer pass `--json`; the gate
   gets its own untimed run. `scripts/report_cost.py` prints what each port's document *contains*
   before what it costs, because the shape is the reason for the cost.
+- **Run the invocation in an empty directory and look at what appears.** The same fault was on the
+  other side of the table for another week: the Rust port defaults `--out` to
+  `<a>__vs__<b>.html`, so the ladder's flagless invocation had it rendering, gzipping and writing a
+  report the other three never built. `-o /dev/null` was already there and only moved the write.
+  It is 1.31x wall on a 4M pair. Ports are compared with `--summary` now; `gate_flags` hands the
+  report back to the untimed counts gate.
+- **Never put a shell wrapper between `bench_ab.sh` and the binary.** Two one-line `bash` scripts
+  around one binary, differing only in a flag, reported 1.08x where the binary-against-binary
+  measurement said 1.31x, with one arm bimodal. Build the second binary.
 - **Rounds scale with how short the run is.** *No result* at nine rounds has become 1.29x at
   twenty-five.
 - **Peak RSS is not the memory answer for anything that maps its input.** `scripts/memory_floor.sh`

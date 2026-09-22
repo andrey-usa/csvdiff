@@ -1124,6 +1124,11 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             .collect()
     };
 
+    // Nothing is decoded when the caller asked for no rows. The counts above are
+    // already final -- `changed_total` is the population count of the mismatch
+    // mask, not the length of anything kept -- so this only drops what a report
+    // would have shown.
+    let keep: &[usize] = if opt.row_lists { &keep } else { &[] };
     let mut rows: Vec<(Vec<Val>, Vec<CellDiff>)> = keep
         .iter()
         .map(|&p| (key_values(&a_keys, pair_a[p]), Vec::new()))
@@ -1163,14 +1168,18 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         }
         out
     };
-    let mut added_rows: Vec<Vec<Val>> = added
-        .held
+    const NONE: &[i32] = &[];
+    let (keep_added, keep_removed) = if opt.row_lists {
+        (added.held.as_slice(), removed.held.as_slice())
+    } else {
+        (NONE, NONE)
+    };
+    let mut added_rows: Vec<Vec<Val>> = keep_added
         .iter()
         .enumerate()
         .map(|(i, &r)| full_row(&b_keys, r, i, true))
         .collect();
-    let mut removed_rows: Vec<Vec<Val>> = removed
-        .held
+    let mut removed_rows: Vec<Vec<Val>> = keep_removed
         .iter()
         .enumerate()
         .map(|(i, &r)| full_row(&a_keys, r, i, false))
@@ -1209,8 +1218,16 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
             truncated: total > cap,
         }
     };
-    let dup_a = dup_section(&a_keys, &ai);
-    let dup_b = dup_section(&b_keys, &bi);
+    let empty_dups = || {
+        let mut cols_out = opt.key.clone();
+        cols_out.push("count".to_string());
+        Section::capped(cols_out, Vec::new(), cap)
+    };
+    let (dup_a, dup_b) = if opt.row_lists {
+        (dup_section(&a_keys, &ai), dup_section(&b_keys, &bi))
+    } else {
+        (empty_dups(), empty_dups())
+    };
 
     let matched = npairs as i64;
     let counts = Counts {
