@@ -176,6 +176,25 @@ Exactly nothing at one thread, and the whole of it at four. That is the
 signature, and without it "padding made it faster" would have been a result
 without a reason.
 
+### On two different processors, which was not on purpose
+
+The container was replaced part-way through this work and came back on a
+different CPU -- a 2.80GHz Xeon where the numbers above were taken on a 2.10GHz
+one. Everything was rebuilt and re-measured there, which by the rule at the top
+of this file is a second table and not a continuation of the first:
+
+| | 2.10GHz Xeon | 2.80GHz Xeon |
+|---|---|---|
+| whole run, wall | 1.35x [1.26-1.47] | 1.22x [1.14-1.33] |
+| whole run, CPU | 1.36x [1.26-1.39] | 1.22x [1.15-1.32] |
+| join at 1 thread | 0.987x [0.933-1.041] | 0.982x [0.928-1.044] |
+| join at 4 threads | 1.210x [1.136-1.344] | 1.282x [1.069-1.333] |
+| the floor, one build against itself | 0.99x [0.92-1.07] | 1.02x [0.96-1.09] |
+
+Different sizes, same shape, and the one-thread control is nothing on both. Two
+machines agreeing on a mechanism is worth more than either agreeing with itself,
+and it was an accident.
+
 ### It is not a general truth about the design
 
 Both sibling ports have the same shape and neither wants the fix:
