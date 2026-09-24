@@ -120,6 +120,49 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (parallel insert) — deterministic, and it does not pay
+
+Every port builds its index the same way: find and hash the rows on every core,
+then insert them on one. The C port says why in as many words -- *"first
+occurrence wins, and which occurrence is first depends on the order rows arrive,
+so threading it would make the answer depend on the scheduler"* -- and every
+other port repeats it. The phase is a third of the run, so "insert on one core"
+is the largest deliberate serialisation in this project, and it has never been
+priced.
+
+**The determinism objection is answerable.** Partition the rows by `hash & (P-1)`
+and every occurrence of a key lands in the same partition, so first-occurrence
+still wins and file order still decides it: P sub-tables, built in parallel,
+give the same answer as one table built serially. A lookup then picks its
+sub-table from the same bits.
+
+Priced with a probe that builds the sub-tables beside the real index and drops
+them -- nothing downstream sees them -- on the 4M CSV pair at four threads,
+which is two per file:
+
+| | serial | partitioned |
+|---|---:|---:|
+| partition pass | -- | 0.05s |
+| insert | 0.24s | 0.15s |
+| **total** | **0.24s** | **0.20s** |
+
+The insert itself does parallelise -- 0.24s to 0.15s on two ways -- and the pass
+that makes it possible costs most of what that saves. At four ways on a quiet
+machine the ceiling is about 0.17s against 0.24s, which is 0.07s of a 0.62s run:
+**11%, before paying for anything.**
+
+And the thing it would have to pay for is not in the table. Every lookup on the
+join's hot path would gain a sub-table selection -- one more dependent load
+before the probe that is already the port's worst cache miss. That cost is on
+the phase this project has spent the most effort on, and 11% is not enough
+headroom to go looking for it.
+
+Not built. Recorded because the comment in four ports says the insert *cannot*
+be threaded, and that is not true -- it can, deterministically, and it is not
+worth it. Those are different reasons and the second one is the real one.
+
+---
+
 ## 2026-09-24 (parquet join) — the Rust port walked B for a sample nobody asked for
 
 Parquet is the widest ratio in the published tables and nobody had looked at it:
