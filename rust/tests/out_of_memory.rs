@@ -220,13 +220,18 @@ fn the_same_files_compare_when_the_budget_is_enough() {
 /// the band down with it past caps this test samples, and *widened* it from
 /// three rungs to six. The suite stayed green.
 ///
-/// So this scans, and it is a ratchet rather than a guarantee. The guarantee
-/// cannot be made for a run that renders: the report goes through `serde_json`
-/// and the gzip encoder, neither of which has a fallible allocation path this
-/// port can reach. Everything the port allocates itself is checked -- the
-/// index, the sections, the rows, and every `String` in them -- which is what
-/// took this from three rungs to two. The two that remain are third-party, and
-/// this test's job is to notice the day there are three.
+/// So this scans, and it is a ratchet rather than a guarantee. Everything the
+/// port allocates itself is checked -- the index, the sections, the rows, every
+/// `String` in them, and the buffers the JSON, the gzip stream and the base64
+/// are written into. What is left is inside `serde_json` and the compressor
+/// themselves, and at the one cap where the process is a single allocation from
+/// its ceiling it is a coin flip which allocation is the one that fails: the
+/// port's own, which refuses, or theirs, which cannot. Repeating the scan gives
+/// one or two rungs and never the same one twice in a row.
+///
+/// So the number below is the count of rungs that have *ever* aborted across
+/// repeats, not a per-run count, and this test's job is to notice the day there
+/// are three.
 #[test]
 fn the_band_where_it_aborts_does_not_grow() {
     // What the port allocates itself is checked, so an abort in this range is
