@@ -120,6 +120,77 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (false sharing) — the C port's threads were fighting over two cache lines
+
+The C join scaled to **2.8x** on four cores. The Rust port does the same work in
+the same time on one core -- 1.26s against 1.33s serial -- and reaches **3.9x**.
+Same machine, same pair, same afternoon.
+
+### The obvious cause, priced and rejected
+
+C cuts the join into one range per thread; Rust pulls sixty-one chunks from a
+queue, and its comment says why: a chunk that turns out expensive should delay
+one worker rather than three. So the queue was built for C first.
+
+| | speedup |
+|---|---:|
+| one range per thread | 2.80x |
+| sixty-one chunks from a queue | 2.76x |
+
+**Nothing.** Imbalance was not it.
+
+### What it was
+
+`CmpPart` is one per thread in a single `calloc`ed array, about ninety bytes
+apart. Two of them share a cache line, so `out->matched++` on one thread dirties
+the line another thread is incrementing its own counters in, and the line moves
+between cores. Four million rows of that shows up as nothing in particular and
+everything in the scaling.
+
+`Chunk` has it worse: one per sweep thread, forty bytes apart, and `chunk_push`
+touches `n`, `cap` and both pointers on *every row*.
+
+Both padded to a cache line, on the 4M CSV pair, phases alternating and paired
+per run:
+
+| | before | after | paired [mid half] |
+|---|---:|---:|---|
+| join | 0.485s | 0.352s | **1.384x** [1.260-1.448] |
+| sweep | 0.218s | 0.152s | **1.354x** [1.322-1.676] |
+| whole run, wall | 1.075s | 0.772s | **1.35x** [1.26-1.47] |
+| whole run, CPU | 3.09s | 2.32s | **1.36x** [1.26-1.39] |
+
+The join's speedup goes 2.80x to 3.91x, which is Rust's 3.85x.
+
+### The check that makes it a diagnosis rather than a number
+
+False sharing costs nothing when there is nothing to share. So the same pair of
+builds, on the same join, at one thread and at four:
+
+| threads | paired [mid half] |
+|---|---|
+| 1 | **0.987x** [0.933-1.041] |
+| 4 | **1.210x** [1.136-1.344] |
+
+Exactly nothing at one thread, and the whole of it at four. That is the
+signature, and without it "padding made it faster" would have been a result
+without a reason.
+
+### It is not a general truth about the design
+
+The Zig port has the same shape -- one `Chunk` per sweep thread in one
+`gpa.alloc` array, fifty-six bytes apart, `at.append` on every row -- and
+padding it measures **0.966x [0.948-1.138]**, which is no result. Whatever
+Zig's `ArrayList.append` compiles to, it is not reloading the length from the
+struct on every row the way a call through a pointer to `chunk_push` must.
+
+The phase floor on this host, one build against itself by the same alternating
+method, is 0.99x [0.91-1.12]. Every number kept above is clear of it; the two
+that are not -- the queue, and the Zig padding -- are reported as no result and
+not built.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242
