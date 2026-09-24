@@ -178,11 +178,20 @@ without a reason.
 
 ### It is not a general truth about the design
 
-The Zig port has the same shape -- one `Chunk` per sweep thread in one
-`gpa.alloc` array, fifty-six bytes apart, `at.append` on every row -- and
-padding it measures **0.966x [0.948-1.138]**, which is no result. Whatever
-Zig's `ArrayList.append` compiles to, it is not reloading the length from the
-struct on every row the way a call through a pointer to `chunk_push` must.
+Both sibling ports have the same shape and neither wants the fix:
+
+| port | the same padding |
+|---|---|
+| Zig -- one `Chunk` per sweep thread in a `gpa.alloc` array, `at.append` per row | **0.966x** [0.948-1.138] -- no result |
+| C++ -- `std::vector<Chunk>` and `std::vector<Part>`, `push_back` and `matched++` per row | **0.95x** [0.93-0.99] -- slower, and inside the floor |
+
+So this is not "per-thread accumulators must be padded". It is about what the
+per-row update compiles to. `chunk_push` is a call through a pointer and has to
+reload `n` and `cap` from the struct every row; `ArrayList.append` and
+`std::vector::push_back` are fully visible to the optimiser, which keeps them in
+registers across the loop and touches the struct only when it grows. The line
+that moves between cores in the C port is barely read in the other two, and
+padding there only adds sixty-four bytes of footprint per chunk.
 
 The phase floor on this host, one build against itself by the same alternating
 method, is 0.99x [0.91-1.12]. Every number kept above is clear of it; the two
