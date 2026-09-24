@@ -204,8 +204,15 @@ Both sibling ports have the same shape and neither wants the fix:
 | Zig -- one `Chunk` per sweep thread in a `gpa.alloc` array, `at.append` per row | **0.966x** [0.948-1.138] -- no result |
 | C++ -- `std::vector<Chunk>` and `std::vector<Part>`, `push_back` and `matched++` per row | **0.95x** [0.93-0.99] -- slower, and inside the floor |
 
+The same is true of C's own Parquet path: `Part` there is one per join thread in
+a `calloc`ed array, forty bytes apart, and `join_part` writes `pa[n++]` for every
+key it matches. Padded, the join phase measures 1.082x [1.000-1.230] and the
+whole run 1.00x [0.95-1.02] -- no result, so it is not in this change either.
+That path's join is a tenth of a second of a third of a second, and an integer
+compare per key rather than a row parse.
+
 So this is not "per-thread accumulators must be padded". It is about what the
-per-row update compiles to. `chunk_push` is a call through a pointer and has to
+per-row update compiles to, and about how much of the run is spent doing it. `chunk_push` is a call through a pointer and has to
 reload `n` and `cap` from the struct every row; `ArrayList.append` and
 `std::vector::push_back` are fully visible to the optimiser, which keeps them in
 registers across the loop and touches the struct only when it grows. The line
