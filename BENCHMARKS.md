@@ -161,6 +161,12 @@ paired per round, on this host (4 vCPU Xeon @ 2.10GHz):
 The match sweep itself goes **0.108s to 0.050s**, against C's 0.047s. The second
 pair is the bigger win because the skipped pass is over twice as many keys.
 
+`bench_ab.sh --self-test` on the same pair and the same fifteen rounds puts this
+host's floor at 0.99x [0.92-1.04]. Both rows above sit clear of it -- the 2M
+pair's middle half starts at 1.09, above the floor's own upper bound -- which is
+worth stating because on the same afternoon this machine could not resolve an
+8% question at all (see the zig scan-width entry).
+
 Counts are identical, which is the thing that had to hold, and the case that
 tests it is two files of different sizes with duplicate keys on both sides:
 1,001,000 added rows derived rather than counted, and the same number either
