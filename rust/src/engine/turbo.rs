@@ -484,60 +484,76 @@ impl RowIndex {
         while cap * 2 < total * 3 + 16 {
             cap <<= 1;
         }
+        // The chunks are drained into the flat arrays and released *before* the
+        // table exists.
+        //
+        // Releasing each chunk as it is inserted -- which the loop below this
+        // used to do -- keeps two copies of every row's address and hash alive
+        // for only as long as one chunk, and the note that said so was right as
+        // far as it went. What it left out is what is resident *underneath*
+        // that duplication: `table`, `first_row` and `occurrences` were built
+        // in the struct literal below and so were alive through the whole
+        // transfer.
+        //
+        // Measured on an 8M pair, peak anonymous memory, this hump alone
+        // (`--summary`, so the report path cannot mask it): 885 MB before, 634
+        // MB after. On a default run the report path is then the higher hump
+        // and the run shows 885 -> 801. At 4M it shows nothing at all -- the
+        // hump is 445 -> 320 and the run is 469 either way. It is worth having
+        // because this hump grows with the row count and the report path does
+        // not: `--max-rows` caps that one, so this is the term that decides
+        // whether a large rung fits.
+        //
+        // C and C++ both allocate their tables after the transfer, and the C
+        // port has always said so; C++ was changed to match in #116.
+        let mut row_at: Vec<u64> = alloc::sized(total, "one offset per row")?;
+        let mut row_hash: Vec<u64> = alloc::sized(total, "one hash per row")?;
+        for chunk in &mut chunks {
+            row_at.extend_from_slice(&chunk.at);
+            row_hash.extend_from_slice(&chunk.hash);
+            chunk.at = Vec::new();
+            chunk.hash = Vec::new();
+        }
+        drop(chunks);
+
         let mut idx = RowIndex {
-            row_at: alloc::sized(total, "one offset per row")?,
-            row_hash: alloc::sized(total, "one hash per row")?,
+            row_at,
+            row_hash,
             table: empty_table(cap)?,
             mask: cap - 1,
             first_row: alloc::sized(total, "one row per distinct key")?,
             occurrences: alloc::sized(total, "one count per distinct key")?,
-            rows: 0,
+            rows: total as i64,
             dup_keys: 0,
             dup_rows: 0,
         };
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
-        // Each chunk is released as soon as it has been inserted. Holding all of
-        // them to the end would keep two copies of every row's address and hash
-        // alive at once, which is sixteen bytes a row of pure duplication —
-        // 320 MB at ten million rows across both files.
-        for chunk in &mut chunks {
-            for i in 0..chunk.at.len() {
-                if let Some(&soon) = chunk.hash.get(i + PREFETCH_AHEAD) {
-                    idx.prefetch(soon);
-                }
-                idx.insert(
-                    side,
-                    chunk.at[i],
-                    chunk.hash[i],
-                    key_size,
-                    opt,
-                    &mut probe,
-                    &mut mine,
-                )?;
+        for i in 0..total {
+            if let Some(&soon) = idx.row_hash.get(i + PREFETCH_AHEAD) {
+                idx.prefetch(soon);
             }
-            chunk.at = Vec::new();
-            chunk.hash = Vec::new();
+            idx.insert(side, i, key_size, opt, &mut probe, &mut mine)?;
         }
         phases.mark("index insert (serial)");
         Ok(idx)
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `row` indexes `row_at` and `row_hash`, which `build` has already filled:
+    /// this adds the row to the table and nothing else.
     fn insert(
         &mut self,
         side: &Side,
-        at: u64,
-        hash: u64,
+        row: usize,
         key_size: usize,
         opt: &Options,
         probe: &mut [Field],
         mine: &mut [Field],
     ) -> Result<()> {
-        self.rows += 1;
-        let row = self.row_at.len() as i32;
-        self.row_at.push(at);
-        self.row_hash.push(hash);
+        let at = self.row_at[row];
+        let hash = self.row_hash[row];
+        let row = row as i32;
 
         let mut slot = self.slot(hash);
         let mut mine_parsed = false;
