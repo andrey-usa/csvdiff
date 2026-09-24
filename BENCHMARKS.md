@@ -120,6 +120,72 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (zig scan width) — the phase got faster and the run did not
+
+With the Rust port's measurement corrected, the 4M CSV table on this host reads:
+
+| Port | Best | Median | CPU |
+|---|---:|---:|---:|
+| Rust | 0.62s | 0.63s | 1.9s |
+| C | 0.66s | 0.72s | 2.1s |
+| C++ | 0.67s | 0.71s | 1.8s |
+| **Zig** | **0.92s** | **0.96s** | **3.0s** |
+
+Zig is the outlier and the port nobody has examined. Its phases say where: the
+sweep is 0.41s a side against C's 0.20s, and everything else is within noise.
+That is the whole of the 0.9s of extra CPU.
+
+Zig's scan step is eight bytes -- SWAR, no CPU feature at all -- where
+`-Dscan=32` puts the same question to a vector register. Building it:
+
+| | sweep, a side | whole run, paired |
+|---|---:|---|
+| `-Dscan=8` (shipped) | 0.41s | -- |
+| `-Dscan=32` | **0.30s** | **0.87x** -- *slower* |
+| `-Dscan=64` | 0.31s | not pursued |
+
+**The sweep is 27% faster and the run is 13% slower.** At `--threads 1`, where
+there is no contention to blame, it is 0.82x wall and 0.76x CPU.
+
+The direct alternating measurement says what the paired one cannot: `scan=32` is
+**bimodal** and `scan=8` is not. Ten pairs, milliseconds:
+
+    scan=8   1275 1308 1316 1326 1344 1375 1382 1382 1409 1459
+    scan=32  1271 1288 1292 1343 | 1544 1596 1631 1654 1661 1683
+
+Four runs at parity, six about 20% slower, nothing in between, and the same
+split in the per-run paired ratios. A phase measurement cannot see this at all:
+every phase of `scan=32` is faster in every run, including the ones where the
+whole run is 300 ms slower. That shape -- wide vectors, one binary, two clusters
+-- is what frequency licensing looks like on an Intel server part.
+
+**And it is the host's answer, not the port's.** The 10m CI rows in the entry of
+2026-09-19 have `Zig v32` at 1.72-1.82s against `Zig` at 1.87-1.97s, which is
+the opposite. So the width that wins depends on the processor, which is why it
+is a build option and why it cannot simply become the default.
+
+Not built. Recorded because "Zig scans eight bytes where everyone else scans
+thirty-two" is the first thing anyone looking at that row will try.
+
+### Two things checked and found not to be true
+
+Both are the obvious explanations for the Zig row, and both are wrong:
+
+* **"Zig is not compiled for the host."** C and C++ probe and add
+  `-march=native`; Rust gets `-C target-cpu=x86-64-v3`; `zig build` is given
+  nothing. But Zig's default target *is* the host: rebuilt from a cleared cache,
+  `zig build --release=fast` and the same with `-Dcpu=native` are byte-identical,
+  and the binary carries `vpcmpeqb`, `vpbroadcastb` and `vmovdqa32`. The note in
+  `scripts/build_ports.sh` is right.
+* **"The sweep is oversubscribed."** #109 found the C++ sweep splitting each file
+  `threads` ways while both files were in flight, which is twice the cores. Zig
+  already halves it -- `const per_file = @max(1, total / 2)` -- and has for as
+  long as the file has existed.
+
+The sweep gap is real and is neither of these.
+
+---
+
 ## 2026-09-22 (summary only) — the same fault as #106, on the other side
 
 #106 found the cross-port tables timing four different tasks, because only the
