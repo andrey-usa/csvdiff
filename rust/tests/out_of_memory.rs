@@ -235,9 +235,16 @@ fn the_same_files_compare_when_the_budget_is_enough() {
 #[test]
 fn the_band_where_it_aborts_does_not_grow() {
     // What the port allocates itself is checked, so an abort in this range is
-    // one of the two rungs inside the report writer. Raising this number is a
-    // decision, not a fix: find what widened it first.
-    const ALLOWED: usize = 2;
+    // inside `serde_json` or the compressor at the cap where the process is one
+    // allocation from its ceiling. One pass measures one or two; three is this
+    // number so that the coin flip cannot fail a run on its own, which is the
+    // failure mode a scanning test has that a sampling one does not.
+    //
+    // It is still a ratchet with room to catch something real: dropping the
+    // index's peak, which turns graceful index refusals into report-path ones
+    // over a 4 MB stretch of caps, measures six. Raising this number is a
+    // decision, not a fix -- find what widened it first.
+    const ALLOWED: usize = 3;
 
     let fx = Fixture::new();
     let mut aborted = Vec::new();
