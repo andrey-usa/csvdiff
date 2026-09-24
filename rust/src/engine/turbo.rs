@@ -449,60 +449,75 @@ impl RowIndex {
         while cap * 2 < total * 3 + 16 {
             cap <<= 1;
         }
+        // The chunks are drained into the flat arrays and released *before* the
+        // table exists.
+        //
+        // Releasing each chunk as it is inserted -- which the loop below this
+        // used to do -- keeps two copies of every row's address and hash alive
+        // for only as long as one chunk, and the note that said so was right as
+        // far as it went. What it left out is what is resident *underneath* that
+        // duplication: `table`, `first_row` and `occurrences` were built in the
+        // struct literal below and so were alive through the whole transfer.
+        //
+        // Measured on an 8M pair, peak anonymous memory, this hump alone (the
+        // report suppressed with `--summary` so it cannot mask it): 885 MB
+        // before, 634 MB after. On a default run the report path peaks at 801
+        // MB, so what the run shows is 885 -> 801. At 4M it shows nothing at
+        // all: the hump is 445 -> 320 and the report path peaks at 469 either
+        // way. It is worth having because this hump grows with the row count
+        // and the report path does not -- `--max-rows` caps that one -- so it
+        // is the term that decides whether a large rung fits.
+        //
+        // C and C++ both allocate their tables after the transfer, and the C
+        // port has always said so; C++ was changed to match in #116.
+        let mut row_at: Vec<u64> = alloc::sized(total, "one offset per row")?;
+        let mut row_hash: Vec<u64> = alloc::sized(total, "one hash per row")?;
+        for chunk in &mut chunks {
+            row_at.extend_from_slice(&chunk.at);
+            row_hash.extend_from_slice(&chunk.hash);
+            chunk.at = Vec::new();
+            chunk.hash = Vec::new();
+        }
+        drop(chunks);
+
         let mut idx = RowIndex {
-            row_at: alloc::sized(total, "one offset per row")?,
-            row_hash: alloc::sized(total, "one hash per row")?,
+            row_at,
+            row_hash,
             table: empty_table(cap)?,
             mask: cap - 1,
             first_row: alloc::sized(total, "one row per distinct key")?,
             occurrences: alloc::sized(total, "one count per distinct key")?,
-            rows: 0,
+            rows: total as i64,
             dup_keys: 0,
             dup_rows: 0,
         };
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
-        // Each chunk is released as soon as it has been inserted. Holding all of
-        // them to the end would keep two copies of every row's address and hash
-        // alive at once, which is sixteen bytes a row of pure duplication —
-        // 320 MB at ten million rows across both files.
-        for chunk in &mut chunks {
-            for i in 0..chunk.at.len() {
-                if let Some(&soon) = chunk.hash.get(i + PREFETCH_AHEAD) {
-                    idx.prefetch(soon);
-                }
-                idx.insert(
-                    side,
-                    chunk.at[i],
-                    chunk.hash[i],
-                    key_size,
-                    opt,
-                    &mut probe,
-                    &mut mine,
-                )?;
+        for i in 0..total {
+            if let Some(&soon) = idx.row_hash.get(i + PREFETCH_AHEAD) {
+                idx.prefetch(soon);
             }
-            chunk.at = Vec::new();
-            chunk.hash = Vec::new();
+            idx.insert(side, i, key_size, opt, &mut probe, &mut mine)?;
         }
         phases.mark("index insert (serial)");
         Ok(idx)
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `row` indexes `row_at` and `row_hash`, which `build` has already filled:
+    /// this adds the row to the table and nothing else.
     fn insert(
         &mut self,
         side: &Side,
-        at: u64,
-        hash: u64,
+        row: usize,
         key_size: usize,
         opt: &Options,
         probe: &mut [Field],
         mine: &mut [Field],
     ) -> Result<()> {
-        self.rows += 1;
-        let row = self.row_at.len() as i32;
-        self.row_at.push(at);
-        self.row_hash.push(hash);
+        let at = self.row_at[row];
+        let hash = self.row_hash[row];
+        let row = row as i32;
 
         let mut slot = self.slot(hash);
         let mut mine_parsed = false;
@@ -756,7 +771,7 @@ where
 /// Chunked rather than one thread per list: the four lists are very uneven —
 /// fifty thousand against ten — so dealing them out whole would leave two
 /// threads idle while the other two did all of it.
-fn map_rows<T, U, F>(items: &[T], threads: usize, each: F) -> Vec<U>
+fn map_rows<T, U, F>(items: &[T], threads: usize, what: &str, each: F) -> Result<Vec<U>>
 where
     T: Sync,
     U: Send,
@@ -764,12 +779,14 @@ where
 {
     let parts = threads.clamp(1, items.len().div_ceil(1 << 12).max(1));
     if parts <= 1 {
-        return items.iter().map(&each).collect();
+        let mut out: Vec<U> = alloc::sized(items.len(), what)?;
+        out.extend(items.iter().map(&each));
+        return Ok(out);
     }
     let chunk = items.len().div_ceil(parts);
     let slices: Vec<&[T]> = items.chunks(chunk).collect();
     let one = |p: usize| slices[p].iter().map(&each).collect::<Vec<U>>();
-    let mut out: Vec<U> = Vec::with_capacity(items.len());
+    let mut out: Vec<U> = alloc::sized(items.len(), what)?;
     std::thread::scope(|scope| {
         let handles: Vec<_> = (1..slices.len())
             .map(|p| parallel::spawn_at(scope, &one, p))
@@ -782,7 +799,7 @@ where
             out.extend(handle.join().expect("a report row worker"));
         }
     });
-    out
+    Ok(out)
 }
 
 /// Parses and hashes every row of a mapped text file, in `threads` chunks.
@@ -1071,7 +1088,7 @@ fn join(
     compared: &[String],
     exporting: bool,
     threads: usize,
-) -> Joined {
+) -> Result<Joined> {
     let key_size = opt.key.len();
     let nc = compared.len();
     let width = key_size + nc;
@@ -1378,10 +1395,18 @@ fn join(
     // "only" is up to two hundred thousand rows over twenty columns, which was
     // the last serial second of every run that renders a report.
     phases.mark("  merge parts (serial)");
-    let mut removed_rows = map_rows(&removed.held, threads, |p| row_values(a, ai, p.row, opt));
-    let mut added_rows = map_rows(&added.held, threads, |p| row_values(b, bi, p.row, opt));
-    let mut changed_a = map_rows(&changed.held, threads, |p| row_values(a, ai, p.row, opt));
-    let mut changed_b = map_rows(&changed.held, threads, |p| row_values(b, bi, p.mate, opt));
+    let mut removed_rows = map_rows(&removed.held, threads, "a removed row", |p| {
+        row_values(a, ai, p.row, opt)
+    })?;
+    let mut added_rows = map_rows(&added.held, threads, "an added row", |p| {
+        row_values(b, bi, p.row, opt)
+    })?;
+    let mut changed_a = map_rows(&changed.held, threads, "a changed row, A side", |p| {
+        row_values(a, ai, p.row, opt)
+    })?;
+    let mut changed_b = map_rows(&changed.held, threads, "a changed row, B side", |p| {
+        row_values(b, bi, p.mate, opt)
+    })?;
 
     phases.mark("  row values (par)");
     sort_rows(&mut removed_rows, key_size);
@@ -1391,8 +1416,9 @@ fn join(
     // Zipped by index rather than by iterator so the two sides can be chunked
     // together; they are the same length and in the same order by construction.
     phases.mark("  sorts (serial)");
-    let rows: Vec<usize> = (0..changed_a.len()).collect();
-    let changed_cells: Vec<Vec<Cell>> = map_rows(&rows, threads, |&r| {
+    let mut rows: Vec<usize> = alloc::sized(changed_a.len(), "the changed-row index")?;
+    rows.extend(0..changed_a.len());
+    let changed_cells: Vec<Vec<Cell>> = map_rows(&rows, threads, "a changed row's cells", |&r| {
         let (ar, br) = (&changed_a[r], &changed_b[r]);
         let mut cells: Vec<CellDiff> = Vec::new();
         for i in 0..nc {
@@ -1411,7 +1437,7 @@ fn join(
             .collect();
         row.push(Cell::Diffs(cells));
         row
-    });
+    })?;
 
     phases.mark("  changed cells (par)");
     let counts = Counts {
@@ -1430,15 +1456,19 @@ fn join(
         b_dup_rows: bi.dup_rows,
     };
 
-    Joined {
+    Ok(Joined {
         counts,
         columns,
         changed: changed_cells,
-        added: map_rows(&added_rows, threads, |r| to_cells(r)),
-        removed: map_rows(&removed_rows, threads, |r| to_cells(r)),
+        added: map_rows(&added_rows, threads, "an added row's cells", |r| {
+            to_cells(r)
+        })?,
+        removed: map_rows(&removed_rows, threads, "a removed row's cells", |r| {
+            to_cells(r)
+        })?,
         changed_a,
         changed_b,
-    }
+    })
 }
 
 fn sort_rows(rows: &mut [Vec<Val>], key_size: usize) {
@@ -1688,7 +1718,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         &resolved.compared,
         opt.export_dir.is_some(),
         total,
-    );
+    )?;
 
     phases.mark("join");
     let meta = resolved.meta(&opt.key, a_cols, b_cols);
