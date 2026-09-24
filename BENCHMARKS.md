@@ -156,8 +156,23 @@ The direct alternating measurement says what the paired one cannot: `scan=32` is
 Four runs at parity, six about 20% slower, nothing in between, and the same
 split in the per-run paired ratios. A phase measurement cannot see this at all:
 every phase of `scan=32` is faster in every run, including the ones where the
-whole run is 300 ms slower. That shape -- wide vectors, one binary, two clusters
--- is what frequency licensing looks like on an Intel server part.
+whole run is 300 ms slower. `bench_ab.sh` sees the cost but not the shape: over
+25 rounds it reports 0.89x [0.84-0.94], with `scan=32`'s best-to-median spread
+twice `scan=8`'s.
+
+**The cost is measured; the cause is not.** Vector frequency licensing is the
+obvious suspect and the evidence does not support it: the Rust port scans
+**thirty-two bytes** on this same host -- `VECTOR_WIDTH = 32` in
+`turbo/field.rs`, built `-C target-cpu=x86-64-v3` -- and its runs are tight,
+0.62s best against 0.63s median and 0.70s worst. Whatever destabilises the Zig
+build at that width does not destabilise the Rust one. Naming a mechanism here
+would be a guess dressed as a finding.
+
+One measurement that looked like a refutation was not one: running eight of
+`scan=8` and then eight of `scan=32` had the second build consistently *faster*.
+That is the one-build-at-a-time method this file opens by rejecting, and the
+two properly interleaved measurements -- ten alternating pairs and twenty-five
+paired rounds -- agree with each other and not with it.
 
 **And it is the host's answer, not the port's.** The 10m CI rows in the entry of
 2026-09-19 have `Zig v32` at 1.72-1.82s against `Zig` at 1.87-1.97s, which is
