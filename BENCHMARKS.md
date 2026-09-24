@@ -120,6 +120,73 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (zig split) — the sweep got slower with more threads, and it was the allocator
+
+Zig was the slowest port on the 4M CSV pair and its sweep was the whole of it.
+Two earlier explanations were checked and ruled out -- it is compiled for the
+host, and its sweep is not oversubscribed -- and a third, widening the scan
+step, could not be resolved on a noisy machine. The one-thread control settled
+where to look:
+
+| sweep, a side | 1 thread | 4 threads |
+|---|---:|---:|
+| C | 0.342s | 0.181s |
+| **Zig** | **0.35s** | **0.46-0.58s** |
+
+**Zig's sweep got slower with more threads.** At four, each file is split two
+ways, and each of those threads ran at well under half the speed of one.
+
+### Isolated, one variable at a time
+
+| build | sweep at 4 threads |
+|---|---:|
+| shipped: no libc, `smp_allocator` | 0.46-0.58s |
+| libc linked, `c_allocator` | **0.30s** |
+| libc linked, `smp_allocator` forced back | 0.49s |
+
+Linking libc changes two things -- the allocator and `memcpy`/`memset` -- and
+the third row separates them. **It is the allocator.**
+
+What it is *not*, each measured:
+
+* **The serial quote count.** `chunkBounds` counts quotes over half the file on
+  the calling thread before any sweep thread starts. Skipping it -- correct on
+  this file, which has none -- moved nothing: 0.465s against 0.454s.
+* **Syscalls.** `strace -c`: 430 against glibc's 373, 0.11s against 0.06s.
+* **Page faults.** 112,984 against 124,652 for glibc; flat across thread counts.
+* **Blocking.** Single-digit voluntary context switches at every thread count.
+* **The sweep's own arrays growing.** `ArrayList` grows 1.5x a step, one
+  `mremap` each: 192 inside the sweep window. Pre-sizing them took that to 60
+  and moved the sweep from 0.49s to 0.42s -- still slower than one thread.
+
+What differs is **user time**, 3.60s against 2.67s for identical code, with no
+allocation on the per-row path at all. Where in user space it goes is not
+established here; the leading candidate is where the page allocator places the
+arrays rather than any call into it, and without a profiler on this host that
+stays a candidate.
+
+### What changed
+
+Each file is swept on one thread. Four-core runner, 4M CSV pair:
+
+| | shipped | no split | paired [mid half] |
+|---|---:|---:|---|
+| whole run, wall | 1.743s | 1.144s | **1.38x** [1.25-1.84] |
+| whole run, CPU | 5.91s | 2.79s | **2.02x** [1.70-2.43] |
+| `--max-memory 1500` | 3.71s | 1.76s | one run each |
+
+Half the CPU. Under a budget -- which is what this port is for -- the budgeted
+allocator takes a lock, and the gain is larger again. Parquet goes through
+`pqdiff.zig` and does not read `per_file`: 0.98x [0.89-1.02], no result.
+
+**Linking libc would buy the split back and more** -- 1.72x wall and 2.15x CPU
+against this change's 1.38x and 2.02x -- and would put Zig on the same allocator
+as the other three ports. This port links no libc deliberately (see the zstd
+entry), so that is left as a decision rather than taken as a side effect of a
+sweep.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242
