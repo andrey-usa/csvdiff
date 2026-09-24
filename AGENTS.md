@@ -145,6 +145,12 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
   before what it costs, because the shape is the reason for the cost.
 - **Rounds scale with how short the run is.** *No result* at nine rounds has become 1.29x at
   twenty-five.
+- **Outside 1.00 is not the same as outside the floor.** `--self-test` runs one build against
+  itself and names what this machine can resolve today. It measured 0.99x [0.92-1.07] on the
+  afternoon a 0.89x [0.84-0.94] "result" was written into BENCHMARKS.md -- outside 1.00, inside
+  the floor, and taken back the next day. `bench_ab.sh` now says so itself when the middle half
+  clears 1.00 by less than a tenth, but the habit is to run `--self-test` on a machine you have
+  not measured on before quoting a number from it.
 - **Peak RSS is not the memory answer for anything that maps its input.** `scripts/memory_floor.sh`
   takes memory away until the run dies; that is the honest floor.
 - **A benchmark rung dies of memory, not disk — cap it with `RLIMIT_DATA`, never `RLIMIT_AS`.**

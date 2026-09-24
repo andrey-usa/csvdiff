@@ -30,6 +30,12 @@
 # instead of leaving a ratio to be argued about. A day went into a 5%
 # "regression" here that this would have called immediately.
 #
+# **A verdict outside 1.00 is not automatically a result.** The floor is about
+# 3% on a quiet machine and this project has measured 7% on a shared runner --
+# one build against itself, fifteen rounds. So a middle half that clears 1.00 by
+# less than a tenth now says so and points at `--self-test`, because a number
+# outside 1.00 and inside the floor reads exactly like a finding and is not one.
+#
 #   scripts/bench_ab.sh old/csvdiff new/csvdiff -- compare a.csv b.csv -k id
 #   scripts/bench_ab.sh --self-test c/csvdiff   -- compare a.csv b.csv -k id
 #
@@ -143,8 +149,27 @@ awk -v rc="$rc" -v lo="$rclo" -v hi="$rchi" -v self="$self_test" -v n="$rounds" 
   if (!told_apart) {
     printf "\nno result: the middle half of the rounds straddles 1.00x. The two builds\n"
     printf "were not told apart -- run more rounds, or the difference is not there.\n"
-  } else if (rc > 1)
+    exit
+  }
+  if (rc > 1)
     printf "\nthe new build does %.0f%% less work, in every quarter of the rounds\n", 100*(1 - 1/rc)
   else
     printf "\nthe new build does %.0f%% MORE work, in every quarter of the rounds\n", 100*(1/rc - 1)
+
+  # Told apart, but only just. A shared runner does not hold a 3% floor all day:
+  # this one was measured at 0.99x with a middle half of 0.92-1.07 on the same
+  # afternoon it reported a 0.89x [0.84-0.94] "result" -- a number outside 1.00,
+  # inside the floor, and quoted in BENCHMARKS.md for a day before --self-test
+  # was run and took it back.
+  #
+  # The threshold is the edge of the middle half rather than the median, because
+  # that is what the verdict above is built on, and CLOSE is a tenth because
+  # that is the widest floor this project has measured on a runner it uses.
+  edge = (lo > 1.0) ? lo : 1/hi
+  CLOSE = 1.10
+  if (edge < CLOSE) {
+    printf "\nbut only just: the middle half reaches %.2fx of 1.00, and this harness has\n", edge
+    printf "measured a floor of 1.07x on a shared runner -- one build against itself.\n"
+    printf "Run --self-test on this machine before quoting the number above.\n"
+  }
 }'
