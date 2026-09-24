@@ -144,8 +144,8 @@ Zig's scan step is eight bytes -- SWAR, no CPU feature at all -- where
 | `-Dscan=32` | **0.30s** | **0.87x** -- *slower* |
 | `-Dscan=64` | 0.31s | not pursued |
 
-**The sweep is 27% faster and the run is 13% slower.** At `--threads 1`, where
-there is no contention to blame, it is 0.82x wall and 0.76x CPU.
+The sweep is 27% faster. What the *run* does is the part this host could not
+settle, and the rest of this entry is that story rather than a result.
 
 The direct alternating measurement says what the paired one cannot: `scan=32` is
 **bimodal** and `scan=8` is not. Ten pairs, milliseconds:
@@ -160,27 +160,50 @@ whole run is 300 ms slower. `bench_ab.sh` sees the cost but not the shape: over
 25 rounds it reports 0.89x [0.84-0.94], with `scan=32`'s best-to-median spread
 twice `scan=8`'s.
 
-**The cost is measured; the cause is not.** Vector frequency licensing is the
-obvious suspect and the evidence does not support it: the Rust port scans
-**thirty-two bytes** on this same host -- `VECTOR_WIDTH = 32` in
-`turbo/field.rs`, built `-C target-cpu=x86-64-v3` -- and its runs are tight,
-0.62s best against 0.63s median and 0.70s worst. Whatever destabilises the Zig
-build at that width does not destabilise the Rust one. Naming a mechanism here
-would be a guess dressed as a finding.
+### The floor, and why none of this is a result
 
-One measurement that looked like a refutation was not one: running eight of
-`scan=8` and then eight of `scan=32` had the second build consistently *faster*.
-That is the one-build-at-a-time method this file opens by rejecting, and the
-two properly interleaved measurements -- ten alternating pairs and twenty-five
-paired rounds -- agree with each other and not with it.
+`bench_ab.sh --self-test` runs one build against itself. On this host, fifteen
+rounds:
+
+| | wall | mid half |
+|---|---|---|
+| the same binary, twice | 0.99x | **0.92-1.07** |
+
+**The noise floor here is about eight percent.** The scan-width measurement is
+0.89x [0.84-0.94] over twenty-five rounds -- outside 1.00, and overlapping the
+floor's own band. It is at the edge of what this machine can resolve, not
+clearly past it, and "13% slower" is more than the data carries.
+
+Two other things that looked like results and were not:
+
+* **Frequency licensing** as the mechanism. It is the obvious suspect and the
+  evidence is against it: the Rust port scans **thirty-two bytes** on this same
+  host -- `VECTOR_WIDTH = 32` in `turbo/field.rs`, built
+  `-C target-cpu=x86-64-v3` -- and its runs are tight, 0.62s best against 0.63s
+  median. Whatever unsettles the Zig build at that width leaves the Rust one
+  alone.
+* **Two measurements where `scan=32` came out faster.** Both ran eight of one
+  build and then eight of the other, which is the one-build-at-a-time method
+  this file opens by rejecting. They are not evidence of anything. The two
+  interleaved measurements agree with each other; these do not belong beside
+  them.
+
+So: the sweep is faster at thirty-two bytes, the run is not measurably faster,
+and this host cannot tell whether it is slower. **The question needs a quieter
+machine, and the ladder already runs on one** -- the 10m CI rows have `Zig v32`
+ahead of `Zig`, and that is the measurement to trust until a paired one on a
+quiet host says otherwise.
 
 **And it is the host's answer, not the port's.** The 10m CI rows in the entry of
 2026-09-19 have `Zig v32` at 1.72-1.82s against `Zig` at 1.87-1.97s, which is
 the opposite. So the width that wins depends on the processor, which is why it
 is a build option and why it cannot simply become the default.
 
-Not built. Recorded because "Zig scans eight bytes where everyone else scans
-thirty-two" is the first thing anyone looking at that row will try.
+Not built, and not refused either -- **unresolved**. Recorded because "Zig scans
+eight bytes where C and Rust scan thirty-two" is the first thing anyone looking
+at that row will try, and because the trap is not the idea but the measurement:
+a 27% phase win that the whole-run number will not confirm on a machine whose
+floor is 8%.
 
 ### Two things checked and found not to be true
 
