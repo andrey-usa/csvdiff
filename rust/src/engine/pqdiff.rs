@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -87,16 +88,27 @@ fn value_of(c: Look<'_>, opt: &Options) -> Val {
     if text.is_empty() { None } else { Some(text) }
 }
 
+// `absent` and `same` run for every key cell the index and the join touch, and
+// were calls: the compiler kept them out of line because the normalising half
+// allocates. The common case is a null check and a byte compare, so that is what
+// is inlined, and the normalising half is a cold call. On the 2M Parquet pair
+// the two functions were 0.49B instructions of their own, and `Col::at` beside
+// them another 0.49B.
+#[inline]
 fn absent(c: Look<'_>, opt: &Options) -> bool {
     if c.null || c.bytes.is_empty() {
         return true;
     }
-    if !needs_normalising(opt) {
-        return false;
-    }
+    needs_normalising(opt) && absent_normalised(c, opt)
+}
+
+#[cold]
+#[inline(never)]
+fn absent_normalised(c: Look<'_>, opt: &Options) -> bool {
     value_of(c, opt).is_none()
 }
 
+#[inline]
 fn same(x: Look<'_>, y: Look<'_>, opt: &Options) -> bool {
     let (xa, ya) = (absent(x, opt), absent(y, opt));
     if xa || ya {
@@ -105,6 +117,12 @@ fn same(x: Look<'_>, y: Look<'_>, opt: &Options) -> bool {
     if !needs_normalising(opt) {
         return x.bytes == y.bytes;
     }
+    same_normalised(x, y, opt)
+}
+
+#[cold]
+#[inline(never)]
+fn same_normalised(x: Look<'_>, y: Look<'_>, opt: &Options) -> bool {
     value_of(x, opt) == value_of(y, opt)
 }
 
@@ -169,12 +187,36 @@ fn fold_bytes(mut h: u64, v: &[u8]) -> u64 {
         h ^= h >> 29; // the xor-shift is what spreads a whole word into the low bits
     }
     if !tail.is_empty() {
-        let mut buf = [0u8; 8];
-        buf[..tail.len()].copy_from_slice(tail);
-        h = (h ^ u64::from_le_bytes(buf)).wrapping_mul(PRIME);
+        h = (h ^ tail_word(v, tail.len())).wrapping_mul(PRIME);
         h ^= h >> 29;
     }
     (h ^ v.len() as u64).wrapping_mul(PRIME)
+}
+
+/// The last `rem` bytes of `v`, one to seven of them, as a little-endian word
+/// padded with zeros.
+///
+/// This was a copy into a zeroed buffer, and a copy of a length only known at
+/// run time is a call to memcpy, once per key cell per row. A value of eight
+/// bytes or more has eight real bytes ending where the tail does, so one load
+/// and a shift gives the same word; a shorter one is read as two overlapping
+/// halves, or as its first, middle and last byte. The Zig port does the same
+/// (`scan.tailWord`).
+#[inline]
+fn tail_word(v: &[u8], rem: usize) -> u64 {
+    let n = v.len();
+    debug_assert!(rem > 0 && rem < 8 && rem <= n);
+    if n >= 8 {
+        let last = u64::from_le_bytes(v[n - 8..].try_into().unwrap());
+        return last >> (8 * (8 - rem));
+    }
+    // Shorter than a word: nothing was folded yet, so the tail is all of it.
+    if n >= 4 {
+        let lo = u32::from_le_bytes(v[..4].try_into().unwrap()) as u64;
+        let hi = u32::from_le_bytes(v[n - 4..].try_into().unwrap()) as u64;
+        return lo | (hi << (8 * (n - 4)));
+    }
+    v[0] as u64 | (v[n / 2] as u64) << (8 * (n / 2)) | (v[n - 1] as u64) << (8 * (n - 1))
 }
 fn fold_absent(h: u64) -> u64 {
     (h ^ 0x9e3779b97f4a7c15).wrapping_mul(PRIME)
@@ -198,6 +240,7 @@ impl<'m> Col<'m> {
     fn new(c: parquet::Column, map: &'m [u8]) -> Self {
         Col { c, map }
     }
+    #[inline]
     fn base(&self) -> &[u8] {
         if self.c.owned.is_empty() {
             self.map
@@ -205,6 +248,7 @@ impl<'m> Col<'m> {
             &self.c.owned
         }
     }
+    #[inline]
     fn at(&self, row: usize) -> Look<'_> {
         look(self.base(), self.slice_at(row))
     }
@@ -253,13 +297,35 @@ fn look(base: &[u8], s: parquet::Slice) -> Look<'_> {
 /// ids are, and a column diff is a comparison of two `i32` arrays.
 #[derive(Default)]
 struct Ids {
-    table: HashMap<Vec<u8>, i32>,
+    table: HashMap<Vec<u8>, i32, BuildHasherDefault<FoldHasher>>,
 }
 
 impl Ids {
+    /// Looked up before it is inserted: `entry` wants an owned key, so asking it
+    /// allocated a copy of every value, including the ones already interned.
     fn of(&mut self, v: &[u8]) -> i32 {
+        if let Some(&id) = self.table.get(v) {
+            return id;
+        }
         let next = self.table.len() as i32;
-        *self.table.entry(v.to_vec()).or_insert(next)
+        self.table.insert(v.to_vec(), next);
+        next
+    }
+}
+
+/// The key hash this file already uses, as a `Hasher`, for interning. The
+/// default SipHash is keyed against collision attacks, which a table of one
+/// file's own dictionary values does not need; it was 0.18B instructions on the
+/// 2M pair for 1.6M lookups.
+#[derive(Default)]
+struct FoldHasher(u64);
+
+impl Hasher for FoldHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = fold_bytes(self.0 ^ SEED, bytes);
     }
 }
 
@@ -1280,4 +1346,24 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     phases.mark("assemble");
     let meta = resolved.meta(&opt.key, a_meta.names.len(), b_meta.names.len());
     assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_word_is_the_zero_padded_tail() {
+        let buf: Vec<u8> = (0..40u32).map(|i| (0x21 + i * 7 % 200) as u8).collect();
+        for n in 1..=buf.len() {
+            let v = &buf[..n];
+            let rem = n % 8;
+            if rem == 0 {
+                continue;
+            }
+            let mut padded = [0u8; 8];
+            padded[..rem].copy_from_slice(&v[n - rem..]);
+            assert_eq!(tail_word(v, rem), u64::from_le_bytes(padded), "length {n}");
+        }
+    }
 }

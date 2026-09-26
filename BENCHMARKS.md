@@ -120,6 +120,66 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (rust parquet hot paths) — Rust's Parquet path ran 35% more instructions than C's
+
+On the 2M pair at one thread, callgrind counted 7.24 B instructions for Rust
+against 5.38 B for C, on the path the ladder had at 1.34x of C. None of it was
+algorithmic. It was per-row overhead the other ports had already shed:
+
+| what | where | before |
+|---|---|---:|
+| `Col::at`, `absent`, `same` called rather than inlined | index build, join | 0.98 B |
+| definition levels and dictionary indices re-zeroed on every page | `read_column` | 0.24 B of memset |
+| `Ids::of` copying every value to ask whether it was interned, then SipHash | dictionary interning | 0.18 B + malloc/free |
+| the hash's partial last word through `memcpy` (as #144 fixed in Zig) | `fold_bytes` | part of 0.18 B memcpy |
+| a bounds test per value in bit-packed RLE runs | `RleReader::fill` | 1.08 B total |
+
+Each fix follows the pattern another port already used. `absent`, `same` and
+`Col::at` are inline, with the normalising halves moved to cold calls. The
+level and index buffers are reused and only grown. `Ids` looks up before it
+inserts, and hashes with the file's own fold. The tail is built from loads.
+The RLE loop is split once per run at the buffer's last whole word.
+Snappy pages are now appended rather than written into a zeroed buffer, which
+the ladder never exercises (its generator writes uncompressed Parquet) but a
+snappy file does.
+
+| callgrind, 2M pair, one thread | main | this |
+|---|---:|---:|
+| uncompressed (the ladder's) | 7.237 B | 6.252 B (−13.6%) |
+| snappy | 15.06 B | 11.62 B (−22.9%) |
+
+CI, `phases.yml`, 10M rows, both runs on an **AMD EPYC 7763** (runs
+36268801643 and 36268799949), the other ports as controls:
+
+| 10M, 4 threads | main | this |
+|---|---:|---:|
+| Rust wall | 1.702 s | **1.365 s** |
+| Rust CPU | 5.72 s | **4.61 s** |
+| compared columns | 0.963 s | 0.737 s |
+| index build | 0.418 s | 0.348 s |
+| match sweep | 0.242 s | 0.203 s |
+| C wall (control) | 1.240 s | 1.255 s |
+| Zig wall (control) | 1.331 s | 1.316 s |
+
+1.25x, with the controls within 1%. Rust's Parquet goes from 1.37x of C's to
+1.09x on that CPU.
+
+Paired, 4 vCPU Xeon @ 2.10 GHz, four threads:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| 2M uncompressed, 21 rounds | **1.18x** 1.09–1.21 | 1.19x 1.07–1.22 |
+| 10M uncompressed, 11 rounds | **1.12x** 1.08–1.29 | 1.16x 1.13–1.34 |
+| 2M snappy, 15 rounds (before the RLE split) | 1.07x 0.99–1.15 | 1.07x 1.04–1.12 |
+
+New tests pin the three decoders that changed: `tail_word` against the old
+padded copy, snappy copies that overlap themselves at every offset 1–10 and
+length 1–60, and bit-packed RLE at every width 1–32 around the group size. Each
+fails when its boundary is moved by one (checked by breaking it). Counts and
+columns are identical to main on both pairs.
+
+---
+
 ## 2026-09-26 (zig hash tail) — the last bytes of every hashed key went through memcpy
 
 Zig's word-at-a-time hash of a key field (`hashBytes` in the text engine,
