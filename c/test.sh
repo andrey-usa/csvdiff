@@ -307,11 +307,13 @@ else
 fi
 rm -rf "$esc_dir"
 
-# The same, with the escapes in the *key*. A key is hashed before it is ever
-# compared, so two spellings of one key have to hash alike or the lookup never
-# reaches the comparison above: the row is reported added and removed instead of
-# matched. Keys of every length around the eight bytes the hash folds at a time,
-# and a CSV key with a doubled quote against the JSON spelling of it.
+# The same, with the escapes in the *key* -- and in every port. A key is hashed
+# before it is ever compared, so two spellings of one key have to hash alike or
+# the lookup never reaches the comparison above, and the row comes out added and
+# removed instead of matched. The C++, Rust and Zig ports hashed an escaped key's
+# decoded bytes one at a time and an unescaped one a word at a time, and missed
+# exactly this. Keys of every length around the eight bytes the hash folds at
+# once, and a CSV key with a doubled quote against the JSON spelling of it.
 kesc_dir=$(mktemp -d)
 python3 - "$kesc_dir" <<'PY'
 import json, sys
@@ -336,18 +338,23 @@ with open(f"{out}/c.csv", "w") as fc:
 with open(f"{out}/d.ndjson", "w") as fd:
     fd.write('{"k":"quote%s\"in","v":"6"}\n{"k":"a/b","v":"0"}\n' % BS)
 PY
-got=$(./csvdiff compare "$kesc_dir/a.ndjson" "$kesc_dir/b.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
-if [ "$got" = "matched 8" ]; then
-  echo "  ok    an escaped key finds the same key written literally"
-else
-  echo "  FAIL  escaped and literal spellings of one key did not match: $got"; fail=1
-fi
-got=$(./csvdiff compare "$kesc_dir/c.csv" "$kesc_dir/d.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
-if [ "$got" = "matched 2" ]; then
-  echo "  ok    and a CSV doubled quote finds the JSON backslash"
-else
-  echo "  FAIL  a CSV key with a doubled quote missed its JSON spelling: $got"; fail=1
-fi
+key_ports="C:./csvdiff"
+[ "$with_ports" = 1 ] && key_ports="$key_ports Rust:$RUST C++:$CPP"
+for entry in $key_ports; do
+  name=${entry%%:*}; exe=${entry#*:}
+  got=$("$exe" compare "$kesc_dir/a.ndjson" "$kesc_dir/b.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
+  if [ "$got" = "matched 8" ]; then
+    echo "  ok    $name: an escaped key finds the same key written literally"
+  else
+    echo "  FAIL  $name: escaped and literal spellings of one key did not match: $got"; fail=1
+  fi
+  got=$("$exe" compare "$kesc_dir/c.csv" "$kesc_dir/d.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
+  if [ "$got" = "matched 2" ]; then
+    echo "  ok    $name: and a CSV doubled quote finds the JSON backslash"
+  else
+    echo "  FAIL  $name: a CSV key with a doubled quote missed its JSON spelling: $got"; fail=1
+  fi
+done
 rm -rf "$kesc_dir"
 # --- the Parquet path -------------------------------------------------------
 #

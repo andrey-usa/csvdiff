@@ -326,9 +326,28 @@ fn hash_field(slab: &Slab, f: Field, opt: &Options, seed: u64) -> u64 {
         h = hash_bytes(raw, h);
         len = raw.len() as u64;
     } else {
+        // Decoded, then folded by the same word-at-a-time loop as the branch
+        // above. Folding the decoded bytes one at a time gave a different hash
+        // for the same value, so a key a JSON writer escaped (`a\/b`, `\u0041`)
+        // never found the same key written literally in the other file: the row
+        // came out added and removed instead of matched.
+        //
+        // The words are assembled from the decoded bytes as they come, which
+        // is `hash_bytes` over them without a buffer: a field may be megabytes.
+        let (mut word, mut have) = (0u64, 0u32);
         for b in slab.logical(f) {
-            h = (h ^ (b as u64)).wrapping_mul(PRIME);
+            word |= (b as u64) << (8 * have);
+            have += 1;
             len += 1;
+            if have == 8 {
+                h = (h ^ word).wrapping_mul(PRIME);
+                h ^= h >> 29;
+                (word, have) = (0, 0);
+            }
+        }
+        if have > 0 {
+            h = (h ^ word).wrapping_mul(PRIME);
+            h ^= h >> 29;
         }
     }
     (h ^ len).wrapping_mul(PRIME)

@@ -460,10 +460,28 @@ fn hashField(slab: Slab, f: Field, o: Options, seed: u64, buf: []u8) Error!u64 {
             h = hashBytes(raw, h);
             len = raw.len;
         } else {
+            // Decoded, then folded eight bytes at a time like the branch above,
+            // with the words assembled as the bytes come: a field may be
+            // megabytes. Folding them one at a time gave the same value a
+            // different hash, so a key a JSON writer escaped (`a\/b`, `\u0041`)
+            // never found the same key written literally in the other file.
             var it = slab.logical(f);
+            var word: u64 = 0;
+            var have: u6 = 0;
             while (it.next()) |b| {
-                h = (h ^ b) *% PRIME;
+                word |= @as(u64, b) << (@as(u6, 8) *% have);
+                have += 1;
                 len += 1;
+                if (have == 8) {
+                    h = (h ^ word) *% PRIME;
+                    h ^= h >> 29;
+                    word = 0;
+                    have = 0;
+                }
+            }
+            if (have > 0) {
+                h = (h ^ word) *% PRIME;
+                h ^= h >> 29;
             }
         }
     }
