@@ -456,20 +456,34 @@ class RleReader {
             } else if (width_ == 0) {
                 std::fill_n(out + done, take, 0);
             } else {
-                for (std::size_t i = 0; i < take; ++i) {
-                    const std::size_t byte = bit_ >> 3;
-                    std::uint64_t w = 0;
-                    if (byte + 8 <= n_) {
-                        std::memcpy(&w, d_ + byte, 8);
-                    } else {
-                        for (std::size_t k = 0; k < 8 && byte + k < n_; ++k)
-                            w |= static_cast<std::uint64_t>(
-                                     static_cast<std::uint8_t>(d_[byte + k]))
-                                 << (8 * k);
-                    }
-                    out[done + i] = static_cast<std::int32_t>((w >> (bit_ & 7)) & mask_);
-                    bit_ += static_cast<std::size_t>(width_);
+                // Split once per run rather than tested once per value: the
+                // values whose eight-byte window lies inside the buffer, which
+                // is all but the last few of a page, then the tail a byte at a
+                // time. The Rust port does the same.
+                const std::size_t width = static_cast<std::size_t>(width_);
+                std::size_t bit = bit_;
+                std::size_t safe = 0;
+                if (n_ >= 8) {
+                    const std::size_t last = (n_ - 8) * 8 + 7;  // last bit a whole window starts at
+                    if (bit <= last) safe = std::min(take, (last - bit) / width + 1);
                 }
+                std::int32_t* o = out + done;
+                for (std::size_t i = 0; i < safe; ++i) {
+                    std::uint64_t w;
+                    std::memcpy(&w, d_ + (bit >> 3), 8);
+                    o[i] = static_cast<std::int32_t>((w >> (bit & 7)) & mask_);
+                    bit += width;
+                }
+                for (std::size_t i = safe; i < take; ++i) {
+                    const std::size_t byte = bit >> 3;
+                    std::uint64_t w = 0;
+                    for (std::size_t k = 0; k < 8 && byte + k < n_; ++k)
+                        w |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(d_[byte + k]))
+                             << (8 * k);
+                    o[i] = static_cast<std::int32_t>((w >> (bit & 7)) & mask_);
+                    bit += width;
+                }
+                bit_ = bit;
             }
             left_ -= take;
             done += take;

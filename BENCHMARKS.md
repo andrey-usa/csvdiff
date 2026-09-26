@@ -120,6 +120,30 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (cpp rle split) — the same per-value bounds test in C++'s bit-packed runs
+
+C++'s `RleReader::fill` tested, for every value of a bit-packed run, whether an
+eight-byte load at it would stay inside the page. It now splits each run once,
+as #146 did in Rust: the values whose window is inside the buffer take a plain
+load, and only the tail is read a byte at a time. Without the test in the loop,
+clang handles it far better than it did in Rust.
+
+| callgrind, 2M uncompressed pair, one thread, clang | main | this |
+|---|---:|---:|
+| `RleReader::fill` | 1.020 B | 0.540 B |
+| whole run | 5.748 B | 5.256 B (−8.6%) |
+
+That puts C++'s Parquet instruction count under C's (5.38 B). Time does not
+show it: paired on this host it is 1.00x [0.92–1.09] at 2M on four threads, and
+0.97x [0.90–1.12] at 10M on one, where this host's noise was larger than the
+effect. Decoding the levels and indices looks memory-bound rather than
+instruction-bound, so this is shipped on the instruction count, the way #144
+was. The logic is the Rust version's line for line, which a test there covers
+at every width from 1 to 32; here `c/test.sh --with-ports` (89 cases, Parquet
+among them) agrees with the other ports.
+
+---
+
 ## 2026-09-26 (rust parquet hot paths) — Rust's Parquet path ran 35% more instructions than C's
 
 On the 2M pair at one thread, callgrind counted 7.24 B instructions for Rust
