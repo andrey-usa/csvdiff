@@ -1190,34 +1190,28 @@ const Sweep = struct {
 
     fn one(self: *Sweep, i: usize) !void {
         const gpa = self.gpa;
-        const fields = try gpa.alloc(Field, self.side.width);
-        defer gpa.free(fields);
+        const fields_line = try privateAlloc(gpa, Field, self.side.width);
+        defer gpa.free(fields_line);
+        const fields = fields_line[0..self.side.width];
         // The sweep parses with the key-only parser, so it needs room for the
         // key columns; the full-width buffer above is what a row over the field
         // cap is re-read into, and what the columnar branch fills.
-        const keys = try gpa.alloc(Field, @max(1, self.key_size));
-        defer gpa.free(keys);
+        const keys_line = try privateAlloc(gpa, Field, @max(1, self.key_size));
+        defer gpa.free(keys_line);
+        const keys = keys_line[0..@max(1, self.key_size)];
         var s = Scratch{};
-        // The lists are built here and published once at the end. Appending to
-        // `self.chunks[i]` directly writes its lengths on every row, and a chunk
-        // is a few dozen bytes: its neighbours in the array, or the other
-        // file's chunk allocated beside it, share its cache line, and the line
-        // bounces between the two threads' cores once a row. See `compare`.
-        var at: std.ArrayList(u64) = .empty;
-        errdefer at.deinit(gpa);
-        var hash: std.ArrayList(u64) = .empty;
-        errdefer hash.deinit(gpa);
+        var chunk = &self.chunks[i];
 
         switch (self.side.rows) {
             .columnar => {
                 const lo = self.columnar_rows * i / self.chunks.len;
                 const hi = self.columnar_rows * (i + 1) / self.chunks.len;
-                try at.ensureTotalCapacity(gpa, hi - lo);
-                try hash.ensureTotalCapacity(gpa, hi - lo);
+                try chunk.at.ensureTotalCapacity(gpa, hi - lo);
+                try chunk.hash.ensureTotalCapacity(gpa, hi - lo);
                 for (lo..hi) |row| {
                     self.side.fieldsAt(row, fields);
-                    at.appendAssumeCapacity(row);
-                    hash.appendAssumeCapacity(
+                    chunk.at.appendAssumeCapacity(row);
+                    chunk.hash.appendAssumeCapacity(
                         try keyHash(self.side.slab, fields, self.key_size, self.opt, &s.a),
                     );
                 }
@@ -1250,8 +1244,8 @@ const Sweep = struct {
                         _ = t.parser.parse(data, pos, data.len, fields);
                         for (fields) |field| if (field == TOO_LONG) return Error.FieldTooLong;
                     }
-                    try at.append(gpa, pos);
-                    try hash.append(
+                    try chunk.at.append(gpa, pos);
+                    try chunk.hash.append(
                         gpa,
                         try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a),
                     );
@@ -1260,8 +1254,6 @@ const Sweep = struct {
                 }
             },
         }
-        self.chunks[i].at = at;
-        self.chunks[i].hash = hash;
     }
 };
 
@@ -1312,6 +1304,24 @@ fn sweep(
         if (c.failure) |e| return e;
     }
     return chunks;
+}
+
+/// Scratch a thread writes on every row, on cache lines no other thread's
+/// allocation can share.
+///
+/// `smp_allocator` starts every thread on the same slot and moves one only when
+/// that slot is contended, and it aligns a small allocation only to its own
+/// size. So the key buffer A's sweep parses into on every row -- sixteen bytes
+/// for a two-column key -- and B's, allocated a moment apart on two threads,
+/// come out thirty-two bytes apart on one cache line in most runs, and the line
+/// moves between the two cores once a row. Rounding the length up to whole
+/// lines and aligning to one makes the buffer the only thing on its lines.
+/// Free the slice this returns, not a narrower one: the allocator finds the
+/// size class from the length.
+fn privateAlloc(gpa: std.mem.Allocator, comptime T: type, n: usize) ![]align(std.atomic.cache_line) T {
+    const per_line = @max(1, std.atomic.cache_line / @sizeOf(T));
+    const len = std.mem.alignForward(usize, @max(n, 1), per_line);
+    return gpa.alignedAlloc(T, .fromByteUnits(std.atomic.cache_line), len);
 }
 
 /// Runs `entry` on `ways` threads, or on this one where a thread cannot be had:
@@ -1645,26 +1655,29 @@ pub fn compare(
     //
     // Each file used to be split further, `total / 2` ways, on the reasoning that
     // two files across four cores is two chunks each and the whole machine busy.
-    // Measured, it was the opposite: on the 4M CSV pair the sweep took 0.35s a
-    // side unsplit and 0.46-0.58s split two ways. That was blamed on
-    // `smp_allocator`, since the same code under glibc's `c_allocator` scaled.
+    // Measured, it was the opposite. On the 4M CSV pair the sweep took 0.35s a
+    // side unsplit and 0.46-0.58s split two ways: *slower* with twice the
+    // threads, and the whole run 1.50x wall and 2.06x CPU better without it.
     //
-    // The allocator was only where the cause was hiding. The sweep appended to
-    // its chunk's lists in place, writing their lengths on every row, and
-    // `smp_allocator` packs small allocations tightly -- so two threads' chunks,
-    // split or not, could sit on one cache line, and the line bounced between
-    // their cores once a row. Even unsplit, A's one chunk and B's one chunk did:
-    // on CI at one thread, where nothing is split, building the lists locally
-    // took the sweep from 0.78s to 0.49s at 10M rows of CSV and from 1.70s to
-    // 1.17s of JSON. See BENCHMARKS.md.
+    // That was blamed on the allocator: the same code linked against libc and
+    // given `c_allocator` scaled, and handed `smp_allocator` it did not. The
+    // allocator was where the cause was hiding rather than the cause.
+    // `smp_allocator` starts every thread on the same slot and aligns a small
+    // allocation only to its own size, so the sixteen-byte buffer A's sweep
+    // parses its key into on every row and B's came out on one cache line in
+    // most runs, and the line moved between the two cores once a row. glibc's
+    // per-thread arenas happened to keep them apart. `privateAlloc` now gives
+    // that scratch lines of its own: on the 2M pairs at four threads the sweep
+    // went 0.349s to 0.208s for CSV and 0.565s to 0.329s for JSON, and the
+    // whole run 1.22x and 1.26x on less CPU. See BENCHMARKS.md.
     //
-    // With that gone the split was measured again, and it still does not pay
-    // here: on an EPYC 9V45 runner it took the 10M CSV sweep from 0.49s to
-    // 0.62s, the serial quote count in front of it included; on an EPYC 7763
-    // it took JSON's from 1.17s to 1.07s, not enough to carry the CSV loss. A
-    // four-vCPU runner is two cores, and A and B already fill them.
+    // The split was tried again on CI before the key buffer was found, with the
+    // chunks' own lists unshared, and did not pay: on an EPYC 9V45 it took the
+    // 10M CSV sweep from 0.49s to 0.62s, the serial quote count in front of it
+    // included. That run still had the shared key buffer in it, so it is not
+    // the last word on splitting; it is why this change does not also split.
     //
-    // `gpa` has to be thread-safe, since A and B run at once. Under
+    // `gpa` still has to be thread-safe, since A and B run at once. Under
     // --max-memory it is a FixedBufferAllocator -- a bump pointer with no lock,
     // which would hand two threads the same bytes -- so main.zig passes its
     // lock-taking variant. The budget it enforces is unchanged.
