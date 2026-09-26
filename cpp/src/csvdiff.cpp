@@ -1048,7 +1048,7 @@ class RowIndex {
         const std::size_t end = d.size();
         if (from >= end) return;
 
-        const std::vector<std::size_t> bounds = chunk_bounds(d, from, threads);
+        const std::vector<std::size_t> bounds = chunk_bounds(d, from, threads, slab.dialect() == Dialect::Json);
         phase.mark("chunk bounds");
         const std::size_t n = bounds.size() - 1;
         std::vector<Chunk> chunks(n);
@@ -1264,8 +1264,15 @@ class RowIndex {
     // quotes before a position says whether that position is inside a field.
     // Counting them is a scan for one byte, far cheaper than parsing, and it
     // splits across the same threads.
+    // JSON needs no quote count: a raw newline inside a string is not valid
+    // JSON, so every newline ends a record. Counting anyway is not only wasted
+    // -- ndjson quotes every key and most values, so the count stops every few
+    // bytes and cost 0.47s a side on a 2M-row pair, more than the sweep it
+    // splits -- it is also wrong: an escaped `\"` toggles the parity, and a
+    // split whose count comes out odd can walk to the end of the file looking for
+    // a newline outside quotes, and the chunk is dropped.
     static std::vector<std::size_t> chunk_bounds(std::string_view d, std::size_t from,
-                                                 unsigned threads) {
+                                                 unsigned threads, bool json) {
         const std::size_t end = d.size();
         // Below this there is nothing to divide: the boundary work would cost
         // more than the parsing it splits.
@@ -1286,7 +1293,7 @@ class RowIndex {
         // the work it prepares shrinks. Counting the slice *since* the previous
         // split gives the same numbers from one pass split evenly.
         std::vector<std::size_t> quotes(nominal.size(), 0);
-        {
+        if (!json) {
             std::vector<std::thread> counters;
             auto count = [&](std::size_t i) {
                 const std::size_t begin = i == 0 ? from : nominal[i - 1];
@@ -1320,7 +1327,7 @@ class RowIndex {
             std::size_t at = nominal[i];
             for (; at < end; ++at) {
                 const char c = d[at];
-                if (c == '"') {
+                if (c == '"' && !json) {
                     in_quotes = !in_quotes;
                 } else if (c == '\n' && !in_quotes) {
                     ++at;
