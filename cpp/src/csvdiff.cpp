@@ -693,6 +693,9 @@ class RowParser {
             while (slots_[at] >= 0) at = (at + 1) & slot_mask_;
             slots_[at] = static_cast<int>(i);
         }
+        canon_.resize(wanted_.size());
+        for (std::size_t i = 0; i < wanted_.size(); ++i)
+            canon_[i] = wanted_[i].empty() ? -1 : slot_for(wanted_[i]);
     }
 
     // Parses one row into `out`, returning the offset of the next row. A row
@@ -768,10 +771,29 @@ class RowParser {
     }
 
   private:
+    // A word at a time rather than a byte at a time: the first and last eight
+    // bytes (four, or three single bytes, for a shorter name) and the length. A
+    // byte loop is a serial multiply per byte, twenty names a row; collisions
+    // are settled by comparing the name, so this only has to spread them.
     static std::uint64_t name_hash(std::string_view s) {
-        std::uint64_t h = 0xcbf29ce484222325ULL;
-        for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ULL;
-        return h ^ (h >> 32);
+        const std::size_t n = s.size();
+        std::uint64_t a = 0, b = 0;
+        if (n >= 8) {
+            std::memcpy(&a, s.data(), 8);
+            std::memcpy(&b, s.data() + n - 8, 8);
+        } else if (n >= 4) {
+            std::uint32_t x, y;
+            std::memcpy(&x, s.data(), 4);
+            std::memcpy(&y, s.data() + n - 4, 4);
+            a = x;
+            b = y;
+        } else if (n > 0) {
+            a = static_cast<std::uint64_t>(static_cast<unsigned char>(s[0])) |
+                static_cast<std::uint64_t>(static_cast<unsigned char>(s[n / 2])) << 8 |
+                static_cast<std::uint64_t>(static_cast<unsigned char>(s[n - 1])) << 16;
+        }
+        const std::uint64_t h = (a ^ (b * 0x9e3779b97f4a7c15ULL) ^ n) * 0xbf58476d1ce4e5b9ULL;
+        return h ^ (h >> 31);
     }
 
     // Walks one JSON object, storing the values of the keys we want. One pass
@@ -781,6 +803,7 @@ class RowParser {
                            std::size_t slots) const {
         std::fill(out, out + slots, kAbsent);
         std::size_t found = 0;  // key slots filled, for the early exit below
+        std::size_t guess = 0;  // the slot the next member most likely fills
         std::size_t pos = start;
         while (pos < end && json_space(d[pos])) ++pos;
         if (pos >= end) return end;
@@ -833,7 +856,11 @@ class RowParser {
                 }
             }
             if (!v.absent) {
-                const int slot = slot_for(key);
+                const int slot = guess < wanted_.size() && !wanted_[guess].empty() &&
+                                         wanted_[guess] == key
+                                     ? canon_[guess]
+                                     : slot_for(key);
+                if (slot >= 0) guess = static_cast<std::size_t>(slot) + 1;
                 if (slot >= 0 && static_cast<std::size_t>(slot) < slots) {
                     // First occurrence wins for a key column, and only for a key
                     // column -- the C port's rule, adopted here so the two agree
@@ -982,6 +1009,12 @@ class RowParser {
     std::vector<std::string> wanted_;   // JSON: the key whose value goes in each slot
     std::vector<int> slots_;            // JSON: open-addressed name -> slot
     std::size_t slot_mask_ = 0;
+    // JSON: what `slot_for` answers for `wanted_[i]` -- i itself unless the
+    // same name also fills an earlier slot. Names arrive in the same order row
+    // after row, usually slot order, so the member after slot i is tried as
+    // i + 1 before any hashing, and a right guess has to give exactly the slot
+    // the table would.
+    std::vector<int> canon_;
 };
 
 // ---------------------------------------------------------------------------
