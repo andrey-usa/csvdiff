@@ -9,6 +9,16 @@ them cost it 15% of its CSV wall and 30% of its CPU. The previous edition of thi
 file carried that asymmetry; see
 [BENCHMARKS.md](BENCHMARKS.md) for the before and after on one processor.
 
+> **The Rust rows below are stale, and in Rust's disfavour.** The same fault was
+> found a second time, on the other side. This port defaults `--out` to
+> `<a>__vs__<b>.html` and so writes a report whether or not one is asked for; C,
+> C++ and Zig write nothing without an output flag. The harness passed it
+> `-o /dev/null`, which moved the write and left the render — and left the
+> engine building every row behind it. On one host that is **1.31x wall and
+> 1.18x CPU** on a 4M CSV pair, and 1.27x / 1.11x on 2M rows of Parquet. The
+> port now has `--summary`, the harness passes it, and these tables will be
+> re-measured on CI. Until then, read every Rust row as an upper bound.
+
 ---
 
 ## The one rule, and what CI does to it

@@ -464,3 +464,66 @@ fn a_real_error_is_not_dressed_up_as_an_unsupported_codec() {
         "the columnar path owns this failure: {err}"
     );
 }
+
+/// The counts do not depend on the pass that only produces a sample.
+///
+/// A key matches from either side or from neither, so the number of B's keys
+/// with an A counterpart is exactly the pair count the A pass produces, and
+/// `added` is B's distinct keys minus it. What the B pass is *for* is the
+/// report's added section, which names rows -- so when nothing will read those
+/// rows the pass does not run and the count is derived instead. That is a
+/// second full random-probed pass over A's table skipped, and on a 2M pair it
+/// is the whole of this path's join.
+///
+/// The derivation is the risk, so this asks for it where it is hardest: two
+/// files of different sizes, so a million of B's keys have no counterpart at
+/// all, and duplicate keys on both sides so "distinct" and "rows" are not the
+/// same number.
+#[test]
+fn skipping_the_added_sample_does_not_change_the_counts() {
+    let Some(tool) = generator() else {
+        eprintln!("skipping: ../cpp/build/gen-data is not built");
+        return;
+    };
+    let Some(big) = Fixture::new(&tool, "20k", PLAIN) else {
+        return;
+    };
+    let Some(small) = Fixture::new(&tool, "5k", PLAIN) else {
+        return;
+    };
+
+    // Both directions: B larger than A is where `added` is large and derived,
+    // A larger than B is where it is zero and must stay zero.
+    for (a, b) in [
+        (
+            small.path("a", ".unc.parquet"),
+            big.path("b", ".unc.parquet"),
+        ),
+        (
+            big.path("a", ".unc.parquet"),
+            small.path("b", ".unc.parquet"),
+        ),
+    ] {
+        let with = compare(&a, &b, &mut options(&["account_id", "txn_id"], |_| {}))
+            .expect("the comparison runs");
+        let without = compare(
+            &a,
+            &b,
+            &mut options(&["account_id", "txn_id"], |o| o.row_lists = false),
+        )
+        .expect("the comparison runs");
+
+        assert_eq!(
+            serde_json::to_string(&with.counts).unwrap(),
+            serde_json::to_string(&without.counts).unwrap(),
+            "the counts changed when the added sample was skipped ({} vs {})",
+            a.display(),
+            b.display()
+        );
+        // The case the assert above would pass vacuously on.
+        assert!(
+            with.counts.added > 0 || with.counts.removed > 0,
+            "this pair has neither added nor removed rows, so it proves nothing"
+        );
+    }
+}

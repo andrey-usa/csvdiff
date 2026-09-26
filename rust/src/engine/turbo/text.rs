@@ -273,6 +273,15 @@ pub(super) enum RowParser {
         /// Open-addressed name to slot, so a key costs one hash.
         slots: Vec<i32>,
         slot_mask: usize,
+        /// Slots below this are key columns: the first value wins, and once
+        /// every slot is a filled key column the rest of the object is skipped.
+        key_size: usize,
+        /// What the table answers for `wanted[i]`: `i` itself unless the same
+        /// name also fills an earlier slot, and -1 for a missing column. Names
+        /// arrive in the same order row after row, usually slot order, so the
+        /// member after slot `i` is tried as `i + 1` first, and a right guess
+        /// has to give exactly the slot the table would.
+        canon: Vec<i32>,
     },
 }
 
@@ -281,12 +290,33 @@ pub(super) enum RowParser {
 const NONE: i32 = -1;
 const MANY: i32 = -2;
 
+/// A word at a time rather than a byte at a time: the first and last eight
+/// bytes (four, or three single bytes, for a shorter name) and the length. A
+/// byte loop is a serial multiply per byte, twenty names a row; collisions are
+/// settled by comparing the name, so this only has to spread them.
 fn name_hash(s: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &c in s {
-        h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3);
-    }
-    h ^ (h >> 32)
+    let n = s.len();
+    let (a, b) = if n >= 8 {
+        (
+            u64::from_le_bytes(s[..8].try_into().unwrap()),
+            u64::from_le_bytes(s[n - 8..].try_into().unwrap()),
+        )
+    } else if n >= 4 {
+        (
+            u32::from_le_bytes(s[..4].try_into().unwrap()) as u64,
+            u32::from_le_bytes(s[n - 4..].try_into().unwrap()) as u64,
+        )
+    } else if n > 0 {
+        (
+            s[0] as u64 | (s[n / 2] as u64) << 8 | (s[n - 1] as u64) << 16,
+            0,
+        )
+    } else {
+        (0, 0)
+    };
+    let h =
+        (a ^ b.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ n as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^ (h >> 31)
 }
 
 /// Where the wanted part of a row ends, when two files agree closely enough for
@@ -360,7 +390,7 @@ impl RowParser {
         }
     }
 
-    pub(super) fn json(wanted: Vec<Option<String>>) -> Self {
+    pub(super) fn json(wanted: Vec<Option<String>>, key_size: usize) -> Self {
         let mut n = 16usize;
         while n < wanted.len() * 4 {
             n <<= 1;
@@ -375,11 +405,27 @@ impl RowParser {
             }
             slots[at] = i as i32;
         }
-        RowParser::Json {
+        let mut parser = RowParser::Json {
+            key_size: key_size.min(wanted.len()),
             wanted,
             slots,
             slot_mask,
+            canon: Vec::new(),
+        };
+        let canon: Vec<i32> = match &parser {
+            RowParser::Json { wanted, .. } => wanted
+                .iter()
+                .map(|w| match w {
+                    Some(w) => parser.slot_for(w.as_bytes()).map_or(-1, |s| s as i32),
+                    None => -1,
+                })
+                .collect(),
+            RowParser::Csv { .. } => unreachable!(),
+        };
+        if let RowParser::Json { canon: c, .. } = &mut parser {
+            *c = canon;
         }
+        parser
     }
 
     /// Parses one row into `out`, returning the offset of the next row.
@@ -489,7 +535,18 @@ impl RowParser {
 
     /// Walks one JSON object, storing the values of the keys we want.
     fn parse_json(&self, data: &[u8], start: usize, end: usize, out: &mut [Field]) -> usize {
+        let RowParser::Json {
+            wanted,
+            key_size,
+            canon,
+            ..
+        } = self
+        else {
+            unreachable!("parse_json on a CSV parser");
+        };
         out.fill(ABSENT);
+        let mut found = 0; // key slots filled, for the early exit below
+        let mut guess = 0; // the slot the next member most likely fills
         let mut pos = start;
         while pos < end && json_space(data[pos]) {
             pos += 1;
@@ -567,9 +624,32 @@ impl RowParser {
                 }
             };
             if let Some(field) = field
-                && let Some(slot) = self.slot_for(key)
+                && let Some(slot) = match wanted.get(guess) {
+                    Some(Some(w)) if w.as_bytes() == key => usize::try_from(canon[guess]).ok(),
+                    _ => self.slot_for(key),
+                }
             {
-                out[slot] = field;
+                guess = slot + 1;
+                // First occurrence wins for a key column, and only for a key
+                // column -- the rule the C port states. A JSON object is not
+                // supposed to repeat a name, but the key-only parse stops as
+                // soon as it has the keys, and it has to agree with the full
+                // parse on what a row's key is: last-wins would let it stop on a
+                // different value than the full parse ends with, a lookup that
+                // misses its own row. Compared columns keep last-wins.
+                if slot < *key_size {
+                    if out[slot] == ABSENT {
+                        out[slot] = field;
+                        found += 1;
+                        // Every key found and nothing else wanted: the rest of
+                        // the object is bytes to skip, not fields to parse.
+                        if found == wanted.len() {
+                            break;
+                        }
+                    }
+                } else {
+                    out[slot] = field;
+                }
             }
         }
         end_of_json_row(data, pos, end)
@@ -580,6 +660,7 @@ impl RowParser {
             wanted,
             slots,
             slot_mask,
+            ..
         } = self
         else {
             return None;
@@ -684,7 +765,7 @@ mod tests {
     fn values_are_read_by_key_whatever_order_they_come_in() {
         let text = "{\"k\":\"1\",\"v\":\"a\"}\n{\"v\":\"b\",\"k\":\"2\"}\n";
         let slab = json_slab(text);
-        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())]);
+        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())], 0);
         let mut out = vec![ABSENT; 2];
         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"1");
@@ -698,13 +779,16 @@ mod tests {
     fn null_a_nested_value_and_a_missing_key_are_all_absent() {
         let text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":1},\"x\":[1,2]}\n";
         let slab = json_slab(text);
-        let parser = RowParser::json(vec![
-            Some("k".into()),
-            Some("v".into()),
-            Some("w".into()),
-            Some("x".into()),
-            Some("missing".into()),
-        ]);
+        let parser = RowParser::json(
+            vec![
+                Some("k".into()),
+                Some("v".into()),
+                Some("w".into()),
+                Some("x".into()),
+                Some("missing".into()),
+            ],
+            0,
+        );
         let mut out = vec![0; 5];
         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"1");
@@ -716,11 +800,48 @@ mod tests {
     fn a_newline_inside_a_string_does_not_end_the_row() {
         let text = "{\"k\":\"a\\nb\",\"v\":\"1\"}\n{\"k\":\"c\",\"v\":\"2\"}\n";
         let slab = json_slab(text);
-        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())]);
+        let parser = RowParser::json(vec![Some("k".into()), Some("v".into())], 0);
         let mut out = vec![ABSENT; 2];
         let next = parser.parse(slab.data(), 0, text.len(), &mut out);
         assert_eq!(slab.logical(out[0]).collect::<Vec<u8>>(), b"a\nb");
         parser.parse(slab.data(), next, text.len(), &mut out);
         assert_eq!(slab.raw(out[0]), b"c");
+    }
+
+    #[test]
+    fn a_repeated_key_the_key_only_and_full_parses_agree() {
+        // The first `k` is the row's key in both parses -- the key-only one
+        // stops there -- while a repeated compared column keeps its last value.
+        let text = "{\"k\":\"1\",\"v\":\"a\",\"k\":\"2\",\"v\":\"b\"}\n{\"k\":\"3\"}\n";
+        let slab = json_slab(text);
+        let full = RowParser::json(vec![Some("k".into()), Some("v".into())], 1);
+        let keys = RowParser::json(vec![Some("k".into())], 1);
+        let mut out = vec![ABSENT; 2];
+        let next = full.parse(slab.data(), 0, text.len(), &mut out);
+        assert_eq!(slab.raw(out[0]), b"1");
+        assert_eq!(slab.raw(out[1]), b"b");
+        let mut key = vec![ABSENT; 1];
+        assert_eq!(keys.parse(slab.data(), 0, text.len(), &mut key), next);
+        assert_eq!(slab.raw(key[0]), b"1");
+        keys.parse(slab.data(), next, text.len(), &mut key);
+        assert_eq!(slab.raw(key[0]), b"3");
+    }
+
+    #[test]
+    fn a_name_in_two_slots_is_found_where_the_table_would_find_it() {
+        // `k` fills slot 0 and slot 2, as when a key column is also named as a
+        // compared one. After `v` fills slot 1 the next member is guessed as
+        // slot 2, and a right guess has to answer what the table does: slot 0.
+        let text = "{\"k\":\"1\",\"v\":\"a\",\"k\":\"2\"}\n";
+        let slab = json_slab(text);
+        let parser = RowParser::json(
+            vec![Some("k".into()), Some("v".into()), Some("k".into())],
+            1,
+        );
+        let mut out = vec![ABSENT; 3];
+        parser.parse(slab.data(), 0, text.len(), &mut out);
+        assert_eq!(slab.raw(out[0]), b"1");
+        assert_eq!(slab.raw(out[1]), b"a");
+        assert_eq!(out[2], ABSENT);
     }
 }

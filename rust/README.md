@@ -65,6 +65,7 @@ port has a `serve` or `mail` command.
 | `--export-dir` | full, uncapped changed/added/removed CSVs |
 | `--engine` | `auto` (default, resolves to `turbo`), `turbo`, `sortmerge`, or `native` |
 | `--no-compress` | plain JSON payload for pre-2023 browsers |
+| `--summary` | print the counts and write nothing: no report, no rows, no sections. Refuses `--out`, `--json` and `--export-dir` rather than guessing which was meant. This is what the other ports in this repository do without an output flag, and what the benchmark ladder times |
 
 Duplicate keys are counted and listed per file; the first occurrence of each key takes part in the join.
 
