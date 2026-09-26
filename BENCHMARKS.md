@@ -120,6 +120,112 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (false sharing) — the C port's threads were fighting over two cache lines
+
+The C join scaled to **2.8x** on four cores. The Rust port does the same work in
+the same time on one core -- 1.26s against 1.33s serial -- and reaches **3.9x**.
+Same machine, same pair, same afternoon.
+
+### The obvious cause, priced and rejected
+
+C cuts the join into one range per thread; Rust pulls sixty-one chunks from a
+queue, and its comment says why: a chunk that turns out expensive should delay
+one worker rather than three. So the queue was built for C first.
+
+| | speedup |
+|---|---:|
+| one range per thread | 2.80x |
+| sixty-one chunks from a queue | 2.76x |
+
+**Nothing.** Imbalance was not it.
+
+### What it was
+
+`CmpPart` is one per thread in a single `calloc`ed array, about ninety bytes
+apart. Two of them share a cache line, so `out->matched++` on one thread dirties
+the line another thread is incrementing its own counters in, and the line moves
+between cores. Four million rows of that shows up as nothing in particular and
+everything in the scaling.
+
+`Chunk` has it worse: one per sweep thread, forty bytes apart, and `chunk_push`
+touches `n`, `cap` and both pointers on *every row*.
+
+Both padded to a cache line, on the 4M CSV pair, phases alternating and paired
+per run:
+
+| | before | after | paired [mid half] |
+|---|---:|---:|---|
+| join | 0.485s | 0.352s | **1.384x** [1.260-1.448] |
+| sweep | 0.218s | 0.152s | **1.354x** [1.322-1.676] |
+| whole run, wall | 1.075s | 0.772s | **1.35x** [1.26-1.47] |
+| whole run, CPU | 3.09s | 2.32s | **1.36x** [1.26-1.39] |
+
+The join's speedup goes 2.80x to 3.91x, which is Rust's 3.85x.
+
+### The check that makes it a diagnosis rather than a number
+
+False sharing costs nothing when there is nothing to share. So the same pair of
+builds, on the same join, at one thread and at four:
+
+| threads | paired [mid half] |
+|---|---|
+| 1 | **0.987x** [0.933-1.041] |
+| 4 | **1.210x** [1.136-1.344] |
+
+Exactly nothing at one thread, and the whole of it at four. That is the
+signature, and without it "padding made it faster" would have been a result
+without a reason.
+
+### On two different processors, which was not on purpose
+
+The container was replaced part-way through this work and came back on a
+different CPU -- a 2.80GHz Xeon where the numbers above were taken on a 2.10GHz
+one. Everything was rebuilt and re-measured there, which by the rule at the top
+of this file is a second table and not a continuation of the first:
+
+| | 2.10GHz Xeon | 2.80GHz Xeon |
+|---|---|---|
+| whole run, wall | 1.35x [1.26-1.47] | 1.22x [1.14-1.33] |
+| whole run, CPU | 1.36x [1.26-1.39] | 1.22x [1.15-1.32] |
+| join at 1 thread | 0.987x [0.933-1.041] | 0.982x [0.928-1.044] |
+| join at 4 threads | 1.210x [1.136-1.344] | 1.282x [1.069-1.333] |
+| the floor, one build against itself | 0.99x [0.92-1.07] | 1.02x [0.96-1.09] |
+
+Different sizes, same shape, and the one-thread control is nothing on both. Two
+machines agreeing on a mechanism is worth more than either agreeing with itself,
+and it was an accident.
+
+### It is not a general truth about the design
+
+Both sibling ports have the same shape and neither wants the fix:
+
+| port | the same padding |
+|---|---|
+| Zig -- one `Chunk` per sweep thread in a `gpa.alloc` array, `at.append` per row | **0.966x** [0.948-1.138] -- no result |
+| C++ -- `std::vector<Chunk>` and `std::vector<Part>`, `push_back` and `matched++` per row | **0.95x** [0.93-0.99] -- slower, and inside the floor |
+
+The same is true of C's own Parquet path: `Part` there is one per join thread in
+a `calloc`ed array, forty bytes apart, and `join_part` writes `pa[n++]` for every
+key it matches. Padded, the join phase measures 1.082x [1.000-1.230] and the
+whole run 1.00x [0.95-1.02] -- no result, so it is not in this change either.
+That path's join is a tenth of a second of a third of a second, and an integer
+compare per key rather than a row parse.
+
+So this is not "per-thread accumulators must be padded". It is about what the
+per-row update compiles to, and about how much of the run is spent doing it. `chunk_push` is a call through a pointer and has to
+reload `n` and `cap` from the struct every row; `ArrayList.append` and
+`std::vector::push_back` are fully visible to the optimiser, which keeps them in
+registers across the loop and touches the struct only when it grows. The line
+that moves between cores in the C port is barely read in the other two, and
+padding there only adds sixty-four bytes of footprint per chunk.
+
+The phase floor on this host, one build against itself by the same alternating
+method, is 0.99x [0.91-1.12]. Every number kept above is clear of it; the two
+that are not -- the queue, and the Zig padding -- are reported as no result and
+not built.
+
+---
+
 ## 2026-09-24 (zig scan width) — the phase got faster and the run did not
 
 With the Rust port's measurement corrected, the 4M CSV table on this host reads:
