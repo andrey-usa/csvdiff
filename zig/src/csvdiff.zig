@@ -1198,18 +1198,25 @@ const Sweep = struct {
         const keys = try gpa.alloc(Field, @max(1, self.key_size));
         defer gpa.free(keys);
         var s = Scratch{};
-        var chunk = &self.chunks[i];
+        // The lists are built here and published once at the end. Appending to
+        // `self.chunks[i]` directly writes its length on every row, and the
+        // chunks sit side by side in one array: two threads' lengths share a
+        // cache line, and the line bounces between their cores once a row.
+        var at: std.ArrayList(u64) = .empty;
+        errdefer at.deinit(gpa);
+        var hash: std.ArrayList(u64) = .empty;
+        errdefer hash.deinit(gpa);
 
         switch (self.side.rows) {
             .columnar => {
                 const lo = self.columnar_rows * i / self.chunks.len;
                 const hi = self.columnar_rows * (i + 1) / self.chunks.len;
-                try chunk.at.ensureTotalCapacity(gpa, hi - lo);
-                try chunk.hash.ensureTotalCapacity(gpa, hi - lo);
+                try at.ensureTotalCapacity(gpa, hi - lo);
+                try hash.ensureTotalCapacity(gpa, hi - lo);
                 for (lo..hi) |row| {
                     self.side.fieldsAt(row, fields);
-                    chunk.at.appendAssumeCapacity(row);
-                    chunk.hash.appendAssumeCapacity(
+                    at.appendAssumeCapacity(row);
+                    hash.appendAssumeCapacity(
                         try keyHash(self.side.slab, fields, self.key_size, self.opt, &s.a),
                     );
                 }
@@ -1242,8 +1249,8 @@ const Sweep = struct {
                         _ = t.parser.parse(data, pos, data.len, fields);
                         for (fields) |field| if (field == TOO_LONG) return Error.FieldTooLong;
                     }
-                    try chunk.at.append(gpa, pos);
-                    try chunk.hash.append(
+                    try at.append(gpa, pos);
+                    try hash.append(
                         gpa,
                         try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a),
                     );
@@ -1252,6 +1259,8 @@ const Sweep = struct {
                 }
             },
         }
+        self.chunks[i].at = at;
+        self.chunks[i].hash = hash;
     }
 };
 
@@ -1410,7 +1419,12 @@ const Join = struct {
         const fb = try gpa.alloc(Field, self.width);
         defer gpa.free(fb);
         var s = Scratch{};
-        var out = &self.parts[p];
+        // Counted here and published once at the end, for the sweep's reason:
+        // the parts lie side by side, and so do their column arrays, all
+        // allocated one after another on one thread. Counting into them in place
+        // put several threads' counters on one cache line, bumped once a row.
+        var out: Part = .{ .columns = try gpa.dupe(ColumnStat, self.parts[p].columns) };
+        defer gpa.free(out.columns);
 
         const keys = self.ai.first_row.items;
         const lo = keys.len * p / self.parts.len;
@@ -1523,6 +1537,11 @@ const Join = struct {
             }
             if (any) out.changed += 1;
         }
+        const into = &self.parts[p];
+        into.matched = out.matched;
+        into.changed = out.changed;
+        into.removed = out.removed;
+        @memcpy(into.columns, out.columns);
     }
 };
 
@@ -1631,34 +1650,27 @@ pub fn compare(
     for (compared.items) |c| try wanted.append(gpa, c);
 
     // The two files share nothing until the join, so they are read at the same
-    // time -- one thread each.
+    // time, and each is split `total / 2` ways again inside its own sweep.
     //
-    // Each file used to be split further, `total / 2` ways, on the reasoning that
-    // two files across four cores is two chunks each and the whole machine busy.
-    // Measured, it was the opposite. On the 4M CSV pair the sweep takes 0.35s a
-    // side unsplit and 0.46-0.58s split two ways: *slower* with twice the
-    // threads, and the whole run 1.50x wall and 2.06x CPU better without it.
+    // That split was off for a while, measured as *slower* -- 0.35s a side
+    // unsplit against 0.46-0.58s split on the 4M CSV pair -- and the blame went
+    // to the allocator, since the same code under glibc's `c_allocator` scaled
+    // and under `smp_allocator` did not. The allocator was only where the
+    // cause was hiding. Each sweep chunk appended to its own lists in place,
+    // writing their lengths on every row, and the chunks lie side by side in
+    // one array: two threads' lengths on one cache line. `smp_allocator` packs
+    // small allocations tightly, so it put them there; glibc's headers happened
+    // to push them apart.
     //
-    // The cause is the allocator, and it was isolated rather than guessed. The
-    // same code linked against libc and given `c_allocator` scales -- 0.36s to
-    // 0.30s -- and linked against libc but handed `smp_allocator`, which is what
-    // this port gets by default, it does not: 0.49s. It is not memcpy or memset
-    // (the second build has glibc's), not syscalls, not page faults (flat across
-    // all four builds), and not the sweep's own arrays growing: pre-sizing them
-    // took the mremap calls inside the sweep from 192 to 60 and moved nothing.
-    // What differs is user time, 3.60s against 2.67s for identical code. Where in
-    // user space it goes is not established; see BENCHMARKS.md.
+    // The sweep now builds its lists locally and publishes them once, and the
+    // split pays: on the 2M pairs at four threads the sweep went 0.303s to
+    // 0.206s for CSV and 0.542s to 0.255s for JSON; see BENCHMARKS.md.
     //
-    // So no split, which needs nothing this port does not already have. Linking
-    // libc would buy the split back and more -- 1.72x wall against this change's
-    // 1.50x -- but this port deliberately links none, and that is not a decision
-    // a sweep gets to make.
-    //
-    // `gpa` still has to be thread-safe, since A and B run at once. Under
+    // `gpa` has to be thread-safe, since A and B run at once. Under
     // --max-memory it is a FixedBufferAllocator -- a bump pointer with no lock,
     // which would hand two threads the same bytes -- so main.zig passes its
     // lock-taking variant. The budget it enforces is unchanged.
-    const per_file: usize = 1;
+    const per_file: usize = @max(1, total / 2);
     var prepare_a = Prepare{
         .gpa = gpa,
         .input = a_input,
