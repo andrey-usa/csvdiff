@@ -120,6 +120,51 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (speculative split) — Rust's sweep did not scale because of the step before it
+
+The Rust sweep took as long at four threads as at one on the 4M CSV pair,
+0.34 s a side, where C's halves. Timed from inside: each of the two chunks
+finished in 0.15-0.22 s, and `chunk_bounds` took **0.13-0.16 s a side before
+either started**. At two chunks a file, its quote count is one task over half
+the file, on one thread. A notes entry once said removing the count "didn't
+help". Timed directly, it is nearly half the phase.
+
+It isn't slow counting. A vectorisable rewrite changed nothing, and a second
+pass over the same bytes still took 148 ms (80 ms on a native build). It's
+reading 368 MB a side on one thread before the parallel part begins.
+
+So the count isn't done up front any more. For CSV the split is guessed at
+the next newline, exactly as for JSON, and **checked afterwards**. Chunk 0
+starts at a real row, so the row it finishes on ends at the first real row
+start past its boundary. If that is where chunk 1 began, the boundary was real,
+and the same argument carries down the line. If any guess was wrong (a quoted
+newline at the split), the sweep runs again on counted bounds, which is exactly
+what it did before. A chunk that started on a wrong guess parsed garbage, so its
+rows and its errors are discarded unread.
+
+4M CSV pair, `-k account_id,txn_id -i updated_at`, 4 vCPU Xeon @ 2.10 GHz,
+paired against main, 15 rounds, reports identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| four threads (two chunks a file) | **1.20x** 1.15-1.24 | **1.18x** 1.13-1.21 |
+| two threads (one chunk a file: nothing to guess) | 0.99x 0.94-1.10 (no result) | 1.00x 0.95-1.05 |
+
+The two-thread row is the control: no split, no count, no change.
+
+Two tests cover the guess. `chunk_boundaries_land_between_rows_in_a_quoted_file`
+already existed; seven of each row's eight newlines are quoted, so the guess
+almost always fails and the fallback runs. It fails if the check is disabled.
+The new `a_wrong_split_guess_cannot_fail_the_run` places a legal 7.9 MB quoted
+field across the middle of the file so the guessed chunk reads a field of over
+8 MB and raises an error that belongs to no row. It fails if chunk errors are
+surfaced before their boundary is checked.
+
+C and C++ count the same way before their sweeps: C serially, C++ in one task
+at two chunks a file.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242
