@@ -1029,7 +1029,7 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
     for (std::size_t w = 0; w < words; ++w) {
         std::uint64_t word = any[w];
         changed_total += __builtin_popcountll(word);
-        while (word && keep.size() <= opt.max_rows) {
+        while (opt.row_lists && word && keep.size() <= opt.max_rows) {
             const unsigned bit = static_cast<unsigned>(__builtin_ctzll(word));
             keep.push_back(w * 64 + bit);
             word &= word - 1;
@@ -1037,6 +1037,16 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
     }
 
     // --- the report -------------------------------------------------------
+    //
+    // Only when something will print it. Without `--json` the run ends in one
+    // line of counts, and everything below is rows nobody reads: the key of up
+    // to `max_rows` changed pairs decoded into strings, the added and removed
+    // rows built from their columns, three sorts over them, and a pass over
+    // every distinct key of both files for the duplicate sections. That was
+    // 0.046s of a 0.54s run on 2M rows of Parquet, charged to a count. The
+    // CSV engine has always skipped it under the same flag; the counts below
+    // never depended on any of it.
+    if (opt.row_lists) {
     const auto key_values = [&](const KeySide& s, std::int32_t row) {
         std::vector<Val> out;
         out.reserve(key_size);
@@ -1098,6 +1108,7 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
     };
     dup_section(keys.a, ai, r.dup_a, r.dup_a_truncated);
     dup_section(keys.b, bi, r.dup_b, r.dup_b_truncated);
+    }
 
     const std::int64_t matched = static_cast<std::int64_t>(npairs);
     r.counts.a_rows = ai.rows;
