@@ -1199,9 +1199,10 @@ const Sweep = struct {
         defer gpa.free(keys);
         var s = Scratch{};
         // The lists are built here and published once at the end. Appending to
-        // `self.chunks[i]` directly writes its length on every row, and the
-        // chunks sit side by side in one array: two threads' lengths share a
-        // cache line, and the line bounces between their cores once a row.
+        // `self.chunks[i]` directly writes its lengths on every row, and a chunk
+        // is a few dozen bytes: its neighbours in the array, or the other
+        // file's chunk allocated beside it, share its cache line, and the line
+        // bounces between the two threads' cores once a row. See `compare`.
         var at: std.ArrayList(u64) = .empty;
         errdefer at.deinit(gpa);
         var hash: std.ArrayList(u64) = .empty;
@@ -1419,12 +1420,7 @@ const Join = struct {
         const fb = try gpa.alloc(Field, self.width);
         defer gpa.free(fb);
         var s = Scratch{};
-        // Counted here and published once at the end, for the sweep's reason:
-        // the parts lie side by side, and so do their column arrays, all
-        // allocated one after another on one thread. Counting into them in place
-        // put several threads' counters on one cache line, bumped once a row.
-        var out: Part = .{ .columns = try gpa.dupe(ColumnStat, self.parts[p].columns) };
-        defer gpa.free(out.columns);
+        var out = &self.parts[p];
 
         const keys = self.ai.first_row.items;
         const lo = keys.len * p / self.parts.len;
@@ -1537,11 +1533,6 @@ const Join = struct {
             }
             if (any) out.changed += 1;
         }
-        const into = &self.parts[p];
-        into.matched = out.matched;
-        into.changed = out.changed;
-        into.removed = out.removed;
-        @memcpy(into.columns, out.columns);
     }
 };
 
@@ -1650,27 +1641,34 @@ pub fn compare(
     for (compared.items) |c| try wanted.append(gpa, c);
 
     // The two files share nothing until the join, so they are read at the same
-    // time, and each is split `total / 2` ways again inside its own sweep.
+    // time -- one thread each.
     //
-    // That split was off for a while, measured as *slower* -- 0.35s a side
-    // unsplit against 0.46-0.58s split on the 4M CSV pair -- and the blame went
-    // to the allocator, since the same code under glibc's `c_allocator` scaled
-    // and under `smp_allocator` did not. The allocator was only where the
-    // cause was hiding. Each sweep chunk appended to its own lists in place,
-    // writing their lengths on every row, and the chunks lie side by side in
-    // one array: two threads' lengths on one cache line. `smp_allocator` packs
-    // small allocations tightly, so it put them there; glibc's headers happened
-    // to push them apart.
+    // Each file used to be split further, `total / 2` ways, on the reasoning that
+    // two files across four cores is two chunks each and the whole machine busy.
+    // Measured, it was the opposite: on the 4M CSV pair the sweep took 0.35s a
+    // side unsplit and 0.46-0.58s split two ways. That was blamed on
+    // `smp_allocator`, since the same code under glibc's `c_allocator` scaled.
     //
-    // The sweep now builds its lists locally and publishes them once, and the
-    // split pays: on the 2M pairs at four threads the sweep went 0.303s to
-    // 0.206s for CSV and 0.542s to 0.255s for JSON; see BENCHMARKS.md.
+    // The allocator was only where the cause was hiding. The sweep appended to
+    // its chunk's lists in place, writing their lengths on every row, and
+    // `smp_allocator` packs small allocations tightly -- so two threads' chunks,
+    // split or not, could sit on one cache line, and the line bounced between
+    // their cores once a row. Even unsplit, A's one chunk and B's one chunk did:
+    // on CI at one thread, where nothing is split, building the lists locally
+    // took the sweep from 0.78s to 0.49s at 10M rows of CSV and from 1.70s to
+    // 1.17s of JSON. See BENCHMARKS.md.
+    //
+    // With that gone the split was measured again, and it still does not pay
+    // here: on an EPYC 9V45 runner it took the 10M CSV sweep from 0.49s to
+    // 0.62s, the serial quote count in front of it included; on an EPYC 7763
+    // it took JSON's from 1.17s to 1.07s, not enough to carry the CSV loss. A
+    // four-vCPU runner is two cores, and A and B already fill them.
     //
     // `gpa` has to be thread-safe, since A and B run at once. Under
     // --max-memory it is a FixedBufferAllocator -- a bump pointer with no lock,
     // which would hand two threads the same bytes -- so main.zig passes its
     // lock-taking variant. The budget it enforces is unchanged.
-    const per_file: usize = @max(1, total / 2);
+    const per_file: usize = 1;
     var prepare_a = Prepare{
         .gpa = gpa,
         .input = a_input,
