@@ -678,8 +678,8 @@ const Input = union(enum) {
                     for (wanted, 0..) |n, i| keys[i] = if (has(t.names, n)) n else null;
                     side.wanted_names = keys;
                     side.rows = .{ .text = .{
-                        .parser = try text.RowParser.initJson(gpa, keys),
-                        .keys = try text.RowParser.initJson(gpa, keys[0..@min(key_size, width)]),
+                        .parser = try text.RowParser.initJson(gpa, keys, key_size),
+                        .keys = try text.RowParser.initJson(gpa, keys[0..@min(key_size, width)], key_size),
                         .from = t.from,
                     } };
                 } else {
