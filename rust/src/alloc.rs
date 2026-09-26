@@ -32,15 +32,34 @@
 //! column` fail at very different budgets, and knowing which one hit the
 //! ceiling is the difference between a number and a diagnosis.
 
+use std::sync::Mutex;
+
 use crate::{Error, Result};
 
-/// The refusal itself: what was being sized, and how big it was.
+/// Room held back so that a refusal can always be written.
 ///
-/// Formatting allocates, which looks circular in a function that exists because
-/// an allocation failed. It is not: the allocation that failed was megabytes and
-/// has not been taken, so there is room for sixty bytes of message. The other
-/// ports print at this point too.
+/// Formatting the refusal allocates, and so does everything between it and the
+/// line on stderr. When the allocation that failed was megabytes that is no
+/// problem -- it was never taken -- but the checked ones include a report row's
+/// few dozen bytes, and when one of those fails the process is at its ceiling
+/// to the byte: the message's own allocation failed after it and aborted from
+/// inside the refusal. This is released first thing in [`refuse`], which is
+/// what the message and the unwinding after it are written into.
+static RESERVE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+const RESERVE_BYTES: usize = 64 * 1024;
+
+/// Sets aside the room a refusal is written into. `main` calls it first.
+pub fn hold_reserve() {
+    if let Ok(mut reserve) = RESERVE.lock() {
+        *reserve = Vec::with_capacity(RESERVE_BYTES);
+    }
+}
+
+/// The refusal itself: what was being sized, and how big it was.
 fn refuse(what: &str, bytes: usize) -> Error {
+    if let Ok(mut reserve) = RESERVE.lock() {
+        *reserve = Vec::new();
+    }
     Error::new(format!(
         "out of memory: {what} needs {}",
         human_bytes(bytes)
