@@ -104,13 +104,18 @@ struct Run {
 /// not about to take one for a test. The limit applies to the `exec`ed child, so
 /// what it bounds is the binary under test and nothing else.
 fn run_capped(cap_mb: usize, a: &Path, b: &Path, report: &Path) -> Run {
+    run_script(cap_mb * 1024, a, b, &format!("-o {}", report.display()))
+}
+
+/// The same, at `cap_kb` kilobytes and with whatever output flag is given.
+fn run_script(cap_kb: usize, a: &Path, b: &Path, out_flag: &str) -> Run {
     let script = format!(
-        "ulimit -d {}; exec {} compare {} {} -k account_id,txn_id -o {}",
-        cap_mb * 1024,
+        "ulimit -d {}; exec {} compare {} {} -k account_id,txn_id {}",
+        cap_kb,
         env!("CARGO_BIN_EXE_csvdiff"),
         a.display(),
         b.display(),
-        report.display(),
+        out_flag,
     );
     let mut child = Command::new("bash")
         .arg("-c")
@@ -203,4 +208,90 @@ fn the_same_files_compare_when_the_budget_is_enough() {
         run.stderr.trim()
     );
     assert!(report.exists(), "no report was written");
+}
+
+/// Every budget from too small to enough, not five of them.
+///
+/// The five sampled caps above are five points on a line, and the failure this
+/// file exists to catch does not live at points -- it lives in a *band*, and a
+/// band moves when the port's requirement changes. It moved under this test
+/// without it noticing: a change that stopped the index holding the sweep
+/// chunks and the table at the same time lowered what the port needs, carried
+/// the band down with it past caps this test samples, and *widened* it from
+/// three rungs to six. The suite stayed green.
+///
+/// So this scans, and it is a ratchet rather than a guarantee. Everything the
+/// port allocates itself is checked -- the index, the sections, the rows, every
+/// `String` in them, and the buffers the JSON, the gzip stream and the base64
+/// are written into. What is left is inside `serde_json` and the compressor
+/// themselves, and at the one cap where the process is a single allocation from
+/// its ceiling it is a coin flip which allocation is the one that fails: the
+/// port's own, which refuses, or theirs, which cannot. Repeating the scan gives
+/// one or two rungs and never the same one twice in a row.
+///
+/// So the number below is the count of rungs that have *ever* aborted across
+/// repeats, not a per-run count, and this test's job is to notice the day there
+/// are three.
+#[test]
+fn the_band_where_it_aborts_does_not_grow() {
+    // What the port allocates itself is checked, so an abort in this range is
+    // inside `serde_json` or the compressor at the cap where the process is one
+    // allocation from its ceiling. One pass measures one or two; three is this
+    // number so that the coin flip cannot fail a run on its own, which is the
+    // failure mode a scanning test has that a sampling one does not.
+    //
+    // It is still a ratchet with room to catch something real: dropping the
+    // index's peak, which turns graceful index refusals into report-path ones
+    // over a 4 MB stretch of caps, measures six. Raising this number is a
+    // decision, not a fix -- find what widened it first.
+    const ALLOWED: usize = 3;
+
+    let fx = Fixture::new();
+    let mut aborted = Vec::new();
+    let mut answered = 0usize;
+    let mut refused = 0usize;
+    let report = fx.dir.join("scan.html");
+    let out_flag = format!("-o {}", report.display());
+
+    // 512 KB steps: wide enough that the whole scan is seconds, fine enough
+    // that a band has nowhere to hide -- the narrowest measured here was 1 MB.
+    let mut cap_kb = 4 * 1024;
+    while cap_kb <= 24 * 1024 {
+        let run = run_script(cap_kb, &fx.a(), &fx.b(), &out_flag);
+        assert!(!run.hung, "{cap_kb} KB: the run did not finish");
+        match run.code {
+            // Killed by a signal: an allocation failed and took the process.
+            None => aborted.push((cap_kb, run.stderr.trim().to_string())),
+            Some(2) => {
+                assert!(
+                    run.stderr.contains("needs"),
+                    "{cap_kb} KB: the refusal does not say how big it was: {}",
+                    run.stderr.trim()
+                );
+                refused += 1;
+            }
+            Some(0) | Some(1) => answered += 1,
+            other => panic!(
+                "{cap_kb} KB: unexpected exit {other:?}; stderr: {}",
+                run.stderr.trim()
+            ),
+        }
+        cap_kb += 512;
+    }
+
+    assert!(
+        aborted.len() <= ALLOWED,
+        "{} of the scanned budgets aborted instead of refusing, against {ALLOWED} allowed:\n{}",
+        aborted.len(),
+        aborted
+            .iter()
+            .map(|(kb, err)| format!("  {} KB: {err}", kb))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // A scan that only ever refused, or only ever answered, is not crossing the
+    // boundary and would pass on a port that had lost the ability to do either.
+    assert!(refused > 0, "no cap in the range was too small to serve");
+    assert!(answered > 0, "no cap in the range was enough to answer");
 }
