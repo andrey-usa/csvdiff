@@ -162,6 +162,48 @@ there to fix.
 
 ---
 
+## 2026-09-21 (duplicate keys) — the section decoded every column to keep two
+
+The Rust port's duplicate-key section decodes one row per duplicated key and
+keeps the key columns. It was decoding the *whole* row to do it:
+
+    let values = row_values(side, idx, *row, opt);   // side.width columns
+    (values[..key_size].to_vec(), *n as i64)          // key_size of them kept
+
+`row_values` turns every field into a `String`, so a twenty-column file built
+eighteen strings per duplicated key and dropped them, then cloned the two it
+wanted into a second vector. The index already carries a parser that stops at
+the key — `keys_of`, which the insert path uses on every row — so the fix is to
+call it instead of decoding past the key at all.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+7 rounds interleaved, paired per round. The pair is 2M rows × 20 columns with
+every key repeated ten times: **200,000 duplicated keys**, which is what this
+section is proportional to.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.135s | 0.658s | **1.71x** 1.68-1.73 |
+| CPU (median) | 1.74s | 1.27s | **1.36x** 1.34-1.38 |
+
+The report is byte-identical across the change: the HTML payload decompresses to
+the same 2,480,022 bytes apart from `meta`, which carries the timestamp and the
+elapsed time.
+
+**It is proportional to duplicated keys, not to rows.** On the standard 4M pair,
+which has 400 duplicated keys against 200,000 here, the same change measures
+1.02x CPU [1.02-1.03] — real but at the paired noise floor, and not worth
+quoting on its own. A file with no repeated key does not enter the section at
+all. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+C++ has the identical shape at `dup_section` — `row_values(...)` then
+`values.resize(key_size)` — and already has a `key_values` helper beside it that
+#101 added for the changed rows. C and Zig report duplicate *counts* and no rows,
+so there is nothing there to fix.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242
