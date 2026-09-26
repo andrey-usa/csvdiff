@@ -1248,9 +1248,17 @@ class RowIndex {
     }
 
     // One chunk's rows, in the order they appear in it.
-    struct Chunk {
+    // Padded to a cache line. One of these per sweep thread in one
+    // `std::vector<Chunk>`, forty-eight bytes apart, and `push_back` on either
+    // vector touches this struct's pointers on every row -- so two threads
+    // sweeping concurrently move the line between cores once a row each.
+    //
+    // This is why the split below looked unprofitable when it was measured. See
+    // the note there.
+    struct alignas(64) Chunk {
         std::vector<std::size_t> starts;
         std::vector<std::uint64_t> hashes;
+        char pad[64]{};
     };
 
     // Where each chunk begins, as offsets of real row starts. The nominal
@@ -1799,7 +1807,23 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // over eleven paired rounds, faster in all eleven, and the whole phase then
     // costs what it cost on one thread -- the sweep does not scale on this
     // machine at any width, so the split was buying nothing and paying for it.
-    const unsigned per_file = budget >= 8 ? budget / 2 : 1;
+    //
+    // **That conclusion was right about the measurement and wrong about the
+    // cause, and the cause has since been fixed.** The sweep did not scale
+    // because two threads' `Chunk`s shared a cache line and each row either
+    // appended moved it; the split was paying for the sharing rather than for
+    // the chunking. `Chunk` is padded now, and the curve is a different one:
+    //
+    //     against no split at all, 4M pair, --threads 4, 15 paired rounds
+    //     per_file      budget/2        budget
+    //     wall          1.11x           1.11x
+    //     cpu           0.96x           0.94x
+    //
+    // Eleven percent of the wall for four percent more CPU, which is what
+    // threading is supposed to trade, and `budget / 2` buys it for less than
+    // `budget` does. That is also the rule the C port has always used, and both
+    // files are swept at once, so half the machine each is the whole of it.
+    const unsigned per_file = budget > 1 ? budget / 2 : 1;
 
     std::optional<RowIndex> ai_slot, bi_slot;
     std::exception_ptr worker_failure;

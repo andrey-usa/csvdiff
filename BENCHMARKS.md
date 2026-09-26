@@ -120,6 +120,56 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (cpp sweep) — #109 measured the right thing and named the wrong cause
+
+#109 tried splitting the C++ sweep across threads and found it did not pay, on a
+curve where every width was worse than not splitting at all:
+
+    per_file  1     2      3      4      6      8
+    vs two    0.923 1.000  0.965  0.936  0.936  0.903
+
+It concluded *"the sweep does not scale on this machine at any width"*, and set
+`per_file = budget >= 8 ? budget / 2 : 1`, which on every four-core runner means
+one chunk and no split.
+
+**The measurement was right and the cause was not.** Two threads' `Chunk`s sat
+forty-eight bytes apart in one `std::vector<Chunk>`, and `push_back` on either of
+their vectors touches the struct's pointers on every row. The split was paying
+for a cache line moving between cores once per row, not for the chunking.
+
+With `Chunk` padded to a cache line -- the same fix the C port needed, found the
+same afternoon -- the split is worth having:
+
+| against no split, 4M pair, `--threads 4` | wall | CPU |
+|---|---|---|
+| `per_file = budget / 2` | **1.11x** | 0.96x |
+| `per_file = budget` | 1.11x | 0.94x |
+
+Same wall either way and `budget / 2` costs less CPU for it, which is also the
+rule the C port has always used: both files are swept at once, so half the
+machine each is the whole of it.
+
+Shipped against new, 4M pair, `--threads 4`:
+
+| | shipped | new | paired [mid half] |
+|---|---:|---:|---|
+| sweep phase | 0.391s | 0.211s | **1.822x** [1.780-2.000] |
+| whole run, wall | 1.350s | 1.225s | **1.11x** [1.07-1.16] |
+| whole run, CPU | 3.74s | 3.87s | 0.96x [0.94-1.00] |
+
+Eleven percent of the wall for four percent more CPU is what threading is for,
+and the sweep phase itself nearly halves.
+
+**The lesson is not that #109 was careless.** It measured nine interleaved
+rounds, tabulated six widths, and drew the only conclusion those numbers
+support. A width curve cannot distinguish "this work does not parallelise" from
+"this work parallelises and something else is serialising it", and nothing in
+the phase timings said which. What separated them here was the one-thread
+control from the false-sharing entry below: a cost that vanishes when there is
+only one thread is not a cost of the work.
+
+---
+
 ## 2026-09-24 (false sharing) — the C port's threads were fighting over two cache lines
 
 The C join scaled to **2.8x** on four cores. The Rust port does the same work in
