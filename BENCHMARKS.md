@@ -120,6 +120,30 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (cpp slot guess) — the name lookup change, in C++
+
+#129 (C) and #130 (Rust, Zig) try the member after slot *i* as slot *i + 1*
+before hashing its name, and hash the misses a word at a time rather than a
+byte at a time. This is the same change for C++: `canon_[i]` holds what
+`slot_for` answers for `wanted_[i]`, so a right guess gives the table's slot
+even when one name fills two.
+
+2M-row ndjson pair, `-k account_id,txn_id -i updated_at`, 4 vCPU Xeon @
+2.10 GHz, paired against main, 15 rounds. Reports identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| one thread | **1.11x** 1.08-1.19 | 1.11x 1.08-1.16 |
+| four threads | **1.09x** 1.04-1.10 | **1.10x** 1.05-1.12 |
+
+The same day's floor was 0.88-1.08 wall and 0.95-1.06 CPU, so the CPU columns
+are the result and the wall columns agree with them. Identical `--json`
+reports, too, on a hand-built file with members reversed, shuffled, repeated
+and missing, including `-k id --compare id,b,c`, where one name fills two
+slots. `cpp/test.sh` passes.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242
