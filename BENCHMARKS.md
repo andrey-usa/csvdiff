@@ -120,6 +120,58 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (zig key buffer) — A's and B's sweeps parsed their keys into one cache line
+
+Zig's text sweep never scaled: one thread per file, because splitting it had
+measured slower, and the code blamed `smp_allocator` for that (#126). The CI
+phase runs showed worse than not scaling. The same unsplit sweep took 0.50 s on
+one run and 0.78 s on the next, and on an EPYC 7763 JSON's took 1.58-1.70 s
+where Rust's took 0.95 s.
+
+The cause is the allocator's layout, not its speed. `smp_allocator` starts every
+thread on the same slot and aligns a small allocation only to its own size. The
+sweep's key buffer, two 8-byte fields for this workload's two-column key, is
+allocated by A's thread and by B's a moment apart, and printing the addresses put
+them 32 bytes apart on one cache line in two runs of three (`…8d00d0` and
+`…8d00f0`). Both threads write theirs on every row. `privateAlloc` rounds the
+buffer up to whole cache lines and aligns it to one.
+
+Two earlier attempts on this branch were wrong and are not in the diff: building
+the chunk lists locally (a `Chunk` is 56 bytes, in its own 64-byte slot, so it
+was never what was shared), and splitting each file again (0.49 s to 0.62 s on
+CSV at 10M on an EPYC 9V45).
+
+CI, `phases.yml`, 10M rows, four threads, all four runs on an **AMD EPYC 7763**,
+with the other ports as controls:
+
+| 10M, 4 threads | Zig main | Zig this | C main / this | Rust main / this |
+|---|---:|---:|---:|---:|
+| CSV wall | 2.122 s | **1.755 s** | 1.756 / 1.678 s | 1.675 / 1.604 s |
+| CSV sweep | 1.08 s | **0.78 s** | | |
+| CSV CPU | 5.48 s | **4.74 s** | | |
+| ndjson wall | 4.046 s | **3.627 s** | 3.939 / 3.940 s | 3.584 / 3.594 s |
+| ndjson sweep | 1.58 s | **1.16 s** | | |
+| ndjson CPU | 12.18 s | **11.36 s** | | |
+
+Runs 36263539985 and 36263538528 (CSV), 36263542754 and 36263541440 (ndjson).
+The controls moved 0-5%, Zig 12-21%. On ndjson Zig now ties C++ (3.59 s) and
+Rust and is ahead of C. On CSV it is within 5% of C.
+
+Locally, 2M pairs, 4 vCPU Xeon @ 2.10 GHz, 7 interleaved rounds:
+
+| 2M, 4 threads | main wall / cpu | this wall / cpu | sweep |
+|---|---|---|---|
+| CSV | 0.630 s / 1.49 s | 0.516 s / 1.22 s | 0.349 s → 0.208 s |
+| ndjson | 1.101 s / 2.87 s | 0.876 s / 2.43 s | 0.565 s → 0.329 s |
+
+The join's `fa`/`fb` buffers were given the same treatment and measured nothing
+(0.110 s against 0.108 s with a one-column `--compare`). Its four threads
+allocate at the same moment, contend for slot 0, and get pushed onto separate
+slabs, so they are left as they were. Output is byte-identical to main at 1, 4
+and 8 threads, under `--max-memory`, and on a mixed Parquet/CSV pair.
+
+---
+
 ## 2026-09-26 (zig parquet b pass) — Zig walked B's keys through A's table to count what it already knew
 
 The CI phase runs put Zig's Parquet match sweep at twice C's join. It ran both
