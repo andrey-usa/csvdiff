@@ -675,14 +675,24 @@ Column read_column(const char* data, std::size_t size, std::size_t which,
                             fail("a parquet dictionary index is out of range", path);
                         idx[i] = static_cast<std::int32_t>(k);
                     }
-                    std::size_t k = 0;
-                    for (std::size_t i = 0; i < n_vals; ++i) {
-                        const bool here = !optional || defs[i];
-                        if (dictionary)
-                            out.index.push_back(here ? idx[k++] : Column::kNull);
-                        else
-                            out.values.push_back(here ? out.dict[static_cast<std::size_t>(idx[k++])]
-                                                      : Slice{});
+                    if (dictionary && real == n_vals) {
+                        // Every value present and the column still indices: the
+                        // page's indices are the column's, as they are -- one
+                        // copy rather than a push_back and two branches per
+                        // value. Every page of a REQUIRED column takes this,
+                        // and most of an OPTIONAL one.
+                        out.index.insert(out.index.end(), idx.begin(),
+                                         idx.begin() + static_cast<std::ptrdiff_t>(real));
+                    } else {
+                        std::size_t k = 0;
+                        for (std::size_t i = 0; i < n_vals; ++i) {
+                            const bool here = !optional || defs[i];
+                            if (dictionary)
+                                out.index.push_back(here ? idx[k++] : Column::kNull);
+                            else
+                                out.values.push_back(
+                                    here ? out.dict[static_cast<std::size_t>(idx[k++])] : Slice{});
+                        }
                     }
                 } else if (h.encoding == kPlain) {
                     degrade();
@@ -690,9 +700,13 @@ Column read_column(const char* data, std::size_t size, std::size_t which,
                     got.reserve(real);
                     plain_slices(page + vat, page_len - vat, page_base + vat,
                                  static_cast<std::int32_t>(real), got, path);
-                    std::size_t k = 0;
-                    for (std::size_t i = 0; i < n_vals; ++i)
-                        out.values.push_back(!optional || defs[i] ? got[k++] : Slice{});
+                    if (real == n_vals) {
+                        out.values.insert(out.values.end(), got.begin(), got.end());
+                    } else {
+                        std::size_t k = 0;
+                        for (std::size_t i = 0; i < n_vals; ++i)
+                            out.values.push_back(defs[i] ? got[k++] : Slice{});
+                    }
                 } else {
                     fail("only PLAIN and dictionary parquet encodings are read here", path);
                 }
