@@ -1089,6 +1089,25 @@ fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Result<Ve
     Ok(out)
 }
 
+/// Decodes just one row's key columns.
+///
+/// [`row_values`] decodes the whole row, which is what the report's own rows
+/// need and between twice and ten times what the duplicate-key section needs:
+/// that section keeps the key and throws the compared columns away. The index
+/// already has a parser that stops at the key, and there is one of these per
+/// duplicated key rather than per kept row, so the columns it was decoding and
+/// discarding were the largest allocation anywhere in the report path.
+fn key_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Result<Vec<Val>> {
+    let key_size = opt.key.len();
+    let mut fields = vec![ABSENT; key_size];
+    idx.keys_of(side, row, key_size, &mut fields);
+    let mut out: Vec<Val> = alloc::sized(key_size, "a duplicated key")?;
+    for f in &fields {
+        out.push(value_checked(&side.slab, *f, opt, "a duplicated key")?);
+    }
+    Ok(out)
+}
+
 /// Runs `work` on `threads` threads and returns everything they produced.
 ///
 /// Each worker pulls from a queue `work` closes over until it is empty, so the
@@ -1581,11 +1600,7 @@ fn duplicate_section(side: &Side, idx: &RowIndex, opt: &Options) -> Result<Secti
         if *n <= 1 {
             continue;
         }
-        let values = row_values(side, idx, *row, opt)?;
-        let mut key: Vec<Val> = alloc::sized(key_size, "a duplicated key")?;
-        for v in &values[..key_size] {
-            key.push(alloc::val(v.as_deref(), "a duplicated key")?);
-        }
+        let key = key_values(side, idx, *row, opt)?;
         alloc::push(&mut entries, (key, *n as i64), "a duplicated key")?;
     }
     entries.sort_by(|x, y| {
