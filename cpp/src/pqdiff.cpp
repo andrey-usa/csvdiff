@@ -124,17 +124,30 @@ Val value_of(Cell c, const Options& o) {
     return text;
 }
 
-bool absent(Cell c, const Options& o) {
-    if (c.null || c.n == 0) return true;
-    if (!needs_normalising(o)) return false;
+// The two per-cell questions, split so the common case inlines. Without
+// --trim, --ignore-case, --empty-is-null or --tolerance each is a null check, a
+// length and a memcmp; the normalised form builds a string and belongs out of
+// line. As one function each, neither inlined, and the call was most of the
+// cost -- 1.18B instructions of a 2M-row Parquet run, once per key cell in the
+// index and the join and once per compared cell outside the dictionary path.
+[[gnu::noinline]] bool absent_normalised(Cell c, const Options& o) {
     return !value_of(c, o).has_value();
 }
 
-bool same(Cell x, Cell y, const Options& o) {
+[[gnu::noinline]] bool same_normalised(Cell x, Cell y, const Options& o) {
+    return value_of(x, o) == value_of(y, o);
+}
+
+inline bool absent(Cell c, const Options& o) {
+    if (c.null || c.n == 0) return true;
+    return needs_normalising(o) && absent_normalised(c, o);
+}
+
+inline bool same(Cell x, Cell y, const Options& o) {
     const bool xa = absent(x, o), ya = absent(y, o);
     if (xa || ya) return xa && ya;
     if (!needs_normalising(o)) return x.n == y.n && std::memcmp(x.p, y.p, x.n) == 0;
-    return value_of(x, o) == value_of(y, o);
+    return same_normalised(x, y, o);
 }
 
 std::optional<double> as_number(std::string_view s) {
