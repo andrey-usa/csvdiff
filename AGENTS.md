@@ -143,8 +143,34 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
   feature. That was a third of the published CSV gap. Timed runs no longer pass `--json`; the gate
   gets its own untimed run. `scripts/report_cost.py` prints what each port's document *contains*
   before what it costs, because the shape is the reason for the cost.
+- **Run the invocation in an empty directory and look at what appears.** The same fault was on the
+  other side of the table for another week: the Rust port defaults `--out` to
+  `<a>__vs__<b>.html`, so the ladder's flagless invocation had it rendering, gzipping and writing a
+  report the other three never built. `-o /dev/null` was already there and only moved the write.
+  It is 1.31x wall on a 4M pair. Ports are compared with `--summary` now; `gate_flags` hands the
+  report back to the untimed counts gate.
+- **Never put a shell wrapper between `bench_ab.sh` and the binary.** Two one-line `bash` scripts
+  around one binary, differing only in a flag, reported 1.08x where the binary-against-binary
+  measurement said 1.31x, with one arm bimodal. Build the second binary.
+- **A memory-cap scan is one run per rung, and one run per rung is a coin flip at the boundary.**
+  At the cap where the process is a single allocation from its ceiling, which allocation fails
+  first decides whether it refuses or aborts — the same binary at the same cap came out exit 2,
+  134, 2, 134, 2 on five consecutive runs. Count the rungs that abort in *any* of three passes,
+  not the ones that abort in one.
+- **A fixed range of caps does not compare two builds that need different amounts.** A change that
+  lowers the requirement moves its boundary region down into the middle of the range, so more of
+  that region is scanned and the count goes up — which reads as a regression and is partly an
+  artifact. The honest reading is what the change converts: dropping the index's peak turned
+  graceful index refusals at 12.5-16.5 MB into report-path refusals at the same caps, and the
+  report path is the one that cannot always refuse.
 - **Rounds scale with how short the run is.** *No result* at nine rounds has become 1.29x at
   twenty-five.
+- **Outside 1.00 is not the same as outside the floor.** `--self-test` runs one build against
+  itself and names what this machine can resolve today. It measured 0.99x [0.92-1.07] on the
+  afternoon a 0.89x [0.84-0.94] "result" was written into BENCHMARKS.md -- outside 1.00, inside
+  the floor, and taken back the next day. `bench_ab.sh` now says so itself when the middle half
+  clears 1.00 by less than a tenth, but the habit is to run `--self-test` on a machine you have
+  not measured on before quoting a number from it.
 - **Peak RSS is not the memory answer for anything that maps its input.** `scripts/memory_floor.sh`
   takes memory away until the run dies; that is the honest floor.
 - **A benchmark rung dies of memory, not disk — cap it with `RLIMIT_DATA`, never `RLIMIT_AS`.**

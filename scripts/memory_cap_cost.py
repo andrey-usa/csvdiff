@@ -12,7 +12,10 @@ PORTS = {
 }
 A, B = "/home/user/ab4m/n_a.ndjson", "/home/user/ab4m/n_b.ndjson"
 K = ["compare", A, B, "-k", "account_id,txn_id", "-i", "updated_at"]
-EXTRA = {"Rust": ["-o", "/dev/null"], "C": []}
+# `--summary`, not `-o /dev/null`: that only moved the write. The render still
+# ran, and so did the row building behind it, none of which the C port does
+# without an output flag.
+EXTRA = {"Rust": ["--summary"], "C": []}
 
 total_mb = int(subprocess.run(["awk", "/^MemTotal:/ { printf \"%d\", $2 / 1024 }", "/proc/meminfo"],
                               capture_output=True, text=True).stdout)
