@@ -138,12 +138,12 @@ Val value_of(Cell c, const Options& o) {
     return value_of(x, o) == value_of(y, o);
 }
 
-inline bool absent(Cell c, const Options& o) {
+[[gnu::always_inline]] inline bool absent(Cell c, const Options& o) {
     if (c.null || c.n == 0) return true;
     return needs_normalising(o) && absent_normalised(c, o);
 }
 
-inline bool same(Cell x, Cell y, const Options& o) {
+[[gnu::always_inline]] inline bool same(Cell x, Cell y, const Options& o) {
     const bool xa = absent(x, o), ya = absent(y, o);
     if (xa || ya) return xa && ya;
     if (!needs_normalising(o)) return x.n == y.n && std::memcmp(x.p, y.p, x.n) == 0;
