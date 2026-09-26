@@ -120,6 +120,35 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (cpp parquet join inline) — C++'s cell checks were calls, and its join parts shared lines
+
+Two small things in C++'s Parquet path, measured together because neither
+clears this host's noise alone. clang declined the `inline` hint on `same()` and
+`absent()`, and a `Cell` is 24 bytes, so every key comparison in the index build
+and the join passed two cells through memory; they are `always_inline` now. And
+the join's per-range `Part`s sat side by side in one vector with `push_back`
+writing each one's end pointer on every row; each range now fills a local `Part`
+and moves it into place once.
+
+| callgrind, 2M Parquet pair, one thread | main | this |
+|---|---:|---:|
+| whole run | 5.256 B | 5.060 B (−3.7%) |
+
+CI, `phases.yml`, 10M, both on an **AMD EPYC 7763** (runs 36276914483 and
+36276756694), the other ports as controls:
+
+| 10M | main | this | Rust (control) | Zig (control) |
+|---|---:|---:|---:|---:|
+| C++ wall, 4 threads | 1.402 s | **1.361 s** | 1.404 / 1.418 s | 1.342 / 1.347 s |
+| C++ wall, 1 thread | 2.434 s | **2.337 s** | 2.532 / 2.532 s | 2.476 / 2.494 s |
+| C++ join, 4 threads | 0.262 s | 0.240 s | | |
+| C++ compared columns, 1 thread | 1.367 s | 1.287 s | | |
+
+About 3–4%, with the controls within 1%. Paired locally at one thread: 1.04x wall
+[1.00–1.09], 1.04x CPU [1.00–1.06].
+
+---
+
 ## 2026-09-26 (c word key hash) — C hashed its keys a byte at a time
 
 C's `hash_field` folded one byte per dependent multiply. On this workload's two
