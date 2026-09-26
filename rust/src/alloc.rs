@@ -122,6 +122,33 @@ pub fn push<T>(v: &mut Vec<T>, value: T, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// `s.to_string()` that returns instead of aborting.
+///
+/// A `String` is a `Vec<u8>` that has been checked for UTF-8, and
+/// `String::from_utf8` takes the vector's allocation rather than copying it --
+/// so a string built this way costs exactly what `to_string` costs and can
+/// still refuse. That is what makes the report path checkable without changing
+/// [`crate::contract::Val`], which is `Option<String>` and shared with every
+/// other engine.
+///
+/// One of these per cell sounds like a lot of checking. It is the check `Vec`
+/// already performs; what changes is that a failure returns here instead of
+/// printing from inside the allocator and calling `abort`.
+pub fn string(s: &str, what: &str) -> Result<String> {
+    let mut v: Vec<u8> = sized(s.len(), what)?;
+    v.extend_from_slice(s.as_bytes());
+    // `v` was filled from a `&str`, so it is UTF-8 by construction.
+    Ok(String::from_utf8(v).unwrap_or_default())
+}
+
+/// [`string`] for a value that may be absent.
+pub fn val(v: Option<&str>, what: &str) -> Result<crate::contract::Val> {
+    match v {
+        None => Ok(None),
+        Some(s) => Ok(Some(string(s, what)?)),
+    }
+}
+
 /// [`grow`] as a method, for the sites that read better that way.
 pub trait TryGrow {
     /// Room for `extra` more entries, or a refusal naming `what`.

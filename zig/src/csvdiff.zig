@@ -678,8 +678,8 @@ const Input = union(enum) {
                     for (wanted, 0..) |n, i| keys[i] = if (has(t.names, n)) n else null;
                     side.wanted_names = keys;
                     side.rows = .{ .text = .{
-                        .parser = try text.RowParser.initJson(gpa, keys),
-                        .keys = try text.RowParser.initJson(gpa, keys[0..@min(key_size, width)]),
+                        .parser = try text.RowParser.initJson(gpa, keys, key_size),
+                        .keys = try text.RowParser.initJson(gpa, keys[0..@min(key_size, width)], key_size),
                         .from = t.from,
                     } };
                 } else {
@@ -1631,14 +1631,34 @@ pub fn compare(
     for (compared.items) |c| try wanted.append(gpa, c);
 
     // The two files share nothing until the join, so they are read at the same
-    // time, and each is split further: two files across four cores is two chunks
-    // each, so the whole machine is busy rather than half of it.
+    // time -- one thread each.
     //
-    // `gpa` has to be thread-safe for this. Under --max-memory it is a
-    // FixedBufferAllocator -- a bump pointer with no lock, which would hand two
-    // threads the same bytes -- so main.zig passes its lock-taking variant. The
-    // budget it enforces is unchanged.
-    const per_file = @max(1, total / 2);
+    // Each file used to be split further, `total / 2` ways, on the reasoning that
+    // two files across four cores is two chunks each and the whole machine busy.
+    // Measured, it was the opposite. On the 4M CSV pair the sweep takes 0.35s a
+    // side unsplit and 0.46-0.58s split two ways: *slower* with twice the
+    // threads, and the whole run 1.50x wall and 2.06x CPU better without it.
+    //
+    // The cause is the allocator, and it was isolated rather than guessed. The
+    // same code linked against libc and given `c_allocator` scales -- 0.36s to
+    // 0.30s -- and linked against libc but handed `smp_allocator`, which is what
+    // this port gets by default, it does not: 0.49s. It is not memcpy or memset
+    // (the second build has glibc's), not syscalls, not page faults (flat across
+    // all four builds), and not the sweep's own arrays growing: pre-sizing them
+    // took the mremap calls inside the sweep from 192 to 60 and moved nothing.
+    // What differs is user time, 3.60s against 2.67s for identical code. Where in
+    // user space it goes is not established; see BENCHMARKS.md.
+    //
+    // So no split, which needs nothing this port does not already have. Linking
+    // libc would buy the split back and more -- 1.72x wall against this change's
+    // 1.50x -- but this port deliberately links none, and that is not a decision
+    // a sweep gets to make.
+    //
+    // `gpa` still has to be thread-safe, since A and B run at once. Under
+    // --max-memory it is a FixedBufferAllocator -- a bump pointer with no lock,
+    // which would hand two threads the same bytes -- so main.zig passes its
+    // lock-taking variant. The budget it enforces is unchanged.
+    const per_file: usize = 1;
     var prepare_a = Prepare{
         .gpa = gpa,
         .input = a_input,

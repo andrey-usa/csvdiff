@@ -10,7 +10,8 @@ PORTS = {"C":    "/home/user/csvdiff/c/csvdiff",
          "C++":  "/home/user/csvdiff/cpp/build/csvdiff",
          "Rust": "/home/user/csvdiff/rust/target/release/csvdiff",
          "Zig":  "/home/user/csvdiff/zig/zig-out/bin/csvdiff"}
-EXTRA = {"Rust": ["-o", "/dev/null"]}
+# `--summary`, not `-o /dev/null`: see `bench_formats_ports.py`.
+EXTRA = {"Rust": ["--summary"]}
 A, B = "/home/user/ab4m/c_a.csv", "/home/user/ab4m/c_b.csv"
 BASE = ["compare", A, B, "-k", "account_id,txn_id", "-i", "updated_at"]
 THREADS = [1, 2, 3, 4]
