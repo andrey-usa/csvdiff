@@ -503,9 +503,29 @@ impl RowIndex {
         while cap * 2 < total * 3 + 16 {
             cap <<= 1;
         }
+        // A chunk's two lists are already `row_at` and `row_hash` for its rows:
+        // every row the sweep saw, in file order. So the first chunk's are taken
+        // over rather than copied, and the rest appended a slice at a time, each
+        // chunk released as soon as it has been. With one chunk that is no copy
+        // at all where there used to be two pushes a row into a second pair of
+        // lists the size of the file.
+        let (mut row_at, mut row_hash) = match chunks.first_mut() {
+            Some(c) => (std::mem::take(&mut c.at), std::mem::take(&mut c.hash)),
+            None => (Vec::new(), Vec::new()),
+        };
+        let rest = total - row_at.len();
+        alloc::grow(&mut row_at, rest, "one offset per row")?;
+        alloc::grow(&mut row_hash, rest, "one hash per row")?;
+        for chunk in chunks.iter_mut().skip(1) {
+            row_at.extend_from_slice(&chunk.at);
+            row_hash.extend_from_slice(&chunk.hash);
+            chunk.at = Vec::new();
+            chunk.hash = Vec::new();
+        }
+        drop(chunks);
         let mut idx = RowIndex {
-            row_at: alloc::sized(total, "one offset per row")?,
-            row_hash: alloc::sized(total, "one hash per row")?,
+            row_at,
+            row_hash,
             table: empty_table(cap)?,
             mask: cap - 1,
             first_row: alloc::sized(total, "one row per distinct key")?,
@@ -516,47 +536,30 @@ impl RowIndex {
         };
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
-        // Each chunk is released as soon as it has been inserted. Holding all of
-        // them to the end would keep two copies of every row's address and hash
-        // alive at once, which is sixteen bytes a row of pure duplication —
-        // 320 MB at ten million rows across both files.
-        for chunk in &mut chunks {
-            for i in 0..chunk.at.len() {
-                if let Some(&soon) = chunk.hash.get(i + PREFETCH_AHEAD) {
-                    idx.prefetch(soon);
-                }
-                idx.insert(
-                    side,
-                    chunk.at[i],
-                    chunk.hash[i],
-                    key_size,
-                    opt,
-                    &mut probe,
-                    &mut mine,
-                )?;
+        for row in 0..total {
+            if let Some(&soon) = idx.row_hash.get(row + PREFETCH_AHEAD) {
+                idx.prefetch(soon);
             }
-            chunk.at = Vec::new();
-            chunk.hash = Vec::new();
+            idx.insert(side, row as i32, key_size, opt, &mut probe, &mut mine)?;
         }
         phases.mark("index insert (serial)");
         Ok(idx)
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Indexes row `row`, which is already in `row_at` and `row_hash`.
     fn insert(
         &mut self,
         side: &Side,
-        at: u64,
-        hash: u64,
+        row: i32,
         key_size: usize,
         opt: &Options,
         probe: &mut [Field],
         mine: &mut [Field],
     ) -> Result<()> {
         self.rows += 1;
-        let row = self.row_at.len() as i32;
-        self.row_at.push(at);
-        self.row_hash.push(hash);
+        let at = self.row_at[row as usize];
+        let hash = self.row_hash[row as usize];
 
         let mut slot = self.slot(hash);
         let mut mine_parsed = false;

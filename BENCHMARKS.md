@@ -120,6 +120,74 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (adopt sweep lists) — Zig and Rust copied every row's address and hash twice
+
+The sweep builds, per chunk, the list of every row's offset and key hash in file
+order. That is exactly what the index keeps as `row_at` and `row_hash` — and
+both ports' index insert appended each row to those again, one at a time: Zig
+into lists growing by reallocation to the size of the file, Rust into a pair
+sized up front and faulted in by the copy. The first chunk's lists are now taken
+over as they are and any later chunk's appended a slice at a time; `insert` is
+handed the row number instead of pushing it. With one chunk a file (Zig's text
+sweep) there is no copy at all.
+
+Output is identical to main on the 2M CSV, ndjson and Parquet pairs at one and
+four threads, both ports.
+
+**Zig**, CI, `phases.yml`, 10M CSV, grouped by CPU (the one processor both
+builds landed on is the EPYC 7763; the others ran one build each):
+
+| AMD EPYC 7763 | main (run 46) | this (run 48) | this (run 50) |
+|---|---:|---:|---:|
+| Zig index insert, a side, 1 thread | 0.293 s | 0.247 s | 0.237 s |
+| … against Rust's insert in the same run | 1.02x | 0.88x | 0.86x |
+| Zig wall, 4 threads | 1.692 s | 1.639 s | 1.598 s |
+| … against Rust's wall in the same run | 1.034x | 1.010x | 0.985x |
+
+Locally (10M, five interleaved runs, a host with 15 GB for 3.7 GB of input): the
+insert went from 0.55–1.78 s a side to 0.31–0.39 s, four-thread wall from 2.20 s
+to 1.95 s median, and peak RSS from 4,516 MB to 4,224 MB. The local spread on
+main is the reallocations under memory pressure; CI has room, and there the
+saving is the copy itself — 0.05 s a side.
+
+**Both ports**, the second pair: main and this, dispatched together, landed on
+the same EPYC 7763 (runs 54 and 51):
+
+| AMD EPYC 7763 | main (run 54) | this (run 51) |
+|---|---:|---:|
+| Rust index insert, A / B, 1 thread | 0.270 / 0.277 s | **0.219 / 0.227 s** |
+| Zig index insert, A / B, 1 thread | 0.278 / 0.276 s | **0.230 / 0.234 s** |
+| Rust wall, 1 / 4 threads | 2.487 / 1.570 s | 2.416 / 1.548 s |
+| Zig wall, 1 / 4 threads | 2.749 / 1.646 s | 2.702 / 1.597 s |
+| C wall, 1 / 4 threads (control) | 2.752 / 1.625 s | 2.778 / 1.627 s |
+
+The insert is 16–19% faster in both ports with the control flat; the whole run
+2–3%. On an EPYC 9V45 (runs 49 and 53, Zig changed in both, Rust only in 53)
+Rust's insert went 0.212 → 0.179 s. Locally Rust's insert went from 0.53–1.48 s
+to 0.36–0.42 s a side, for the same memory-pressure reason as Zig's.
+
+**The refusal it exposed.** Rust's `out_of_memory` ratchet failed on the change:
+six budgets aborted instead of refusing, against three allowed. The index's
+lower peak moved the refusal band down to caps where the allocation that fails
+is a report row's few dozen bytes, and there the process is at its ceiling to
+the byte — so the refusal's own `format!` failed after it and aborted from
+inside `refuse`. The comment above `refuse` said this could not happen because
+"the allocation that failed was megabytes"; for the checked allocations in the
+report path it is not. `main` now sets aside 64 KB, and `refuse` releases it
+before formatting. The scan measures two aborted rungs a pass with that (main:
+one to two), both inside std. Found along the way and not changed: with
+`RUST_BACKTRACE` set, a thread that cannot allocate its signal stack panics, and
+`quiet_panics` then captures a backtrace whose symbolisation runs out of memory
+under the backtrace lock — the deadlock that hook's comment describes, reached
+through the one path it leaves to the caller.
+
+**Tried alongside and dropped:** `MADV_SEQUENTIAL` on Zig's input mapping, as
+the other three ports do. Zig's 1-thread sweep against Rust's on the EPYC 7763
+was 1.18x / 1.21x / 1.18x with it (runs 40, 45, 47) and 1.20x on main (run
+46): nothing.
+
+---
+
 ## 2026-09-26 (cpp parquet join inline) — C++'s cell checks were calls, and its join parts shared lines
 
 Two small things in C++'s Parquet path, measured together because neither

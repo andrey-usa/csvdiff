@@ -103,6 +103,7 @@ fn quiet_panics() {
 
 fn main() -> ExitCode {
     quiet_panics();
+    csvdiff::alloc::hold_reserve();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let status = run(&args);
     report_peak_rss();
