@@ -479,6 +479,59 @@ fn chunk_boundaries_land_between_rows_in_a_quoted_file() {
     }
 }
 
+/// A split guessed at the next newline and wrong must not be able to fail the
+/// run.
+///
+/// The one quoted field here is legal -- just under the packed field limit --
+/// and holds no newline but its last byte, and it straddles the middle of the
+/// file. So the guessed split lands on its closing quote. A chunk that starts
+/// there reads that quote as the opening of a key field, finds no other quote
+/// in the rest of the file, and calls everything to the end one field: over the
+/// limit, which is an error. The guess is wrong, so the chunk before it says so
+/// and the sweep runs again on counted bounds -- and the error, which belongs to
+/// no row of the file, must never be reported.
+#[test]
+fn a_wrong_split_guess_cannot_fail_the_run() {
+    let long = 7_900_000;
+    let mut a = String::from("k,note,v\n");
+    for i in 0..150_000 {
+        a.push_str(&format!("P{i},short,1\n"));
+    }
+    a.push_str("K0,\"");
+    a.push_str(&"a".repeat(long));
+    a.push_str("\n\",x\n");
+    // More than the field limit after the closing quote, and less than there
+    // is before it, so the middle stays inside the field.
+    let tail_from = a.len();
+    while a.len() < tail_from + 8_600_000 {
+        let i = a.len();
+        a.push_str(&format!("Q{i},plain,1\n"));
+    }
+    let mid = a.len() / 2;
+    let field = a.find("K0,\"").expect("the long row");
+    assert!(
+        field < mid && mid < field + long,
+        "the long field must straddle the middle: {field}..{} against {mid}",
+        field + long
+    );
+    let b = a.replacen("P7,short,1", "P7,short,2", 1);
+    let f = Fixture::new(&a, &b);
+
+    let mut reference = None;
+    for threads in [1usize, 4] {
+        let mut opt = Options::with_key(["k"]);
+        opt.engine = Engine::Turbo.label().to_string();
+        opt.threads = Some(threads);
+        let r = compare(&f.a, &f.b, &mut opt).unwrap_or_else(|e| panic!("threads {threads}: {e}"));
+        let got = serde_json::json!({"counts": r.counts, "columns": r.columns}).to_string();
+        assert!(got.contains("\"changed\":1"), "threads {threads}: {got}");
+        match &reference {
+            None => reference = Some(got),
+            Some(first) => assert_eq!(&got, first, "threads {threads} disagrees"),
+        }
+    }
+}
+
 /// One pair of newline-delimited JSON files, since `Fixture` writes `.csv`.
 fn json_fixture(a_body: &str, b_body: &str) -> Fixture {
     let dir = std::env::temp_dir().join(format!(

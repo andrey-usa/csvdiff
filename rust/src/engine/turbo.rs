@@ -842,6 +842,21 @@ where
 }
 
 /// Parses and hashes every row of a mapped text file, in `threads` chunks.
+///
+/// A CSV split has to land on a row boundary, and a newline inside a quoted
+/// field is not one. `chunk_bounds` can settle that by counting the quotes
+/// before each split -- but that count is a pass over the front of the file on
+/// one thread before any chunk starts, and at two chunks a file it read half the
+/// file: 0.13-0.16s a side on a 4M-row pair, as long as a chunk's own sweep.
+///
+/// So the split is guessed first -- the next newline, as for JSON -- and
+/// checked after. The first chunk starts at a real row, so the row it finishes
+/// on ends at the first real row start past its boundary; if that is where the
+/// next chunk began, the boundary was real, and the same holds down the line.
+/// Only if a guess was wrong -- a quoted newline at the split -- is the sweep
+/// run again on counted bounds, which is exactly what it did before. A chunk
+/// that started on a wrong guess parsed garbage, so its rows *and its errors*
+/// are discarded unread.
 fn sweep_text(
     side: &Side,
     keys: &RowParser,
@@ -855,10 +870,48 @@ fn sweep_text(
     if from >= data.len() {
         return Ok(Vec::new());
     }
-    let bounds = chunk_bounds(data, from, threads, side.slab.dialect());
-    let parts = bounds.len() - 1;
+    let dialect = side.slab.dialect();
+    if dialect == Dialect::Csv {
+        let bounds = chunk_bounds(data, from, threads, dialect, false);
+        let mut swept = sweep_chunks(side, keys, whole, &bounds, key_size, opt).into_iter();
+        let mut chunks = Vec::with_capacity(bounds.len() - 1);
+        let mut held = true;
+        for i in 0..bounds.len() - 1 {
+            // Chunk i started at a real row: chunk 0 by construction, and every
+            // later one because the loop only gets here past the check below.
+            let (chunk, end) = swept.next().expect("one result per chunk")?;
+            chunks.push(chunk);
+            if i + 2 < bounds.len() && end != bounds[i + 1] {
+                held = false;
+                break;
+            }
+        }
+        if held {
+            return Ok(chunks);
+        }
+    }
+    let bounds = chunk_bounds(data, from, threads, dialect, true);
+    sweep_chunks(side, keys, whole, &bounds, key_size, opt)
+        .into_iter()
+        .map(|r| r.map(|(chunk, _)| chunk))
+        .collect()
+}
 
-    let results = in_parallel(parts, |i| {
+/// One chunk per pair of `bounds`, each returned with the offset its sweep
+/// stopped at: the start of the first row past its boundary, or the end of the
+/// file.
+#[allow(clippy::type_complexity)]
+fn sweep_chunks(
+    side: &Side,
+    keys: &RowParser,
+    whole: &RowParser,
+    bounds: &[usize],
+    key_size: usize,
+    opt: &Options,
+) -> Vec<Result<(Chunk, usize)>> {
+    let data = side.slab.data();
+    let parts = bounds.len() - 1;
+    in_parallel(parts, |i| {
         let (begin, stop) = (bounds[i], bounds[i + 1]);
         let mut chunk = Chunk {
             at: Vec::new(),
@@ -911,9 +964,8 @@ fn sweep_text(
             }
             pos = next;
         }
-        Ok(chunk)
-    });
-    results.into_iter().collect()
+        Ok((chunk, pos))
+    })
 }
 
 /// Hashes every row of an already-materialised columnar file. There is nothing
@@ -959,8 +1011,17 @@ fn sweep_columnar(
 ///
 /// JSON needs none of that: a raw newline inside a string is not valid JSON, so
 /// every newline ends a record.
-fn chunk_bounds(data: &[u8], from: usize, threads: usize, dialect: Dialect) -> Vec<usize> {
+fn chunk_bounds(
+    data: &[u8],
+    from: usize,
+    threads: usize,
+    dialect: Dialect,
+    counted: bool,
+) -> Vec<usize> {
     let end = data.len();
+    // Uncounted, a CSV split is walked like a JSON one: to the next newline,
+    // whatever the quotes say. That is a guess, and `sweep_text` checks it.
+    let quoted = dialect == Dialect::Csv && counted;
     if threads <= 1 || end - from < CHUNKING_THRESHOLD {
         return vec![from, end];
     }
@@ -981,7 +1042,7 @@ fn chunk_bounds(data: &[u8], from: usize, threads: usize, dialect: Dialect) -> V
     //
     // Counting each slice on its own and running a prefix sum over the results
     // gives the same numbers for one pass split evenly.
-    let quotes: Vec<usize> = if dialect == Dialect::Json {
+    let quotes: Vec<usize> = if !quoted {
         vec![0; nominal.len()]
     } else {
         let mut edges = Vec::with_capacity(nominal.len() + 1);
@@ -1005,7 +1066,7 @@ fn chunk_bounds(data: &[u8], from: usize, threads: usize, dialect: Dialect) -> V
         let mut at = start;
         while at < end {
             match data[at] {
-                b'"' if dialect == Dialect::Csv => in_quotes = !in_quotes,
+                b'"' if quoted => in_quotes = !in_quotes,
                 b'\n' if !in_quotes => {
                     at += 1;
                     break;
