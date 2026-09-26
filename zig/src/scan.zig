@@ -337,3 +337,44 @@ test "the delimiter cursor gives the same answers as a fresh scan" {
         }
     }
 }
+
+/// The bytes from `at` to the end of `bytes`, fewer than eight, as a little-endian
+/// word padded with zeros -- without copying them into a padded buffer first.
+///
+/// The copy was a variable-length `@memcpy`, which is a call into compiler_rt's
+/// memcpy, once per key field of every row of both files. A field of eight bytes
+/// or more has eight real bytes ending where the tail ends, so one load of those
+/// and a shift that drops the ones already hashed gives the same word. A shorter
+/// field is read as two overlapping halves, or as its first, middle and last
+/// byte, which between them cover it for every length from one to seven.
+pub fn tailWord(bytes: []const u8, at: usize) u64 {
+    const n = bytes.len;
+    const rem = n - at;
+    std.debug.assert(rem > 0 and rem < 8);
+    if (n >= 8) {
+        const last = std.mem.readInt(u64, bytes[n - 8 ..][0..8], .little);
+        return last >> @intCast(8 * (8 - rem));
+    }
+    // n < 8 means nothing was hashed yet, so the tail is the whole field.
+    if (n >= 4) {
+        const lo: u64 = std.mem.readInt(u32, bytes[0..4], .little);
+        const hi: u64 = std.mem.readInt(u32, bytes[n - 4 ..][0..4], .little);
+        return lo | (hi << @intCast(8 * (n - 4)));
+    }
+    return @as(u64, bytes[0]) |
+        (@as(u64, bytes[n / 2]) << @intCast(8 * (n / 2))) |
+        (@as(u64, bytes[n - 1]) << @intCast(8 * (n - 1)));
+}
+
+test "tailWord is the zero-padded tail for every length and offset" {
+    var buf: [40]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast(0x21 + i * 7 % 200);
+    for (1..buf.len + 1) |n| {
+        const bytes = buf[0..n];
+        const at = n - n % 8;
+        if (at == n) continue;
+        var tail: [8]u8 = @splat(0);
+        @memcpy(tail[0 .. n - at], bytes[at..]);
+        try std.testing.expectEqual(std.mem.readInt(u64, &tail, .little), tailWord(bytes, at));
+    }
+}

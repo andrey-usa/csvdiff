@@ -429,9 +429,7 @@ fn hashBytes(bytes: []const u8, seed: u64) u64 {
         h ^= h >> 29;
     }
     if (at < bytes.len) {
-        var tail: [8]u8 = @splat(0);
-        @memcpy(tail[0 .. bytes.len - at], bytes[at..]);
-        h = (h ^ std.mem.readInt(u64, &tail, .little)) *% PRIME;
+        h = (h ^ scan.tailWord(bytes, at)) *% PRIME;
         h ^= h >> 29;
     }
     return h;

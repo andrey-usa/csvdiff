@@ -27,6 +27,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const csvdiff = @import("csvdiff.zig");
+const scan = @import("scan.zig");
 const parquet = @import("parquet.zig");
 
 /// Bytes per step of the mismatch scan, from the same `-Dscan` build option the
@@ -196,9 +197,7 @@ fn foldBytes(seed: u64, v: []const u8) u64 {
         h ^= h >> 29; // the xor-shift is what spreads a whole word into the low bits
     }
     if (at < v.len) {
-        var tail: [8]u8 = @splat(0);
-        @memcpy(tail[0 .. v.len - at], v[at..]);
-        h = (h ^ std.mem.readInt(u64, &tail, .little)) *% PRIME;
+        h = (h ^ scan.tailWord(v, at)) *% PRIME;
         h ^= h >> 29;
     }
     return (h ^ v.len) *% PRIME;

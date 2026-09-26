@@ -120,6 +120,33 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (zig hash tail) — the last bytes of every hashed key went through memcpy
+
+Zig's word-at-a-time hash of a key field (`hashBytes` in the text engine,
+`foldBytes` in the Parquet one) padded the field's last, partial word by
+copying it into a zeroed eight-byte buffer. A variable-length `@memcpy` is a
+call into compiler_rt, and it ran once per key field of every row of both files.
+`scan.tailWord` builds the same word from loads instead: one overlapping 8-byte
+load and a shift when the field is eight bytes or longer, and two overlapping
+halves or the first, middle and last byte when it is shorter. The word is
+identical, so no hash changes. A test in `scan.zig` checks this against the old
+padded copy for every length from 1 to 40, and fails if the shift is off by one
+(checked by breaking it).
+
+callgrind, one thread, x86-64-v3 builds:
+
+| 2M pair | main | this | |
+|---|---:|---:|---:|
+| CSV | 8.097 B | 7.933 B | −2.0% |
+| Parquet | 5.954 B | 5.742 B | −3.6% |
+
+Time does not show it. Paired on this host (4 vCPU Xeon @ 2.10 GHz, 15 rounds),
+both formats straddle 1.00x (Parquet 0.99x [0.97–1.08], CSV 1.01x
+[0.96–1.09]), which is what a 2–4% instruction cut looks like under a floor of
+about 5%. This change is shipped on the instruction count, not on a timing.
+
+---
+
 ## 2026-09-26 (zig key buffer) — A's and B's sweeps parsed their keys into one cache line
 
 Zig's text sweep never scaled: one thread per file, because splitting it had
