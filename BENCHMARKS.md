@@ -120,6 +120,111 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (parallel insert) — deterministic, and it does not pay
+
+Every port builds its index the same way: find and hash the rows on every core,
+then insert them on one. The C port says why in as many words -- *"first
+occurrence wins, and which occurrence is first depends on the order rows arrive,
+so threading it would make the answer depend on the scheduler"* -- and every
+other port repeats it. The phase is a third of the run, so "insert on one core"
+is the largest deliberate serialisation in this project, and it has never been
+priced.
+
+**The determinism objection is answerable.** Partition the rows by `hash & (P-1)`
+and every occurrence of a key lands in the same partition, so first-occurrence
+still wins and file order still decides it: P sub-tables, built in parallel,
+give the same answer as one table built serially. A lookup then picks its
+sub-table from the same bits.
+
+Priced with a probe that builds the sub-tables beside the real index and drops
+them -- nothing downstream sees them -- on the 4M CSV pair at four threads,
+which is two per file:
+
+| | serial | partitioned |
+|---|---:|---:|
+| partition pass | -- | 0.05s |
+| insert | 0.24s | 0.15s |
+| **total** | **0.24s** | **0.20s** |
+
+The insert itself does parallelise -- 0.24s to 0.15s on two ways -- and the pass
+that makes it possible costs most of what that saves. At four ways on a quiet
+machine the ceiling is about 0.17s against 0.24s, which is 0.07s of a 0.62s run:
+**11%, before paying for anything.**
+
+And the thing it would have to pay for is not in the table. Every lookup on the
+join's hot path would gain a sub-table selection -- one more dependent load
+before the probe that is already the port's worst cache miss. That cost is on
+the phase this project has spent the most effort on, and 11% is not enough
+headroom to go looking for it.
+
+Not built. Recorded because the comment in four ports says the insert *cannot*
+be threaded, and that is not true -- it can, deterministically, and it is not
+worth it. Those are different reasons and the second one is the real one.
+
+---
+
+## 2026-09-24 (parquet join) — the Rust port walked B for a sample nobody asked for
+
+Parquet is the widest ratio in the published tables and nobody had looked at it:
+at ten million rows C does the CSV-equivalent work in 1.11s against Rust's 2.12s.
+Phases on a 2M pair, warm page cache, three runs each, `--summary` so the report
+is not in the number:
+
+| phase | C | Rust |
+|---|---:|---:|
+| read key columns | 0.044s | 0.024s |
+| build key indexes | 0.09s | 0.09s |
+| **join / match sweep** | **0.047s** | **0.108s** |
+| compared columns | 0.139s | 0.158s |
+
+Everything is close except one phase, and that phase is 2.3x. The first
+measurement said otherwise -- compared columns 0.269s against 0.155s -- and was
+a cold page cache on the first touch of a 160 MB file. Warm it and that gap is
+1.14x.
+
+### The B pass is for the sample, not the count
+
+A key matches from either side or from neither, so the number of B's keys with
+an A counterpart *is* the pair count the A pass already produced, and `added` is
+B's distinct keys minus it. The pass over B is a second full random-probed walk
+of A's table, and all it adds is the report's added-rows **sample**.
+
+`csvdiff.cpp` has run it only when something will print the sample since it was
+measured there, and `pqdiff.cpp` since #106 -- the comment there says so in as
+many words. The Rust port's `pqdiff.rs` never asked.
+
+Skipping it under `--summary`, `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, on this host (4 vCPU Xeon @ 2.10GHz):
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 2M x 2M | **1.15x** 1.09-1.20 | **1.18x** 1.11-1.20 |
+| 1M x 2M | **1.29x** 1.19-1.33 | **1.21x** 1.16-1.28 |
+
+The match sweep itself goes **0.108s to 0.050s**, against C's 0.047s. The second
+pair is the bigger win because the skipped pass is over twice as many keys.
+
+`bench_ab.sh --self-test` on the same pair and the same fifteen rounds puts this
+host's floor at 0.99x [0.92-1.04]. Both rows above sit clear of it -- the 2M
+pair's middle half starts at 1.09, above the floor's own upper bound -- which is
+worth stating because on the same afternoon this machine could not resolve an
+8% question at all (see the zig scan-width entry).
+
+Counts are identical, which is the thing that had to hold, and the case that
+tests it is two files of different sizes with duplicate keys on both sides:
+1,001,000 added rows derived rather than counted, and the same number either
+way. A test asserts it in both directions, and fails when the derivation is
+removed.
+
+### While measuring: the C++ summary line names the wrong engine
+
+`main.cpp` prints `| turbo <seconds>s` unconditionally, so a Parquet run reports
+`turbo`. C, Rust and Zig all print `parquet`. Nothing is wrong with the run --
+it did take the columnar path -- but the line is the first thing anyone reads
+when checking which engine a number came from.
+
+---
+
 ## 2026-09-22 (summary only) — the same fault as #106, on the other side
 
 #106 found the cross-port tables timing four different tasks, because only the
