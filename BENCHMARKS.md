@@ -120,6 +120,36 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (cpp parquet cells) — the per-cell checks were calls
+
+After the page copy (#140), the next item in the C++ Parquet profile was
+`absent` and `same`: 1.18 B instructions of a 2M-row run at one thread, once
+per key cell in the index and the join and once per compared cell outside the
+dictionary path. Neither inlined. `same` called `absent` twice, and both
+carried the normalising branch (`--trim`, `--ignore-case`, `--empty-is-null`,
+`--tolerance`) that builds a string.
+
+Split so the common case inlines: a null check, a length and a `memcmp`. The
+normalised form moved to two out-of-line helpers. Behaviour is unchanged,
+and summaries are identical with and without each normalising option.
+
+| 2M Parquet pair, one thread | main | this |
+|---|---:|---:|
+| instructions | 8.54 B | **7.62 B** (-11%) |
+
+| paired, 4 vCPU Xeon @ 2.10 GHz | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| 2M, 15 rounds | 1.05x 1.00-1.13 | 1.08x 1.02-1.15 |
+| 10M, 9 rounds | 1.06x 0.98-1.12 (no result) | 1.08x 0.95-1.16 |
+
+Near the floor here, as the page copy was. Independent of #140 and adds to it.
+
+Also tried and dropped: assembling `fold_bytes`'s 1-7 byte tail with shifts
+instead of a variable-length `memcpy`. It removed the libc calls and gave back
+almost all of it in the loop: 7.62 B to 7.56 B.
+
+---
+
 ## 2026-09-26 (speculative split) — Rust's sweep did not scale because of the step before it
 
 The Rust sweep took as long at four threads as at one on the 4M CSV pair,
