@@ -45,7 +45,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
-use slab::{Dialect, Slab, same_bytes, text_of};
+use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
     RowParser, csv_header, detect_delimiter, json_header, json_tail_is_clean, shared_tail,
     sniff_dialect,
@@ -181,6 +181,41 @@ fn value(slab: &Slab, f: Field, opt: &Options) -> Val {
         return None;
     }
     normalise(empty_to_null(&text_of(slab, f)), opt)
+}
+
+/// [`value`] that refuses rather than aborting when there is no room.
+///
+/// The report path uses this one; see `text_of_checked` for why the comparison
+/// path does not. `empty_to_null` and `normalise` are re-expressed here rather
+/// than called because both take an owned `Val` and hand back another --
+/// `s.trim().to_string()` is a second allocation of a string this already owns
+/// -- and because they are shared with the other two engines, which this change
+/// does not touch.
+fn value_checked(slab: &Slab, f: Field, opt: &Options, what: &str) -> Result<Val> {
+    if f == ABSENT {
+        return Ok(None);
+    }
+    let s = text_of_checked(slab, f, what)?;
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if !needs_normalising(opt) {
+        return Ok(Some(s));
+    }
+    let trimmed = if opt.trim { s.trim() } else { s.as_str() };
+    if opt.empty_is_null && trimmed.is_empty() {
+        return Ok(None);
+    }
+    if opt.ignore_case {
+        // `to_lowercase` allocates on its own and can grow the string, so it
+        // gets its own checked buffer rather than being done in place.
+        let lower = trimmed.to_lowercase();
+        return alloc::val(Some(lower.as_str()), what);
+    }
+    if opt.trim {
+        return alloc::val(Some(trimmed), what);
+    }
+    Ok(Some(s))
 }
 
 fn is_absent(slab: &Slab, f: Field, opt: &Options) -> bool {
@@ -756,33 +791,54 @@ where
 /// Chunked rather than one thread per list: the four lists are very uneven —
 /// fifty thousand against ten — so dealing them out whole would leave two
 /// threads idle while the other two did all of it.
-fn map_rows<T, U, F>(items: &[T], threads: usize, each: F) -> Vec<U>
+fn map_rows<T, U, F>(items: &[T], threads: usize, what: &str, each: F) -> Result<Vec<U>>
 where
     T: Sync,
     U: Send,
-    F: Fn(&T) -> U + Sync,
+    F: Fn(&T) -> Result<U> + Sync,
 {
     let parts = threads.clamp(1, items.len().div_ceil(1 << 12).max(1));
     if parts <= 1 {
-        return items.iter().map(&each).collect();
+        let mut out: Vec<U> = alloc::sized(items.len(), what)?;
+        for item in items {
+            out.push(each(item)?);
+        }
+        return Ok(out);
     }
     let chunk = items.len().div_ceil(parts);
     let slices: Vec<&[T]> = items.chunks(chunk).collect();
-    let one = |p: usize| slices[p].iter().map(&each).collect::<Vec<U>>();
-    let mut out: Vec<U> = Vec::with_capacity(items.len());
+    let one = |p: usize| -> Result<Vec<U>> {
+        let mut part: Vec<U> = alloc::sized(slices[p].len(), what)?;
+        for item in slices[p] {
+            part.push(each(item)?);
+        }
+        Ok(part)
+    };
+    let mut out: Vec<U> = alloc::sized(items.len(), what)?;
     std::thread::scope(|scope| {
         let handles: Vec<_> = (1..slices.len())
             .map(|p| parallel::spawn_at(scope, &one, p))
             .collect();
-        out.extend(one(0));
+        let mut failed: Option<Error> = None;
+        match one(0) {
+            Ok(part) => out.extend(part),
+            Err(e) => failed = Some(e),
+        }
         for handle in handles {
             // A panicking worker would mean losing rows silently, which is worse
-            // than the panic: there is no error path out of here, and a short
-            // report that looks complete is the one outcome to avoid.
-            out.extend(handle.join().expect("a report row worker"));
+            // than the panic: a short report that looks complete is the one
+            // outcome to avoid. A worker that ran out of room is different --
+            // it says so, and the first such refusal is the one reported.
+            match handle.join().expect("a report row worker") {
+                Ok(part) => out.extend(part),
+                Err(e) => failed = failed.or(Some(e)),
+            }
         }
-    });
-    out
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    })
 }
 
 /// Parses and hashes every row of a mapped text file, in `threads` chunks.
@@ -1023,10 +1079,14 @@ struct Part {
 /// Decodes one row's key and compared columns into the owned values the report
 /// holds. This is the only place a cell becomes a `String`, and it runs at most
 /// `--max-rows` times per section rather than once per row in the file.
-fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> {
+fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Result<Vec<Val>> {
     let mut fields = vec![ABSENT; side.width];
     idx.fields_of(side, row, &mut fields);
-    fields.iter().map(|f| value(&side.slab, *f, opt)).collect()
+    let mut out: Vec<Val> = alloc::sized(side.width, "a report row")?;
+    for f in &fields {
+        out.push(value_checked(&side.slab, *f, opt, "a report cell")?);
+    }
+    Ok(out)
 }
 
 /// Decodes just one row's key columns.
@@ -1037,11 +1097,15 @@ fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> 
 /// already has a parser that stops at the key, and there is one of these per
 /// duplicated key rather than per kept row, so the columns it was decoding and
 /// discarding were the largest allocation anywhere in the report path.
-fn key_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> {
+fn key_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Result<Vec<Val>> {
     let key_size = opt.key.len();
     let mut fields = vec![ABSENT; key_size];
     idx.keys_of(side, row, key_size, &mut fields);
-    fields.iter().map(|f| value(&side.slab, *f, opt)).collect()
+    let mut out: Vec<Val> = alloc::sized(key_size, "a duplicated key")?;
+    for f in &fields {
+        out.push(value_checked(&side.slab, *f, opt, "a duplicated key")?);
+    }
+    Ok(out)
 }
 
 /// Runs `work` on `threads` threads and returns everything they produced.
@@ -1072,8 +1136,12 @@ fn ways_for(keys: usize) -> usize {
     }
 }
 
-fn to_cells(values: &[Val]) -> Vec<Cell> {
-    values.iter().map(|v| Cell::Value(v.clone())).collect()
+fn to_cells(values: &[Val]) -> Result<Vec<Cell>> {
+    let mut out: Vec<Cell> = alloc::sized(values.len(), "a report row's cells")?;
+    for v in values {
+        out.push(Cell::Value(alloc::val(v.as_deref(), "a report cell")?));
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1086,7 +1154,7 @@ fn join(
     compared: &[String],
     exporting: bool,
     threads: usize,
-) -> Joined {
+) -> Result<Joined> {
     let key_size = opt.key.len();
     let nc = compared.len();
     let width = key_size + nc;
@@ -1407,10 +1475,18 @@ fn join(
     } else {
         (NONE, NONE, NONE)
     };
-    let mut removed_rows = map_rows(keep_removed, threads, |p| row_values(a, ai, p.row, opt));
-    let mut added_rows = map_rows(keep_added, threads, |p| row_values(b, bi, p.row, opt));
-    let mut changed_a = map_rows(keep_changed, threads, |p| row_values(a, ai, p.row, opt));
-    let mut changed_b = map_rows(keep_changed, threads, |p| row_values(b, bi, p.mate, opt));
+    let mut removed_rows = map_rows(keep_removed, threads, "a removed row", |p| {
+        row_values(a, ai, p.row, opt)
+    })?;
+    let mut added_rows = map_rows(keep_added, threads, "an added row", |p| {
+        row_values(b, bi, p.row, opt)
+    })?;
+    let mut changed_a = map_rows(keep_changed, threads, "a changed row, A side", |p| {
+        row_values(a, ai, p.row, opt)
+    })?;
+    let mut changed_b = map_rows(keep_changed, threads, "a changed row, B side", |p| {
+        row_values(b, bi, p.mate, opt)
+    })?;
 
     phases.mark("  row values (par)");
     sort_rows(&mut removed_rows, key_size);
@@ -1420,27 +1496,35 @@ fn join(
     // Zipped by index rather than by iterator so the two sides can be chunked
     // together; they are the same length and in the same order by construction.
     phases.mark("  sorts (serial)");
-    let rows: Vec<usize> = (0..changed_a.len()).collect();
-    let changed_cells: Vec<Vec<Cell>> = map_rows(&rows, threads, |&r| {
+    let mut rows: Vec<usize> = alloc::sized(changed_a.len(), "the changed-row index")?;
+    rows.extend(0..changed_a.len());
+    let changed_cells: Vec<Vec<Cell>> = map_rows(&rows, threads, "a changed row's cells", |&r| {
         let (ar, br) = (&changed_a[r], &changed_b[r]);
         let mut cells: Vec<CellDiff> = Vec::new();
         for i in 0..nc {
             let (x, y) = (&ar[key_size + i], &br[key_size + i]);
             if differs(x, y, opt) {
-                cells.push(CellDiff {
-                    column: i,
-                    a: x.clone(),
-                    b: y.clone(),
-                });
+                alloc::push(
+                    &mut cells,
+                    CellDiff {
+                        column: i,
+                        a: alloc::val(x.as_deref(), "a changed cell")?,
+                        b: alloc::val(y.as_deref(), "a changed cell")?,
+                    },
+                    "a changed cell",
+                )?;
             }
         }
-        let mut row: Vec<Cell> = ar[..key_size]
-            .iter()
-            .map(|v| Cell::Value(v.clone()))
-            .collect();
+        let mut row: Vec<Cell> = alloc::sized(key_size + 1, "a changed row's key")?;
+        for v in &ar[..key_size] {
+            row.push(Cell::Value(alloc::val(
+                v.as_deref(),
+                "a changed row's key",
+            )?));
+        }
         row.push(Cell::Diffs(cells));
-        row
-    });
+        Ok(row)
+    })?;
 
     phases.mark("  changed cells (par)");
     let counts = Counts {
@@ -1459,15 +1543,19 @@ fn join(
         b_dup_rows: bi.dup_rows,
     };
 
-    Joined {
+    Ok(Joined {
         counts,
         columns,
         changed: changed_cells,
-        added: map_rows(&added_rows, threads, |r| to_cells(r)),
-        removed: map_rows(&removed_rows, threads, |r| to_cells(r)),
+        added: map_rows(&added_rows, threads, "an added row's cells", |r| {
+            to_cells(r)
+        })?,
+        removed: map_rows(&removed_rows, threads, "a removed row's cells", |r| {
+            to_cells(r)
+        })?,
         changed_a,
         changed_b,
-    }
+    })
 }
 
 fn sort_rows(rows: &mut [Vec<Val>], key_size: usize) {
@@ -1505,37 +1593,39 @@ fn empty_section(opt: &Options) -> Section {
 }
 
 /// The duplicate-key section: most duplicated first, then by key.
-fn duplicate_section(side: &Side, idx: &RowIndex, opt: &Options) -> Section {
+fn duplicate_section(side: &Side, idx: &RowIndex, opt: &Options) -> Result<Section> {
     let key_size = opt.key.len();
-    let mut entries: Vec<(Vec<Val>, i64)> = idx
-        .first_row
-        .iter()
-        .zip(&idx.occurrences)
-        .filter(|(_, n)| **n > 1)
-        .map(|(row, n)| (key_values(side, idx, *row, opt), *n as i64))
-        .collect();
+    let mut entries: Vec<(Vec<Val>, i64)> = Vec::new();
+    for (row, n) in idx.first_row.iter().zip(&idx.occurrences) {
+        if *n <= 1 {
+            continue;
+        }
+        let key = key_values(side, idx, *row, opt)?;
+        alloc::push(&mut entries, (key, *n as i64), "a duplicated key")?;
+    }
     entries.sort_by(|x, y| {
         y.1.cmp(&x.1)
             .then_with(|| compare_keys(&x.0, &y.0, key_size))
     });
 
     let total = entries.len();
-    let rows: Vec<Vec<Cell>> = entries
-        .into_iter()
-        .take(opt.max_rows)
-        .map(|(key, count)| {
-            let mut row: Vec<Cell> = key.iter().map(|v| Cell::Value(v.clone())).collect();
-            row.push(Cell::Count(count));
-            row
-        })
-        .collect();
+    entries.truncate(opt.max_rows);
+    let mut rows: Vec<Vec<Cell>> = alloc::sized(entries.len(), "a duplicate-section row")?;
+    for (key, count) in entries {
+        let mut row: Vec<Cell> = alloc::sized(key.len() + 1, "a duplicate-section row")?;
+        for v in key {
+            row.push(Cell::Value(v));
+        }
+        row.push(Cell::Count(count));
+        rows.push(row);
+    }
     let mut cols = opt.key.clone();
     cols.push("count".to_string());
-    Section {
+    Ok(Section {
         cols,
         rows,
         truncated: total > opt.max_rows,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,8 +1807,8 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     // walks every duplicated key to decode one row for each of them.
     let (dup_a, dup_b) = if opt.row_lists {
         (
-            duplicate_section(&a, &ai, opt),
-            duplicate_section(&b, &bi, opt),
+            duplicate_section(&a, &ai, opt)?,
+            duplicate_section(&b, &bi, opt)?,
         )
     } else {
         (empty_section(opt), empty_section(opt))
@@ -1733,7 +1823,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         &resolved.compared,
         opt.export_dir.is_some(),
         total,
-    );
+    )?;
 
     phases.mark("join");
     let meta = resolved.meta(&opt.key, a_cols, b_cols);
