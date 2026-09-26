@@ -1087,8 +1087,15 @@ pub fn compare(
     if (build_a.err) |e| return e;
     if (build_b.err) |e| return e;
 
+    // One direction, not two. A key matches from either side or from neither,
+    // so the number of B's distinct keys with a mate in A *is* the number of
+    // pairs the A pass finds, and `added` is B's distinct keys minus it. The
+    // pass over B existed to count exactly that: a second randomly-probed walk
+    // of A's table to learn a number already in hand. The Rust port found the
+    // same (#121), and C and C++ run it only when a report samples added rows,
+    // which this port never prints.
     const a_ways = sweepWays(ai.firsts.items.len);
-    const b_ways = sweepWays(bi.firsts.items.len);
+    const b_ways: usize = 0;
     const parts = try gpa.alloc(SweepPart, a_ways + b_ways);
     defer {
         for (parts) |*part| part.deinit(gpa);
@@ -1155,8 +1162,8 @@ pub fn compare(
             part.pair_a = .empty;
             part.pair_b = .empty;
         }
-        for (parts[a_ways..]) |part| added_total += part.missing;
     }
+    added_total = bi.unique() - @as(i64, @intCast(pair_a.items.len));
 
     const npairs = pair_a.items.len;
     const words = (npairs + 63) / 64;
