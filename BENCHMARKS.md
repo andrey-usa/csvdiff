@@ -120,6 +120,34 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (cpp join prefetch) — the one join in four that did not prefetch
+
+At one thread the C++ join was 1.43x C's on the 4M CSV pair (1.36 s against
+0.95 s), which puts the gap in per-row work and not in threading. Callgrind on
+a 400k pair says it isn't instructions: 1.82 B against C's 1.71 B, 7% apart.
+So it's memory. Every join probes the other file's table once per key, in this
+file's order, and the table is far too big to cache. C, Rust and Zig all ask
+for that line rows ahead, since the hash that decides it is already in hand. C++
+did it in its insert loop and never in either join pass.
+
+`RowIndex::prefetch(hash)`, called 24 rows ahead (the insert's distance) in the
+A pass and the B pass.
+
+4M CSV pair, `-k account_id,txn_id -i updated_at`, 4 vCPU Xeon @ 2.10 GHz,
+paired against main, 15 rounds, reports identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| one thread | **1.17x** 1.12-1.21 | 1.13x 1.08-1.17 |
+| four threads | **1.08x** 1.06-1.12 | **1.12x** 1.11-1.14 |
+| ndjson 2M, four threads | 1.03x 0.99-1.11 (no result) | 1.07x 1.00-1.14 |
+
+The join phase alone at one thread: 1.28-1.46 s to 1.03-1.20 s. On ndjson on
+main, the serial quote count (#127) is most of a four-thread run and hides it.
+Parquet goes through `pqdiff.cpp`, which already prefetches.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242
