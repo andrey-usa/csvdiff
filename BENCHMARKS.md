@@ -120,6 +120,43 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (c word key hash) — C hashed its keys a byte at a time
+
+C's `hash_field` folded one byte per dependent multiply. On this workload's two
+keys of twelve and fifteen bytes that was 1.04 B of the 8.5 B instructions a 2M
+CSV pair costs at one thread, where Rust's word-at-a-time `key_hash` spent 0.72 B.
+It now folds eight bytes a step, with the tail built from loads. An escaped
+value is decoded first and folded by the same loop, so two spellings of one key
+still hash alike, which is exactly what #148 found the other three ports getting
+wrong. C was the only port that got it right, and it still does: the escaped-key
+checks from #148 pass.
+
+| callgrind, 2M CSV pair, one thread | main | this |
+|---|---:|---:|
+| `hash_field` | 1.04 B | 0.46 B |
+| whole run | 8.517 B | 7.937 B (−6.8%) |
+
+CI, `phases.yml`, 10M rows:
+
+| | main | this | controls |
+|---|---:|---:|---|
+| ndjson, EPYC 7763 both, C sweep 1 thread | 1.171 s | **1.003 s** | Rust 6.396 / 6.403 s wall |
+| ndjson, C both indexes 1 thread | 1.315 s | **1.152 s** | Zig 5.797 / 5.818 s wall |
+| ndjson, C wall 4 threads | 3.945 s | 3.987 s | Rust 3.487 / 3.481 s |
+| CSV, C sweep 4 threads | 0.438 s | 0.292 s | *different runners* |
+| CSV, C wall / Rust wall, 4 threads | 1.04 | 0.92 | same pairs |
+
+The sweep, where the hash runs, gains 14% on ndjson on one CPU. On ndjson's wall
+the gain is swallowed: C's join came out 2–4% slower in that pair, a phase this
+change does not touch. The CSV pair landed on two different runners, so only its
+ratios to the other ports mean anything, and against all three C moved about 10%.
+Locally the paired runs straddled 1.00x on this host (1.07x [0.93–1.14] CSV wall,
+1.04x [0.96–1.13] ndjson). Shipped on the instruction count and the sweep phase,
+with the wall result left as it is: a CSV improvement across two machines and
+nothing measurable on ndjson.
+
+---
+
 ## 2026-09-26 (cpp rle split) — the same per-value bounds test in C++'s bit-packed runs
 
 C++'s `RleReader::fill` tested, for every value of a bit-packed run, whether an
