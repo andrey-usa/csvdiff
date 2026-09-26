@@ -226,6 +226,379 @@ not built.
 
 ---
 
+## 2026-09-24 (zig scan width) — the phase got faster and the run did not
+
+With the Rust port's measurement corrected, the 4M CSV table on this host reads:
+
+| Port | Best | Median | CPU |
+|---|---:|---:|---:|
+| Rust | 0.62s | 0.63s | 1.9s |
+| C | 0.66s | 0.72s | 2.1s |
+| C++ | 0.67s | 0.71s | 1.8s |
+| **Zig** | **0.92s** | **0.96s** | **3.0s** |
+
+Zig is the outlier and the port nobody has examined. Its phases say where: the
+sweep is 0.41s a side against C's 0.20s, and everything else is within noise.
+That is the whole of the 0.9s of extra CPU.
+
+Zig's scan step is eight bytes -- SWAR, no CPU feature at all -- where
+`-Dscan=32` puts the same question to a vector register. Building it:
+
+| | sweep, a side | whole run, paired |
+|---|---:|---|
+| `-Dscan=8` (shipped) | 0.41s | -- |
+| `-Dscan=32` | **0.30s** | **0.87x** -- *slower* |
+| `-Dscan=64` | 0.31s | not pursued |
+
+The sweep is 27% faster. What the *run* does is the part this host could not
+settle, and the rest of this entry is that story rather than a result.
+
+The direct alternating measurement says what the paired one cannot: `scan=32` is
+**bimodal** and `scan=8` is not. Ten pairs, milliseconds:
+
+    scan=8   1275 1308 1316 1326 1344 1375 1382 1382 1409 1459
+    scan=32  1271 1288 1292 1343 | 1544 1596 1631 1654 1661 1683
+
+Four runs at parity, six about 20% slower, nothing in between, and the same
+split in the per-run paired ratios. A phase measurement cannot see this at all:
+every phase of `scan=32` is faster in every run, including the ones where the
+whole run is 300 ms slower. `bench_ab.sh` sees the cost but not the shape: over
+25 rounds it reports 0.89x [0.84-0.94], with `scan=32`'s best-to-median spread
+twice `scan=8`'s.
+
+### The floor, and why none of this is a result
+
+`bench_ab.sh --self-test` runs one build against itself. On this host, fifteen
+rounds:
+
+| | wall | mid half |
+|---|---|---|
+| the same binary, twice | 0.99x | **0.92-1.07** |
+
+**The noise floor here is about eight percent.** The scan-width measurement is
+0.89x [0.84-0.94] over twenty-five rounds -- outside 1.00, and overlapping the
+floor's own band. It is at the edge of what this machine can resolve, not
+clearly past it, and "13% slower" is more than the data carries.
+
+Two other things that looked like results and were not:
+
+* **Frequency licensing** as the mechanism. It is the obvious suspect and the
+  evidence is against it: the Rust port scans **thirty-two bytes** on this same
+  host -- `VECTOR_WIDTH = 32` in `turbo/field.rs`, built
+  `-C target-cpu=x86-64-v3` -- and its runs are tight, 0.62s best against 0.63s
+  median. Whatever unsettles the Zig build at that width leaves the Rust one
+  alone.
+* **Two measurements where `scan=32` came out faster.** Both ran eight of one
+  build and then eight of the other, which is the one-build-at-a-time method
+  this file opens by rejecting. They are not evidence of anything. The two
+  interleaved measurements agree with each other; these do not belong beside
+  them.
+
+So: the sweep is faster at thirty-two bytes, the run is not measurably faster,
+and this host cannot tell whether it is slower. **The question needs a quieter
+machine, and the ladder already runs on one** -- the 10m CI rows have `Zig v32`
+ahead of `Zig`, and that is the measurement to trust until a paired one on a
+quiet host says otherwise.
+
+**And it is the host's answer, not the port's.** The 10m CI rows in the entry of
+2026-09-19 have `Zig v32` at 1.72-1.82s against `Zig` at 1.87-1.97s, which is
+the opposite. So the width that wins depends on the processor, which is why it
+is a build option and why it cannot simply become the default.
+
+Not built, and not refused either -- **unresolved**. Recorded because "Zig scans
+eight bytes where C and Rust scan thirty-two" is the first thing anyone looking
+at that row will try, and because the trap is not the idea but the measurement:
+a 27% phase win that the whole-run number will not confirm on a machine whose
+floor is 8%.
+
+### Two things checked and found not to be true
+
+Both are the obvious explanations for the Zig row, and both are wrong:
+
+* **"Zig is not compiled for the host."** C and C++ probe and add
+  `-march=native`; Rust gets `-C target-cpu=x86-64-v3`; `zig build` is given
+  nothing. But Zig's default target *is* the host: rebuilt from a cleared cache,
+  `zig build --release=fast` and the same with `-Dcpu=native` are byte-identical,
+  and the binary carries `vpcmpeqb`, `vpbroadcastb` and `vmovdqa32`. The note in
+  `scripts/build_ports.sh` is right.
+* **"The sweep is oversubscribed."** #109 found the C++ sweep splitting each file
+  `threads` ways while both files were in flight, which is twice the cores. Zig
+  already halves it -- `const per_file = @max(1, total / 2)` -- and has for as
+  long as the file has existed.
+
+The sweep gap is real and is neither of these.
+
+---
+
+## 2026-09-24 (parallel insert) — deterministic, and it does not pay
+
+Every port builds its index the same way: find and hash the rows on every core,
+then insert them on one. The C port says why in as many words -- *"first
+occurrence wins, and which occurrence is first depends on the order rows arrive,
+so threading it would make the answer depend on the scheduler"* -- and every
+other port repeats it. The phase is a third of the run, so "insert on one core"
+is the largest deliberate serialisation in this project, and it has never been
+priced.
+
+**The determinism objection is answerable.** Partition the rows by `hash & (P-1)`
+and every occurrence of a key lands in the same partition, so first-occurrence
+still wins and file order still decides it: P sub-tables, built in parallel,
+give the same answer as one table built serially. A lookup then picks its
+sub-table from the same bits.
+
+Priced with a probe that builds the sub-tables beside the real index and drops
+them -- nothing downstream sees them -- on the 4M CSV pair at four threads,
+which is two per file:
+
+| | serial | partitioned |
+|---|---:|---:|
+| partition pass | -- | 0.05s |
+| insert | 0.24s | 0.15s |
+| **total** | **0.24s** | **0.20s** |
+
+The insert itself does parallelise -- 0.24s to 0.15s on two ways -- and the pass
+that makes it possible costs most of what that saves. At four ways on a quiet
+machine the ceiling is about 0.17s against 0.24s, which is 0.07s of a 0.62s run:
+**11%, before paying for anything.**
+
+And the thing it would have to pay for is not in the table. Every lookup on the
+join's hot path would gain a sub-table selection -- one more dependent load
+before the probe that is already the port's worst cache miss. That cost is on
+the phase this project has spent the most effort on, and 11% is not enough
+headroom to go looking for it.
+
+Not built. Recorded because the comment in four ports says the insert *cannot*
+be threaded, and that is not true -- it can, deterministically, and it is not
+worth it. Those are different reasons and the second one is the real one.
+
+---
+
+## 2026-09-24 (parquet join) — the Rust port walked B for a sample nobody asked for
+
+Parquet is the widest ratio in the published tables and nobody had looked at it:
+at ten million rows C does the CSV-equivalent work in 1.11s against Rust's 2.12s.
+Phases on a 2M pair, warm page cache, three runs each, `--summary` so the report
+is not in the number:
+
+| phase | C | Rust |
+|---|---:|---:|
+| read key columns | 0.044s | 0.024s |
+| build key indexes | 0.09s | 0.09s |
+| **join / match sweep** | **0.047s** | **0.108s** |
+| compared columns | 0.139s | 0.158s |
+
+Everything is close except one phase, and that phase is 2.3x. The first
+measurement said otherwise -- compared columns 0.269s against 0.155s -- and was
+a cold page cache on the first touch of a 160 MB file. Warm it and that gap is
+1.14x.
+
+### The B pass is for the sample, not the count
+
+A key matches from either side or from neither, so the number of B's keys with
+an A counterpart *is* the pair count the A pass already produced, and `added` is
+B's distinct keys minus it. The pass over B is a second full random-probed walk
+of A's table, and all it adds is the report's added-rows **sample**.
+
+`csvdiff.cpp` has run it only when something will print the sample since it was
+measured there, and `pqdiff.cpp` since #106 -- the comment there says so in as
+many words. The Rust port's `pqdiff.rs` never asked.
+
+Skipping it under `--summary`, `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, on this host (4 vCPU Xeon @ 2.10GHz):
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 2M x 2M | **1.15x** 1.09-1.20 | **1.18x** 1.11-1.20 |
+| 1M x 2M | **1.29x** 1.19-1.33 | **1.21x** 1.16-1.28 |
+
+The match sweep itself goes **0.108s to 0.050s**, against C's 0.047s. The second
+pair is the bigger win because the skipped pass is over twice as many keys.
+
+`bench_ab.sh --self-test` on the same pair and the same fifteen rounds puts this
+host's floor at 0.99x [0.92-1.04]. Both rows above sit clear of it -- the 2M
+pair's middle half starts at 1.09, above the floor's own upper bound -- which is
+worth stating because on the same afternoon this machine could not resolve an
+8% question at all (see the zig scan-width entry).
+
+Counts are identical, which is the thing that had to hold, and the case that
+tests it is two files of different sizes with duplicate keys on both sides:
+1,001,000 added rows derived rather than counted, and the same number either
+way. A test asserts it in both directions, and fails when the derivation is
+removed.
+
+### While measuring: the C++ summary line names the wrong engine
+
+`main.cpp` prints `| turbo <seconds>s` unconditionally, so a Parquet run reports
+`turbo`. C, Rust and Zig all print `parquet`. Nothing is wrong with the run --
+it did take the columnar path -- but the line is the first thing anyone reads
+when checking which engine a number came from.
+
+---
+
+## 2026-09-22 (summary only) — the same fault as #106, on the other side
+
+#106 found the cross-port tables timing four different tasks, because only the
+C++ port emitted row samples and every harness passed `--json` to all four. The
+fix was to stop passing it. The same fault was sitting on the other side of the
+table the whole time, and it is bigger.
+
+**The Rust port writes a report whether or not one is asked for.** Its `--out`
+defaults to `<a>__vs__<b>.html`; C, C++ and Zig write nothing without an output
+flag. Run the ladder's exact invocation in an empty directory:
+
+    C     compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    C++   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    Rust  compare a.csv b.csv -k account_id,txn_id  ->  a__vs__b.html
+    Zig   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+
+`ports()` knew about it and half-fixed it: `report = ["-o", "/dev/null"]`. That
+moves the *write*. The render still ran, the gzip still ran, and so did
+everything the engine does to feed them — up to `--max-rows` rows per section
+decoded into `String`s, sorted and cell-diffed, plus a walk of every duplicated
+key to build that section.
+
+### What it costs
+
+`--summary` turns all of it off: the CLI writes nothing and `opt.row_lists`
+tells the engine not to build what it would have written. Measured on this host
+(4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, against the unmodified binary:
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 4M CSV, 20 columns | **1.31x** 1.28-1.34 | **1.18x** 1.16-1.19 |
+| 2M Parquet, 20 columns | **1.27x** 1.24-1.29 | **1.11x** 1.09-1.12 |
+
+Counts are identical with and without, which is the thing that had to hold: a
+section records how many rows it dropped, so the totals never depended on any of
+them being kept.
+
+### The project already had the evidence
+
+`--matrix` carried a `Rust engine` row — the same binary with `--max-rows 1` —
+and the entry at 2026-09-19 says of it, in as many words:
+
+> **Rust engine is first on csv at both sizes** -- 1.67s at 10m and 3.22s at 20m
+
+That row existed *because* someone noticed the report was in the number. It was
+in the matrix, behind a flag, while the published table kept charging it. With
+`--summary` on the main row the two measure the same thing, so the extra row is
+gone — for the reason `ports()` already gives about `csvdiff-swar`, which was
+"the same binary under a second name".
+
+### A measurement that lied, and why
+
+The first paired run of this used two one-line `bash` wrappers around one binary
+— one appending `--summary`, one not — because that is the quick way to A/B a
+flag. It reported **1.08x [1.05-1.13]** where the binary-against-binary probe
+had said 1.28x, and the `--summary` arm was bimodal: best 1.092s against a
+median of 1.289s. Timing the same two invocations directly, alternating, gave a
+flat 1400ms against 1130ms every round. The wrappers were the artifact. Building
+a second binary and comparing binaries — which is what `bench_ab.sh` is for —
+put it back at 1.31x. **Do not put a shell script between this harness and the
+thing being measured.**
+
+### What changed
+
+* `--summary` on the Rust CLI: prints the counts line and writes nothing. It
+  refuses `--out`, `--json` and `--export-dir` rather than picking a winner,
+  because guessing which was meant is how a report silently stops appearing.
+* `Options::row_lists`, defaulting to `true`, so a library caller asking for a
+  `Diff` still gets its rows. Both engines honour it, `turbo` and `pqdiff`.
+* Every port-comparison script trades `-o /dev/null` for `--summary`;
+  `gate_flags` puts the report back for the counts gate, which needs the JSON
+  document and is not timed. `report_cost.py` keeps `-o /dev/null`, since
+  pricing the report is what it is for.
+
+Every Rust row in RESULTS.md was measured the old way and is an upper bound
+until the ladder runs again.
+
+---
+
+## 2026-09-21 (duplicate keys, C++) — the same shape, and the helper was already there
+
+`dup_section` keeps one row per duplicated key and, of that row, the key columns.
+It was decoding the whole row to get them:
+
+    auto values = row_values(s, idx, firsts[i], width, opt);
+    values.resize(key_size);
+
+`value_of` turns every field into a `Val`, so a twenty-column file built eighteen
+strings per duplicated key and threw them away. `key_values` has sat four hundred
+lines above that since #101, which added it for the changed rows, and the Parquet
+path's own `dup_section` was already calling it. Only the CSV path was not.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+**15 rounds** interleaved, paired per round. The pair is 2M rows × 20 columns
+with every key repeated ten times: **200,000 duplicated keys**, which is what
+this section is proportional to. `--json`, because `dup_section` runs under
+`row_lists` and that flag is the only thing that sets it.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.056s | 0.737s | **1.48x** 1.43-1.64 |
+| CPU (median) | 1.63s | 1.33s | **1.29x** 1.22-1.38 |
+
+Seven rounds first gave 1.64x wall and 1.38x CPU with a mid half twice as wide
+(1.13-1.53 on CPU). Fifteen is what the band above is worth quoting from; the
+seven-round numbers are recorded because the point of the mid half is that it
+tells you when you have not run enough rounds. The JSON is identical across the
+change apart from `meta`'s `seconds`.
+
+**Proportional to duplicated keys, not to rows.** A file without repeated keys
+never enters the section, and on the standard 4M pair — 400 duplicated keys
+against 200,000 here — the equivalent Rust change measured 1.02x, the noise
+floor. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+The Rust port had the identical shape at `duplicate_section`; that is a separate
+change. C and Zig report duplicate *counts* and no rows, so there is nothing
+there to fix.
+
+---
+
+## 2026-09-21 (duplicate keys) — the section decoded every column to keep two
+
+The Rust port's duplicate-key section decodes one row per duplicated key and
+keeps the key columns. It was decoding the *whole* row to do it:
+
+    let values = row_values(side, idx, *row, opt);   // side.width columns
+    (values[..key_size].to_vec(), *n as i64)          // key_size of them kept
+
+`row_values` turns every field into a `String`, so a twenty-column file built
+eighteen strings per duplicated key and dropped them, then cloned the two it
+wanted into a second vector. The index already carries a parser that stops at
+the key — `keys_of`, which the insert path uses on every row — so the fix is to
+call it instead of decoding past the key at all.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+7 rounds interleaved, paired per round. The pair is 2M rows × 20 columns with
+every key repeated ten times: **200,000 duplicated keys**, which is what this
+section is proportional to.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.135s | 0.658s | **1.71x** 1.68-1.73 |
+| CPU (median) | 1.74s | 1.27s | **1.36x** 1.34-1.38 |
+
+The report is byte-identical across the change: the HTML payload decompresses to
+the same 2,480,022 bytes apart from `meta`, which carries the timestamp and the
+elapsed time.
+
+**It is proportional to duplicated keys, not to rows.** On the standard 4M pair,
+which has 400 duplicated keys against 200,000 here, the same change measures
+1.02x CPU [1.02-1.03] — real but at the paired noise floor, and not worth
+quoting on its own. A file with no repeated key does not enter the section at
+all. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+C++ has the identical shape at `dup_section` — `row_values(...)` then
+`values.resize(key_size)` — and already has a `key_values` helper beside it that
+#101 added for the changed rows. C and Zig report duplicate *counts* and no rows,
+so there is nothing there to fix.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242

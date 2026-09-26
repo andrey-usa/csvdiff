@@ -11,7 +11,8 @@ import subprocess, re, time, os, statistics, sys
 
 PORTS = {"C":    ("/home/user/csvdiff/c/csvdiff", []),
          "C++":  ("/home/user/csvdiff/cpp/build/csvdiff", []),
-         "Rust": ("/home/user/csvdiff/rust/target/release/csvdiff", ["-o","/dev/null"]),
+         # `--summary`, not `-o /dev/null`: see `bench_formats_ports.py`.
+         "Rust": ("/home/user/csvdiff/rust/target/release/csvdiff", ["--summary"]),
          "Zig":  ("/home/user/csvdiff/zig/zig-out/bin/csvdiff", [])}
 A, B = "/home/user/ab4m/c_a.csv", "/home/user/ab4m/c_b.csv"
 K = ["-k", "account_id,txn_id", "-i", "updated_at"]
