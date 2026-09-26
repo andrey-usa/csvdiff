@@ -63,7 +63,11 @@ def ports() -> list[tuple[str, list[str], list[str]]]:
     # 0.43s and 91 MB against 263 MB above the input, for identical counts, so
     # every Rust Parquet number this script has produced was of the reader `auto`
     # does not pick.
-    report = ["-o", "/dev/null"]
+    #
+    # `--summary` rather than `-o /dev/null`, which only moved the write: the
+    # render still ran, and so did everything the engine does to feed it. See
+    # `bench_formats_ports.py` for the measurement.
+    report = ["--summary"]
     out = []
     for label, path, flags in [
         ("C", ROOT / "c/csvdiff", []),
@@ -77,6 +81,18 @@ def ports() -> list[tuple[str, list[str], list[str]]]:
             print(f"  {label:5s} -- not built ({path})", file=sys.stderr)
     out += extras()
     return out
+
+
+def gate_flags(flags: list[str]) -> list[str]:
+    """The timed flags, with `--summary` traded back for a discarded report.
+
+    The counts gate needs the JSON document, and `--summary` refuses an output
+    flag rather than guessing which of the two was meant. The gate is untimed,
+    so what it costs the port that renders one reaches no table.
+    """
+    if "--summary" not in flags:
+        return flags
+    return [f for f in flags if f != "--summary"] + ["-o", "/dev/null"]
 
 
 def extras() -> list[tuple[str, list[str], list[str]]]:
@@ -179,7 +195,7 @@ def main() -> int:
     for label, prefix, flags in builds:
         out = f"{args.tmp}/ports_{slug(label)}.json"
         _, _, _, code = run(prefix + ["compare", args.a, args.b, "-k", args.key,
-                                      "-i", args.ignore, "--json", out] + flags,
+                                      "-i", args.ignore, "--json", out] + gate_flags(flags),
                             f"{args.tmp}/ports_err.txt")
         if code in (0, 1) and counts(out) is not None:
             reads.append((label, prefix, flags))

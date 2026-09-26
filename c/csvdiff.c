@@ -852,13 +852,20 @@ static void index_keys(const RowIndex *ix, int32_t row, Field *out) {
  * than the parsing it splits. */
 #define SPLIT_FROM (4u << 20)
 
-/* One chunk's rows, in the order they appear in it. */
+/* One chunk's rows, in the order they appear in it.
+ *
+ * Padded for the same reason as `CmpPart`: these are one per sweep thread in a
+ * single `calloc`ed array, forty bytes apart, and `chunk_push` touches `n`,
+ * `cap` and the two pointers on *every row*. Unpadded, two threads' chunks
+ * share a cache line and every row one of them appends moves it. */
 typedef struct {
+    _Alignas(64)
     uint64_t *start;
     uint64_t *hash;
     size_t    n, cap;
     bool      failed;   /* a field too long for the packed length */
     bool      oom;
+    char      pad[64];
 } Chunk;
 
 /*
@@ -1246,11 +1253,29 @@ static bool json_tail_is_clean(const RowParser *p, const char *d, size_t at, siz
     return true;
 }
 
+/*
+ * One per thread, and padded so that two of them cannot share a cache line.
+ *
+ * Without the padding these sit in one `calloc`ed array about ninety bytes
+ * apart, so two of them share a line. `out->matched++` on one thread then
+ * dirties the line another thread is incrementing its own counters in, and the
+ * line moves between cores. Four million rows of that does not show up as any
+ * single slow thing: it shows up as the join scaling 2.8x on four cores, where
+ * the same work in the Rust port -- whose per-thread accumulator is a value
+ * returned from a closure and so never adjacent to another thread's -- reaches
+ * 3.9x. Padded, this port reaches 3.9x too.
+ *
+ * The counters could equally be locals merged at the end, which is what the
+ * Rust port does by accident of language. Padding is the smaller change to a
+ * structure the caller already allocates as an array.
+ */
 typedef struct {
+    _Alignas(64)
     int64_t  matched, changed, removed, added;
     int64_t *col_changed, *col_blanked, *col_filled;
     Field   *fa, *fb, *probe;
     bool     oom;
+    char     pad[64];
 } CmpPart;
 
 typedef struct {

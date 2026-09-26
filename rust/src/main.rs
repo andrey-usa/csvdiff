@@ -51,6 +51,7 @@ compare options:
   -o, --out PATH          Report path (default: <a>__vs__<b>.html)
       --json PATH         Also write a JSON summary (counts + column stats) here
       --no-compress       Embed plain JSON instead of gzip (older browsers)
+      --summary           Print the counts and write nothing: no report, no rows
       --fail-on-dups      Exit 3 when either file has duplicate keys
 
 Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
@@ -155,12 +156,13 @@ struct Args {
 
 /// The options that take no value. Anything else consumes the token after it,
 /// which is how a file path can appear before, between or after the options.
-const FLAGS: [&str; 8] = [
+const FLAGS: [&str; 9] = [
     "trim",
     "ignore-case",
     "empty-is-null",
     "no-compress",
     "fail-on-dups",
+    "summary",
     // `head --csv`. A value-taking flag left out of this list does not fail
     // quietly -- it eats the token after it -- but it does fail confusingly:
     // `head a.csv --csv` reported "--csv needs a value".
@@ -285,19 +287,45 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         return Err(Error::new("--key (or a profile with key) is required"));
     }
 
+    // `--summary` is the invocation that writes nothing: it prints the counts
+    // line and stops. That is what the other three ports in this repository do
+    // without an output flag, and it is what the benchmark ladder times -- so
+    // this port was being timed rendering, gzipping and writing a report the
+    // others never built.
+    //
+    // It refuses an output flag rather than quietly ignoring one, because
+    // "write this here" and "write nothing" cannot both be honoured and
+    // guessing which was meant is how a report silently stops appearing.
+    let summary_only = args.flag("summary");
+    if summary_only {
+        for (flag, short) in [("out", Some("o")), ("json", None), ("export-dir", None)] {
+            if args.get(flag, short).is_some() {
+                return Err(Error::new(format!(
+                    "--summary writes nothing; --{flag} asks it to"
+                )));
+            }
+        }
+        opt.row_lists = false;
+    }
+
     let result = compare(a_path, b_path, &mut opt)?;
 
-    let out_path = match args.get("out", Some("o")) {
-        Some(p) => PathBuf::from(p),
-        None => PathBuf::from(format!("{}__vs__{}.html", stem(a_path), stem(b_path))),
-    };
-    let html = render(&result, !args.flag("no-compress"))?;
-    fs::write(&out_path, html)
-        .map_err(|e| Error::new(format!("cannot write {}: {e}", out_path.display())))?;
+    let mut written: Option<PathBuf> = None;
+    if !summary_only {
+        let out_path = match args.get("out", Some("o")) {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from(format!("{}__vs__{}.html", stem(a_path), stem(b_path))),
+        };
+        let html = render(&result, !args.flag("no-compress"))?;
+        fs::write(&out_path, html)
+            .map_err(|e| Error::new(format!("cannot write {}: {e}", out_path.display())))?;
 
-    if let Some(path) = args.get("json", None) {
-        let summary = serde_json::to_string_pretty(&result.summary())?;
-        fs::write(path, summary).map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
+        if let Some(path) = args.get("json", None) {
+            let summary = serde_json::to_string_pretty(&result.summary())?;
+            fs::write(path, summary)
+                .map_err(|e| Error::new(format!("cannot write {path}: {e}")))?;
+        }
+        written = Some(out_path);
     }
 
     let c = &result.counts;
@@ -315,7 +343,10 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
         result.meta.engine,
         result.meta.seconds
     );
-    if let Ok(meta) = fs::metadata(&out_path) {
+    if let Some((out_path, meta)) = written
+        .as_ref()
+        .and_then(|p| fs::metadata(p).ok().map(|m| (p, m)))
+    {
         println!(
             "Report: {} ({:.0} KB)",
             out_path.display(),
