@@ -120,6 +120,56 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (json names) — C looked up every member's name as if it had never seen the row before
+
+Profiled with callgrind on a 200k-row ndjson pair at one thread (an x86-64-v3
+build, because valgrind cannot decode AVX-512): the join's full parse of each
+A row was **52%** of all instructions, about 5,900 a row, and the name lookup
+inside it was the largest single part -- `parser_slot_for` at 98 instructions
+a member, twenty members a row. Each lookup hashed the name a byte at a time
+(FNV: a serial multiply per byte), then took a `strlen` of the candidate before
+comparing it.
+
+Three changes, all in how a name finds its slot:
+
+- **Guess first.** Rows of one file list their names in the same order, and
+  usually in slot order, so the member after slot *i* is tried as slot *i + 1*
+  with a length compare and a `memcmp` before any hashing. A wrong guess costs
+  those two compares and falls through to the table. `want_slot[i]` holds what
+  the table answers for `want[i]`, so a right guess returns exactly the slot
+  the table would have, even when one name fills two slots.
+- **The table's entries carry the name's hash and length**, so a probe rejects
+  a different name on one compare and no lookup calls `strlen`.
+- **A word-at-a-time name hash** in place of the byte loop.
+
+| | main | this |
+|---|---:|---:|
+| instructions, 200k pair, one thread | 2.63 B | **2.13 B** (-19%) |
+
+Paired, 2M-row pair (849 MB a side), `-k account_id,txn_id -i updated_at`,
+4 vCPU Xeon @ 2.10 GHz:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| one thread, against main | **1.17x** 1.13-1.22 | 1.14x 1.11-1.20 |
+| four threads, against main | 1.04x 0.97-1.07 (no result) | 1.07x 1.06-1.09 |
+| four threads, both with #127, 25 rounds | 1.12x 1.05-1.20 | 1.09x 1.04-1.15 |
+| floor: one build against itself, same day | 0.95x 0.88-1.08 | 0.98x 0.95-1.06 |
+
+The one-thread row and the instruction count are the result. At four threads
+on main the serial quote count (#127) is most of the run and hides it. On top
+of #127 the wall figure is consistent but its lower edge is inside this
+machine's floor, so it's reported and not claimed.
+
+Reports are byte-identical to main's on the 2M pair and on a hand-built file
+with members reversed, shuffled, repeated and missing, under three key sets.
+`c/test.sh --with-ports`: 89/89.
+
+C++, Rust and Zig look names up the same way (FNV byte loop, table
+probe) and are candidates for the same change.
+
+---
+
 ## 2026-09-26 (json keys) — Zig and Rust parsed every field of an ndjson row to find two
 
 The sweep only needs a row's key. For CSV every port stops at the last key
