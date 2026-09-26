@@ -998,6 +998,14 @@ pub fn compare(
     defer a_keys.deinit(gpa);
     defer b_keys.deinit(gpa);
 
+    // `--threads` bounds every pass on this path, as it does in the other three
+    // ports: the key reads here, the index build and match sweep below, and the
+    // column pass after them. The key reads and the column pass used to take
+    // the machine whatever `--threads` said, so a one-thread run of this port
+    // used a second and a half of CPU in two thirds of a second of wall, and
+    // measured nothing about one thread.
+    const machine = @max(1, if (opt.threads != 0) opt.threads else (std.Thread.getCpuCount() catch 1));
+
     // Every key column, both sides, at once. These reads are the phase that
     // decodes pages for ten million rows and they share nothing -- different
     // files, different columns, separate outputs -- but they used to run one
@@ -1020,10 +1028,15 @@ pub fn compare(
         }
 
         var threads: [KeyRead.max_jobs]?std.Thread = @splat(null);
-        // The last job runs on this thread rather than waiting for one.
-        for (1..n) |i| threads[i] = std.Thread.spawn(.{}, KeyRead.run, .{&jobs[i]}) catch null;
+        // Up to `machine` at once: jobs past that run on this thread after its
+        // own, which is the same work in the same order as a narrower machine.
+        const spawned = @min(n, machine);
+        for (1..spawned) |i| threads[i] = std.Thread.spawn(.{}, KeyRead.run, .{&jobs[i]}) catch null;
         if (n > 0) jobs[0].run();
-        for (1..n) |i| if (threads[i]) |t| t.join() else jobs[i].run();
+        for (spawned..n) |i| jobs[i].run();
+        // A job whose spawn failed runs here instead; one past `spawned` has
+        // already run above and must not run twice.
+        for (1..spawned) |i| if (threads[i]) |t| t.join() else jobs[i].run();
         for (jobs[0..n]) |job| if (job.err) |e| return e;
     }
     phases.mark("key columns (par)");
@@ -1069,7 +1082,6 @@ pub fn compare(
     // thread while the column pass below it used every core.
     // The same budget the sweep and the column pass take, halved: the two sides
     // build at the same time, so each gets half the machine for its hash pass.
-    const machine = @max(1, if (opt.threads != 0) opt.threads else (std.Thread.getCpuCount() catch 1));
     const per_side = @max(1, machine / 2);
     var build_a = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = a_keys, .opt = opt, .ways = per_side };
     var build_b = IndexBuild{ .gpa = gpa, .as_id = as_id, .side = b_keys, .opt = opt, .ways = per_side };
@@ -1183,7 +1195,7 @@ pub fn compare(
         // many run at once is a memory choice as much as a parallelism one: a
         // column of ten million values costs a couple of hundred megabytes on
         // each side while it is being read, and is released before the next.
-        const lanes = @max(1, @min(Worker.max_lanes, @min(std.Thread.getCpuCount() catch 1, nc)));
+        const lanes = @max(1, @min(Worker.max_lanes, @min(machine, nc)));
         const job = Job{
             .a_map = a_map,
             .b_map = b_map,

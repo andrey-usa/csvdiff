@@ -961,22 +961,30 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                         }
                         *v = k as i32;
                     }
-                    let mut k = 0usize;
-                    for i in 0..n_vals {
-                        if !here(i) {
-                            if dictionary {
-                                index.push(Column::NULL);
-                            } else {
-                                values.push(Slice::null());
+                    // A page with no nulls, still in dictionary form, is its
+                    // indices as they are: one copy rather than a push, a
+                    // capacity check and two branches per value. It is every
+                    // page of a REQUIRED column and most of an OPTIONAL one.
+                    if dictionary && real == n_vals {
+                        index.extend_from_slice(&idx);
+                    } else {
+                        let mut k = 0usize;
+                        for i in 0..n_vals {
+                            if !here(i) {
+                                if dictionary {
+                                    index.push(Column::NULL);
+                                } else {
+                                    values.push(Slice::null());
+                                }
+                                continue;
                             }
-                            continue;
-                        }
-                        let v = idx[k];
-                        k += 1;
-                        if dictionary {
-                            index.push(v);
-                        } else {
-                            values.push(dict[v as usize]);
+                            let v = idx[k];
+                            k += 1;
+                            if dictionary {
+                                index.push(v);
+                            } else {
+                                values.push(dict[v as usize]);
+                            }
                         }
                     }
                 } else if h.encoding == ENC_PLAIN {
@@ -1002,15 +1010,19 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                         &mut got,
                         path,
                     )?;
-                    let mut k = 0usize;
-                    for i in 0..n_vals {
-                        values.push(if here(i) {
-                            let v = got[k];
-                            k += 1;
-                            v
-                        } else {
-                            Slice::null()
-                        });
+                    if real == n_vals {
+                        values.extend_from_slice(&got);
+                    } else {
+                        let mut k = 0usize;
+                        for i in 0..n_vals {
+                            values.push(if here(i) {
+                                let v = got[k];
+                                k += 1;
+                                v
+                            } else {
+                                Slice::null()
+                            });
+                        }
                     }
                 } else {
                     return fail(
