@@ -120,6 +120,110 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (zig scan width) — the phase got faster and the run did not
+
+With the Rust port's measurement corrected, the 4M CSV table on this host reads:
+
+| Port | Best | Median | CPU |
+|---|---:|---:|---:|
+| Rust | 0.62s | 0.63s | 1.9s |
+| C | 0.66s | 0.72s | 2.1s |
+| C++ | 0.67s | 0.71s | 1.8s |
+| **Zig** | **0.92s** | **0.96s** | **3.0s** |
+
+Zig is the outlier and the port nobody has examined. Its phases say where: the
+sweep is 0.41s a side against C's 0.20s, and everything else is within noise.
+That is the whole of the 0.9s of extra CPU.
+
+Zig's scan step is eight bytes -- SWAR, no CPU feature at all -- where
+`-Dscan=32` puts the same question to a vector register. Building it:
+
+| | sweep, a side | whole run, paired |
+|---|---:|---|
+| `-Dscan=8` (shipped) | 0.41s | -- |
+| `-Dscan=32` | **0.30s** | **0.87x** -- *slower* |
+| `-Dscan=64` | 0.31s | not pursued |
+
+The sweep is 27% faster. What the *run* does is the part this host could not
+settle, and the rest of this entry is that story rather than a result.
+
+The direct alternating measurement says what the paired one cannot: `scan=32` is
+**bimodal** and `scan=8` is not. Ten pairs, milliseconds:
+
+    scan=8   1275 1308 1316 1326 1344 1375 1382 1382 1409 1459
+    scan=32  1271 1288 1292 1343 | 1544 1596 1631 1654 1661 1683
+
+Four runs at parity, six about 20% slower, nothing in between, and the same
+split in the per-run paired ratios. A phase measurement cannot see this at all:
+every phase of `scan=32` is faster in every run, including the ones where the
+whole run is 300 ms slower. `bench_ab.sh` sees the cost but not the shape: over
+25 rounds it reports 0.89x [0.84-0.94], with `scan=32`'s best-to-median spread
+twice `scan=8`'s.
+
+### The floor, and why none of this is a result
+
+`bench_ab.sh --self-test` runs one build against itself. On this host, fifteen
+rounds:
+
+| | wall | mid half |
+|---|---|---|
+| the same binary, twice | 0.99x | **0.92-1.07** |
+
+**The noise floor here is about eight percent.** The scan-width measurement is
+0.89x [0.84-0.94] over twenty-five rounds -- outside 1.00, and overlapping the
+floor's own band. It is at the edge of what this machine can resolve, not
+clearly past it, and "13% slower" is more than the data carries.
+
+Two other things that looked like results and were not:
+
+* **Frequency licensing** as the mechanism. It is the obvious suspect and the
+  evidence is against it: the Rust port scans **thirty-two bytes** on this same
+  host -- `VECTOR_WIDTH = 32` in `turbo/field.rs`, built
+  `-C target-cpu=x86-64-v3` -- and its runs are tight, 0.62s best against 0.63s
+  median. Whatever unsettles the Zig build at that width leaves the Rust one
+  alone.
+* **Two measurements where `scan=32` came out faster.** Both ran eight of one
+  build and then eight of the other, which is the one-build-at-a-time method
+  this file opens by rejecting. They are not evidence of anything. The two
+  interleaved measurements agree with each other; these do not belong beside
+  them.
+
+So: the sweep is faster at thirty-two bytes, the run is not measurably faster,
+and this host cannot tell whether it is slower. **The question needs a quieter
+machine, and the ladder already runs on one** -- the 10m CI rows have `Zig v32`
+ahead of `Zig`, and that is the measurement to trust until a paired one on a
+quiet host says otherwise.
+
+**And it is the host's answer, not the port's.** The 10m CI rows in the entry of
+2026-09-19 have `Zig v32` at 1.72-1.82s against `Zig` at 1.87-1.97s, which is
+the opposite. So the width that wins depends on the processor, which is why it
+is a build option and why it cannot simply become the default.
+
+Not built, and not refused either -- **unresolved**. Recorded because "Zig scans
+eight bytes where C and Rust scan thirty-two" is the first thing anyone looking
+at that row will try, and because the trap is not the idea but the measurement:
+a 27% phase win that the whole-run number will not confirm on a machine whose
+floor is 8%.
+
+### Two things checked and found not to be true
+
+Both are the obvious explanations for the Zig row, and both are wrong:
+
+* **"Zig is not compiled for the host."** C and C++ probe and add
+  `-march=native`; Rust gets `-C target-cpu=x86-64-v3`; `zig build` is given
+  nothing. But Zig's default target *is* the host: rebuilt from a cleared cache,
+  `zig build --release=fast` and the same with `-Dcpu=native` are byte-identical,
+  and the binary carries `vpcmpeqb`, `vpbroadcastb` and `vmovdqa32`. The note in
+  `scripts/build_ports.sh` is right.
+* **"The sweep is oversubscribed."** #109 found the C++ sweep splitting each file
+  `threads` ways while both files were in flight, which is twice the cores. Zig
+  already halves it -- `const per_file = @max(1, total / 2)` -- and has for as
+  long as the file has existed.
+
+The sweep gap is real and is neither of these.
+
+---
+
 ## 2026-09-24 (parallel insert) — deterministic, and it does not pay
 
 Every port builds its index the same way: find and hash the rows on every core,
