@@ -154,6 +154,34 @@ compare loop, not the decode.
 
 ---
 
+## 2026-09-26 (cpp parquet report) — C++ built a Parquet report on every run and printed a line of counts
+
+Found by reading every port's `CSVDIFF_PHASES=1` output side by side. On 2M rows of Parquet
+the C++ port's `report` phase took 0.046-0.050 s of a 0.54 s run that asked
+for no report: with no `--json` it ends in one line of counts. Everything in
+that phase is rows nobody reads: the key of up to `max_rows` (50,000) changed
+pairs decoded into strings, the added and removed rows built from their
+columns, three sorts over them, and a pass over every distinct key of both
+files for the duplicate-key sections.
+
+The CSV engine has skipped the same work under `row_lists` since #106; the
+Parquet one never asked. It does now, and the counts never depended on any of
+it.
+
+| 2M Parquet pair, 4 vCPU Xeon @ 2.10 GHz | before | after |
+|---|---:|---:|
+| `report` phase | 0.046-0.050 s | 0.001 s |
+| wall, paired, 21 rounds | | 1.09x [1.04-1.16] |
+| wall at 10M, paired, 11 rounds | | 1.03x [1.01-1.06] |
+
+The wall figures sit at this host's floor (0.88-1.08 the same day), and at 10M
+the saving is a smaller share because the work was capped at 50,000 rows and
+doesn't grow with the file. The claim is the phase, which is deterministic. The
+point is the one #106 and #119 made: a benchmark of four ports should time four
+ports doing the same job. Summary and `--json` output are identical to main's.
+
+---
+
 ## 2026-09-26 (speculative split) — Rust's sweep did not scale because of the step before it
 
 The Rust sweep took as long at four threads as at one on the 4M CSV pair,
