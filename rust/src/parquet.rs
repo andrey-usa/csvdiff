@@ -719,21 +719,43 @@ impl<'a> RleReader<'a> {
             } else if self.width == 0 {
                 out[done..done + take].fill(0);
             } else {
-                for i in 0..take {
-                    let byte = self.bit >> 3;
-                    let mut w = 0u64;
-                    if byte + 8 <= self.d.len() {
-                        w = u64::from_le_bytes(self.d[byte..byte + 8].try_into().unwrap());
+                // Split once per run rather than tested once per value: the
+                // values whose eight-byte window lies inside the buffer, which
+                // is all but the last few of a page, and the tail that is read
+                // a byte at a time. The position is a local, and the output is
+                // walked rather than indexed.
+                let (d, width, mask) = (self.d, self.width as usize, self.mask);
+                let mut bit = self.bit;
+                let dst = &mut out[done..done + take];
+                let safe = if d.len() >= 8 {
+                    let last = (d.len() - 8) * 8 + 7; // the last bit a whole window starts at
+                    if bit > last {
+                        0
                     } else {
-                        for k in 0..8 {
-                            if byte + k < self.d.len() {
-                                w |= (self.d[byte + k] as u64) << (8 * k);
-                            }
+                        ((last - bit) / width + 1).min(take)
+                    }
+                } else {
+                    0
+                };
+                let (fast, slow) = dst.split_at_mut(safe);
+                for o in fast {
+                    let byte = bit >> 3;
+                    let w = u64::from_le_bytes(d[byte..byte + 8].try_into().unwrap());
+                    *o = ((w >> (bit & 7)) & mask) as i32;
+                    bit += width;
+                }
+                for o in slow {
+                    let byte = bit >> 3;
+                    let mut w = 0u64;
+                    for k in 0..8 {
+                        if byte + k < d.len() {
+                            w |= (d[byte + k] as u64) << (8 * k);
                         }
                     }
-                    out[done + i] = ((w >> (self.bit & 7)) & self.mask) as i32;
-                    self.bit += self.width as usize;
+                    *o = ((w >> (bit & 7)) & mask) as i32;
+                    bit += width;
                 }
+                self.bit = bit;
             }
             self.left -= take;
             done += take;
@@ -1107,6 +1129,51 @@ mod tests {
                 let mut want = b"prefix".to_vec();
                 want.extend(naive(lit, offset, len));
                 assert_eq!(out, want, "offset {offset} len {len}");
+            }
+        }
+    }
+
+    /// One bit-packed run of `vals` at `width`, as the hybrid encoding writes it.
+    fn packed(vals: &[u32], width: u32) -> Vec<u8> {
+        let groups = vals.len().div_ceil(8);
+        let mut out = vec![((groups << 1) | 1) as u8]; // fits one varint byte here
+        let mut bits = vec![0u8; groups * width as usize];
+        for (i, &v) in vals.iter().enumerate() {
+            for b in 0..width as usize {
+                if v >> b & 1 == 1 {
+                    let at = i * width as usize + b;
+                    bits[at / 8] |= 1 << (at % 8);
+                }
+            }
+        }
+        out.extend(bits);
+        out
+    }
+
+    #[test]
+    fn rle_unpacks_every_width_to_the_last_value() {
+        let mut seed = 0x9e37_79b9_u64;
+        for width in 1..=32u32 {
+            for n in [1usize, 7, 8, 9, 63, 64, 120] {
+                let mask = if width == 32 {
+                    u32::MAX
+                } else {
+                    (1 << width) - 1
+                };
+                let vals: Vec<u32> = (0..n)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        (seed >> 32) as u32 & mask
+                    })
+                    .collect();
+                let bytes = packed(&vals, width);
+                let mut got = vec![0i32; n];
+                assert!(
+                    RleReader::new(&bytes, width).fill(&mut got),
+                    "width {width} n {n}"
+                );
+                let want: Vec<i32> = vals.iter().map(|&v| v as i32).collect();
+                assert_eq!(got, want, "width {width} n {n}");
             }
         }
     }
