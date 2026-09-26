@@ -1029,6 +1029,21 @@ fn row_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> 
     fields.iter().map(|f| value(&side.slab, *f, opt)).collect()
 }
 
+/// Decodes just one row's key columns.
+///
+/// [`row_values`] decodes the whole row, which is what the report's own rows
+/// need and between twice and ten times what the duplicate-key section needs:
+/// that section keeps the key and throws the compared columns away. The index
+/// already has a parser that stops at the key, and there is one of these per
+/// duplicated key rather than per kept row, so the columns it was decoding and
+/// discarding were the largest allocation anywhere in the report path.
+fn key_values(side: &Side, idx: &RowIndex, row: i32, opt: &Options) -> Vec<Val> {
+    let key_size = opt.key.len();
+    let mut fields = vec![ABSENT; key_size];
+    idx.keys_of(side, row, key_size, &mut fields);
+    fields.iter().map(|f| value(&side.slab, *f, opt)).collect()
+}
+
 /// Runs `work` on `threads` threads and returns everything they produced.
 ///
 /// Each worker pulls from a queue `work` closes over until it is empty, so the
@@ -1497,10 +1512,7 @@ fn duplicate_section(side: &Side, idx: &RowIndex, opt: &Options) -> Section {
         .iter()
         .zip(&idx.occurrences)
         .filter(|(_, n)| **n > 1)
-        .map(|(row, n)| {
-            let values = row_values(side, idx, *row, opt);
-            (values[..key_size].to_vec(), *n as i64)
-        })
+        .map(|(row, n)| (key_values(side, idx, *row, opt), *n as i64))
         .collect();
     entries.sort_by(|x, y| {
         y.1.cmp(&x.1)
