@@ -306,6 +306,49 @@ else
   echo "  FAIL  the escape check cannot fail, so it proves nothing"; fail=1
 fi
 rm -rf "$esc_dir"
+
+# The same, with the escapes in the *key*. A key is hashed before it is ever
+# compared, so two spellings of one key have to hash alike or the lookup never
+# reaches the comparison above: the row is reported added and removed instead of
+# matched. Keys of every length around the eight bytes the hash folds at a time,
+# and a CSV key with a doubled quote against the JSON spelling of it.
+kesc_dir=$(mktemp -d)
+python3 - "$kesc_dir" <<'PY'
+import json, sys
+out = sys.argv[1]
+BS = chr(92)
+pairs = [
+    ("a" + BS + "/b",                          "a/b"),
+    (BS + "u0041BC",                           "ABC"),
+    ("tab" + BS + "there",                     "tab\there"),
+    ("sev" + BS + "/ena",                      "sev/ena"),
+    ("an eight" + BS + "/",                    "an eight/"),
+    ("a key longer than a word " + BS + "/ x", "a key longer than a word / x"),
+    ("quote" + BS + '"in',                     'quote"in'),
+    (BS + "u4e2d" + BS + "u6587 key",          "中文 key"),
+]
+with open(f"{out}/a.ndjson", "w") as fa, open(f"{out}/b.ndjson", "w") as fb:
+    for i, (escaped, literal) in enumerate(pairs):
+        fa.write('{"k":"%s","v":"%d"}\n' % (escaped, i))
+        fb.write(json.dumps({"k": literal, "v": str(i)}, ensure_ascii=False) + "\n")
+with open(f"{out}/c.csv", "w") as fc:
+    fc.write('k,v\n"quote""in",6\n"a/b",0\n')
+with open(f"{out}/d.ndjson", "w") as fd:
+    fd.write('{"k":"quote%s\"in","v":"6"}\n{"k":"a/b","v":"0"}\n' % BS)
+PY
+got=$(./csvdiff compare "$kesc_dir/a.ndjson" "$kesc_dir/b.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
+if [ "$got" = "matched 8" ]; then
+  echo "  ok    an escaped key finds the same key written literally"
+else
+  echo "  FAIL  escaped and literal spellings of one key did not match: $got"; fail=1
+fi
+got=$(./csvdiff compare "$kesc_dir/c.csv" "$kesc_dir/d.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
+if [ "$got" = "matched 2" ]; then
+  echo "  ok    and a CSV doubled quote finds the JSON backslash"
+else
+  echo "  FAIL  a CSV key with a doubled quote missed its JSON spelling: $got"; fail=1
+fi
+rm -rf "$kesc_dir"
 # --- the Parquet path -------------------------------------------------------
 #
 # The claim the columnar path has to earn is that it is the *same* comparison:

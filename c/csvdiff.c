@@ -464,32 +464,66 @@ static bool is_absent(const Slab *s, Field f) {
     return !field_real(f) || field_len(f) == 0;
 }
 
-/* FNV-1a over exactly the bytes equality compares, by the same route. */
+/*
+ * The last `rem` bytes of p[0..len), one to seven of them, as a little-endian
+ * word padded with zeros -- from loads rather than a copy into a zeroed buffer,
+ * which is a call to memcpy for a length only known at run time. A value of
+ * eight bytes or more has eight real bytes ending where the tail does, so one
+ * load and a shift; a shorter one is two overlapping halves, or its first,
+ * middle and last byte. The Rust and Zig ports read their tails the same way.
+ */
+static inline uint64_t tail_word(const char *p, size_t len, size_t rem) {
+    uint64_t w;
+    if (len >= 8) {
+        memcpy(&w, p + len - 8, 8);
+        return w >> (8 * (8 - rem));
+    }
+    if (len >= 4) {
+        uint32_t lo, hi;
+        memcpy(&lo, p, 4);
+        memcpy(&hi, p + len - 4, 4);
+        return (uint64_t)lo | ((uint64_t)hi << (8 * (len - 4)));
+    }
+    const unsigned char *u = (const unsigned char *)p;
+    return (uint64_t)u[0] | ((uint64_t)u[len / 2] << (8 * (len / 2))) |
+           ((uint64_t)u[len - 1] << (8 * (len - 1)));
+}
+
+/*
+ * The key hash, over exactly the bytes equality compares: a field's logical
+ * value, whatever escaping it arrived in, so that two spellings of one value
+ * hash alike.
+ *
+ * It took a byte at a time, one dependent multiply per byte, which on this
+ * workload's two keys of twelve and fifteen bytes was 1.04B instructions of the
+ * 8.5B a 2M CSV pair costs. Eight bytes a step is what the Rust and Zig ports
+ * have done all along; an escaped value is decoded first -- the rare case, a
+ * doubled quote or a backslash -- and folded by the same loop.
+ */
 static uint64_t hash_field(const Slab *s, Field f, uint64_t seed) {
     const uint64_t PRIME = UINT64_C(0x100000001b3);
     uint64_t h = seed;
     if (is_absent(s, f)) return (h ^ UINT64_C(0x9e3779b97f4a7c15)) * PRIME;
-    size_t len = field_len(f);
     const char *p = s->data + field_off(f);
-    uint64_t n = 0;
-    if (!field_escaped(f)) {
-        for (size_t i = 0; i < len; i++) { h = (h ^ (unsigned char)p[i]) * PRIME; n++; }
-    } else if (s->dialect == DIALECT_JSON) {
-        /* Hashed over the decoded bytes, because that is what equality compares.
-         * The buffer is the same one same_bytes uses, and a longer value is
-         * refused upstream by the length cap. */
-        char tmp[4096];
-        size_t m = json_unescape(p, len, tmp, sizeof tmp);
-        if (m > sizeof tmp) m = sizeof tmp;
-        for (size_t i = 0; i < m; i++) { h = (h ^ (unsigned char)tmp[i]) * PRIME; n++; }
-    } else {
-        for (size_t i = 0; i < len; i++) {
-            h = (h ^ (unsigned char)p[i]) * PRIME;
-            n++;
-            if (p[i] == '"' && i + 1 < len && p[i + 1] == '"') i++;
-        }
+    size_t len = field_len(f);
+    char tmp[4096];
+    if (field_escaped(f)) {
+        /* A longer value is refused upstream by the length cap. */
+        len = logical_copy(s, f, tmp, sizeof tmp);
+        p = tmp;
     }
-    return (h ^ n) * PRIME;
+    size_t i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * PRIME;
+        h ^= h >> 29; /* spreads a whole word into the low bits, where the slot comes from */
+    }
+    if (i < len) {
+        h = (h ^ tail_word(p, len, len - i)) * PRIME;
+        h ^= h >> 29;
+    }
+    return (h ^ (uint64_t)len) * PRIME;
 }
 
 /* ------------------------------------------------------------------------- */
