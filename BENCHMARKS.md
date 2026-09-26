@@ -120,6 +120,43 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (zig parquet append) — a third of Zig's Parquet instructions were ArrayList bookkeeping
+
+The 10M ladder on CI's EPYC 7763 had Zig at 2.42 s on Parquet against C's
+1.26 s, and 8.6 CPU-seconds against 4.0: twice the work. On this container the
+two measure close in wall, so the gap could not be read off a stopwatch here.
+Callgrind can read it anywhere. On the 2M pair at one thread, **C executes
+5.38 B instructions and Zig 11.20 B**, the same 2.1 ratio as the CI CPU times.
+
+A third of Zig's were in `readColumn`'s appends. Every decoded value went
+through `try list.append(gpa, v)`: a capacity check and a call that did not
+inline, 60 M times for dictionary indices and 33 M for value slices, with
+`ensureTotalCapacity` alone at 1.85 B instructions. The arrays had been pre-sized
+from the footer, so every one of those checks passed.
+
+Now each page reserves its values once and appends without the check. A
+required column still in dictionary form takes the page's indices as one slice
+copy, and a plain page's slices likewise. `plainSlices` reserves what the page
+could hold: at least four bytes a value, so a corrupt count cannot ask for
+more than the page could contain.
+
+| 2M Parquet pair | main | this |
+|---|---:|---:|
+| instructions, one thread | 11.20 B | **6.95 B** (-38%) |
+| C, for scale | 5.38 B | |
+
+Paired, 4 vCPU Xeon @ 2.10 GHz, counts identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| 2M, 15 rounds | **1.16x** 1.11-1.18 | 1.17x 1.13-1.20 |
+| 10M, 9 rounds | **1.14x** 1.07-1.24 | 1.18x 1.12-1.25 |
+
+`zig build test`, `zig/test.sh` (every Parquet fixture: dictionary, plain,
+snappy, gzip, zstd, lz4, optional columns) and `c/test.sh --with-ports` pass.
+
+---
+
 ## 2026-09-26 (speculative split) — Rust's sweep did not scale because of the step before it
 
 The Rust sweep took as long at four threads as at one on the 4M CSV pair,

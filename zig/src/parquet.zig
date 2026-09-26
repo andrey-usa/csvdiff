@@ -698,6 +698,11 @@ fn plainSlices(
     count: i32,
     out: *std.ArrayList(Slice),
 ) !void {
+    // A count the page cannot hold is refused below, value by value; reserving
+    // for it first would let a corrupt header ask for any amount of memory, so
+    // the reservation is capped by what four-byte length prefixes could fit.
+    const possible = @min(@as(usize, @intCast(@max(count, 0))), page.len / 4);
+    try out.ensureUnusedCapacity(gpa, possible);
     var at: usize = 0;
     var i: i32 = 0;
     while (i < count) : (i += 1) {
@@ -706,7 +711,7 @@ fn plainSlices(
         at += 4;
         if (at + len > page.len) return Error.ParquetTruncated;
         if (len > Slice.max_length) return Error.ParquetValueTooLong;
-        try out.append(gpa, Slice.at(base + at, len));
+        out.appendAssumeCapacity(Slice.at(base + at, len));
         at += len;
     }
 }
@@ -847,43 +852,59 @@ pub fn readColumn(gpa: std.mem.Allocator, data: []const u8, which: usize) !Colum
                         if (k >= dict.items.len) return Error.ParquetMalformed;
                         v.* = @intCast(k);
                     }
-                    var k: usize = 0;
-                    var i: usize = 0;
-                    while (i < n_vals) : (i += 1) {
-                        const here = !optional or defs.items[i] != 0;
-                        if (!here) {
-                            if (dictionary) try index.append(gpa, Column.null_index) else try values.append(gpa, Slice.none);
-                            continue;
-                        }
-                        const v = idx.items[k];
-                        k += 1;
-                        if (dictionary) {
-                            try index.append(gpa, v);
-                        } else {
-                            try values.append(gpa, dict.items[@intCast(v)]);
+                    // Room for the whole page first, then appends that cannot
+                    // fail: `append` checks capacity per value and does not
+                    // inline, and at ten million values a column that call
+                    // was more of the decode than the decoding.
+                    if (dictionary) try index.ensureUnusedCapacity(gpa, n_vals) else try values.ensureUnusedCapacity(gpa, n_vals);
+                    if (!optional and dictionary) {
+                        // Every value present and the column still indices: the
+                        // page's indices are the column's, as they are.
+                        index.appendSliceAssumeCapacity(idx.items);
+                    } else {
+                        var k: usize = 0;
+                        var i: usize = 0;
+                        while (i < n_vals) : (i += 1) {
+                            const here = !optional or defs.items[i] != 0;
+                            if (!here) {
+                                if (dictionary) index.appendAssumeCapacity(Column.null_index) else values.appendAssumeCapacity(Slice.none);
+                                continue;
+                            }
+                            const v = idx.items[k];
+                            k += 1;
+                            if (dictionary) {
+                                index.appendAssumeCapacity(v);
+                            } else {
+                                values.appendAssumeCapacity(dict.items[@intCast(v)]);
+                            }
                         }
                     }
                 } else if (h.encoding == enc_plain) {
                     if (dictionary) {
                         // Fold what has been read into the plain form. This
                         // copies eight-byte handles, not values.
-                        try values.ensureTotalCapacity(gpa, @intCast(fm.rows));
+                        try values.ensureTotalCapacity(gpa, @max(@as(usize, @intCast(fm.rows)), index.items.len));
                         for (index.items) |k| {
-                            try values.append(gpa, if (k >= 0) dict.items[@intCast(k)] else Slice.none);
+                            values.appendAssumeCapacity(if (k >= 0) dict.items[@intCast(k)] else Slice.none);
                         }
                         index.clearAndFree(gpa);
                         dictionary = false;
                     }
                     got.clearRetainingCapacity();
                     try plainSlices(gpa, body[vat..], page_base + vat, @intCast(real), &got);
-                    var k: usize = 0;
-                    var i: usize = 0;
-                    while (i < n_vals) : (i += 1) {
-                        const here = !optional or defs.items[i] != 0;
-                        if (here) {
-                            try values.append(gpa, got.items[k]);
-                            k += 1;
-                        } else try values.append(gpa, Slice.none);
+                    try values.ensureUnusedCapacity(gpa, n_vals);
+                    if (!optional) {
+                        values.appendSliceAssumeCapacity(got.items);
+                    } else {
+                        var k: usize = 0;
+                        var i: usize = 0;
+                        while (i < n_vals) : (i += 1) {
+                            const here = defs.items[i] != 0;
+                            if (here) {
+                                values.appendAssumeCapacity(got.items[k]);
+                                k += 1;
+                            } else values.appendAssumeCapacity(Slice.none);
+                        }
                     }
                 } else return Error.ParquetEncodingUnsupported;
                 seen += h.num_values;
