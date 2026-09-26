@@ -120,6 +120,40 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (json slot guess) — the C name lookup change, in Rust and Zig
+
+Rust and Zig find a member's slot the way C did before #129: an FNV hash a byte
+at a time, then a table probe. Same three changes, adapted to each port:
+the member after slot *i* is tried as *i + 1* first (`canon[i]` holds the
+table's own answer, so a right guess returns the table's slot even when one
+name fills two), and a word-at-a-time name hash for the misses. Rust's and
+Zig's names already carry their length, so there was no `strlen` to remove.
+
+2M-row ndjson pair, `-k account_id,txn_id -i updated_at`, 4 vCPU Xeon @
+2.10 GHz, paired, each against the same port with #128. Reports identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| Rust, one thread | **1.16x** 1.10-1.25 | 1.14x 1.09-1.20 |
+| Rust, four threads | **1.09x** 1.04-1.15 | **1.11x** 1.07-1.15 |
+| Zig, one thread | **1.14x** 1.12-1.18 | 1.12x 1.10-1.14 |
+| Zig with #126, four threads | **1.12x** 1.11-1.15 | **1.13x** 1.11-1.17 |
+| Zig on main, four threads, run 1 | 0.93x 0.87-1.03 | 0.93x 0.80-0.96 |
+| Zig on main, four threads, run 2 | 0.87x 0.78-1.04 (no result) | 0.74x 0.66-1.04 |
+| floor that day: one build against itself | 0.95x 0.88-1.08 | 0.98x 0.95-1.06 |
+
+The two Zig-on-main rows are the configuration #126 is about: the sweep split
+two ways a file under `smp_allocator`, where the same build's user time wanders.
+In run 2 the new build's own CPU went from 2.20 s best to 3.32 s median. The
+change allocates nothing, and with the split off (#126) or at one thread it
+measures clean and positive. Those rows are recorded, not explained.
+
+A unit test in each port puts one name in two slots and fails if a right guess
+returns its own slot instead of the table's (checked by breaking it).
+`c/test.sh --with-ports`: 89/89.
+
+---
+
 ## 2026-09-26 (json names) — C looked up every member's name as if it had never seen the row before
 
 Profiled with callgrind on a 200k-row ndjson pair at one thread (an x86-64-v3

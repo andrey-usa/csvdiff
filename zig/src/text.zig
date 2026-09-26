@@ -175,10 +175,25 @@ fn endOfJsonRow(d: []const u8, from: usize, end: usize) usize {
     return if (stop >= end) end else stop + 1;
 }
 
+/// A word at a time rather than a byte at a time: the first and last eight
+/// bytes (four, or three single bytes, for a shorter name) and the length. A
+/// byte loop is a serial multiply per byte, twenty names a row; collisions are
+/// settled by comparing the name, so this only has to spread them.
 fn nameHash(s: []const u8) u64 {
-    var h: u64 = 0xcbf2_9ce4_8422_2325;
-    for (s) |c| h = (h ^ c) *% 0x100_0000_01b3;
-    return h ^ (h >> 32);
+    const n = s.len;
+    var a: u64 = 0;
+    var b: u64 = 0;
+    if (n >= 8) {
+        a = std.mem.readInt(u64, s[0..8], .little);
+        b = std.mem.readInt(u64, s[n - 8 ..][0..8], .little);
+    } else if (n >= 4) {
+        a = std.mem.readInt(u32, s[0..4], .little);
+        b = std.mem.readInt(u32, s[n - 4 ..][0..4], .little);
+    } else if (n > 0) {
+        a = @as(u64, s[0]) | @as(u64, s[n / 2]) << 8 | @as(u64, s[n - 1]) << 16;
+    }
+    const h = (a ^ (b *% 0x9e37_79b9_7f4a_7c15) ^ n) *% 0xbf58_476d_1ce4_e5b9;
+    return h ^ (h >> 31);
 }
 
 /// Splits rows into fields, projecting straight to the columns asked for.
@@ -301,6 +316,12 @@ pub const RowParser = union(enum) {
         /// Slots below this are key columns: the first value wins, and once
         /// every slot is a filled key column the rest of the object is skipped.
         key_size: usize,
+        /// What the table answers for `wanted[i]`: `i` itself unless the same
+        /// name also fills an earlier slot, and -1 for a missing column. Names
+        /// arrive in the same order row after row, usually slot order, so the
+        /// member after slot `i` is tried as `i + 1` first, and a right guess
+        /// has to give exactly the slot the table would.
+        canon: []i32,
 
         pub fn slotFor(self: Json, key: []const u8) ?usize {
             var at = nameHash(key) & self.slot_mask;
@@ -360,6 +381,7 @@ pub const RowParser = union(enum) {
         var n: usize = 16;
         while (n < wanted.len * 4) n <<= 1;
         const slots = try gpa.alloc(i32, n);
+        errdefer gpa.free(slots);
         @memset(slots, -1);
         const mask = n - 1;
         for (wanted, 0..) |name, i| {
@@ -368,17 +390,26 @@ pub const RowParser = union(enum) {
             while (slots[at] >= 0) at = (at + 1) & mask;
             slots[at] = @intCast(i);
         }
-        return .{ .json = .{
+        const canon = try gpa.alloc(i32, wanted.len);
+        const json: Json = .{
             .wanted = wanted,
             .slots = slots,
             .slot_mask = mask,
             .key_size = @min(key_size, wanted.len),
-        } };
+            .canon = canon,
+        };
+        for (wanted, 0..) |name, i| {
+            canon[i] = if (name) |w| (if (json.slotFor(w)) |slot| @intCast(slot) else -1) else -1;
+        }
+        return .{ .json = json };
     }
 
     pub fn deinit(self: RowParser, gpa: std.mem.Allocator) void {
         switch (self) {
-            .json => |j| gpa.free(j.slots),
+            .json => |j| {
+                gpa.free(j.slots);
+                gpa.free(j.canon);
+            },
             .csv => |c| {
                 gpa.free(c.slots);
                 gpa.free(c.starts);
@@ -453,6 +484,7 @@ pub const RowParser = union(enum) {
     fn parseJson(self: Json, d: []const u8, start: usize, end: usize, out: []Field) usize {
         @memset(out, f.ABSENT);
         var found: usize = 0; // key slots filled, for the early exit below
+        var guess: usize = 0; // the slot the next member most likely fills
         var pos = start;
         while (pos < end and jsonSpace(d[pos])) pos += 1;
         if (pos >= end) return end;
@@ -501,7 +533,13 @@ pub const RowParser = union(enum) {
                 if (!std.mem.eql(u8, d[from..pos], "null")) field = f.pack(from, pos - from, false);
             }
             if (field) |value| {
-                if (self.slotFor(key)) |slot| {
+                const hit: ?usize = if (guess < self.wanted.len and self.wanted[guess] != null and
+                    std.mem.eql(u8, self.wanted[guess].?, key))
+                    (if (self.canon[guess] >= 0) @as(usize, @intCast(self.canon[guess])) else null)
+                else
+                    self.slotFor(key);
+                if (hit) |slot| {
+                    guess = slot + 1;
                     // First occurrence wins for a key column, and only for a key
                     // column -- the rule the C port states. A JSON object is not
                     // supposed to repeat a name, but the key-only parse below
@@ -653,6 +691,23 @@ test "a repeated key: the key-only and full parses agree, and stop where they sh
     try std.testing.expectEqualStrings("1", slab.raw(key[0]));
     _ = keys.parse(text, next, text.len, &key);
     try std.testing.expectEqualStrings("3", slab.raw(key[0]));
+}
+
+test "a name in two slots is found where the table would find it" {
+    // `k` fills slot 0 and slot 2, as when a key column is also named as a
+    // compared one. After `v` fills slot 1 the next member is guessed as slot
+    // 2, and a right guess has to answer what the table does: slot 0.
+    const text = "{\"k\":\"1\",\"v\":\"a\",\"k\":\"2\"}\n";
+    const slab = Slab{ .data = text, .dialect = .json };
+    const gpa = std.testing.allocator;
+    const wanted = [_]?[]const u8{ "k", "v", "k" };
+    const parser = try RowParser.initJson(gpa, &wanted, 1);
+    defer parser.deinit(gpa);
+    var out: [3]Field = undefined;
+    _ = parser.parse(text, 0, text.len, &out);
+    try std.testing.expectEqualStrings("1", slab.raw(out[0]));
+    try std.testing.expectEqualStrings("a", slab.raw(out[1]));
+    try std.testing.expectEqual(f.ABSENT, out[2]);
 }
 
 test "null, a nested value and a missing key are all absent" {
