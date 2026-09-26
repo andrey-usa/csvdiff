@@ -1200,18 +1200,24 @@ const Sweep = struct {
         defer gpa.free(keys_line);
         const keys = keys_line[0..@max(1, self.key_size)];
         var s = Scratch{};
-        var chunk = &self.chunks[i];
+        // Built here and published once at the end: the chunks sit side by side
+        // in one array, and appending in place writes a chunk's lengths on
+        // every row, on a line its neighbour's thread is writing too.
+        var at: std.ArrayList(u64) = .empty;
+        errdefer at.deinit(gpa);
+        var hash: std.ArrayList(u64) = .empty;
+        errdefer hash.deinit(gpa);
 
         switch (self.side.rows) {
             .columnar => {
                 const lo = self.columnar_rows * i / self.chunks.len;
                 const hi = self.columnar_rows * (i + 1) / self.chunks.len;
-                try chunk.at.ensureTotalCapacity(gpa, hi - lo);
-                try chunk.hash.ensureTotalCapacity(gpa, hi - lo);
+                try at.ensureTotalCapacity(gpa, hi - lo);
+                try hash.ensureTotalCapacity(gpa, hi - lo);
                 for (lo..hi) |row| {
                     self.side.fieldsAt(row, fields);
-                    chunk.at.appendAssumeCapacity(row);
-                    chunk.hash.appendAssumeCapacity(
+                    at.appendAssumeCapacity(row);
+                    hash.appendAssumeCapacity(
                         try keyHash(self.side.slab, fields, self.key_size, self.opt, &s.a),
                     );
                 }
@@ -1244,8 +1250,8 @@ const Sweep = struct {
                         _ = t.parser.parse(data, pos, data.len, fields);
                         for (fields) |field| if (field == TOO_LONG) return Error.FieldTooLong;
                     }
-                    try chunk.at.append(gpa, pos);
-                    try chunk.hash.append(
+                    try at.append(gpa, pos);
+                    try hash.append(
                         gpa,
                         try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a),
                     );
@@ -1254,6 +1260,8 @@ const Sweep = struct {
                 }
             },
         }
+        self.chunks[i].at = at;
+        self.chunks[i].hash = hash;
     }
 };
 
@@ -1681,7 +1689,7 @@ pub fn compare(
     // --max-memory it is a FixedBufferAllocator -- a bump pointer with no lock,
     // which would hand two threads the same bytes -- so main.zig passes its
     // lock-taking variant. The budget it enforces is unchanged.
-    const per_file: usize = 1;
+    const per_file: usize = @max(1, total / 2);
     var prepare_a = Prepare{
         .gpa = gpa,
         .input = a_input,
