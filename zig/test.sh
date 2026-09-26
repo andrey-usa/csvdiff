@@ -267,4 +267,32 @@ case "$out" in
 esac
 rm -rf "$trunc"
 
+# A key a JSON writer escaped has to find the same key written literally: the
+# hash sees the decoded bytes on both sides, or the row comes out added and
+# removed. This port once folded an escaped key's bytes one at a time and a plain
+# one a word at a time, and missed it. Lengths around the eight-byte fold, and a
+# CSV doubled quote against the JSON backslash.
+kesc=$(mktemp -d)
+python3 - "$kesc" <<'PY'
+import json, sys
+out = sys.argv[1]
+BS = chr(92)
+pairs = [("a" + BS + "/b", "a/b"), (BS + "u0041BC", "ABC"), ("an eight" + BS + "/", "an eight/"),
+         ("a key longer than a word " + BS + "/ x", "a key longer than a word / x"),
+         ("quote" + BS + '"in', 'quote"in'), (BS + "u4e2d" + BS + "u6587 key", "中文 key")]
+with open(f"{out}/a.ndjson", "w") as fa, open(f"{out}/b.ndjson", "w") as fb:
+    for i, (escaped, literal) in enumerate(pairs):
+        fa.write('{"k":"%s","v":"%d"}\n' % (escaped, i))
+        fb.write(json.dumps({"k": literal, "v": str(i)}, ensure_ascii=False) + "\n")
+open(f"{out}/c.csv", "w").write('k,v\n"quote""in",4\n"a/b",0\n')
+open(f"{out}/d.ndjson", "w").write('{"k":"quote%s\"in","v":"4"}\n{"k":"a/b","v":"0"}\n' % BS)
+PY
+got=$($BIN compare "$kesc/a.ndjson" "$kesc/b.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
+if [ "$got" = "matched 6" ]; then echo "  ok    an escaped key finds the same key written literally"
+else echo "  FAIL  escaped and literal spellings of one key did not match: $got"; fail=1; fi
+got=$($BIN compare "$kesc/c.csv" "$kesc/d.ndjson" -k k 2>/dev/null | grep -o 'matched [0-9]*' || true)
+if [ "$got" = "matched 2" ]; then echo "  ok    and a CSV doubled quote finds the JSON backslash"
+else echo "  FAIL  a CSV key with a doubled quote missed its JSON spelling: $got"; fail=1; fi
+rm -rf "$kesc"
+
 exit $fail

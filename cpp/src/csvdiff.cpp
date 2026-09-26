@@ -583,10 +583,28 @@ std::uint64_t hash_field(const Slab& s, Field f, const Options& o, std::uint64_t
             ++len;
         }
     } else {
+        // Decoded, then folded eight bytes at a time like the branch above, with
+        // the words assembled as the bytes come: a field may be megabytes.
+        // Folding them one at a time gave the same value a different hash, so a
+        // key a JSON writer escaped (`a\/b`, `\u0041`) never found the same key
+        // written literally in the other file.
+        std::uint64_t word = 0;
+        unsigned have = 0;
         for_each_byte(s, f, [&](unsigned char b) {
-            h = (h ^ b) * kPrime;
+            word |= static_cast<std::uint64_t>(b) << (8 * have);
+            ++have;
             ++len;
+            if (have == 8) {
+                h = (h ^ word) * kPrime;
+                h ^= h >> 29;
+                word = 0;
+                have = 0;
+            }
         });
+        if (have > 0) {
+            h = (h ^ word) * kPrime;
+            h ^= h >> 29;
+        }
     }
     return (h ^ len) * kPrime;
 }
