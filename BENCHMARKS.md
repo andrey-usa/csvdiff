@@ -120,6 +120,48 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-21 (duplicate keys, C++) — the same shape, and the helper was already there
+
+`dup_section` keeps one row per duplicated key and, of that row, the key columns.
+It was decoding the whole row to get them:
+
+    auto values = row_values(s, idx, firsts[i], width, opt);
+    values.resize(key_size);
+
+`value_of` turns every field into a `Val`, so a twenty-column file built eighteen
+strings per duplicated key and threw them away. `key_values` has sat four hundred
+lines above that since #101, which added it for the changed rows, and the Parquet
+path's own `dup_section` was already calling it. Only the CSV path was not.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+**15 rounds** interleaved, paired per round. The pair is 2M rows × 20 columns
+with every key repeated ten times: **200,000 duplicated keys**, which is what
+this section is proportional to. `--json`, because `dup_section` runs under
+`row_lists` and that flag is the only thing that sets it.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.056s | 0.737s | **1.48x** 1.43-1.64 |
+| CPU (median) | 1.63s | 1.33s | **1.29x** 1.22-1.38 |
+
+Seven rounds first gave 1.64x wall and 1.38x CPU with a mid half twice as wide
+(1.13-1.53 on CPU). Fifteen is what the band above is worth quoting from; the
+seven-round numbers are recorded because the point of the mid half is that it
+tells you when you have not run enough rounds. The JSON is identical across the
+change apart from `meta`'s `seconds`.
+
+**Proportional to duplicated keys, not to rows.** A file without repeated keys
+never enters the section, and on the standard 4M pair — 400 duplicated keys
+against 200,000 here — the equivalent Rust change measured 1.02x, the noise
+floor. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+The Rust port had the identical shape at `duplicate_section`; that is a separate
+change. C and Zig report duplicate *counts* and no rows, so there is nothing
+there to fix.
+
+---
+
 ## 2026-09-21 (duplicate keys) — the section decoded every column to keep two
 
 The Rust port's duplicate-key section decodes one row per duplicated key and
