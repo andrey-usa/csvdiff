@@ -94,6 +94,23 @@ pub struct Options {
     pub engine: String,
     pub threads: Option<usize>,
     pub export_dir: Option<String>,
+
+    /// Whether the engine materialises the report's rows.
+    ///
+    /// The counts, the per-column stats and the duplicate-key tallies are the
+    /// whole of what a summary needs, and they are exact either way: a section
+    /// records how many rows it dropped, so the totals do not depend on any of
+    /// them being kept. What this turns off is the rest -- decoding up to
+    /// `max_rows` rows per section into `String`s, sorting them, diffing their
+    /// cells, and walking every duplicated key to build that section.
+    ///
+    /// It is `true` by default because a library caller asking for a [`Diff`]
+    /// wants the rows in it. The CLI sets it false for `--summary`, which is
+    /// the invocation that writes nothing.
+    ///
+    /// [`Diff`]: crate::contract::Diff
+    #[serde(skip)]
+    pub row_lists: bool,
 }
 
 impl Default for Options {
@@ -112,6 +129,7 @@ impl Default for Options {
             engine: Engine::Auto.label().to_string(),
             threads: None,
             export_dir: None,
+            row_lists: true,
         }
     }
 }

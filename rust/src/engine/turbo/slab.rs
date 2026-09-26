@@ -294,6 +294,38 @@ pub(super) fn text_of(slab: &Slab, f: Field) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// [`text_of`] that refuses rather than aborting when there is no room.
+///
+/// The report path uses this one. The comparison path keeps [`text_of`]: it
+/// decodes a cell only when `--trim` or `--ignore-case` is on, throws the string
+/// away immediately, and is the hottest loop in the port -- a `Result` there
+/// would be paid ten million times to report a failure that cannot happen,
+/// because nothing of that size is being held.
+pub(super) fn text_of_checked(slab: &Slab, f: Field, what: &str) -> crate::Result<String> {
+    let logical = slab.logical(f);
+    if logical.is_plain() {
+        return match std::str::from_utf8(slab.raw(f)) {
+            Ok(s) => crate::alloc::string(s, what),
+            // Lossy replacement allocates its own string; it is reached only by
+            // input that is not UTF-8, which is not the case a budget is tight
+            // for.
+            Err(_) => Ok(String::from_utf8_lossy(slab.raw(f)).into_owned()),
+        };
+    }
+    let mut bytes: Vec<u8> = crate::alloc::sized(f_len_hint(f), what)?;
+    bytes.extend(logical);
+    match String::from_utf8(bytes) {
+        Ok(s) => Ok(s),
+        Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    }
+}
+
+/// An upper bound on a field's decoded length: decoding only ever removes
+/// bytes (a doubled quote becomes one), so the raw length is enough.
+fn f_len_hint(f: Field) -> usize {
+    super::field::len_of(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::field::pack;
