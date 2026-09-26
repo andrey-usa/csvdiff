@@ -872,17 +872,35 @@ const RowIndex = struct {
         // Each chunk is released as soon as it has been inserted. Holding all of
         // them to the end would keep two copies of every row's address and hash
         // alive at once, which is sixteen bytes a row of pure duplication.
+        //
+        // A chunk's two lists are already `row_at` and `row_hash` for its rows:
+        // every row the sweep saw, in file order. So the first chunk's lists are
+        // taken over rather than copied, and a later chunk's are appended a
+        // slice at a time. With one chunk a file, which is what the text sweep
+        // makes, this is no copy at all where it used to be two appends a row
+        // into lists growing to the size of the file.
         for (chunks) |*chunk| {
-            const hashes = chunk.hash.items;
-            for (chunk.at.items, hashes, 0..) |at, hash, i| {
-                if (i + PREFETCH_AHEAD < hashes.len) self.prefetch(hashes[i + PREFETCH_AHEAD]);
-                try self.insert(at, hash, &s);
+            const first = self.row_at.items.len;
+            if (first == 0) {
+                self.row_at.deinit(gpa);
+                self.row_hash.deinit(gpa);
+                self.row_at = chunk.at;
+                self.row_hash = chunk.hash;
+            } else {
+                try self.row_at.appendSlice(gpa, chunk.at.items);
+                try self.row_hash.appendSlice(gpa, chunk.hash.items);
+                chunk.deinit(gpa);
             }
             // Emptied rather than only released, because the caller frees the
             // chunks too and a list deinitialised twice frees a pointer it no
-            // longer owns.
-            chunk.deinit(gpa);
+            // longer owns -- or, taken over, one this index owns now.
             chunk.* = .{};
+
+            const hashes = self.row_hash.items[first..];
+            for (self.row_at.items[first..], hashes, 0..) |at, hash, i| {
+                if (i + PREFETCH_AHEAD < hashes.len) self.prefetch(hashes[i + PREFETCH_AHEAD]);
+                try self.insert(@intCast(first + i), at, hash, &s);
+            }
         }
         phases.mark("index insert (serial)");
         return self;
@@ -898,11 +916,9 @@ const RowIndex = struct {
         self.gpa.free(self.mine);
     }
 
-    fn insert(self: *RowIndex, at: u64, hash: u64, s: *Scratch) !void {
+    /// Indexes row `row`, which is already in `row_at` and `row_hash`.
+    fn insert(self: *RowIndex, row: i32, at: u64, hash: u64, s: *Scratch) !void {
         self.rows += 1;
-        const row: i32 = @intCast(self.row_at.items.len);
-        try self.row_at.append(self.gpa, at);
-        try self.row_hash.append(self.gpa, hash);
 
         var slot = self.slotOf(hash);
         var mine_parsed = false;
