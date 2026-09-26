@@ -1190,13 +1190,15 @@ const Sweep = struct {
 
     fn one(self: *Sweep, i: usize) !void {
         const gpa = self.gpa;
-        const fields = try gpa.alloc(Field, self.side.width);
-        defer gpa.free(fields);
+        const fields_line = try privateAlloc(gpa, Field, self.side.width);
+        defer gpa.free(fields_line);
+        const fields = fields_line[0..self.side.width];
         // The sweep parses with the key-only parser, so it needs room for the
         // key columns; the full-width buffer above is what a row over the field
         // cap is re-read into, and what the columnar branch fills.
-        const keys = try gpa.alloc(Field, @max(1, self.key_size));
-        defer gpa.free(keys);
+        const keys_line = try privateAlloc(gpa, Field, @max(1, self.key_size));
+        defer gpa.free(keys_line);
+        const keys = keys_line[0..@max(1, self.key_size)];
         var s = Scratch{};
         var chunk = &self.chunks[i];
 
@@ -1302,6 +1304,24 @@ fn sweep(
         if (c.failure) |e| return e;
     }
     return chunks;
+}
+
+/// Scratch a thread writes on every row, on cache lines no other thread's
+/// allocation can share.
+///
+/// `smp_allocator` starts every thread on the same slot and moves one only when
+/// that slot is contended, and it aligns a small allocation only to its own
+/// size. So the key buffer A's sweep parses into on every row -- sixteen bytes
+/// for a two-column key -- and B's, allocated a moment apart on two threads,
+/// come out thirty-two bytes apart on one cache line in most runs, and the line
+/// moves between the two cores once a row. Rounding the length up to whole
+/// lines and aligning to one makes the buffer the only thing on its lines.
+/// Free the slice this returns, not a narrower one: the allocator finds the
+/// size class from the length.
+fn privateAlloc(gpa: std.mem.Allocator, comptime T: type, n: usize) ![]align(std.atomic.cache_line) T {
+    const per_line = @max(1, std.atomic.cache_line / @sizeOf(T));
+    const len = std.mem.alignForward(usize, @max(n, 1), per_line);
+    return gpa.alignedAlloc(T, .fromByteUnits(std.atomic.cache_line), len);
 }
 
 /// Runs `entry` on `ways` threads, or on this one where a thread cannot be had:
@@ -1635,24 +1655,27 @@ pub fn compare(
     //
     // Each file used to be split further, `total / 2` ways, on the reasoning that
     // two files across four cores is two chunks each and the whole machine busy.
-    // Measured, it was the opposite. On the 4M CSV pair the sweep takes 0.35s a
+    // Measured, it was the opposite. On the 4M CSV pair the sweep took 0.35s a
     // side unsplit and 0.46-0.58s split two ways: *slower* with twice the
     // threads, and the whole run 1.50x wall and 2.06x CPU better without it.
     //
-    // The cause is the allocator, and it was isolated rather than guessed. The
-    // same code linked against libc and given `c_allocator` scales -- 0.36s to
-    // 0.30s -- and linked against libc but handed `smp_allocator`, which is what
-    // this port gets by default, it does not: 0.49s. It is not memcpy or memset
-    // (the second build has glibc's), not syscalls, not page faults (flat across
-    // all four builds), and not the sweep's own arrays growing: pre-sizing them
-    // took the mremap calls inside the sweep from 192 to 60 and moved nothing.
-    // What differs is user time, 3.60s against 2.67s for identical code. Where in
-    // user space it goes is not established; see BENCHMARKS.md.
+    // That was blamed on the allocator: the same code linked against libc and
+    // given `c_allocator` scaled, and handed `smp_allocator` it did not. The
+    // allocator was where the cause was hiding rather than the cause.
+    // `smp_allocator` starts every thread on the same slot and aligns a small
+    // allocation only to its own size, so the sixteen-byte buffer A's sweep
+    // parses its key into on every row and B's came out on one cache line in
+    // most runs, and the line moved between the two cores once a row. glibc's
+    // per-thread arenas happened to keep them apart. `privateAlloc` now gives
+    // that scratch lines of its own: on the 2M pairs at four threads the sweep
+    // went 0.349s to 0.208s for CSV and 0.565s to 0.329s for JSON, and the
+    // whole run 1.22x and 1.26x on less CPU. See BENCHMARKS.md.
     //
-    // So no split, which needs nothing this port does not already have. Linking
-    // libc would buy the split back and more -- 1.72x wall against this change's
-    // 1.50x -- but this port deliberately links none, and that is not a decision
-    // a sweep gets to make.
+    // The split was tried again on CI before the key buffer was found, with the
+    // chunks' own lists unshared, and did not pay: on an EPYC 9V45 it took the
+    // 10M CSV sweep from 0.49s to 0.62s, the serial quote count in front of it
+    // included. That run still had the shared key buffer in it, so it is not
+    // the last word on splitting; it is why this change does not also split.
     //
     // `gpa` still has to be thread-safe, since A and B run at once. Under
     // --max-memory it is a FixedBufferAllocator -- a bump pointer with no lock,
