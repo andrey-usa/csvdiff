@@ -19,29 +19,130 @@ use crate::error::{Error, Result};
 
 const TEMPLATE: &str = include_str!("report.html");
 
+/// A `Write` that appends to a `Vec<u8>` through the checked allocator.
+///
+/// `serde_json` and the gzip encoder both write into a buffer that grows, and
+/// both grow it with `Vec`, which aborts when there is no room. Neither offers
+/// a fallible allocation path -- but both write through `io::Write`, and the
+/// buffer on the far side of that is ours.
+///
+/// The refusal is carried out in `failed` rather than folded into the
+/// `io::Error`, because the `io::Error` loses what the port wants to say: which
+/// structure did not fit and how big it was. The serialiser's own error is
+/// discarded once `failed` is set -- it will be a write error describing the
+/// symptom, and the cause is here.
+struct Checked<'a> {
+    out: &'a mut Vec<u8>,
+    what: &'static str,
+    failed: Option<Error>,
+}
+
+impl<'a> Checked<'a> {
+    fn new(out: &'a mut Vec<u8>, what: &'static str) -> Self {
+        Checked {
+            out,
+            what,
+            failed: None,
+        }
+    }
+}
+
+impl Write for Checked<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Err(e) = crate::alloc::room(self.out, buf.len(), self.what) {
+            self.failed = Some(e);
+            return Err(std::io::Error::other("out of memory"));
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The result as JSON, in a buffer that can refuse instead of aborting.
+fn payload_json(result: &CompareResult) -> Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut writer = Checked::new(&mut buf, "the report payload");
+    let wrote = serde_json::to_writer(&mut writer, result);
+    let refused = writer.failed.take();
+    if let Some(e) = refused {
+        return Err(e);
+    }
+    wrote?;
+    Ok(buf)
+}
+
 /// Renders the report.
 ///
 /// Pass `compress = false` to embed plain JSON instead of the gzip payload.
 pub fn render(result: &CompareResult, compress: bool) -> Result<String> {
-    let raw = serde_json::to_string(result)?;
+    let raw = payload_json(result)?;
 
     let (payload, mode) = if compress {
         // Level 6, not 9: on the largest report this cap allows, level 9 buys
         // 1.3% of file size for 121% more compression time. The size invariant
         // this project cares about is that only differing cells are embedded,
         // which is what keeps the payload near a megabyte at all.
-        (BASE64.encode(gzip(raw.as_bytes())?), "gzip")
+        (base64(&gzip(&raw)?)?, "gzip")
     } else {
         // The payload sits inside a <script> element, so a literal "</" would end
         // it early.
-        (raw.replace("</", "<\\/"), "json")
+        let text =
+            std::str::from_utf8(&raw).map_err(|_| Error::new("the report payload is not UTF-8"))?;
+        (escaped_script_text(text)?, "json")
     };
+    drop(raw);
 
     let title = format!("{} vs {}", result.meta.a.name, result.meta.b.name);
-    Ok(TEMPLATE
+    let shell = TEMPLATE
         .replace("__TITLE__", &escape_html(&title))
-        .replace("__MODE__", mode)
-        .replace("__PAYLOAD__", &payload))
+        .replace("__MODE__", mode);
+    // The payload is the whole of the file's size, so the last substitution is
+    // the one that has to be sized rather than discovered: `String::replace`
+    // would grow its buffer by doubling and abort on the growth that did not
+    // fit.
+    let at = shell
+        .find("__PAYLOAD__")
+        .ok_or_else(|| Error::new("the report template has no payload slot"))?;
+    let need = shell.len() - "__PAYLOAD__".len() + payload.len();
+    let mut out: Vec<u8> = crate::alloc::sized(need, "the report")?;
+    out.extend_from_slice(&shell.as_bytes()[..at]);
+    out.extend_from_slice(payload.as_bytes());
+    out.extend_from_slice(&shell.as_bytes()[at + "__PAYLOAD__".len()..]);
+    // Three `&str` concatenated, so UTF-8 by construction.
+    String::from_utf8(out).map_err(|_| Error::new("the report is not UTF-8"))
+}
+
+/// `BASE64.encode` that refuses instead of aborting.
+fn base64(data: &[u8]) -> Result<String> {
+    let n = base64::encoded_len(data.len(), true)
+        .ok_or_else(|| Error::new("the report is too large to encode"))?;
+    let mut buf = crate::alloc::filled(0u8, n, "the report payload, base64")?;
+    let wrote = BASE64
+        .encode_slice(data, &mut buf)
+        .map_err(|e| Error::new(format!("cannot encode the report: {e}")))?;
+    buf.truncate(wrote);
+    // base64 is ASCII by construction.
+    String::from_utf8(buf).map_err(|_| Error::new("the base64 payload is not UTF-8"))
+}
+
+/// `s.replace("</", "<\\/")` that refuses instead of aborting.
+fn escaped_script_text(s: &str) -> Result<String> {
+    // One extra byte per occurrence; asking for the whole length plus that is a
+    // single reserve rather than a doubling walk.
+    let mut out: Vec<u8> =
+        crate::alloc::sized(s.len() + s.matches("</").count(), "the report payload")?;
+    let mut rest = s;
+    while let Some(at) = rest.find("</") {
+        out.extend_from_slice(&rest.as_bytes()[..at]);
+        out.extend_from_slice(b"<\\/");
+        rest = &rest[at + 2..];
+    }
+    out.extend_from_slice(rest.as_bytes());
+    String::from_utf8(out).map_err(|_| Error::new("the report payload is not UTF-8"))
 }
 
 /// Deflate blocks, one megabyte of payload each.
@@ -71,9 +172,24 @@ const BLOCK: usize = 1 << 20;
 /// original single-encoder path is used unchanged.
 fn gzip(raw: &[u8]) -> Result<Vec<u8>> {
     if raw.len() <= BLOCK {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
-        encoder.write_all(raw)?;
-        return Ok(encoder.finish()?);
+        // The encoder's output buffer is ours, so it grows through `alloc` like
+        // everything else the port holds; what the encoder keeps for itself is
+        // the window and is bounded.
+        let mut out: Vec<u8> = crate::alloc::sized(raw.len() / 2 + 64, "the compressed report")?;
+        let mut refused: Option<Error> = None;
+        {
+            let writer = Checked::new(&mut out, "the compressed report");
+            let mut encoder = GzEncoder::new(writer, Compression::new(6));
+            let wrote = encoder.write_all(raw).and_then(|()| encoder.try_finish());
+            refused = encoder.get_mut().failed.take().or(refused);
+            if refused.is_none() {
+                wrote?;
+            }
+        }
+        return match refused {
+            Some(e) => Err(e),
+            None => Ok(out),
+        };
     }
 
     let blocks: Vec<&[u8]> = raw.chunks(BLOCK).collect();

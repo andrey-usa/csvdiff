@@ -152,6 +152,17 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
 - **Never put a shell wrapper between `bench_ab.sh` and the binary.** Two one-line `bash` scripts
   around one binary, differing only in a flag, reported 1.08x where the binary-against-binary
   measurement said 1.31x, with one arm bimodal. Build the second binary.
+- **A memory-cap scan is one run per rung, and one run per rung is a coin flip at the boundary.**
+  At the cap where the process is a single allocation from its ceiling, which allocation fails
+  first decides whether it refuses or aborts — the same binary at the same cap came out exit 2,
+  134, 2, 134, 2 on five consecutive runs. Count the rungs that abort in *any* of three passes,
+  not the ones that abort in one.
+- **A fixed range of caps does not compare two builds that need different amounts.** A change that
+  lowers the requirement moves its boundary region down into the middle of the range, so more of
+  that region is scanned and the count goes up — which reads as a regression and is partly an
+  artifact. The honest reading is what the change converts: dropping the index's peak turned
+  graceful index refusals at 12.5-16.5 MB into report-path refusals at the same caps, and the
+  report path is the one that cannot always refuse.
 - **Rounds scale with how short the run is.** *No result* at nine rounds has become 1.29x at
   twenty-five.
 - **Peak RSS is not the memory answer for anything that maps its input.** `scripts/memory_floor.sh`

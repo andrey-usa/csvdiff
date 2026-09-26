@@ -224,6 +224,111 @@ The sweep gap is real and is neither of these.
 
 ---
 
+## 2026-09-24 (parallel insert) — deterministic, and it does not pay
+
+Every port builds its index the same way: find and hash the rows on every core,
+then insert them on one. The C port says why in as many words -- *"first
+occurrence wins, and which occurrence is first depends on the order rows arrive,
+so threading it would make the answer depend on the scheduler"* -- and every
+other port repeats it. The phase is a third of the run, so "insert on one core"
+is the largest deliberate serialisation in this project, and it has never been
+priced.
+
+**The determinism objection is answerable.** Partition the rows by `hash & (P-1)`
+and every occurrence of a key lands in the same partition, so first-occurrence
+still wins and file order still decides it: P sub-tables, built in parallel,
+give the same answer as one table built serially. A lookup then picks its
+sub-table from the same bits.
+
+Priced with a probe that builds the sub-tables beside the real index and drops
+them -- nothing downstream sees them -- on the 4M CSV pair at four threads,
+which is two per file:
+
+| | serial | partitioned |
+|---|---:|---:|
+| partition pass | -- | 0.05s |
+| insert | 0.24s | 0.15s |
+| **total** | **0.24s** | **0.20s** |
+
+The insert itself does parallelise -- 0.24s to 0.15s on two ways -- and the pass
+that makes it possible costs most of what that saves. At four ways on a quiet
+machine the ceiling is about 0.17s against 0.24s, which is 0.07s of a 0.62s run:
+**11%, before paying for anything.**
+
+And the thing it would have to pay for is not in the table. Every lookup on the
+join's hot path would gain a sub-table selection -- one more dependent load
+before the probe that is already the port's worst cache miss. That cost is on
+the phase this project has spent the most effort on, and 11% is not enough
+headroom to go looking for it.
+
+Not built. Recorded because the comment in four ports says the insert *cannot*
+be threaded, and that is not true -- it can, deterministically, and it is not
+worth it. Those are different reasons and the second one is the real one.
+
+---
+
+## 2026-09-24 (parquet join) — the Rust port walked B for a sample nobody asked for
+
+Parquet is the widest ratio in the published tables and nobody had looked at it:
+at ten million rows C does the CSV-equivalent work in 1.11s against Rust's 2.12s.
+Phases on a 2M pair, warm page cache, three runs each, `--summary` so the report
+is not in the number:
+
+| phase | C | Rust |
+|---|---:|---:|
+| read key columns | 0.044s | 0.024s |
+| build key indexes | 0.09s | 0.09s |
+| **join / match sweep** | **0.047s** | **0.108s** |
+| compared columns | 0.139s | 0.158s |
+
+Everything is close except one phase, and that phase is 2.3x. The first
+measurement said otherwise -- compared columns 0.269s against 0.155s -- and was
+a cold page cache on the first touch of a 160 MB file. Warm it and that gap is
+1.14x.
+
+### The B pass is for the sample, not the count
+
+A key matches from either side or from neither, so the number of B's keys with
+an A counterpart *is* the pair count the A pass already produced, and `added` is
+B's distinct keys minus it. The pass over B is a second full random-probed walk
+of A's table, and all it adds is the report's added-rows **sample**.
+
+`csvdiff.cpp` has run it only when something will print the sample since it was
+measured there, and `pqdiff.cpp` since #106 -- the comment there says so in as
+many words. The Rust port's `pqdiff.rs` never asked.
+
+Skipping it under `--summary`, `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, on this host (4 vCPU Xeon @ 2.10GHz):
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 2M x 2M | **1.15x** 1.09-1.20 | **1.18x** 1.11-1.20 |
+| 1M x 2M | **1.29x** 1.19-1.33 | **1.21x** 1.16-1.28 |
+
+The match sweep itself goes **0.108s to 0.050s**, against C's 0.047s. The second
+pair is the bigger win because the skipped pass is over twice as many keys.
+
+`bench_ab.sh --self-test` on the same pair and the same fifteen rounds puts this
+host's floor at 0.99x [0.92-1.04]. Both rows above sit clear of it -- the 2M
+pair's middle half starts at 1.09, above the floor's own upper bound -- which is
+worth stating because on the same afternoon this machine could not resolve an
+8% question at all (see the zig scan-width entry).
+
+Counts are identical, which is the thing that had to hold, and the case that
+tests it is two files of different sizes with duplicate keys on both sides:
+1,001,000 added rows derived rather than counted, and the same number either
+way. A test asserts it in both directions, and fails when the derivation is
+removed.
+
+### While measuring: the C++ summary line names the wrong engine
+
+`main.cpp` prints `| turbo <seconds>s` unconditionally, so a Parquet run reports
+`turbo`. C, Rust and Zig all print `parquet`. Nothing is wrong with the run --
+it did take the columnar path -- but the line is the first thing anyone reads
+when checking which engine a number came from.
+
+---
+
 ## 2026-09-22 (summary only) — the same fault as #106, on the other side
 
 #106 found the cross-port tables timing four different tasks, because only the
@@ -301,6 +406,90 @@ thing being measured.**
 
 Every Rust row in RESULTS.md was measured the old way and is an upper bound
 until the ladder runs again.
+
+---
+
+## 2026-09-21 (duplicate keys, C++) — the same shape, and the helper was already there
+
+`dup_section` keeps one row per duplicated key and, of that row, the key columns.
+It was decoding the whole row to get them:
+
+    auto values = row_values(s, idx, firsts[i], width, opt);
+    values.resize(key_size);
+
+`value_of` turns every field into a `Val`, so a twenty-column file built eighteen
+strings per duplicated key and threw them away. `key_values` has sat four hundred
+lines above that since #101, which added it for the changed rows, and the Parquet
+path's own `dup_section` was already calling it. Only the CSV path was not.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+**15 rounds** interleaved, paired per round. The pair is 2M rows × 20 columns
+with every key repeated ten times: **200,000 duplicated keys**, which is what
+this section is proportional to. `--json`, because `dup_section` runs under
+`row_lists` and that flag is the only thing that sets it.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.056s | 0.737s | **1.48x** 1.43-1.64 |
+| CPU (median) | 1.63s | 1.33s | **1.29x** 1.22-1.38 |
+
+Seven rounds first gave 1.64x wall and 1.38x CPU with a mid half twice as wide
+(1.13-1.53 on CPU). Fifteen is what the band above is worth quoting from; the
+seven-round numbers are recorded because the point of the mid half is that it
+tells you when you have not run enough rounds. The JSON is identical across the
+change apart from `meta`'s `seconds`.
+
+**Proportional to duplicated keys, not to rows.** A file without repeated keys
+never enters the section, and on the standard 4M pair — 400 duplicated keys
+against 200,000 here — the equivalent Rust change measured 1.02x, the noise
+floor. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+The Rust port had the identical shape at `duplicate_section`; that is a separate
+change. C and Zig report duplicate *counts* and no rows, so there is nothing
+there to fix.
+
+---
+
+## 2026-09-21 (duplicate keys) — the section decoded every column to keep two
+
+The Rust port's duplicate-key section decodes one row per duplicated key and
+keeps the key columns. It was decoding the *whole* row to do it:
+
+    let values = row_values(side, idx, *row, opt);   // side.width columns
+    (values[..key_size].to_vec(), *n as i64)          // key_size of them kept
+
+`row_values` turns every field into a `String`, so a twenty-column file built
+eighteen strings per duplicated key and dropped them, then cloned the two it
+wanted into a second vector. The index already carries a parser that stops at
+the key — `keys_of`, which the insert path uses on every row — so the fix is to
+call it instead of decoding past the key at all.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+7 rounds interleaved, paired per round. The pair is 2M rows × 20 columns with
+every key repeated ten times: **200,000 duplicated keys**, which is what this
+section is proportional to.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.135s | 0.658s | **1.71x** 1.68-1.73 |
+| CPU (median) | 1.74s | 1.27s | **1.36x** 1.34-1.38 |
+
+The report is byte-identical across the change: the HTML payload decompresses to
+the same 2,480,022 bytes apart from `meta`, which carries the timestamp and the
+elapsed time.
+
+**It is proportional to duplicated keys, not to rows.** On the standard 4M pair,
+which has 400 duplicated keys against 200,000 here, the same change measures
+1.02x CPU [1.02-1.03] — real but at the paired noise floor, and not worth
+quoting on its own. A file with no repeated key does not enter the section at
+all. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+C++ has the identical shape at `dup_section` — `row_values(...)` then
+`values.resize(key_size)` — and already has a `key_values` helper beside it that
+#101 added for the changed rows. C and Zig report duplicate *counts* and no rows,
+so there is nothing there to fix.
 
 ---
 
