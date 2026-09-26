@@ -69,6 +69,19 @@ ALL = {"csv", "ndjson", "parquet"}
 ALIAS = {"json": "ndjson"}
 
 
+def gate_flags(flags: list[str]) -> list[str]:
+    """The timed flags, with `--summary` traded back for a discarded report.
+
+    The counts gate needs the JSON document, and `--summary` refuses an output
+    flag rather than guessing which of the two was meant -- so the gate asks for
+    the report the timed rounds do not. It is untimed, so what it costs the port
+    that renders one does not reach any table.
+    """
+    if "--summary" not in flags:
+        return flags
+    return [f for f in flags if f != "--summary"] + ["-o", "/dev/null"]
+
+
 def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[str], set[str]]]:
     """(label, argv prefix, extra flags, the formats it can read).
 
@@ -99,7 +112,19 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     """
     thread_flag = ["--threads", str(threads)] if threads else []
     # Only the report suppression. See the note above about `--engine`.
-    report = ["-o", "/dev/null"]
+    #
+    # `--summary` rather than `-o /dev/null`, which is what this was and which
+    # only moved the write. The render still ran, and so did everything the
+    # engine does to feed it: up to `--max-rows` rows per section decoded into
+    # strings, sorted and cell-diffed, plus a walk of every duplicated key. C,
+    # C++ and Zig write nothing without an output flag and build none of that,
+    # so those rounds were timing four ports on three tasks. On a 4M pair it is
+    # 1.31x wall and 1.18x CPU of what this port actually has to do; on 2M rows
+    # of Parquet, 1.27x and 1.11x.
+    #
+    # `gate_flags` puts the report back for the counts gate, which needs the
+    # document and is not timed.
+    report = ["--summary"]
     rows: list[tuple[str, list[str], list[str], set[str]]] = [
         ("C", [str(C)], thread_flag, ALL),
         ("C++", [str(CPP)], thread_flag, ALL),
@@ -108,7 +133,6 @@ def ports(threads: int | None, matrix: bool) -> list[tuple[str, list[str], list[
     ]
     if not matrix:
         return rows
-    rows.append(("Rust engine", [str(RUST)], report + ["--max-rows", "1"] + thread_flag, ALL))
     for label, path, flags, formats in [
         # The scanner builds differ only in how they find a delimiter, so they
         # are asked only about the formats that have delimiters to find. The
@@ -507,7 +531,7 @@ def main(argv: list[str]) -> int:
         # its own run outside the timing.
         for entry in runnable:
             argv_gate = entry["prefix"] + ["compare", str(a), str(b)] + KEY + \
-                entry["flags"] + ["--json", str(summary)]
+                gate_flags(entry["flags"]) + ["--json", str(summary)]
             _, _, _, code, why, _ = run(argv_gate, args.timeout, args.memory_cap, errors)
             if code not in (0, 1):
                 said = f": {why}" if why else ""

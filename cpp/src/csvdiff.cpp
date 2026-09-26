@@ -693,6 +693,9 @@ class RowParser {
             while (slots_[at] >= 0) at = (at + 1) & slot_mask_;
             slots_[at] = static_cast<int>(i);
         }
+        canon_.resize(wanted_.size());
+        for (std::size_t i = 0; i < wanted_.size(); ++i)
+            canon_[i] = wanted_[i].empty() ? -1 : slot_for(wanted_[i]);
     }
 
     // Parses one row into `out`, returning the offset of the next row. A row
@@ -768,10 +771,29 @@ class RowParser {
     }
 
   private:
+    // A word at a time rather than a byte at a time: the first and last eight
+    // bytes (four, or three single bytes, for a shorter name) and the length. A
+    // byte loop is a serial multiply per byte, twenty names a row; collisions
+    // are settled by comparing the name, so this only has to spread them.
     static std::uint64_t name_hash(std::string_view s) {
-        std::uint64_t h = 0xcbf29ce484222325ULL;
-        for (char c : s) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ULL;
-        return h ^ (h >> 32);
+        const std::size_t n = s.size();
+        std::uint64_t a = 0, b = 0;
+        if (n >= 8) {
+            std::memcpy(&a, s.data(), 8);
+            std::memcpy(&b, s.data() + n - 8, 8);
+        } else if (n >= 4) {
+            std::uint32_t x, y;
+            std::memcpy(&x, s.data(), 4);
+            std::memcpy(&y, s.data() + n - 4, 4);
+            a = x;
+            b = y;
+        } else if (n > 0) {
+            a = static_cast<std::uint64_t>(static_cast<unsigned char>(s[0])) |
+                static_cast<std::uint64_t>(static_cast<unsigned char>(s[n / 2])) << 8 |
+                static_cast<std::uint64_t>(static_cast<unsigned char>(s[n - 1])) << 16;
+        }
+        const std::uint64_t h = (a ^ (b * 0x9e3779b97f4a7c15ULL) ^ n) * 0xbf58476d1ce4e5b9ULL;
+        return h ^ (h >> 31);
     }
 
     // Walks one JSON object, storing the values of the keys we want. One pass
@@ -781,6 +803,7 @@ class RowParser {
                            std::size_t slots) const {
         std::fill(out, out + slots, kAbsent);
         std::size_t found = 0;  // key slots filled, for the early exit below
+        std::size_t guess = 0;  // the slot the next member most likely fills
         std::size_t pos = start;
         while (pos < end && json_space(d[pos])) ++pos;
         if (pos >= end) return end;
@@ -833,7 +856,11 @@ class RowParser {
                 }
             }
             if (!v.absent) {
-                const int slot = slot_for(key);
+                const int slot = guess < wanted_.size() && !wanted_[guess].empty() &&
+                                         wanted_[guess] == key
+                                     ? canon_[guess]
+                                     : slot_for(key);
+                if (slot >= 0) guess = static_cast<std::size_t>(slot) + 1;
                 if (slot >= 0 && static_cast<std::size_t>(slot) < slots) {
                     // First occurrence wins for a key column, and only for a key
                     // column -- the C port's rule, adopted here so the two agree
@@ -982,6 +1009,12 @@ class RowParser {
     std::vector<std::string> wanted_;   // JSON: the key whose value goes in each slot
     std::vector<int> slots_;            // JSON: open-addressed name -> slot
     std::size_t slot_mask_ = 0;
+    // JSON: what `slot_for` answers for `wanted_[i]` -- i itself unless the
+    // same name also fills an earlier slot. Names arrive in the same order row
+    // after row, usually slot order, so the member after slot i is tried as
+    // i + 1 before any hashing, and a right guess has to give exactly the slot
+    // the table would.
+    std::vector<int> canon_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1048,7 +1081,7 @@ class RowIndex {
         const std::size_t end = d.size();
         if (from >= end) return;
 
-        const std::vector<std::size_t> bounds = chunk_bounds(d, from, threads);
+        const std::vector<std::size_t> bounds = chunk_bounds(d, from, threads, slab.dialect() == Dialect::Json);
         phase.mark("chunk bounds");
         const std::size_t n = bounds.size() - 1;
         std::vector<Chunk> chunks(n);
@@ -1215,6 +1248,16 @@ class RowIndex {
     /// The key hash the sweep computed for this row.
     std::uint64_t hash_of(int row) const { return row_hash_[static_cast<std::size_t>(row)]; }
 
+    /// Asks for the table line a later `lookup(hash)` will read first. The join
+    /// probes this table once per key of the other file, in that file's order,
+    /// so every probe is a miss on a table too big to cache -- and the hash
+    /// that decides which line is already in hand, rows ahead. The insert loop
+    /// above does the same, and so does the C port's join.
+    void prefetch(std::uint64_t hash) const { __builtin_prefetch(&table_[slot_of(hash)], 0, 0); }
+
+    /// How many rows ahead a caller of `prefetch` should look.
+    static constexpr std::size_t kLookupPrefetch = kInsertPrefetch;
+
     const std::vector<int>& first_rows() const { return first_row_; }
     const std::vector<std::uint32_t>& occurrences() const { return occurrences_; }
     std::int64_t rows() const { return rows_; }
@@ -1248,9 +1291,17 @@ class RowIndex {
     }
 
     // One chunk's rows, in the order they appear in it.
-    struct Chunk {
+    // Padded to a cache line. One of these per sweep thread in one
+    // `std::vector<Chunk>`, forty-eight bytes apart, and `push_back` on either
+    // vector touches this struct's pointers on every row -- so two threads
+    // sweeping concurrently move the line between cores once a row each.
+    //
+    // This is why the split below looked unprofitable when it was measured. See
+    // the note there.
+    struct alignas(64) Chunk {
         std::vector<std::size_t> starts;
         std::vector<std::uint64_t> hashes;
+        char pad[64]{};
     };
 
     // Where each chunk begins, as offsets of real row starts. The nominal
@@ -1264,8 +1315,15 @@ class RowIndex {
     // quotes before a position says whether that position is inside a field.
     // Counting them is a scan for one byte, far cheaper than parsing, and it
     // splits across the same threads.
+    // JSON needs no quote count: a raw newline inside a string is not valid
+    // JSON, so every newline ends a record. Counting anyway is not only wasted
+    // -- ndjson quotes every key and most values, so the count stops every few
+    // bytes and cost 0.47s a side on a 2M-row pair, more than the sweep it
+    // splits -- it is also wrong: an escaped `\"` toggles the parity, and a
+    // split whose count comes out odd can walk to the end of the file looking for
+    // a newline outside quotes, and the chunk is dropped.
     static std::vector<std::size_t> chunk_bounds(std::string_view d, std::size_t from,
-                                                 unsigned threads) {
+                                                 unsigned threads, bool json) {
         const std::size_t end = d.size();
         // Below this there is nothing to divide: the boundary work would cost
         // more than the parsing it splits.
@@ -1286,7 +1344,7 @@ class RowIndex {
         // the work it prepares shrinks. Counting the slice *since* the previous
         // split gives the same numbers from one pass split evenly.
         std::vector<std::size_t> quotes(nominal.size(), 0);
-        {
+        if (!json) {
             std::vector<std::thread> counters;
             auto count = [&](std::size_t i) {
                 const std::size_t begin = i == 0 ? from : nominal[i - 1];
@@ -1320,7 +1378,7 @@ class RowIndex {
             std::size_t at = nominal[i];
             for (; at < end; ++at) {
                 const char c = d[at];
-                if (c == '"') {
+                if (c == '"' && !json) {
                     in_quotes = !in_quotes;
                 } else if (c == '\n' && !in_quotes) {
                     ++at;
@@ -1635,7 +1693,13 @@ struct Capped {
     bool truncated() const { return total > static_cast<std::int64_t>(cap); }
 };
 
-// A changed row's key, and nothing else.
+// One row's key, and nothing else.
+//
+// Two callers want this: the changed rows, which carry the key beside their
+// per-cell diffs, and the duplicate-key section, which keeps one row per
+// repeated key and nothing but the key of it. The second was calling
+// `row_values` and resizing the result away, which on a twenty-column file
+// built eighteen strings per duplicated key to drop them.
 //
 // `fields_of` fills `width` fields however few the caller goes on to read, so
 // the Field buffer is full width here even though only `key_size` of them become
@@ -1793,7 +1857,23 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // over eleven paired rounds, faster in all eleven, and the whole phase then
     // costs what it cost on one thread -- the sweep does not scale on this
     // machine at any width, so the split was buying nothing and paying for it.
-    const unsigned per_file = budget >= 8 ? budget / 2 : 1;
+    //
+    // **That conclusion was right about the measurement and wrong about the
+    // cause, and the cause has since been fixed.** The sweep did not scale
+    // because two threads' `Chunk`s shared a cache line and each row either
+    // appended moved it; the split was paying for the sharing rather than for
+    // the chunking. `Chunk` is padded now, and the curve is a different one:
+    //
+    //     against no split at all, 4M pair, --threads 4, 15 paired rounds
+    //     per_file      budget/2        budget
+    //     wall          1.11x           1.11x
+    //     cpu           0.96x           0.94x
+    //
+    // Eleven percent of the wall for four percent more CPU, which is what
+    // threading is supposed to trade, and `budget / 2` buys it for less than
+    // `budget` does. That is also the rule the C port has always used, and both
+    // files are swept at once, so half the machine each is the whole of it.
+    const unsigned per_file = budget > 1 ? budget / 2 : 1;
 
     std::optional<RowIndex> ai_slot, bi_slot;
     std::exception_ptr worker_failure;
@@ -1886,6 +1966,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         unsigned refused = 0;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
+            if (at + RowIndex::kLookupPrefetch < hi)
+                bi.prefetch(ai.hash_of(a_keys[at + RowIndex::kLookupPrefetch]));
             ai.fields_of(row, fa.data());
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
@@ -2040,6 +2122,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         const std::size_t hi = b_keys.size() * (p + 1) / b_ways;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = b_keys[at];
+            if (at + RowIndex::kLookupPrefetch < hi)
+                ai.prefetch(bi.hash_of(b_keys[at + RowIndex::kLookupPrefetch]));
             // Keys only: this pass asks whether B's key exists in A, and the
             // lookup compares key fields. The row's other nineteen columns are
             // parsed later, and only for the rows the report actually keeps.
@@ -2197,9 +2281,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             const auto& counts = idx.occurrences();
             for (std::size_t i = 0; i < firsts.size(); ++i) {
                 if (counts[i] < 2) continue;
-                auto values = row_values(s, idx, firsts[i], width, opt);
-                values.resize(key_size);
-                all.push_back({std::move(values), static_cast<std::int64_t>(counts[i])});
+                all.push_back({key_values(s, idx, firsts[i], width, key_size, opt),
+                               static_cast<std::int64_t>(counts[i])});
             }
             std::stable_sort(all.begin(), all.end(), [&](const DupRow& x, const DupRow& y) {
                 if (x.count != y.count) return x.count > y.count;

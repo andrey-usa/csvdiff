@@ -496,6 +496,19 @@ static uint64_t hash_field(const Slab *s, Field f, uint64_t seed) {
 /* Parsing                                                                     */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * One entry of the JSON name table: the wanted name's hash and length ride
+ * along with its slot, so a probe rejects a different name on one compare and
+ * reads the name's bytes only when it is almost certainly the one. Without
+ * them every lookup took a `strlen` of the candidate before comparing -- twenty
+ * a row, more than the hash.
+ */
+typedef struct {
+    uint64_t hash;
+    uint32_t len;
+    int32_t  idx;   /* the slot, or -1 for an empty entry */
+} NameSlot;
+
 typedef struct {
     char delimiter;
     int *source;   /* CSV: where each projected column sits in the file, or -1 */
@@ -530,8 +543,19 @@ typedef struct {
      * be four hundred comparisons a row.
      */
     char **want;
-    int32_t *slot;
+    NameSlot *slot;
     size_t slot_mask;
+    /*
+     * Names arrive in the same order row after row, and usually in slot order,
+     * so the member after slot i is most often slot i + 1. `want_len` lets a
+     * guess be checked with one compare and a `memcmp`, and `want_slot[i]` is
+     * what the table answers for `want[i]` -- slot i itself unless the same
+     * name also fills an earlier slot -- so a right guess gives exactly the
+     * slot the table would have. `want_n` is how many there are.
+     */
+    uint32_t *want_len;
+    int32_t  *want_slot;
+    size_t    want_n;
 } RowParser;
 
 /*
@@ -559,36 +583,63 @@ static bool parser_index_columns(RowParser *p) {
 }
 
 static uint64_t name_hash(const char *p, size_t n) {
-    uint64_t h = UINT64_C(0xcbf29ce484222325);
-    for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)p[i]) * UINT64_C(0x100000001b3);
-    return h;
+    uint64_t a = 0, b = 0;
+    if (n >= 8) {
+        memcpy(&a, p, 8);
+        memcpy(&b, p + n - 8, 8);
+    } else if (n >= 4) {
+        uint32_t x, y;
+        memcpy(&x, p, 4);
+        memcpy(&y, p + n - 4, 4);
+        a = x;
+        b = y;
+    } else if (n > 0) {
+        a = (uint64_t)(unsigned char)p[0] | (uint64_t)(unsigned char)p[n / 2] << 8 |
+            (uint64_t)(unsigned char)p[n - 1] << 16;
+    }
+    uint64_t h = (a ^ (b * UINT64_C(0x9e3779b97f4a7c15)) ^ n) * UINT64_C(0xbf58476d1ce4e5b9);
+    return h ^ (h >> 31);
 }
 
 /* Builds the name-to-slot table. `want` is borrowed, not owned. */
+static int parser_slot_for(const RowParser *p, const char *key, size_t len);
+
 static bool parser_index_names(RowParser *p, char **want, size_t width) {
     p->want = want;
     size_t n = 16;
     while (n < width * 4) n <<= 1;
     p->slot = malloc(n * sizeof *p->slot);
     if (!p->slot) return false;
-    for (size_t i = 0; i < n; i++) p->slot[i] = -1;
+    for (size_t i = 0; i < n; i++) p->slot[i] = (NameSlot){ 0, 0, -1 };
     p->slot_mask = n - 1;
     for (size_t i = 0; i < width; i++) {
         if (!want[i]) continue;
-        size_t at = name_hash(want[i], strlen(want[i])) & p->slot_mask;
-        while (p->slot[at] >= 0) at = (at + 1) & p->slot_mask;
-        p->slot[at] = (int32_t)i;
+        const size_t len = strlen(want[i]);
+        if (len > UINT32_MAX) return false;
+        const uint64_t h = name_hash(want[i], len);
+        size_t at = h & p->slot_mask;
+        while (p->slot[at].idx >= 0) at = (at + 1) & p->slot_mask;
+        p->slot[at] = (NameSlot){ h, (uint32_t)len, (int32_t)i };
+    }
+    p->want_len = malloc((width ? width : 1) * sizeof *p->want_len);
+    p->want_slot = malloc((width ? width : 1) * sizeof *p->want_slot);
+    if (!p->want_len || !p->want_slot) return false;
+    p->want_n = width;
+    for (size_t i = 0; i < width; i++) {
+        p->want_len[i] = want[i] ? (uint32_t)strlen(want[i]) : 0;
+        p->want_slot[i] = want[i] ? (int32_t)parser_slot_for(p, want[i], p->want_len[i]) : -1;
     }
     return true;
 }
 
 static int parser_slot_for(const RowParser *p, const char *key, size_t len) {
-    size_t at = name_hash(key, len) & p->slot_mask;
+    const uint64_t h = name_hash(key, len);
+    size_t at = h & p->slot_mask;
     for (;;) {
-        int32_t i = p->slot[at];
-        if (i < 0) return -1;
-        const char *w = p->want[i];
-        if (w && strlen(w) == len && memcmp(w, key, len) == 0) return (int)i;
+        const NameSlot *e = &p->slot[at];
+        if (e->idx < 0) return -1;
+        if (e->hash == h && e->len == len && memcmp(p->want[e->idx], key, len) == 0)
+            return (int)e->idx;
         at = (at + 1) & p->slot_mask;
     }
 }
@@ -617,6 +668,7 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
                              Field *out, size_t slots) {
     for (size_t i = 0; i < slots; i++) out[i] = ABSENT;
     size_t found = 0;   /* key slots filled, for the early exit below */
+    size_t guess = 0;   /* the slot the next member most likely fills */
     size_t pos = start;
     while (pos < end && json_space(d[pos])) pos++;
     if (pos >= end) return end;
@@ -662,7 +714,13 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
             absent = (to - from == 4 && memcmp(d + from, "null", 4) == 0);
         }
         if (!absent) {
-            int slot = parser_slot_for(p, d + key_from, key_len);
+            int slot;
+            if (guess < p->want_n && p->want[guess] && p->want_len[guess] == key_len &&
+                memcmp(p->want[guess], d + key_from, key_len) == 0)
+                slot = p->want_slot[guess];
+            else
+                slot = parser_slot_for(p, d + key_from, key_len);
+            if (slot >= 0) guess = (size_t)slot + 1;
             if (slot >= 0 && (size_t)slot < slots) {
                 /*
                  * First occurrence wins for a key column, and only for a key
@@ -852,13 +910,20 @@ static void index_keys(const RowIndex *ix, int32_t row, Field *out) {
  * than the parsing it splits. */
 #define SPLIT_FROM (4u << 20)
 
-/* One chunk's rows, in the order they appear in it. */
+/* One chunk's rows, in the order they appear in it.
+ *
+ * Padded for the same reason as `CmpPart`: these are one per sweep thread in a
+ * single `calloc`ed array, forty bytes apart, and `chunk_push` touches `n`,
+ * `cap` and the two pointers on *every row*. Unpadded, two threads' chunks
+ * share a cache line and every row one of them appends moves it. */
 typedef struct {
+    _Alignas(64)
     uint64_t *start;
     uint64_t *hash;
     size_t    n, cap;
     bool      failed;   /* a field too long for the packed length */
     bool      oom;
+    char      pad[64];
 } Chunk;
 
 /*
@@ -871,6 +936,14 @@ typedef struct {
  * twice and so leaves the state alone, which is exactly right -- so the number
  * of quotes before a position says whether that position is inside a field.
  * Counting them is a scan for one byte, far cheaper than parsing.
+ *
+ * JSON needs none of that: a raw newline inside a string is not valid JSON, so
+ * every newline ends a record. Counting anyway is not only wasted -- ndjson
+ * quotes every key and most values, so the count stops every few bytes, and on
+ * a 2M-row pair it took about 0.47s a side, serially, before any thread started
+ * -- it is also wrong: an escaped `\"` toggles the parity, and a split whose
+ * count comes out odd can walk to the end of the file looking for a newline
+ * outside quotes, and the chunk is dropped.
  */
 static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_t *bounds) {
     const char *d = s->data;
@@ -892,11 +965,12 @@ static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_
      * new, so counting that and adding it keeps a running total of the quotes
      * before `nominal` for one pass in total.
      */
+    const bool json = s->dialect == DIALECT_JSON;
     size_t quotes = 0;
     size_t counted = from;
     for (unsigned i = 1; i < threads; i++) {
         const size_t nominal = from + (end - from) * i / threads;
-        for (size_t at = counted; at < nominal;) {
+        for (size_t at = counted; !json && at < nominal;) {
             const size_t q = next_of1(d, at, nominal, '"');
             if (q >= nominal) break;
             quotes++;
@@ -906,7 +980,7 @@ static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_
         bool in_quotes = (quotes & 1) != 0;
         size_t at = nominal;
         for (; at < end; at++) {
-            if (d[at] == '"') in_quotes = !in_quotes;
+            if (d[at] == '"' && !json) in_quotes = !in_quotes;
             else if (d[at] == '\n' && !in_quotes) { at++; break; }
         }
         if (at > bounds[n - 1] && at < end) bounds[n++] = at;
@@ -1246,11 +1320,29 @@ static bool json_tail_is_clean(const RowParser *p, const char *d, size_t at, siz
     return true;
 }
 
+/*
+ * One per thread, and padded so that two of them cannot share a cache line.
+ *
+ * Without the padding these sit in one `calloc`ed array about ninety bytes
+ * apart, so two of them share a line. `out->matched++` on one thread then
+ * dirties the line another thread is incrementing its own counters in, and the
+ * line moves between cores. Four million rows of that does not show up as any
+ * single slow thing: it shows up as the join scaling 2.8x on four cores, where
+ * the same work in the Rust port -- whose per-thread accumulator is a value
+ * returned from a closure and so never adjacent to another thread's -- reaches
+ * 3.9x. Padded, this port reaches 3.9x too.
+ *
+ * The counters could equally be locals merged at the end, which is what the
+ * Rust port does by accident of language. Padding is the smaller change to a
+ * structure the caller already allocates as an array.
+ */
 typedef struct {
+    _Alignas(64)
     int64_t  matched, changed, removed, added;
     int64_t *col_changed, *col_blanked, *col_filled;
     Field   *fa, *fb, *probe;
     bool     oom;
+    char     pad[64];
 } CmpPart;
 
 typedef struct {
@@ -1983,6 +2075,8 @@ done:
     index_free(&bi);
     free(a_src); free(b_src); free(want_a); free(want_b); free(fa); free(fb);
     free(ap.slot); free(bp.slot);
+    free(ap.want_len); free(bp.want_len);
+    free(ap.want_slot); free(bp.want_slot);
     free(ap.col_first); free(bp.col_first);
     free(ap.slot_next); free(bp.slot_next);
     free(col_changed); free(col_blanked); free(col_filled);

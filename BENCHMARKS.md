@@ -142,6 +142,21 @@ newline at the split), the sweep runs again on counted bounds, which is exactly
 what it did before. A chunk that started on a wrong guess parsed garbage, so its
 rows and its errors are discarded unread.
 
+---
+
+## 2026-09-26 (cpp join prefetch) — the one join in four that did not prefetch
+
+At one thread the C++ join was 1.43x C's on the 4M CSV pair (1.36 s against
+0.95 s), which puts the gap in per-row work and not in threading. Callgrind on
+a 400k pair says it isn't instructions: 1.82 B against C's 1.71 B, 7% apart.
+So it's memory. Every join probes the other file's table once per key, in this
+file's order, and the table is far too big to cache. C, Rust and Zig all ask
+for that line rows ahead, since the hash that decides it is already in hand. C++
+did it in its insert loop and never in either join pass.
+
+`RowIndex::prefetch(hash)`, called 24 rows ahead (the insert's distance) in the
+A pass and the B pass.
+
 4M CSV pair, `-k account_id,txn_id -i updated_at`, 4 vCPU Xeon @ 2.10 GHz,
 paired against main, 15 rounds, reports identical:
 
@@ -162,6 +177,794 @@ surfaced before their boundary is checked.
 
 C and C++ count the same way before their sweeps: C serially, C++ in one task
 at two chunks a file.
+
+---
+
+| one thread | **1.17x** 1.12-1.21 | 1.13x 1.08-1.17 |
+| four threads | **1.08x** 1.06-1.12 | **1.12x** 1.11-1.14 |
+| ndjson 2M, four threads | 1.03x 0.99-1.11 (no result) | 1.07x 1.00-1.14 |
+
+The join phase alone at one thread: 1.28-1.46 s to 1.03-1.20 s. On ndjson on
+main, the serial quote count (#127) is most of a four-thread run and hides it.
+Parquet goes through `pqdiff.cpp`, which already prefetches.
+
+---
+
+## 2026-09-26 (cpp slot guess) — the name lookup change, in C++
+
+#129 (C) and #130 (Rust, Zig) try the member after slot *i* as slot *i + 1*
+before hashing its name, and hash the misses a word at a time rather than a
+byte at a time. This is the same change for C++: `canon_[i]` holds what
+`slot_for` answers for `wanted_[i]`, so a right guess gives the table's slot
+even when one name fills two.
+
+2M-row ndjson pair, `-k account_id,txn_id -i updated_at`, 4 vCPU Xeon @
+2.10 GHz, paired against main, 15 rounds. Reports identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| one thread | **1.11x** 1.08-1.19 | 1.11x 1.08-1.16 |
+| four threads | **1.09x** 1.04-1.10 | **1.10x** 1.05-1.12 |
+
+The same day's floor was 0.88-1.08 wall and 0.95-1.06 CPU, so the CPU columns
+are the result and the wall columns agree with them. Identical `--json`
+reports, too, on a hand-built file with members reversed, shuffled, repeated
+and missing, including `-k id --compare id,b,c`, where one name fills two
+slots. `cpp/test.sh` passes.
+
+---
+
+## 2026-09-26 (json slot guess) — the C name lookup change, in Rust and Zig
+
+Rust and Zig find a member's slot the way C did before #129: an FNV hash a byte
+at a time, then a table probe. Same three changes, adapted to each port:
+the member after slot *i* is tried as *i + 1* first (`canon[i]` holds the
+table's own answer, so a right guess returns the table's slot even when one
+name fills two), and a word-at-a-time name hash for the misses. Rust's and
+Zig's names already carry their length, so there was no `strlen` to remove.
+
+2M-row ndjson pair, `-k account_id,txn_id -i updated_at`, 4 vCPU Xeon @
+2.10 GHz, paired, each against the same port with #128. Reports identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| Rust, one thread | **1.16x** 1.10-1.25 | 1.14x 1.09-1.20 |
+| Rust, four threads | **1.09x** 1.04-1.15 | **1.11x** 1.07-1.15 |
+| Zig, one thread | **1.14x** 1.12-1.18 | 1.12x 1.10-1.14 |
+| Zig with #126, four threads | **1.12x** 1.11-1.15 | **1.13x** 1.11-1.17 |
+| Zig on main, four threads, run 1 | 0.93x 0.87-1.03 | 0.93x 0.80-0.96 |
+| Zig on main, four threads, run 2 | 0.87x 0.78-1.04 (no result) | 0.74x 0.66-1.04 |
+| floor that day: one build against itself | 0.95x 0.88-1.08 | 0.98x 0.95-1.06 |
+
+The two Zig-on-main rows are the configuration #126 is about: the sweep split
+two ways a file under `smp_allocator`, where the same build's user time wanders.
+In run 2 the new build's own CPU went from 2.20 s best to 3.32 s median. The
+change allocates nothing, and with the split off (#126) or at one thread it
+measures clean and positive. Those rows are recorded, not explained.
+
+A unit test in each port puts one name in two slots and fails if a right guess
+returns its own slot instead of the table's (checked by breaking it).
+`c/test.sh --with-ports`: 89/89.
+
+---
+
+## 2026-09-26 (json names) — C looked up every member's name as if it had never seen the row before
+
+Profiled with callgrind on a 200k-row ndjson pair at one thread (an x86-64-v3
+build, because valgrind cannot decode AVX-512): the join's full parse of each
+A row was **52%** of all instructions, about 5,900 a row, and the name lookup
+inside it was the largest single part -- `parser_slot_for` at 98 instructions
+a member, twenty members a row. Each lookup hashed the name a byte at a time
+(FNV: a serial multiply per byte), then took a `strlen` of the candidate before
+comparing it.
+
+Three changes, all in how a name finds its slot:
+
+- **Guess first.** Rows of one file list their names in the same order, and
+  usually in slot order, so the member after slot *i* is tried as slot *i + 1*
+  with a length compare and a `memcmp` before any hashing. A wrong guess costs
+  those two compares and falls through to the table. `want_slot[i]` holds what
+  the table answers for `want[i]`, so a right guess returns exactly the slot
+  the table would have, even when one name fills two slots.
+- **The table's entries carry the name's hash and length**, so a probe rejects
+  a different name on one compare and no lookup calls `strlen`.
+- **A word-at-a-time name hash** in place of the byte loop.
+
+| | main | this |
+|---|---:|---:|
+| instructions, 200k pair, one thread | 2.63 B | **2.13 B** (-19%) |
+
+Paired, 2M-row pair (849 MB a side), `-k account_id,txn_id -i updated_at`,
+4 vCPU Xeon @ 2.10 GHz:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| one thread, against main | **1.17x** 1.13-1.22 | 1.14x 1.11-1.20 |
+| four threads, against main | 1.04x 0.97-1.07 (no result) | 1.07x 1.06-1.09 |
+| four threads, both with #127, 25 rounds | 1.12x 1.05-1.20 | 1.09x 1.04-1.15 |
+| floor: one build against itself, same day | 0.95x 0.88-1.08 | 0.98x 0.95-1.06 |
+
+The one-thread row and the instruction count are the result. At four threads
+on main the serial quote count (#127) is most of the run and hides it. On top
+of #127 the wall figure is consistent but its lower edge is inside this
+machine's floor, so it's reported and not claimed.
+
+Reports are byte-identical to main's on the 2M pair and on a hand-built file
+with members reversed, shuffled, repeated and missing, under three key sets.
+`c/test.sh --with-ports`: 89/89.
+
+C++, Rust and Zig look names up the same way (FNV byte loop, table
+probe) and are candidates for the same change.
+
+---
+
+## 2026-09-26 (json keys) — Zig and Rust parsed every field of an ndjson row to find two
+
+The sweep only needs a row's key. For CSV every port stops at the last key
+column. For ndjson, C and C++ stop as soon as each key slot is filled, and skip
+the rest of the object with one scan for the newline. Zig and Rust did not:
+their key-only parser went through the same object walk as the full one, so
+every string of every row went through `skip_json_string` to find two values
+near the front.
+
+They now stop the same way. That needs the rule C states: **a key column takes
+its first value**. The key-only parse stops at the first one, and a full parse
+that kept the last value of a repeated name would disagree on the row's key,
+so the lookup would miss its own row. Compared columns keep last-wins. Before
+this, Zig and Rust used last-wins for a repeated key name and C and C++ used
+first-wins; now all four agree. A unit test in each port pins it down.
+
+2M-row ndjson pair (849 MB a side, `-k account_id,txn_id -i updated_at`, four
+cores), reports identical apart from timing. The session's container moved
+host partway through: the two Zig-on-main rows ran on the earlier host, the
+rest on a 2.10 GHz Xeon. Each ratio compares two builds on one machine, and no
+row is compared across hosts:
+
+| | sweep, one thread (a side) | wall old/new, paired [mid half] | cpu old/new |
+|---|---|---|---|
+| Rust (main) | 0.78 s → 0.28 s | **1.34x** 1.31-1.42 | 1.46x |
+| Zig (main) | 1.10 s → 0.57 s | **1.33x** 1.16-1.44 | 1.42x |
+| Zig (with #126) | 1.21 s → 0.30 s at the default | **1.71x** 1.63-1.79 | 1.47x |
+
+The Zig gain on main is capped by the split sweep under `smp_allocator`
+(#126): with the split on, the default-thread sweep only went from 0.61 s to
+0.59 s, even though the work per row fell by half. With #126's single chunk a
+file it takes the whole saving.
+
+---
+
+## 2026-09-26 (json bounds) — C and C++ counted quotes in ndjson, where they mean nothing
+
+Both ports split a large file for the sweep by counting the `"` bytes before
+each nominal split: in CSV a newline inside quotes is not a row boundary, and
+the parity says whether a split point is inside a field. They did it for every
+dialect. In ndjson a raw newline cannot appear inside a string (RFC 8259 forbids
+unescaped control characters), so every newline ends a record and the count
+answers nothing. Rust and Zig already skipped it for JSON; C and C++ did not.
+
+ndjson quotes every key and most values, so the count stops every few bytes.
+On a 2M-row pair (849 MB a side, `-k account_id,txn_id -i updated_at`, four
+cores, 2.80 GHz Xeon):
+
+| | before | after |
+|---|---|---|
+| C++ `chunk bounds`, a side (`CSVDIFF_PHASES=1`) | 0.50 s | 0.000 s |
+| C `both indexes` (the count is serial and unmarked in C) | 0.83 s | 0.33 s |
+
+Paired, 15 interleaved rounds (`scripts/bench_ab.sh`), reports identical apart
+from the elapsed-seconds field:
+
+| port | wall old/new [mid half] | cpu old/new [mid half] |
+|---|---|---|
+| C (main) | **1.45x** 1.37-1.51 | 1.29x 1.18-1.34 |
+| C++ (with #125's split) | **1.66x** 1.59-1.70 | 1.36x 1.35-1.39 |
+
+The C++ number is measured on top of #125, which turns the sweep split on at
+two threads a file. On main at four cores C++ does not split (`budget >= 8`),
+so the change does nothing there until #125 merges -- but it does on any runner
+with eight or more.
+
+The count was also wrong, not only slow: an escaped `\"` toggles the parity,
+and a split whose count comes out odd walks to the end of the file looking for
+a newline outside quotes, finds none, and the chunk is dropped -- the sweep
+runs on fewer threads than it was given. The output is right either way, which
+is why no test saw it.
+
+---
+
+## 2026-09-24 (zig split) — the sweep got slower with more threads, and it was the allocator
+
+Zig was the slowest port on the 4M CSV pair and its sweep was the whole of it.
+Two earlier explanations were checked and ruled out -- it is compiled for the
+host, and its sweep is not oversubscribed -- and a third, widening the scan
+step, could not be resolved on a noisy machine. The one-thread control settled
+where to look:
+
+| sweep, a side | 1 thread | 4 threads |
+|---|---:|---:|
+| C | 0.342s | 0.181s |
+| **Zig** | **0.35s** | **0.46-0.58s** |
+
+**Zig's sweep got slower with more threads.** At four, each file is split two
+ways, and each of those threads ran at well under half the speed of one.
+
+### Isolated, one variable at a time
+
+| build | sweep at 4 threads |
+|---|---:|
+| shipped: no libc, `smp_allocator` | 0.46-0.58s |
+| libc linked, `c_allocator` | **0.30s** |
+| libc linked, `smp_allocator` forced back | 0.49s |
+
+Linking libc changes two things -- the allocator and `memcpy`/`memset` -- and
+the third row separates them. **It is the allocator.**
+
+What it is *not*, each measured:
+
+* **The serial quote count.** `chunkBounds` counts quotes over half the file on
+  the calling thread before any sweep thread starts. Skipping it -- correct on
+  this file, which has none -- moved nothing: 0.465s against 0.454s.
+* **Syscalls.** `strace -c`: 430 against glibc's 373, 0.11s against 0.06s.
+* **Page faults.** 112,984 against 124,652 for glibc; flat across thread counts.
+* **Blocking.** Single-digit voluntary context switches at every thread count.
+* **The sweep's own arrays growing.** `ArrayList` grows 1.5x a step, one
+  `mremap` each: 192 inside the sweep window. Pre-sizing them took that to 60
+  and moved the sweep from 0.49s to 0.42s -- still slower than one thread.
+
+What differs is **user time**, 3.60s against 2.67s for identical code, with no
+allocation on the per-row path at all. Where in user space it goes is not
+established here; the leading candidate is where the page allocator places the
+arrays rather than any call into it, and without a profiler on this host that
+stays a candidate.
+
+### What changed
+
+Each file is swept on one thread. Four-core runner, 4M CSV pair:
+
+| | shipped | no split | paired [mid half] |
+|---|---:|---:|---|
+| whole run, wall | 1.743s | 1.144s | **1.38x** [1.25-1.84] |
+| whole run, CPU | 5.91s | 2.79s | **2.02x** [1.70-2.43] |
+| `--max-memory 1500` | 3.71s | 1.76s | one run each |
+
+Half the CPU. Under a budget -- which is what this port is for -- the budgeted
+allocator takes a lock, and the gain is larger again. Parquet goes through
+`pqdiff.zig` and does not read `per_file`: 0.98x [0.89-1.02], no result.
+
+**Linking libc would buy the split back and more** -- 1.72x wall and 2.15x CPU
+against this change's 1.38x and 2.02x -- and would put Zig on the same allocator
+as the other three ports. This port links no libc deliberately (see the zstd
+entry), so that is left as a decision rather than taken as a side effect of a
+sweep.
+
+---
+
+## 2026-09-24 (cpp sweep) — #109 measured the right thing and named the wrong cause
+
+#109 tried splitting the C++ sweep across threads and found it did not pay, on a
+curve where every width was worse than not splitting at all:
+
+    per_file  1     2      3      4      6      8
+    vs two    0.923 1.000  0.965  0.936  0.936  0.903
+
+It concluded *"the sweep does not scale on this machine at any width"*, and set
+`per_file = budget >= 8 ? budget / 2 : 1`, which on every four-core runner means
+one chunk and no split.
+
+**The measurement was right and the cause was not.** Two threads' `Chunk`s sat
+forty-eight bytes apart in one `std::vector<Chunk>`, and `push_back` on either of
+their vectors touches the struct's pointers on every row. The split was paying
+for a cache line moving between cores once per row, not for the chunking.
+
+With `Chunk` padded to a cache line -- the same fix the C port needed, found the
+same afternoon -- the split is worth having:
+
+| against no split, 4M pair, `--threads 4` | wall | CPU |
+|---|---|---|
+| `per_file = budget / 2` | **1.11x** | 0.96x |
+| `per_file = budget` | 1.11x | 0.94x |
+
+Same wall either way and `budget / 2` costs less CPU for it, which is also the
+rule the C port has always used: both files are swept at once, so half the
+machine each is the whole of it.
+
+Shipped against new, 4M pair, `--threads 4`:
+
+| | shipped | new | paired [mid half] |
+|---|---:|---:|---|
+| sweep phase | 0.391s | 0.211s | **1.822x** [1.780-2.000] |
+| whole run, wall | 1.350s | 1.225s | **1.11x** [1.07-1.16] |
+| whole run, CPU | 3.74s | 3.87s | 0.96x [0.94-1.00] |
+
+Eleven percent of the wall for four percent more CPU is what threading is for,
+and the sweep phase itself nearly halves.
+
+**The lesson is not that #109 was careless.** It measured nine interleaved
+rounds, tabulated six widths, and drew the only conclusion those numbers
+support. A width curve cannot distinguish "this work does not parallelise" from
+"this work parallelises and something else is serialising it", and nothing in
+the phase timings said which. What separated them here was the one-thread
+control from the false-sharing entry below: a cost that vanishes when there is
+only one thread is not a cost of the work.
+
+---
+
+## 2026-09-24 (false sharing) — the C port's threads were fighting over two cache lines
+
+The C join scaled to **2.8x** on four cores. The Rust port does the same work in
+the same time on one core -- 1.26s against 1.33s serial -- and reaches **3.9x**.
+Same machine, same pair, same afternoon.
+
+### The obvious cause, priced and rejected
+
+C cuts the join into one range per thread; Rust pulls sixty-one chunks from a
+queue, and its comment says why: a chunk that turns out expensive should delay
+one worker rather than three. So the queue was built for C first.
+
+| | speedup |
+|---|---:|
+| one range per thread | 2.80x |
+| sixty-one chunks from a queue | 2.76x |
+
+**Nothing.** Imbalance was not it.
+
+### What it was
+
+`CmpPart` is one per thread in a single `calloc`ed array, about ninety bytes
+apart. Two of them share a cache line, so `out->matched++` on one thread dirties
+the line another thread is incrementing its own counters in, and the line moves
+between cores. Four million rows of that shows up as nothing in particular and
+everything in the scaling.
+
+`Chunk` has it worse: one per sweep thread, forty bytes apart, and `chunk_push`
+touches `n`, `cap` and both pointers on *every row*.
+
+Both padded to a cache line, on the 4M CSV pair, phases alternating and paired
+per run:
+
+| | before | after | paired [mid half] |
+|---|---:|---:|---|
+| join | 0.485s | 0.352s | **1.384x** [1.260-1.448] |
+| sweep | 0.218s | 0.152s | **1.354x** [1.322-1.676] |
+| whole run, wall | 1.075s | 0.772s | **1.35x** [1.26-1.47] |
+| whole run, CPU | 3.09s | 2.32s | **1.36x** [1.26-1.39] |
+
+The join's speedup goes 2.80x to 3.91x, which is Rust's 3.85x.
+
+### The check that makes it a diagnosis rather than a number
+
+False sharing costs nothing when there is nothing to share. So the same pair of
+builds, on the same join, at one thread and at four:
+
+| threads | paired [mid half] |
+|---|---|
+| 1 | **0.987x** [0.933-1.041] |
+| 4 | **1.210x** [1.136-1.344] |
+
+Exactly nothing at one thread, and the whole of it at four. That is the
+signature, and without it "padding made it faster" would have been a result
+without a reason.
+
+### On two different processors, which was not on purpose
+
+The container was replaced part-way through this work and came back on a
+different CPU -- a 2.80GHz Xeon where the numbers above were taken on a 2.10GHz
+one. Everything was rebuilt and re-measured there, which by the rule at the top
+of this file is a second table and not a continuation of the first:
+
+| | 2.10GHz Xeon | 2.80GHz Xeon |
+|---|---|---|
+| whole run, wall | 1.35x [1.26-1.47] | 1.22x [1.14-1.33] |
+| whole run, CPU | 1.36x [1.26-1.39] | 1.22x [1.15-1.32] |
+| join at 1 thread | 0.987x [0.933-1.041] | 0.982x [0.928-1.044] |
+| join at 4 threads | 1.210x [1.136-1.344] | 1.282x [1.069-1.333] |
+| the floor, one build against itself | 0.99x [0.92-1.07] | 1.02x [0.96-1.09] |
+
+Different sizes, same shape, and the one-thread control is nothing on both. Two
+machines agreeing on a mechanism is worth more than either agreeing with itself,
+and it was an accident.
+
+### It is not a general truth about the design
+
+Both sibling ports have the same shape and neither wants the fix:
+
+| port | the same padding |
+|---|---|
+| Zig -- one `Chunk` per sweep thread in a `gpa.alloc` array, `at.append` per row | **0.966x** [0.948-1.138] -- no result |
+| C++ -- `std::vector<Chunk>` and `std::vector<Part>`, `push_back` and `matched++` per row | **0.95x** [0.93-0.99] -- slower, and inside the floor |
+
+The same is true of C's own Parquet path: `Part` there is one per join thread in
+a `calloc`ed array, forty bytes apart, and `join_part` writes `pa[n++]` for every
+key it matches. Padded, the join phase measures 1.082x [1.000-1.230] and the
+whole run 1.00x [0.95-1.02] -- no result, so it is not in this change either.
+That path's join is a tenth of a second of a third of a second, and an integer
+compare per key rather than a row parse.
+
+So this is not "per-thread accumulators must be padded". It is about what the
+per-row update compiles to, and about how much of the run is spent doing it. `chunk_push` is a call through a pointer and has to
+reload `n` and `cap` from the struct every row; `ArrayList.append` and
+`std::vector::push_back` are fully visible to the optimiser, which keeps them in
+registers across the loop and touches the struct only when it grows. The line
+that moves between cores in the C port is barely read in the other two, and
+padding there only adds sixty-four bytes of footprint per chunk.
+
+The phase floor on this host, one build against itself by the same alternating
+method, is 0.99x [0.91-1.12]. Every number kept above is clear of it; the two
+that are not -- the queue, and the Zig padding -- are reported as no result and
+not built.
+
+---
+
+## 2026-09-24 (zig scan width) — the phase got faster and the run did not
+
+With the Rust port's measurement corrected, the 4M CSV table on this host reads:
+
+| Port | Best | Median | CPU |
+|---|---:|---:|---:|
+| Rust | 0.62s | 0.63s | 1.9s |
+| C | 0.66s | 0.72s | 2.1s |
+| C++ | 0.67s | 0.71s | 1.8s |
+| **Zig** | **0.92s** | **0.96s** | **3.0s** |
+
+Zig is the outlier and the port nobody has examined. Its phases say where: the
+sweep is 0.41s a side against C's 0.20s, and everything else is within noise.
+That is the whole of the 0.9s of extra CPU.
+
+Zig's scan step is eight bytes -- SWAR, no CPU feature at all -- where
+`-Dscan=32` puts the same question to a vector register. Building it:
+
+| | sweep, a side | whole run, paired |
+|---|---:|---|
+| `-Dscan=8` (shipped) | 0.41s | -- |
+| `-Dscan=32` | **0.30s** | **0.87x** -- *slower* |
+| `-Dscan=64` | 0.31s | not pursued |
+
+The sweep is 27% faster. What the *run* does is the part this host could not
+settle, and the rest of this entry is that story rather than a result.
+
+The direct alternating measurement says what the paired one cannot: `scan=32` is
+**bimodal** and `scan=8` is not. Ten pairs, milliseconds:
+
+    scan=8   1275 1308 1316 1326 1344 1375 1382 1382 1409 1459
+    scan=32  1271 1288 1292 1343 | 1544 1596 1631 1654 1661 1683
+
+Four runs at parity, six about 20% slower, nothing in between, and the same
+split in the per-run paired ratios. A phase measurement cannot see this at all:
+every phase of `scan=32` is faster in every run, including the ones where the
+whole run is 300 ms slower. `bench_ab.sh` sees the cost but not the shape: over
+25 rounds it reports 0.89x [0.84-0.94], with `scan=32`'s best-to-median spread
+twice `scan=8`'s.
+
+### The floor, and why none of this is a result
+
+`bench_ab.sh --self-test` runs one build against itself. On this host, fifteen
+rounds:
+
+| | wall | mid half |
+|---|---|---|
+| the same binary, twice | 0.99x | **0.92-1.07** |
+
+**The noise floor here is about eight percent.** The scan-width measurement is
+0.89x [0.84-0.94] over twenty-five rounds -- outside 1.00, and overlapping the
+floor's own band. It is at the edge of what this machine can resolve, not
+clearly past it, and "13% slower" is more than the data carries.
+
+Two other things that looked like results and were not:
+
+* **Frequency licensing** as the mechanism. It is the obvious suspect and the
+  evidence is against it: the Rust port scans **thirty-two bytes** on this same
+  host -- `VECTOR_WIDTH = 32` in `turbo/field.rs`, built
+  `-C target-cpu=x86-64-v3` -- and its runs are tight, 0.62s best against 0.63s
+  median. Whatever unsettles the Zig build at that width leaves the Rust one
+  alone.
+* **Two measurements where `scan=32` came out faster.** Both ran eight of one
+  build and then eight of the other, which is the one-build-at-a-time method
+  this file opens by rejecting. They are not evidence of anything. The two
+  interleaved measurements agree with each other; these do not belong beside
+  them.
+
+So: the sweep is faster at thirty-two bytes, the run is not measurably faster,
+and this host cannot tell whether it is slower. **The question needs a quieter
+machine, and the ladder already runs on one** -- the 10m CI rows have `Zig v32`
+ahead of `Zig`, and that is the measurement to trust until a paired one on a
+quiet host says otherwise.
+
+**And it is the host's answer, not the port's.** The 10m CI rows in the entry of
+2026-09-19 have `Zig v32` at 1.72-1.82s against `Zig` at 1.87-1.97s, which is
+the opposite. So the width that wins depends on the processor, which is why it
+is a build option and why it cannot simply become the default.
+
+Not built, and not refused either -- **unresolved**. Recorded because "Zig scans
+eight bytes where C and Rust scan thirty-two" is the first thing anyone looking
+at that row will try, and because the trap is not the idea but the measurement:
+a 27% phase win that the whole-run number will not confirm on a machine whose
+floor is 8%.
+
+### Two things checked and found not to be true
+
+Both are the obvious explanations for the Zig row, and both are wrong:
+
+* **"Zig is not compiled for the host."** C and C++ probe and add
+  `-march=native`; Rust gets `-C target-cpu=x86-64-v3`; `zig build` is given
+  nothing. But Zig's default target *is* the host: rebuilt from a cleared cache,
+  `zig build --release=fast` and the same with `-Dcpu=native` are byte-identical,
+  and the binary carries `vpcmpeqb`, `vpbroadcastb` and `vmovdqa32`. The note in
+  `scripts/build_ports.sh` is right.
+* **"The sweep is oversubscribed."** #109 found the C++ sweep splitting each file
+  `threads` ways while both files were in flight, which is twice the cores. Zig
+  already halves it -- `const per_file = @max(1, total / 2)` -- and has for as
+  long as the file has existed.
+
+The sweep gap is real and is neither of these.
+
+---
+
+## 2026-09-24 (parallel insert) — deterministic, and it does not pay
+
+Every port builds its index the same way: find and hash the rows on every core,
+then insert them on one. The C port says why in as many words -- *"first
+occurrence wins, and which occurrence is first depends on the order rows arrive,
+so threading it would make the answer depend on the scheduler"* -- and every
+other port repeats it. The phase is a third of the run, so "insert on one core"
+is the largest deliberate serialisation in this project, and it has never been
+priced.
+
+**The determinism objection is answerable.** Partition the rows by `hash & (P-1)`
+and every occurrence of a key lands in the same partition, so first-occurrence
+still wins and file order still decides it: P sub-tables, built in parallel,
+give the same answer as one table built serially. A lookup then picks its
+sub-table from the same bits.
+
+Priced with a probe that builds the sub-tables beside the real index and drops
+them -- nothing downstream sees them -- on the 4M CSV pair at four threads,
+which is two per file:
+
+| | serial | partitioned |
+|---|---:|---:|
+| partition pass | -- | 0.05s |
+| insert | 0.24s | 0.15s |
+| **total** | **0.24s** | **0.20s** |
+
+The insert itself does parallelise -- 0.24s to 0.15s on two ways -- and the pass
+that makes it possible costs most of what that saves. At four ways on a quiet
+machine the ceiling is about 0.17s against 0.24s, which is 0.07s of a 0.62s run:
+**11%, before paying for anything.**
+
+And the thing it would have to pay for is not in the table. Every lookup on the
+join's hot path would gain a sub-table selection -- one more dependent load
+before the probe that is already the port's worst cache miss. That cost is on
+the phase this project has spent the most effort on, and 11% is not enough
+headroom to go looking for it.
+
+Not built. Recorded because the comment in four ports says the insert *cannot*
+be threaded, and that is not true -- it can, deterministically, and it is not
+worth it. Those are different reasons and the second one is the real one.
+
+---
+
+## 2026-09-24 (parquet join) — the Rust port walked B for a sample nobody asked for
+
+Parquet is the widest ratio in the published tables and nobody had looked at it:
+at ten million rows C does the CSV-equivalent work in 1.11s against Rust's 2.12s.
+Phases on a 2M pair, warm page cache, three runs each, `--summary` so the report
+is not in the number:
+
+| phase | C | Rust |
+|---|---:|---:|
+| read key columns | 0.044s | 0.024s |
+| build key indexes | 0.09s | 0.09s |
+| **join / match sweep** | **0.047s** | **0.108s** |
+| compared columns | 0.139s | 0.158s |
+
+Everything is close except one phase, and that phase is 2.3x. The first
+measurement said otherwise -- compared columns 0.269s against 0.155s -- and was
+a cold page cache on the first touch of a 160 MB file. Warm it and that gap is
+1.14x.
+
+### The B pass is for the sample, not the count
+
+A key matches from either side or from neither, so the number of B's keys with
+an A counterpart *is* the pair count the A pass already produced, and `added` is
+B's distinct keys minus it. The pass over B is a second full random-probed walk
+of A's table, and all it adds is the report's added-rows **sample**.
+
+`csvdiff.cpp` has run it only when something will print the sample since it was
+measured there, and `pqdiff.cpp` since #106 -- the comment there says so in as
+many words. The Rust port's `pqdiff.rs` never asked.
+
+Skipping it under `--summary`, `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, on this host (4 vCPU Xeon @ 2.10GHz):
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 2M x 2M | **1.15x** 1.09-1.20 | **1.18x** 1.11-1.20 |
+| 1M x 2M | **1.29x** 1.19-1.33 | **1.21x** 1.16-1.28 |
+
+The match sweep itself goes **0.108s to 0.050s**, against C's 0.047s. The second
+pair is the bigger win because the skipped pass is over twice as many keys.
+
+`bench_ab.sh --self-test` on the same pair and the same fifteen rounds puts this
+host's floor at 0.99x [0.92-1.04]. Both rows above sit clear of it -- the 2M
+pair's middle half starts at 1.09, above the floor's own upper bound -- which is
+worth stating because on the same afternoon this machine could not resolve an
+8% question at all (see the zig scan-width entry).
+
+Counts are identical, which is the thing that had to hold, and the case that
+tests it is two files of different sizes with duplicate keys on both sides:
+1,001,000 added rows derived rather than counted, and the same number either
+way. A test asserts it in both directions, and fails when the derivation is
+removed.
+
+### While measuring: the C++ summary line names the wrong engine
+
+`main.cpp` prints `| turbo <seconds>s` unconditionally, so a Parquet run reports
+`turbo`. C, Rust and Zig all print `parquet`. Nothing is wrong with the run --
+it did take the columnar path -- but the line is the first thing anyone reads
+when checking which engine a number came from.
+
+---
+
+## 2026-09-22 (summary only) — the same fault as #106, on the other side
+
+#106 found the cross-port tables timing four different tasks, because only the
+C++ port emitted row samples and every harness passed `--json` to all four. The
+fix was to stop passing it. The same fault was sitting on the other side of the
+table the whole time, and it is bigger.
+
+**The Rust port writes a report whether or not one is asked for.** Its `--out`
+defaults to `<a>__vs__<b>.html`; C, C++ and Zig write nothing without an output
+flag. Run the ladder's exact invocation in an empty directory:
+
+    C     compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    C++   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    Rust  compare a.csv b.csv -k account_id,txn_id  ->  a__vs__b.html
+    Zig   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+
+`ports()` knew about it and half-fixed it: `report = ["-o", "/dev/null"]`. That
+moves the *write*. The render still ran, the gzip still ran, and so did
+everything the engine does to feed them — up to `--max-rows` rows per section
+decoded into `String`s, sorted and cell-diffed, plus a walk of every duplicated
+key to build that section.
+
+### What it costs
+
+`--summary` turns all of it off: the CLI writes nothing and `opt.row_lists`
+tells the engine not to build what it would have written. Measured on this host
+(4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, against the unmodified binary:
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 4M CSV, 20 columns | **1.31x** 1.28-1.34 | **1.18x** 1.16-1.19 |
+| 2M Parquet, 20 columns | **1.27x** 1.24-1.29 | **1.11x** 1.09-1.12 |
+
+Counts are identical with and without, which is the thing that had to hold: a
+section records how many rows it dropped, so the totals never depended on any of
+them being kept.
+
+### The project already had the evidence
+
+`--matrix` carried a `Rust engine` row — the same binary with `--max-rows 1` —
+and the entry at 2026-09-19 says of it, in as many words:
+
+> **Rust engine is first on csv at both sizes** -- 1.67s at 10m and 3.22s at 20m
+
+That row existed *because* someone noticed the report was in the number. It was
+in the matrix, behind a flag, while the published table kept charging it. With
+`--summary` on the main row the two measure the same thing, so the extra row is
+gone — for the reason `ports()` already gives about `csvdiff-swar`, which was
+"the same binary under a second name".
+
+### A measurement that lied, and why
+
+The first paired run of this used two one-line `bash` wrappers around one binary
+— one appending `--summary`, one not — because that is the quick way to A/B a
+flag. It reported **1.08x [1.05-1.13]** where the binary-against-binary probe
+had said 1.28x, and the `--summary` arm was bimodal: best 1.092s against a
+median of 1.289s. Timing the same two invocations directly, alternating, gave a
+flat 1400ms against 1130ms every round. The wrappers were the artifact. Building
+a second binary and comparing binaries — which is what `bench_ab.sh` is for —
+put it back at 1.31x. **Do not put a shell script between this harness and the
+thing being measured.**
+
+### What changed
+
+* `--summary` on the Rust CLI: prints the counts line and writes nothing. It
+  refuses `--out`, `--json` and `--export-dir` rather than picking a winner,
+  because guessing which was meant is how a report silently stops appearing.
+* `Options::row_lists`, defaulting to `true`, so a library caller asking for a
+  `Diff` still gets its rows. Both engines honour it, `turbo` and `pqdiff`.
+* Every port-comparison script trades `-o /dev/null` for `--summary`;
+  `gate_flags` puts the report back for the counts gate, which needs the JSON
+  document and is not timed. `report_cost.py` keeps `-o /dev/null`, since
+  pricing the report is what it is for.
+
+Every Rust row in RESULTS.md was measured the old way and is an upper bound
+until the ladder runs again.
+
+---
+
+## 2026-09-21 (duplicate keys, C++) — the same shape, and the helper was already there
+
+`dup_section` keeps one row per duplicated key and, of that row, the key columns.
+It was decoding the whole row to get them:
+
+    auto values = row_values(s, idx, firsts[i], width, opt);
+    values.resize(key_size);
+
+`value_of` turns every field into a `Val`, so a twenty-column file built eighteen
+strings per duplicated key and threw them away. `key_values` has sat four hundred
+lines above that since #101, which added it for the changed rows, and the Parquet
+path's own `dup_section` was already calling it. Only the CSV path was not.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+**15 rounds** interleaved, paired per round. The pair is 2M rows × 20 columns
+with every key repeated ten times: **200,000 duplicated keys**, which is what
+this section is proportional to. `--json`, because `dup_section` runs under
+`row_lists` and that flag is the only thing that sets it.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.056s | 0.737s | **1.48x** 1.43-1.64 |
+| CPU (median) | 1.63s | 1.33s | **1.29x** 1.22-1.38 |
+
+Seven rounds first gave 1.64x wall and 1.38x CPU with a mid half twice as wide
+(1.13-1.53 on CPU). Fifteen is what the band above is worth quoting from; the
+seven-round numbers are recorded because the point of the mid half is that it
+tells you when you have not run enough rounds. The JSON is identical across the
+change apart from `meta`'s `seconds`.
+
+**Proportional to duplicated keys, not to rows.** A file without repeated keys
+never enters the section, and on the standard 4M pair — 400 duplicated keys
+against 200,000 here — the equivalent Rust change measured 1.02x, the noise
+floor. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+The Rust port had the identical shape at `duplicate_section`; that is a separate
+change. C and Zig report duplicate *counts* and no rows, so there is nothing
+there to fix.
+
+---
+
+## 2026-09-21 (duplicate keys) — the section decoded every column to keep two
+
+The Rust port's duplicate-key section decodes one row per duplicated key and
+keeps the key columns. It was decoding the *whole* row to do it:
+
+    let values = row_values(side, idx, *row, opt);   // side.width columns
+    (values[..key_size].to_vec(), *n as i64)          // key_size of them kept
+
+`row_values` turns every field into a `String`, so a twenty-column file built
+eighteen strings per duplicated key and dropped them, then cloned the two it
+wanted into a second vector. The index already carries a parser that stops at
+the key — `keys_of`, which the insert path uses on every row — so the fix is to
+call it instead of decoding past the key at all.
+
+Measured on this host (4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`,
+7 rounds interleaved, paired per round. The pair is 2M rows × 20 columns with
+every key repeated ten times: **200,000 duplicated keys**, which is what this
+section is proportional to.
+
+| | before | after | paired ratio [mid half] |
+|---|---:|---:|---|
+| wall (median) | 1.135s | 0.658s | **1.71x** 1.68-1.73 |
+| CPU (median) | 1.74s | 1.27s | **1.36x** 1.34-1.38 |
+
+The report is byte-identical across the change: the HTML payload decompresses to
+the same 2,480,022 bytes apart from `meta`, which carries the timestamp and the
+elapsed time.
+
+**It is proportional to duplicated keys, not to rows.** On the standard 4M pair,
+which has 400 duplicated keys against 200,000 here, the same change measures
+1.02x CPU [1.02-1.03] — real but at the paired noise floor, and not worth
+quoting on its own. A file with no repeated key does not enter the section at
+all. The number above is what the section costs when a file actually has
+duplicates, which is the case it exists for.
+
+C++ has the identical shape at `dup_section` — `row_values(...)` then
+`values.resize(key_size)` — and already has a `key_values` helper beside it that
+#101 added for the changed rows. C and Zig report duplicate *counts* and no rows,
+so there is nothing there to fix.
 
 ---
 
