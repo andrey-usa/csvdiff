@@ -120,6 +120,40 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (rust parquet append) — Rust's page decoder pushed every value it could have copied
+
+The same callgrind comparison as the Zig entry, on the same 2M Parquet pair at
+one thread: **C 5.38 B instructions, Rust 8.93 B**, with `read_column` alone
+at 2.21 B against C's 0.87 B for the same work. Every decoded value went through
+a `push`, two branches (is it present, is the column still in dictionary form)
+and a capacity check, including every page where all values are present and the
+page's indices *are* the column's.
+
+A page with no nulls is now one `extend_from_slice`: its dictionary indices, or
+its plain slices. That's every page of a REQUIRED column, which is what the
+generator writes, and most pages of an OPTIONAL one. Pages with nulls keep the
+per-value loop.
+
+| 2M Parquet pair | main | this |
+|---|---:|---:|
+| instructions, one thread | 8.93 B | **7.24 B** (-19%) |
+| `read_column` | 2.21 B | out of the top ten |
+
+Paired, 4 vCPU Xeon @ 2.10 GHz, counts identical:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| 2M, 21 rounds | 1.05x 1.02-1.13 | 1.06x 1.02-1.10 |
+| 10M, 11 rounds | 1.05x 1.02-1.11 | 1.06x 1.05-1.09 |
+
+The instruction count is the result. On this host a wall-clock difference this
+size is at the floor, and the decode it shortens is waiting on memory as much as
+on instructions. The CI phase run on the Xeon 8370C (run 36244710300) had Rust's
+compared columns at 1.33 s against C's 0.77 s. What remains of that is in the
+compare loop, not the decode.
+
+---
+
 ## 2026-09-26 (speculative split) — Rust's sweep did not scale because of the step before it
 
 The Rust sweep took as long at four threads as at one on the 4M CSV pair,
