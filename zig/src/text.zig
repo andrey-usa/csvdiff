@@ -298,6 +298,9 @@ pub const RowParser = union(enum) {
         /// Open-addressed name to slot, so a key costs one hash.
         slots: []i32,
         slot_mask: usize,
+        /// Slots below this are key columns: the first value wins, and once
+        /// every slot is a filled key column the rest of the object is skipped.
+        key_size: usize,
 
         pub fn slotFor(self: Json, key: []const u8) ?usize {
             var at = nameHash(key) & self.slot_mask;
@@ -353,7 +356,7 @@ pub const RowParser = union(enum) {
         } };
     }
 
-    pub fn initJson(gpa: std.mem.Allocator, wanted: []const ?[]const u8) !RowParser {
+    pub fn initJson(gpa: std.mem.Allocator, wanted: []const ?[]const u8, key_size: usize) !RowParser {
         var n: usize = 16;
         while (n < wanted.len * 4) n <<= 1;
         const slots = try gpa.alloc(i32, n);
@@ -365,7 +368,12 @@ pub const RowParser = union(enum) {
             while (slots[at] >= 0) at = (at + 1) & mask;
             slots[at] = @intCast(i);
         }
-        return .{ .json = .{ .wanted = wanted, .slots = slots, .slot_mask = mask } };
+        return .{ .json = .{
+            .wanted = wanted,
+            .slots = slots,
+            .slot_mask = mask,
+            .key_size = @min(key_size, wanted.len),
+        } };
     }
 
     pub fn deinit(self: RowParser, gpa: std.mem.Allocator) void {
@@ -444,6 +452,7 @@ pub const RowParser = union(enum) {
     /// Walks one JSON object, storing the values of the keys we want.
     fn parseJson(self: Json, d: []const u8, start: usize, end: usize, out: []Field) usize {
         @memset(out, f.ABSENT);
+        var found: usize = 0; // key slots filled, for the early exit below
         var pos = start;
         while (pos < end and jsonSpace(d[pos])) pos += 1;
         if (pos >= end) return end;
@@ -492,7 +501,28 @@ pub const RowParser = union(enum) {
                 if (!std.mem.eql(u8, d[from..pos], "null")) field = f.pack(from, pos - from, false);
             }
             if (field) |value| {
-                if (self.slotFor(key)) |slot| out[slot] = value;
+                if (self.slotFor(key)) |slot| {
+                    // First occurrence wins for a key column, and only for a key
+                    // column -- the rule the C port states. A JSON object is not
+                    // supposed to repeat a name, but the key-only parse below
+                    // stops as soon as it has the keys, and it has to agree with
+                    // the full parse on what a row's key is: last-wins would let
+                    // it stop on a different value than the full parse ends
+                    // with, a lookup that misses its own row. Compared columns
+                    // keep last-wins.
+                    if (slot < self.key_size) {
+                        if (out[slot] == f.ABSENT) {
+                            out[slot] = value;
+                            found += 1;
+                            // Every key found and nothing else wanted: the rest
+                            // of the object is bytes to skip, not fields to
+                            // parse. Walking them was two thirds of the sweep.
+                            if (found == self.wanted.len) break;
+                        }
+                    } else {
+                        out[slot] = value;
+                    }
+                }
             }
         }
         return endOfJsonRow(d, pos, end);
@@ -590,7 +620,7 @@ test "json values are read by key whatever order they come in" {
     const slab = Slab{ .data = text, .dialect = .json };
     const gpa = std.testing.allocator;
     const wanted = [_]?[]const u8{ "k", "v" };
-    const parser = try RowParser.initJson(gpa, &wanted);
+    const parser = try RowParser.initJson(gpa, &wanted, 0);
     defer parser.deinit(gpa);
     var out: [2]Field = undefined;
     const next = parser.parse(text, 0, text.len, &out);
@@ -601,11 +631,35 @@ test "json values are read by key whatever order they come in" {
     try std.testing.expectEqualStrings("b", slab.raw(out[1]));
 }
 
+test "a repeated key: the key-only and full parses agree, and stop where they should" {
+    // The first `k` is the row's key in both parses -- the key-only one stops
+    // there -- while a repeated compared column keeps its last value.
+    const text = "{\"k\":\"1\",\"v\":\"a\",\"k\":\"2\",\"v\":\"b\"}\n{\"k\":\"3\"}\n";
+    const slab = Slab{ .data = text, .dialect = .json };
+    const gpa = std.testing.allocator;
+    const wanted = [_]?[]const u8{ "k", "v" };
+    const full = try RowParser.initJson(gpa, &wanted, 1);
+    defer full.deinit(gpa);
+    const keys = try RowParser.initJson(gpa, wanted[0..1], 1);
+    defer keys.deinit(gpa);
+
+    var out: [2]Field = undefined;
+    const next = full.parse(text, 0, text.len, &out);
+    try std.testing.expectEqualStrings("1", slab.raw(out[0]));
+    try std.testing.expectEqualStrings("b", slab.raw(out[1]));
+
+    var key: [1]Field = undefined;
+    try std.testing.expectEqual(next, keys.parse(text, 0, text.len, &key));
+    try std.testing.expectEqualStrings("1", slab.raw(key[0]));
+    _ = keys.parse(text, next, text.len, &key);
+    try std.testing.expectEqualStrings("3", slab.raw(key[0]));
+}
+
 test "null, a nested value and a missing key are all absent" {
     const text = "{\"k\":\"1\",\"v\":null,\"w\":{\"deep\":1},\"x\":[1,2]}\n";
     const gpa = std.testing.allocator;
     const wanted = [_]?[]const u8{ "k", "v", "w", "x", "missing" };
-    const parser = try RowParser.initJson(gpa, &wanted);
+    const parser = try RowParser.initJson(gpa, &wanted, 0);
     defer parser.deinit(gpa);
     var out: [5]Field = undefined;
     const next = parser.parse(text, 0, text.len, &out);
@@ -632,7 +686,7 @@ test "the json header is the first object's keys in order" {
 test "the json tail scan spots a tracked name and lets an untracked one pass" {
     const gpa = std.testing.allocator;
     const wanted = [_]?[]const u8{ "account_id", "amount" };
-    const parser = try RowParser.initJson(gpa, &wanted);
+    const parser = try RowParser.initJson(gpa, &wanted, 0);
     defer parser.deinit(gpa);
 
     // The case the scan exists for: a compared name written again in the tail
@@ -658,7 +712,7 @@ test "the json tail scan spots a tracked name and lets an untracked one pass" {
 test "an escaped name in the tail refuses the proof rather than guessing" {
     const gpa = std.testing.allocator;
     const wanted = [_]?[]const u8{"amount"};
-    const parser = try RowParser.initJson(gpa, &wanted);
+    const parser = try RowParser.initJson(gpa, &wanted, 0);
     defer parser.deinit(gpa);
 
     // The wanted names are held unescaped, so `amount` would not match by
@@ -671,7 +725,7 @@ test "an escaped name in the tail refuses the proof rather than guessing" {
 test "a value that merely looks like a name does not refuse the proof" {
     const gpa = std.testing.allocator;
     const wanted = [_]?[]const u8{"amount"};
-    const parser = try RowParser.initJson(gpa, &wanted);
+    const parser = try RowParser.initJson(gpa, &wanted, 0);
     defer parser.deinit(gpa);
 
     // `"amount"` here is a *value*, not a name. The scan cannot tell the two

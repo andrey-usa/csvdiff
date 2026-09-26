@@ -120,6 +120,41 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (json keys) — Zig and Rust parsed every field of an ndjson row to find two
+
+The sweep only needs a row's key. For CSV every port stops at the last key
+column. For ndjson, C and C++ stop as soon as each key slot is filled, and skip
+the rest of the object with one scan for the newline. Zig and Rust did not:
+their key-only parser went through the same object walk as the full one, so
+every string of every row went through `skip_json_string` to find two values
+near the front.
+
+They now stop the same way. That needs the rule C states: **a key column takes
+its first value**. The key-only parse stops at the first one, and a full parse
+that kept the last value of a repeated name would disagree on the row's key,
+so the lookup would miss its own row. Compared columns keep last-wins. Before
+this, Zig and Rust used last-wins for a repeated key name and C and C++ used
+first-wins; now all four agree. A unit test in each port pins it down.
+
+2M-row ndjson pair (849 MB a side, `-k account_id,txn_id -i updated_at`, four
+cores), reports identical apart from timing. The session's container moved
+host partway through: the two Zig-on-main rows ran on the earlier host, the
+rest on a 2.10 GHz Xeon. Each ratio compares two builds on one machine, and no
+row is compared across hosts:
+
+| | sweep, one thread (a side) | wall old/new, paired [mid half] | cpu old/new |
+|---|---|---|---|
+| Rust (main) | 0.78 s → 0.28 s | **1.34x** 1.31-1.42 | 1.46x |
+| Zig (main) | 1.10 s → 0.57 s | **1.33x** 1.16-1.44 | 1.42x |
+| Zig (with #126) | 1.21 s → 0.30 s at the default | **1.71x** 1.63-1.79 | 1.47x |
+
+The Zig gain on main is capped by the split sweep under `smp_allocator`
+(#126): with the split on, the default-thread sweep only went from 0.61 s to
+0.59 s, even though the work per row fell by half. With #126's single chunk a
+file it takes the whole saving.
+
+---
+
 ## 2026-09-21 (insert peak) — the memory gap was a transient, and it was an ordering bug
 
 The 10M ladder that confirmed the three C++ fixes also showed C++ carrying 1,242

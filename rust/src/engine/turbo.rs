@@ -1594,6 +1594,7 @@ impl Input {
                     if json {
                         RowParser::json(
                             names.iter().map(|n| has(n).then(|| (*n).clone())).collect(),
+                            key_size,
                         )
                     } else {
                         RowParser::csv(
@@ -1809,7 +1810,7 @@ pub fn head(path: &Path, want: usize, opt: &Options) -> Result<(Vec<String>, Vec
         } => {
             let json = slab.dialect() == Dialect::Json;
             let parser = if json {
-                RowParser::json(header.iter().cloned().map(Some).collect())
+                RowParser::json(header.iter().cloned().map(Some).collect(), 0)
             } else {
                 RowParser::csv(delimiter, (0..width).map(Some).collect())
             };
