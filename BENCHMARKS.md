@@ -120,6 +120,19 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (cpp parquet append) — the same page copy, in C++
+
+The Zig (#138) and Rust (#139) entries, for the third port with the same shape.
+C++'s `read_column` did a `push_back` and two branches for every decoded value,
+including every page where all values are present. Such a page is now one
+`insert` of its indices or its slices.
+
+| 2M Parquet pair, one thread | main | this |
+|---|---:|---:|
+| instructions | 8.54 B | **7.19 B** (-16%) |
+
+---
+
 ## 2026-09-26 (rust parquet append) — Rust's page decoder pushed every value it could have copied
 
 The same callgrind comparison as the Zig entry, on the same 2M Parquet pair at
@@ -170,6 +183,18 @@ Paired, 4 vCPU Xeon @ 2.10 GHz, counts identical:
 
 | | wall [mid half] | cpu [mid half] |
 |---|---|---|
+| 2M, 15 rounds | 1.03x 1.00-1.11 | 1.06x 1.01-1.11 |
+| 10M, 9 rounds | 1.03x 1.01-1.11 | **1.10x** 1.02-1.11 |
+
+CPU moves and wall barely does on this host. The CI phase run on the Xeon
+8370C (run 36244710300) had C++'s compared-columns phase at 2.1x C's at one
+thread, where this decode runs, so that CPU is the one to confirm it on.
+What's left in the C++ profile after this: `absent` and `same` at 1.18 B
+together, called per cell without inlining, and `fold_bytes` spending 0.31 B in
+`memcpy` calls for its eight-byte loads.
+
+---
+
 | 2M, 21 rounds | 1.05x 1.02-1.13 | 1.06x 1.02-1.10 |
 | 10M, 11 rounds | 1.05x 1.02-1.11 | 1.06x 1.05-1.09 |
 
