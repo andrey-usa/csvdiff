@@ -526,7 +526,10 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
     let base = out.len();
     let want = want as usize;
     alloc::grow(out, want, "the expanded snappy page")?;
-    out.resize(base + want, 0);
+    // The page is appended rather than written into a zeroed buffer. Zeroing it
+    // first touched every expanded byte twice, and on the 2M Parquet pair it was
+    // 0.24B instructions of memset. The room is reserved above, so no append
+    // below reallocates, and `dst` is always `out.len()`.
     let mut dst = base;
     let end = base + want;
 
@@ -551,7 +554,7 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
             if at + len > input.len() || len > end - dst {
                 return Ok(false);
             }
-            out[dst..dst + len].copy_from_slice(&input[at..at + len]);
+            out.extend_from_slice(&input[at..at + len]);
             dst += len;
             at += len;
             continue;
@@ -589,28 +592,34 @@ fn snappy_append(input: &[u8], out: &mut Vec<u8>) -> Result<bool> {
             return Ok(false);
         }
         let from = dst - offset;
-        if offset >= 8 {
-            // The source of the next eight bytes is entirely behind the
-            // destination, so whole words can be moved.
-            let mut i = 0;
-            while i + 8 <= len {
-                out.copy_within(from + i..from + i + 8, dst + i);
-                i += 8;
-            }
-            while i < len {
-                out[dst + i] = out[from + i];
-                i += 1;
-            }
+        if offset >= len {
+            // The whole source is behind the destination.
+            out.extend_from_within(from..from + len);
         } else {
-            // A short distance means the copy repeats a pattern it is still
-            // writing, so it has to go a byte at a time.
-            for i in 0..len {
-                out[dst + i] = out[from + i];
+            // The copy repeats a pattern of `offset` bytes that it is still
+            // writing. Everything from `from` on is that pattern, starting in
+            // phase, and each chunk below ends on a whole number of periods, so
+            // the next chunk can take twice as much from the same start.
+            let mut left = len;
+            while left > 0 {
+                let n = left.min(out.len() - from);
+                out.extend_from_within(from..from + n);
+                left -= n;
             }
         }
         dst += len;
     }
     Ok(dst == end)
+}
+
+/// At least `n` entries in `v`, growing it only when it is shorter. What is
+/// already there is left as it is, for a caller that overwrites what it reads.
+fn fit(v: &mut Vec<i32>, n: usize, what: &str) -> Result<()> {
+    if v.len() < n {
+        alloc::grow(v, n - v.len(), what)?;
+        v.resize(n, 0);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -920,13 +929,16 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                     if 4 + dl > page_len {
                         return fail("a parquet page ends inside its levels", path);
                     }
-                    defs.clear();
-                    alloc::grow(&mut defs, n_vals, "definition levels for the page")?;
-                    defs.resize(n_vals, 0);
-                    if !RleReader::new(&body[4..4 + dl], 1).fill(&mut defs) {
+                    // Grown when a page is longer than any before it, and not
+                    // cleared: `fill` writes every entry it is given, so only
+                    // the first `n_vals` are read, and zeroing them first was
+                    // most of the 0.24B instructions of memset this function
+                    // spent on the 2M pair. The same for `idx` below.
+                    fit(&mut defs, n_vals, "definition levels for the page")?;
+                    if !RleReader::new(&body[4..4 + dl], 1).fill(&mut defs[..n_vals]) {
                         return fail("a parquet page ran out of definition levels", path);
                     }
-                    real = defs.iter().filter(|&&d| d != 0).count();
+                    real = defs[..n_vals].iter().filter(|&&d| d != 0).count();
                     vat = 4 + dl;
                 }
                 if vat > page_len {
@@ -948,10 +960,9 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                     if width > 32 {
                         return fail("a parquet dictionary index is wider than 32 bits", path);
                     }
-                    idx.clear();
-                    alloc::grow(&mut idx, real, "dictionary indices for the page")?;
-                    idx.resize(real, 0);
-                    if !RleReader::new(&body[vat + 1..], width).fill(&mut idx) {
+                    fit(&mut idx, real, "dictionary indices for the page")?;
+                    let idx = &mut idx[..real];
+                    if !RleReader::new(&body[vat + 1..], width).fill(idx) {
                         return fail("a parquet page ran out of dictionary indices", path);
                     }
                     for v in idx.iter_mut() {
@@ -966,7 +977,7 @@ pub fn read_column(data: &[u8], which: usize, path: &str) -> Result<Column> {
                     // capacity check and two branches per value. It is every
                     // page of a REQUIRED column and most of an OPTIONAL one.
                     if dictionary && real == n_vals {
-                        index.extend_from_slice(&idx);
+                        index.extend_from_slice(idx);
                     } else {
                         let mut k = 0usize;
                         for i in 0..n_vals {
@@ -1060,5 +1071,49 @@ pub fn is_parquet(path: &std::path::Path) -> bool {
     match std::fs::File::open(path) {
         Ok(mut f) => f.read_exact(&mut magic).is_ok() && &magic == b"PAR1",
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A literal of `lit`, then one two-byte-offset copy of `len` at `offset`.
+    fn stream(lit: &[u8], offset: usize, len: usize) -> Vec<u8> {
+        let mut s = vec![(lit.len() + len) as u8]; // fits one varint byte here
+        s.push(((lit.len() - 1) << 2) as u8);
+        s.extend_from_slice(lit);
+        s.push((((len - 1) << 2) | 2) as u8);
+        s.push(offset as u8);
+        s.push((offset >> 8) as u8);
+        s
+    }
+
+    fn naive(lit: &[u8], offset: usize, len: usize) -> Vec<u8> {
+        let mut v = lit.to_vec();
+        for _ in 0..len {
+            v.push(v[v.len() - offset]);
+        }
+        v
+    }
+
+    #[test]
+    fn snappy_copies_that_overlap_themselves() {
+        let lit = b"abcdefghij";
+        for offset in 1..=lit.len() {
+            for len in 1..=60 {
+                let mut out = b"prefix".to_vec();
+                assert!(snappy_append(&stream(lit, offset, len), &mut out).unwrap());
+                let mut want = b"prefix".to_vec();
+                want.extend(naive(lit, offset, len));
+                assert_eq!(out, want, "offset {offset} len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn snappy_refuses_a_copy_from_before_the_page() {
+        let mut out = b"prefix".to_vec();
+        assert!(!snappy_append(&stream(b"ab", 3, 4), &mut out).unwrap());
     }
 }
