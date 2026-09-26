@@ -120,6 +120,30 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (zig parquet threads) — Zig's Parquet path ignored `--threads` in two of its four passes
+
+Running every port with `CSVDIFF_PHASES=1` at one thread and four, Zig's
+Parquet run at `--threads 1` used 1.46 CPU-seconds in 0.66 s of wall, and its
+compared-columns phase took 0.245 s at both settings. The key-column reads
+spawned one thread per key column per side whatever `--threads` said, and the
+column pass sized itself from the CPU count. The index build and match sweep
+already honoured the flag.
+
+All four passes now take the same budget, as they do in the C, C++ and Rust
+Parquet paths. On 2M rows, 4 vCPU:
+
+| `--threads` | before, wall / cpu | after, wall / cpu |
+|---|---|---|
+| 1 | 0.661 s / 1.46 s | 1.308 s / 1.41 s |
+| 2 | 0.581 s / 1.49 s | 0.802 s / 1.47 s |
+| 4 (the default) | 0.532 s / 1.70 s | 0.527 s / 1.67 s |
+
+The default is unchanged. Nothing in the ladder passes `--threads`. The point
+is that a one-thread measurement of this port is now of one thread, which any
+scaling table depends on. Counts identical at 1 and 4 threads.
+
+---
+
 ## 2026-09-26 (speculative split) — Rust's sweep did not scale because of the step before it
 
 The Rust sweep took as long at four threads as at one on the 4M CSV pair,
