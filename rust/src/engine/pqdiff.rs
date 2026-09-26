@@ -833,7 +833,22 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
         }
     };
     let a_ways = split(ai.firsts.len());
-    let b_ways = split(bi.firsts.len());
+    // The B pass is a second full random-probed pass over A's table, and it is
+    // not what the counts come from: a key matches from either side or from
+    // neither, so the number of B's keys with an A counterpart is exactly the
+    // pair count the A pass produces, and `added` is B's distinct keys minus
+    // it. What the pass is for is the *sample* -- the report's added section
+    // names rows -- so it runs when something will read them and not otherwise.
+    //
+    // `csvdiff.cpp` has followed that rule since it was measured there, and
+    // `pqdiff.cpp` since #106. This path never asked. On a 2M Parquet pair it
+    // is the whole of the join's gap against the C port: 0.108s against 0.047s
+    // for the same answer.
+    let b_ways = if opt.row_lists {
+        split(bi.firsts.len())
+    } else {
+        0
+    };
 
     let a_range = |p: usize| -> Result<Part> {
         let mut out = Part::default();
@@ -942,6 +957,13 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     }
     drop(a_parts);
     drop(b_parts);
+
+    // Derived rather than counted when B was not walked. `held` stays empty,
+    // which is what `row_lists` being false means: the count is exact either
+    // way, and nothing will print the sample.
+    if !opt.row_lists {
+        added.total = bi.unique() - pair_a.len() as i64;
+    }
 
     let npairs = pair_a.len();
     let words = npairs.div_ceil(64);
