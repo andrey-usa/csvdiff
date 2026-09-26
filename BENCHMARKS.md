@@ -120,6 +120,191 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-24 (parallel insert) — deterministic, and it does not pay
+
+Every port builds its index the same way: find and hash the rows on every core,
+then insert them on one. The C port says why in as many words -- *"first
+occurrence wins, and which occurrence is first depends on the order rows arrive,
+so threading it would make the answer depend on the scheduler"* -- and every
+other port repeats it. The phase is a third of the run, so "insert on one core"
+is the largest deliberate serialisation in this project, and it has never been
+priced.
+
+**The determinism objection is answerable.** Partition the rows by `hash & (P-1)`
+and every occurrence of a key lands in the same partition, so first-occurrence
+still wins and file order still decides it: P sub-tables, built in parallel,
+give the same answer as one table built serially. A lookup then picks its
+sub-table from the same bits.
+
+Priced with a probe that builds the sub-tables beside the real index and drops
+them -- nothing downstream sees them -- on the 4M CSV pair at four threads,
+which is two per file:
+
+| | serial | partitioned |
+|---|---:|---:|
+| partition pass | -- | 0.05s |
+| insert | 0.24s | 0.15s |
+| **total** | **0.24s** | **0.20s** |
+
+The insert itself does parallelise -- 0.24s to 0.15s on two ways -- and the pass
+that makes it possible costs most of what that saves. At four ways on a quiet
+machine the ceiling is about 0.17s against 0.24s, which is 0.07s of a 0.62s run:
+**11%, before paying for anything.**
+
+And the thing it would have to pay for is not in the table. Every lookup on the
+join's hot path would gain a sub-table selection -- one more dependent load
+before the probe that is already the port's worst cache miss. That cost is on
+the phase this project has spent the most effort on, and 11% is not enough
+headroom to go looking for it.
+
+Not built. Recorded because the comment in four ports says the insert *cannot*
+be threaded, and that is not true -- it can, deterministically, and it is not
+worth it. Those are different reasons and the second one is the real one.
+
+---
+
+## 2026-09-24 (parquet join) — the Rust port walked B for a sample nobody asked for
+
+Parquet is the widest ratio in the published tables and nobody had looked at it:
+at ten million rows C does the CSV-equivalent work in 1.11s against Rust's 2.12s.
+Phases on a 2M pair, warm page cache, three runs each, `--summary` so the report
+is not in the number:
+
+| phase | C | Rust |
+|---|---:|---:|
+| read key columns | 0.044s | 0.024s |
+| build key indexes | 0.09s | 0.09s |
+| **join / match sweep** | **0.047s** | **0.108s** |
+| compared columns | 0.139s | 0.158s |
+
+Everything is close except one phase, and that phase is 2.3x. The first
+measurement said otherwise -- compared columns 0.269s against 0.155s -- and was
+a cold page cache on the first touch of a 160 MB file. Warm it and that gap is
+1.14x.
+
+### The B pass is for the sample, not the count
+
+A key matches from either side or from neither, so the number of B's keys with
+an A counterpart *is* the pair count the A pass already produced, and `added` is
+B's distinct keys minus it. The pass over B is a second full random-probed walk
+of A's table, and all it adds is the report's added-rows **sample**.
+
+`csvdiff.cpp` has run it only when something will print the sample since it was
+measured there, and `pqdiff.cpp` since #106 -- the comment there says so in as
+many words. The Rust port's `pqdiff.rs` never asked.
+
+Skipping it under `--summary`, `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, on this host (4 vCPU Xeon @ 2.10GHz):
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 2M x 2M | **1.15x** 1.09-1.20 | **1.18x** 1.11-1.20 |
+| 1M x 2M | **1.29x** 1.19-1.33 | **1.21x** 1.16-1.28 |
+
+The match sweep itself goes **0.108s to 0.050s**, against C's 0.047s. The second
+pair is the bigger win because the skipped pass is over twice as many keys.
+
+`bench_ab.sh --self-test` on the same pair and the same fifteen rounds puts this
+host's floor at 0.99x [0.92-1.04]. Both rows above sit clear of it -- the 2M
+pair's middle half starts at 1.09, above the floor's own upper bound -- which is
+worth stating because on the same afternoon this machine could not resolve an
+8% question at all (see the zig scan-width entry).
+
+Counts are identical, which is the thing that had to hold, and the case that
+tests it is two files of different sizes with duplicate keys on both sides:
+1,001,000 added rows derived rather than counted, and the same number either
+way. A test asserts it in both directions, and fails when the derivation is
+removed.
+
+### While measuring: the C++ summary line names the wrong engine
+
+`main.cpp` prints `| turbo <seconds>s` unconditionally, so a Parquet run reports
+`turbo`. C, Rust and Zig all print `parquet`. Nothing is wrong with the run --
+it did take the columnar path -- but the line is the first thing anyone reads
+when checking which engine a number came from.
+
+---
+
+## 2026-09-22 (summary only) — the same fault as #106, on the other side
+
+#106 found the cross-port tables timing four different tasks, because only the
+C++ port emitted row samples and every harness passed `--json` to all four. The
+fix was to stop passing it. The same fault was sitting on the other side of the
+table the whole time, and it is bigger.
+
+**The Rust port writes a report whether or not one is asked for.** Its `--out`
+defaults to `<a>__vs__<b>.html`; C, C++ and Zig write nothing without an output
+flag. Run the ladder's exact invocation in an empty directory:
+
+    C     compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    C++   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+    Rust  compare a.csv b.csv -k account_id,txn_id  ->  a__vs__b.html
+    Zig   compare a.csv b.csv -k account_id,txn_id  ->  (nothing)
+
+`ports()` knew about it and half-fixed it: `report = ["-o", "/dev/null"]`. That
+moves the *write*. The render still ran, the gzip still ran, and so did
+everything the engine does to feed them — up to `--max-rows` rows per section
+decoded into `String`s, sorted and cell-diffed, plus a walk of every duplicated
+key to build that section.
+
+### What it costs
+
+`--summary` turns all of it off: the CLI writes nothing and `opt.row_lists`
+tells the engine not to build what it would have written. Measured on this host
+(4 vCPU Xeon @ 2.80GHz, 15 GB), `scripts/bench_ab.sh`, 15 rounds interleaved,
+paired per round, against the unmodified binary:
+
+| pair | wall [mid half] | CPU [mid half] |
+|---|---|---|
+| 4M CSV, 20 columns | **1.31x** 1.28-1.34 | **1.18x** 1.16-1.19 |
+| 2M Parquet, 20 columns | **1.27x** 1.24-1.29 | **1.11x** 1.09-1.12 |
+
+Counts are identical with and without, which is the thing that had to hold: a
+section records how many rows it dropped, so the totals never depended on any of
+them being kept.
+
+### The project already had the evidence
+
+`--matrix` carried a `Rust engine` row — the same binary with `--max-rows 1` —
+and the entry at 2026-09-19 says of it, in as many words:
+
+> **Rust engine is first on csv at both sizes** -- 1.67s at 10m and 3.22s at 20m
+
+That row existed *because* someone noticed the report was in the number. It was
+in the matrix, behind a flag, while the published table kept charging it. With
+`--summary` on the main row the two measure the same thing, so the extra row is
+gone — for the reason `ports()` already gives about `csvdiff-swar`, which was
+"the same binary under a second name".
+
+### A measurement that lied, and why
+
+The first paired run of this used two one-line `bash` wrappers around one binary
+— one appending `--summary`, one not — because that is the quick way to A/B a
+flag. It reported **1.08x [1.05-1.13]** where the binary-against-binary probe
+had said 1.28x, and the `--summary` arm was bimodal: best 1.092s against a
+median of 1.289s. Timing the same two invocations directly, alternating, gave a
+flat 1400ms against 1130ms every round. The wrappers were the artifact. Building
+a second binary and comparing binaries — which is what `bench_ab.sh` is for —
+put it back at 1.31x. **Do not put a shell script between this harness and the
+thing being measured.**
+
+### What changed
+
+* `--summary` on the Rust CLI: prints the counts line and writes nothing. It
+  refuses `--out`, `--json` and `--export-dir` rather than picking a winner,
+  because guessing which was meant is how a report silently stops appearing.
+* `Options::row_lists`, defaulting to `true`, so a library caller asking for a
+  `Diff` still gets its rows. Both engines honour it, `turbo` and `pqdiff`.
+* Every port-comparison script trades `-o /dev/null` for `--summary`;
+  `gate_flags` puts the report back for the counts gate, which needs the JSON
+  document and is not timed. `report_cost.py` keeps `-o /dev/null`, since
+  pricing the report is what it is for.
+
+Every Rust row in RESULTS.md was measured the old way and is an upper bound
+until the ladder runs again.
+
+---
+
 ## 2026-09-21 (duplicate keys, C++) — the same shape, and the helper was already there
 
 `dup_section` keeps one row per duplicated key and, of that row, the key columns.

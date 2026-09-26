@@ -1392,11 +1392,25 @@ fn join(
     // Only now does anything become a String, and only for the rows kept -- but
     // "only" is up to two hundred thousand rows over twenty columns, which was
     // the last serial second of every run that renders a report.
+    //
+    // Nothing is kept when the caller asked for no rows. The picks were still
+    // collected -- they are how each part reports what it dropped, and the
+    // totals above are computed from that -- but none of them becomes a string.
     phases.mark("  merge parts (serial)");
-    let mut removed_rows = map_rows(&removed.held, threads, |p| row_values(a, ai, p.row, opt));
-    let mut added_rows = map_rows(&added.held, threads, |p| row_values(b, bi, p.row, opt));
-    let mut changed_a = map_rows(&changed.held, threads, |p| row_values(a, ai, p.row, opt));
-    let mut changed_b = map_rows(&changed.held, threads, |p| row_values(b, bi, p.mate, opt));
+    const NONE: &[Pick] = &[];
+    let (keep_removed, keep_added, keep_changed) = if opt.row_lists {
+        (
+            removed.held.as_slice(),
+            added.held.as_slice(),
+            changed.held.as_slice(),
+        )
+    } else {
+        (NONE, NONE, NONE)
+    };
+    let mut removed_rows = map_rows(keep_removed, threads, |p| row_values(a, ai, p.row, opt));
+    let mut added_rows = map_rows(keep_added, threads, |p| row_values(b, bi, p.row, opt));
+    let mut changed_a = map_rows(keep_changed, threads, |p| row_values(a, ai, p.row, opt));
+    let mut changed_b = map_rows(keep_changed, threads, |p| row_values(b, bi, p.mate, opt));
 
     phases.mark("  row values (par)");
     sort_rows(&mut removed_rows, key_size);
@@ -1478,6 +1492,16 @@ fn sort_changed_together(a: &mut Vec<Vec<Val>>, b: &mut Vec<Vec<Val>>, key_size:
 fn permute<T: Default>(v: &mut Vec<T>, order: &[usize]) {
     let mut src = std::mem::take(v);
     *v = order.iter().map(|&i| std::mem::take(&mut src[i])).collect();
+}
+
+/// The duplicate-key section a `--summary` run reports instead of building one.
+///
+/// Empty rather than absent: the section's columns are part of the contract and
+/// a reader that walks the sections should find the same shape either way.
+fn empty_section(opt: &Options) -> Section {
+    let mut cols = opt.key.clone();
+    cols.push("count".to_string());
+    Section::capped(cols, Vec::new(), opt.max_rows)
 }
 
 /// The duplicate-key section: most duplicated first, then by key.
@@ -1688,8 +1712,17 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let (b, bi) = from_b?;
     let mut phases = Phases::new("");
 
-    let dup_a = duplicate_section(&a, &ai, opt);
-    let dup_b = duplicate_section(&b, &bi, opt);
+    // Both sections are empty when the caller asked for no rows: the duplicate
+    // tallies the summary prints come off the index, not from here, and this
+    // walks every duplicated key to decode one row for each of them.
+    let (dup_a, dup_b) = if opt.row_lists {
+        (
+            duplicate_section(&a, &ai, opt),
+            duplicate_section(&b, &bi, opt),
+        )
+    } else {
+        (empty_section(opt), empty_section(opt))
+    };
     phases.mark("duplicate sections");
     let joined = join(
         &a,
