@@ -138,12 +138,12 @@ Val value_of(Cell c, const Options& o) {
     return value_of(x, o) == value_of(y, o);
 }
 
-inline bool absent(Cell c, const Options& o) {
+[[gnu::always_inline]] inline bool absent(Cell c, const Options& o) {
     if (c.null || c.n == 0) return true;
     return needs_normalising(o) && absent_normalised(c, o);
 }
 
-inline bool same(Cell x, Cell y, const Options& o) {
+[[gnu::always_inline]] inline bool same(Cell x, Cell y, const Options& o) {
     const bool xa = absent(x, o), ya = absent(y, o);
     if (xa || ya) return xa && ya;
     if (!needs_normalising(o)) return x.n == y.n && std::memcmp(x.p, y.p, x.n) == 0;
@@ -803,8 +803,12 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
     std::vector<Part> parts(ways), b_parts(b_ways);
     std::vector<std::exception_ptr> failures(ways + b_ways);
 
+    // Each range builds its Part locally and moves it into place once. The parts
+    // sit side by side in one vector, and a push_back writes the vector's end
+    // pointer on every row: filled in place, several threads' end pointers
+    // share a cache line and it bounces between their cores once a row.
     auto a_range = [&](unsigned p) {
-        Part& out = parts[p];
+        Part out;
         const std::size_t lo = ai.firsts.size() * p / ways;
         const std::size_t hi = ai.firsts.size() * (p + 1) / ways;
         out.pa.reserve(hi - lo);
@@ -825,9 +829,10 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
             out.pa.push_back(row);
             out.pb.push_back(mate);
         }
+        parts[p] = std::move(out);
     };
     auto b_range = [&](unsigned p) {
-        Part& out = b_parts[p];
+        Part out;
         const std::size_t lo = bi.firsts.size() * p / b_ways;
         const std::size_t hi = bi.firsts.size() * (p + 1) / b_ways;
         for (std::size_t at = lo; at < hi; ++at) {
@@ -840,6 +845,7 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
             ++out.total;
             if (out.held.size() <= opt.max_rows) out.held.push_back(row);
         }
+        b_parts[p] = std::move(out);
     };
     {
         auto guarded = [&](unsigned p) {
