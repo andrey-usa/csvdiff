@@ -162,6 +162,27 @@ PYEOF
   # where the join never looks at a byte after the dictionaries are mapped.
   same "a dictionary key column" "--format parquet --compression snappy" .parquet -k currency,status
 
+  # Files of different sizes, both ways round, so many keys on one side have
+  # no mate. `added` is derived rather than counted on the columnar path -- B's
+  # distinct keys minus the pairs the A pass found -- and this is where a wrong
+  # derivation would show: the CSV engine still counts it directly.
+  "$GEN" --rows 20k --out-dir "$pq" --prefix big >/dev/null
+  "$GEN" --rows 20k --out-dir "$pq" --prefix big --format parquet --compression snappy >/dev/null
+  "$GEN" --rows 7k --out-dir "$pq" --prefix small >/dev/null
+  "$GEN" --rows 7k --out-dir "$pq" --prefix small --format parquet --compression snappy >/dev/null
+  for pair in "big_a small_b" "small_a big_b"; do
+    set -- $pair
+    c=$($BIN compare "$pq/$1.csv" "$pq/$2.csv" "${K[@]}" 2>&1 | head -1 | answer)
+    p=$($BIN compare "$pq/$1.parquet" "$pq/$2.parquet" "${K[@]}" 2>&1 | head -1 | answer)
+    case "$c" in *"added 0 | removed 0"*) printf '  FAIL  %s: the pair has nothing unmatched to test\n' "$pair"; fail=1; continue ;; esac
+    if [ "$c" = "$p" ]; then
+      printf '  ok    uneven sizes, %s: %s\n' "$pair" "$p"
+    else
+      printf '  FAIL  uneven sizes, %s: csv says %s, parquet says %s\n' "$pair" "$c" "$p"; fail=1
+    fi
+  done
+  rm -f "$pq"/big_* "$pq"/small_*
+
   "$GEN" --rows 1k --out-dir "$pq" --prefix m >/dev/null
   "$GEN" --rows 1k --out-dir "$pq" --prefix m --format parquet --compression snappy >/dev/null
 

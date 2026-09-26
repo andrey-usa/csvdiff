@@ -120,6 +120,35 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (zig parquet b pass) — Zig walked B's keys through A's table to count what it already knew
+
+The CI phase runs put Zig's Parquet match sweep at twice C's join. It ran both
+directions: A's keys against B's table for the pairs, and B's keys against A's
+table only to count B's keys with no mate. That count needs no pass. A key matches
+from either side or from neither, so B's distinct keys with a mate number exactly
+the pairs the A pass found, and `added` is B's distinct keys minus that. C and C++
+run the B pass only when a report samples added rows, the Rust port stopped in
+#121, and Zig never prints row samples at all.
+
+| 2M Parquet pair | main | this |
+|---|---:|---:|
+| match sweep phase | 0.712 s | 0.391 s |
+
+Paired, 4 vCPU Xeon @ 2.10 GHz:
+
+| | wall [mid half] | cpu [mid half] |
+|---|---|---|
+| 2M, 15 rounds | **1.13x** 1.07-1.18 | 1.14x 1.12-1.21 |
+| 10M, 9 rounds | **1.19x** 1.05-1.22 | 1.23x 1.12-1.25 |
+
+Counts match C's on four pairs, including 1M against 2M both ways round, where
+1,001,000 added rows are derived rather than counted. A new case in
+`zig/test.sh` runs files of 20k and 7k rows both ways and requires the Parquet
+answer to equal the CSV engine's, which still counts `added` directly. It
+fails if the subtraction is dropped (checked by breaking it).
+
+---
+
 ## 2026-09-26 (cpp parquet cells) — the per-cell checks were calls
 
 After the page copy (#140), the next item in the C++ Parquet profile was
