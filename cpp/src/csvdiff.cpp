@@ -1643,7 +1643,13 @@ struct Capped {
     bool truncated() const { return total > static_cast<std::int64_t>(cap); }
 };
 
-// A changed row's key, and nothing else.
+// One row's key, and nothing else.
+//
+// Two callers want this: the changed rows, which carry the key beside their
+// per-cell diffs, and the duplicate-key section, which keeps one row per
+// repeated key and nothing but the key of it. The second was calling
+// `row_values` and resizing the result away, which on a twenty-column file
+// built eighteen strings per duplicated key to drop them.
 //
 // `fields_of` fills `width` fields however few the caller goes on to read, so
 // the Field buffer is full width here even though only `key_size` of them become
@@ -2221,9 +2227,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             const auto& counts = idx.occurrences();
             for (std::size_t i = 0; i < firsts.size(); ++i) {
                 if (counts[i] < 2) continue;
-                auto values = row_values(s, idx, firsts[i], width, opt);
-                values.resize(key_size);
-                all.push_back({std::move(values), static_cast<std::int64_t>(counts[i])});
+                all.push_back({key_values(s, idx, firsts[i], width, key_size, opt),
+                               static_cast<std::int64_t>(counts[i])});
             }
             std::stable_sort(all.begin(), all.end(), [&](const DupRow& x, const DupRow& y) {
                 if (x.count != y.count) return x.count > y.count;
