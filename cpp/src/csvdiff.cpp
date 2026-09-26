@@ -1248,6 +1248,16 @@ class RowIndex {
     /// The key hash the sweep computed for this row.
     std::uint64_t hash_of(int row) const { return row_hash_[static_cast<std::size_t>(row)]; }
 
+    /// Asks for the table line a later `lookup(hash)` will read first. The join
+    /// probes this table once per key of the other file, in that file's order,
+    /// so every probe is a miss on a table too big to cache -- and the hash
+    /// that decides which line is already in hand, rows ahead. The insert loop
+    /// above does the same, and so does the C port's join.
+    void prefetch(std::uint64_t hash) const { __builtin_prefetch(&table_[slot_of(hash)], 0, 0); }
+
+    /// How many rows ahead a caller of `prefetch` should look.
+    static constexpr std::size_t kLookupPrefetch = kInsertPrefetch;
+
     const std::vector<int>& first_rows() const { return first_row_; }
     const std::vector<std::uint32_t>& occurrences() const { return occurrences_; }
     std::int64_t rows() const { return rows_; }
@@ -1956,6 +1966,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         unsigned refused = 0;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
+            if (at + RowIndex::kLookupPrefetch < hi)
+                bi.prefetch(ai.hash_of(a_keys[at + RowIndex::kLookupPrefetch]));
             ai.fields_of(row, fa.data());
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
@@ -2110,6 +2122,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         const std::size_t hi = b_keys.size() * (p + 1) / b_ways;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = b_keys[at];
+            if (at + RowIndex::kLookupPrefetch < hi)
+                ai.prefetch(bi.hash_of(b_keys[at + RowIndex::kLookupPrefetch]));
             // Keys only: this pass asks whether B's key exists in A, and the
             // lookup compares key fields. The row's other nineteen columns are
             // parsed later, and only for the rows the report actually keeps.
