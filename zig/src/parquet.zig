@@ -857,9 +857,11 @@ pub fn readColumn(gpa: std.mem.Allocator, data: []const u8, which: usize) !Colum
                     // inline, and at ten million values a column that call
                     // was more of the decode than the decoding.
                     if (dictionary) try index.ensureUnusedCapacity(gpa, n_vals) else try values.ensureUnusedCapacity(gpa, n_vals);
-                    if (!optional and dictionary) {
+                    if (dictionary and real == n_vals) {
                         // Every value present and the column still indices: the
-                        // page's indices are the column's, as they are.
+                        // page's indices are the column's, as they are. That is
+                        // every page of a REQUIRED column and most of an
+                        // OPTIONAL one.
                         index.appendSliceAssumeCapacity(idx.items);
                     } else {
                         var k: usize = 0;
@@ -893,7 +895,7 @@ pub fn readColumn(gpa: std.mem.Allocator, data: []const u8, which: usize) !Colum
                     got.clearRetainingCapacity();
                     try plainSlices(gpa, body[vat..], page_base + vat, @intCast(real), &got);
                     try values.ensureUnusedCapacity(gpa, n_vals);
-                    if (!optional) {
+                    if (real == n_vals) {
                         values.appendSliceAssumeCapacity(got.items);
                     } else {
                         var k: usize = 0;
