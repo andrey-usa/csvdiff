@@ -120,6 +120,45 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-26 (json bounds) — C and C++ counted quotes in ndjson, where they mean nothing
+
+Both ports split a large file for the sweep by counting the `"` bytes before
+each nominal split: in CSV a newline inside quotes is not a row boundary, and
+the parity says whether a split point is inside a field. They did it for every
+dialect. In ndjson a raw newline cannot appear inside a string (RFC 8259 forbids
+unescaped control characters), so every newline ends a record and the count
+answers nothing. Rust and Zig already skipped it for JSON; C and C++ did not.
+
+ndjson quotes every key and most values, so the count stops every few bytes.
+On a 2M-row pair (849 MB a side, `-k account_id,txn_id -i updated_at`, four
+cores, 2.80 GHz Xeon):
+
+| | before | after |
+|---|---|---|
+| C++ `chunk bounds`, a side (`CSVDIFF_PHASES=1`) | 0.50 s | 0.000 s |
+| C `both indexes` (the count is serial and unmarked in C) | 0.83 s | 0.33 s |
+
+Paired, 15 interleaved rounds (`scripts/bench_ab.sh`), reports identical apart
+from the elapsed-seconds field:
+
+| port | wall old/new [mid half] | cpu old/new [mid half] |
+|---|---|---|
+| C (main) | **1.45x** 1.37-1.51 | 1.29x 1.18-1.34 |
+| C++ (with #125's split) | **1.66x** 1.59-1.70 | 1.36x 1.35-1.39 |
+
+The C++ number is measured on top of #125, which turns the sweep split on at
+two threads a file. On main at four cores C++ does not split (`budget >= 8`),
+so the change does nothing there until #125 merges -- but it does on any runner
+with eight or more.
+
+The count was also wrong, not only slow: an escaped `\"` toggles the parity,
+and a split whose count comes out odd walks to the end of the file looking for
+a newline outside quotes, finds none, and the chunk is dropped -- the sweep
+runs on fewer threads than it was given. The output is right either way, which
+is why no test saw it.
+
+---
+
 ## 2026-09-24 (zig split) — the sweep got slower with more threads, and it was the allocator
 
 Zig was the slowest port on the 4M CSV pair and its sweep was the whole of it.

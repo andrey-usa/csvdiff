@@ -878,6 +878,14 @@ typedef struct {
  * twice and so leaves the state alone, which is exactly right -- so the number
  * of quotes before a position says whether that position is inside a field.
  * Counting them is a scan for one byte, far cheaper than parsing.
+ *
+ * JSON needs none of that: a raw newline inside a string is not valid JSON, so
+ * every newline ends a record. Counting anyway is not only wasted -- ndjson
+ * quotes every key and most values, so the count stops every few bytes, and on
+ * a 2M-row pair it took about 0.47s a side, serially, before any thread started
+ * -- it is also wrong: an escaped `\"` toggles the parity, and a split whose
+ * count comes out odd can walk to the end of the file looking for a newline
+ * outside quotes, and the chunk is dropped.
  */
 static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_t *bounds) {
     const char *d = s->data;
@@ -899,11 +907,12 @@ static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_
      * new, so counting that and adding it keeps a running total of the quotes
      * before `nominal` for one pass in total.
      */
+    const bool json = s->dialect == DIALECT_JSON;
     size_t quotes = 0;
     size_t counted = from;
     for (unsigned i = 1; i < threads; i++) {
         const size_t nominal = from + (end - from) * i / threads;
-        for (size_t at = counted; at < nominal;) {
+        for (size_t at = counted; !json && at < nominal;) {
             const size_t q = next_of1(d, at, nominal, '"');
             if (q >= nominal) break;
             quotes++;
@@ -913,7 +922,7 @@ static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_
         bool in_quotes = (quotes & 1) != 0;
         size_t at = nominal;
         for (; at < end; at++) {
-            if (d[at] == '"') in_quotes = !in_quotes;
+            if (d[at] == '"' && !json) in_quotes = !in_quotes;
             else if (d[at] == '\n' && !in_quotes) { at++; break; }
         }
         if (at > bounds[n - 1] && at < end) bounds[n++] = at;
