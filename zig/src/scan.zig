@@ -157,7 +157,12 @@ pub const Delims = struct {
 
     /// The offset of the first byte at or after `from` that is `a` or `b`, or
     /// `end` -- the same answer `nextOf2` gives, without rescanning.
-    pub fn next(self: *Delims, from: usize) usize {
+    ///
+    /// Inline, so the cursor's state can live in registers. As a call taking
+    /// `*Delims` it lived on the stack, and a `perf` profile of the 10M CSV run
+    /// on an EPYC 7763 put this function at 17% of the time on its own. C++
+    /// measured the same cursor 10-14% faster once its state was in locals.
+    pub inline fn next(self: *Delims, from: usize) usize {
         // Matches already found and still ahead of the caller.
         while (self.bits != 0) {
             const at = self.lowest(self.bits);

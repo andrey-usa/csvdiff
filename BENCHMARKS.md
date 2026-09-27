@@ -120,6 +120,47 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (rust and zig cursor inline) — the delimiter cursor lived on the stack
+
+The C++ cursor gained 10–14% once its state moved from a struct into locals.
+A `perf` profile of every port on the 10M CSV pair (measuring branch
+`claude/csv-profile-all`, EPYC 7763) showed Rust and Zig had the same fault:
+
+- **Rust**: `Delims::next` was inlined, but `refill` was `#[inline(never)]` and
+  took `&mut self`, which put the whole cursor on the stack. The parse loop's
+  hottest instructions included reloads of `held`, `bits` and the `wide` flag
+  from `%rsp` for every field.
+- **Zig**: `Delims.next` was an ordinary function taking `*Delims`, 17% of the
+  run on its own.
+
+Both are now always inlined, so the state can stay in registers. Instructions
+on a 200k CSV pair (callgrind, x86-64-v3): Rust 668M → 635M (−5.0%), Zig 640M →
+587M (−8.3%). Output identical to main on 1,600 generated CSV comparisons per
+port (quoted fields, CRLF, ragged rows) at one and three threads; the Rust
+tests and `cargo fmt`, and Zig's unit tests and `test.sh`, pass.
+
+Zig once split its cursor into an inlined pop and a called refill, and dropped it
+because it slowed the join (noted under "zig sweep push"). That kept the refill a
+call; inlined whole, the run as a whole is faster on every runner below.
+
+`ab.yml`, 10M rows, median of 7, main run a second time as the floor:
+
+| head / main, 1 / 4 threads | runner | head | main again (floor) |
+|---|---|---|---:|
+| Rust (run 23) | EPYC 7763 | 0.939 / 0.937 | 0.996 / 1.005 |
+| Rust (run 24) | EPYC 7763 | 0.955 / 0.933 | 1.002 / 1.002 |
+| Rust (run 25) | EPYC 7763 | 0.942 / 0.987 | 0.994 / 1.053 |
+| Zig (run 26) | EPYC 9V74 | 0.911 / 0.942 | 1.003 / 1.002 |
+| Zig (run 27) | Xeon 8370C | 0.927 / 0.910 | 0.997 / 0.999 |
+| Zig (run 28) | EPYC 7763 | 0.941 / 0.970 | 0.993 / 1.010 |
+
+Rust 4.5–6% faster at one thread and about 6% at four; run 25's four-thread
+floor was itself 5% off and is not counted. Zig 6–9% at one thread and 3–9% at
+four. On the 7763 the one-thread CSV now reads about C 1.95 s, C++ 2.05 s, Zig
+2.06 s, Rust 2.09–2.16 s.
+
+---
+
 ## 2026-09-27 (cpp wide row skip) — the sweep skipped each CSV row sixteen bytes at a time
 
 Once the sweep's key-only parse has its two keys, the rest of the row -- about
