@@ -275,6 +275,62 @@ std::size_t skip_quoted(std::string_view d, std::size_t from, std::size_t end) {
     }
 }
 
+// The proof's byte span without parsing the row: through the delimiter that
+// closes source column `commas - 1`, which is the `commas`th delimiter from the
+// row start -- countable with the delimiter cursor alone, skipping a quoted
+// field whole the way `parse_csv` does. The join used to parse every column of
+// every row of A to read that one offset off the guard field. Returns 0 where
+// the row ends first -- a short row, or a malformed one -- and the caller
+// parses instead.
+//
+// The count is exact on well-formed rows: a field that opens with a quote is
+// skipped whole, so a delimiter inside one is never counted, and a quote
+// anywhere else is data, as the parse treats it. Where the bytes are not well
+// formed the span can only come out short of where the parse would put it, and
+// a short span fails the proof or falls back; it never proves a row the parse
+// would not. The C port has the same function (#178).
+std::size_t guard_span(std::string_view d, std::size_t lo, std::size_t hi, char delim,
+                       std::size_t commas) {
+#if defined(__AVX2__)
+    // The cursor `parse_csv` keeps, and for the same reason in locals.
+    std::size_t held = lo, scanned = lo;
+    std::uint32_t bits = 0;
+    const __m256i va = _mm256_set1_epi8(delim), vb = _mm256_set1_epi8('\n');
+    const auto next_delim = [&](std::size_t from) __attribute__((always_inline)) {
+        while (bits) {
+            const std::size_t at = held + static_cast<std::size_t>(std::countr_zero(bits));
+            bits &= bits - 1;
+            if (at >= from) return at;
+        }
+        std::size_t at = std::max(from, scanned);
+        for (; at + 32 <= hi; at += 32) {
+            const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
+            const auto hits = static_cast<std::uint32_t>(_mm256_movemask_epi8(
+                _mm256_or_si256(_mm256_cmpeq_epi8(w, va), _mm256_cmpeq_epi8(w, vb))));
+            scanned = at + 32;
+            if (hits) {
+                held = at;
+                bits = hits & (hits - 1);
+                return at + static_cast<std::size_t>(std::countr_zero(hits));
+            }
+        }
+        const std::size_t next = next_of2(d, at, hi, delim, '\n');
+        scanned = next < hi ? next + 1 : hi;
+        return next;
+    };
+#else
+    const auto next_delim = [&](std::size_t from) { return next_of2(d, from, hi, delim, '\n'); };
+#endif
+    std::size_t at = lo;
+    for (std::size_t i = 0; i < commas; ++i) {
+        const std::size_t cur =
+            at < hi && d[at] == '"' ? next_delim(skip_quoted(d, at + 1, hi)) : next_delim(at);
+        if (cur >= hi || d[cur] != delim) return 0;
+        at = cur + 1;
+    }
+    return at - lo;
+}
+
 // ---------------------------------------------------------------------------
 // The mapped file
 // ---------------------------------------------------------------------------
@@ -1473,6 +1529,9 @@ class RowIndex {
                     proven = true;
                     return candidate;
                 }
+                // No fields: the caller has not parsed its row and will check
+                // this candidate's keys itself after it does.
+                if (!fields) return candidate;
                 keys_of(candidate, probe);
                 bool ok = true;
                 for (std::size_t i = 0; i < key_size_ && ok; ++i)
@@ -2075,6 +2134,11 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         for (std::size_t i = 0; keys_in_proof && i < key_size; ++i)
             keys_in_proof = a_src[i] >= 0 && a_src[i] == b_src[i] && a_src[i] < a_src[width - 1];
     }
+    // How many delimiters from a CSV row's start close its guard column: where
+    // `guard_span` can find the proof's span without the parse. 0 where it
+    // cannot -- JSON, or keys the proof does not cover.
+    const std::size_t guard_commas =
+        keys_in_proof && !json_proof ? static_cast<std::size_t>(a_src[width - 1]) + 1 : 0;
 
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
@@ -2216,12 +2280,41 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             const int row = a_keys[at];
             if (at + RowIndex::kLookupPrefetch < hi)
                 bi.prefetch(ai.hash_of(a_keys[at + RowIndex::kLookupPrefetch]));
+            const bool attempt = refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0;
+            // The proof's span without the parse: the guard's delimiter sits a
+            // fixed count from the row start. Most rows prove out here and never
+            // pay for their fields; a row the bytes do not settle is parsed
+            // below, looked up again by its keys -- which also covers the hash
+            // collision `lookup_proof` passed over -- and compared.
+            bool spanned = false;
+            if (guard_commas && attempt) {
+                const std::size_t a_lo = ai.row_begin(row);
+                const std::size_t span =
+                    guard_span(a.bytes(), a_lo, ai.row_end(row), a_delim, guard_commas);
+                if (span) {
+                    bool proven = false;
+                    const int mate = bi.lookup_proof(a, nullptr, ai.hash_of(row), probe.data(),
+                                                     a.bytes().data() + a_lo, span, false, proven);
+                    if (mate < 0) {
+                        ++out.removed_total;
+                        if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
+                        continue;
+                    }
+                    if (proven) {
+                        ++out.matched;
+                        refused = 0;
+                        continue;
+                    }
+                    if (refused < kProofBackoff) ++refused;
+                    spanned = true;
+                }
+            }
             ai.fields_of(row, fa.data());
             // How many bytes of A's row prove the whole row, keys included --
             // through the byte that closes the last value either file wants --
             // or 0 where this row cannot be proven that way.
             std::size_t need = 0;
-            if (keys_in_proof && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+            if (keys_in_proof && !spanned && attempt) {
                 const char* d = a.bytes().data();
                 const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
                 std::size_t t = a_lo;
@@ -2272,8 +2365,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             // the mate's whole row to compare its keys, and a proof after that
             // saves only the column comparison. Same proof, different place,
             // because the surrounding code differs.
-            if (!need && json_proof &&
-                (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+            if (!need && json_proof && attempt) {
                 const char* d = a.bytes().data();
                 const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
                 const std::size_t b_lo = bi.row_begin(mate);
@@ -2302,7 +2394,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             // where every row really has changed pay for it on every row -- so
             // after kProofBackoff failures in a row it is only attempted every
             // kProofBackoff rows, until one succeeds and it is on again.
-            if (!need && aligned && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+            if (!need && !spanned && aligned && attempt) {
                 const Field g = fa[width - 1];
                 if (is_real(g)) {
                     const char* d = a.bytes().data();

@@ -120,6 +120,35 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp guard span) — the C++ join stopped parsing rows the proof settles
+
+The C change below, ported. `a_range` called `fields_of` on every row of A
+before the byte proof; now `guard_span` counts `a_src[width-1]+1` delimiters
+from the row start with the same local-variable AVX2 cursor `parse_csv` keeps
+(an `#else` falls back to `next_of2`), `lookup_proof` takes a null `fields` to
+mean "first hash match, unproven", and only a row the bytes do not settle is
+parsed and looked up again with the key check. On only where `keys_in_proof`
+holds on CSV; ndjson and a guard that ends the row take the old path.
+
+Instructions on the 200k CSV pair: **608M → 501M (−17.7%)** (callgrind,
+x86-64-v3, clang). Output identical to main on 11,780 generated comparisons --
+CSV from both generators and ndjson, keyed alone and with the last or a middle
+column ignored, at one and three threads, for an AVX2 clang build and a
+baseline x86-64 gcc build; the 36 `cpp/test.sh` checks pass.
+
+`ab.yml`, 10M rows, median of 7, main run a second time as the floor:
+
+| head / main, 1 / 4 threads | runner | head | main again (floor) |
+|---|---|---|---:|
+| run 32 | Xeon 8370C | **0.903 / 0.877** | 0.995 / 1.003 |
+| run 33 | EPYC 7763 | **0.907 / 0.929** | 1.007 / 1.007 |
+| run 34 | EPYC 7763 | **0.910 / 0.927** | 1.006 / 0.999 |
+
+9–10% at one thread on both CPUs; 7–12% at four. On the 7763 C++ goes from
+2.03 s to 1.84 s at one thread.
+
+---
+
 ## 2026-09-27 (c guard span) — the join stopped parsing rows the proof settles
 
 The join parsed every row of A in full before trying the byte proof, though the
