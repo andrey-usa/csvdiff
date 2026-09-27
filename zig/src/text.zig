@@ -196,6 +196,29 @@ fn nameHash(s: []const u8) u64 {
     return h ^ (h >> 31);
 }
 
+/// Whether two names are the same bytes, inline and a word at a time.
+/// `std.mem.eql` was a call per member of every ndjson row -- the guessed
+/// slot, the table probe and the `null` test -- and a sixth of the run's
+/// instructions. Names are short, so the words overlap rather than loop far.
+inline fn sameName(a: []const u8, b: []const u8) bool {
+    const n = a.len;
+    if (n != b.len) return false;
+    if (n >= 8) {
+        var i: usize = 0;
+        while (i + 8 < n) : (i += 8) {
+            if (std.mem.readInt(u64, a[i..][0..8], .little) != std.mem.readInt(u64, b[i..][0..8], .little))
+                return false;
+        }
+        return std.mem.readInt(u64, a[n - 8 ..][0..8], .little) == std.mem.readInt(u64, b[n - 8 ..][0..8], .little);
+    }
+    if (n >= 4) {
+        return std.mem.readInt(u32, a[0..4], .little) == std.mem.readInt(u32, b[0..4], .little) and
+            std.mem.readInt(u32, a[n - 4 ..][0..4], .little) == std.mem.readInt(u32, b[n - 4 ..][0..4], .little);
+    }
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+
 /// Splits rows into fields, projecting straight to the columns asked for.
 ///
 /// The CSV form is addressed by column number: once the last needed column has
@@ -329,7 +352,7 @@ pub const RowParser = union(enum) {
                 const i = self.slots[at];
                 if (i < 0) return null;
                 const name = self.wanted[@intCast(i)];
-                if (name != null and std.mem.eql(u8, name.?, key)) return @intCast(i);
+                if (name != null and sameName(name.?, key)) return @intCast(i);
                 at = (at + 1) & self.slot_mask;
             }
         }
@@ -530,11 +553,11 @@ pub const RowParser = union(enum) {
                 // brace or space.
                 const from = pos;
                 while (pos < end and d[pos] != ',' and d[pos] != '}' and !jsonSpace(d[pos])) pos += 1;
-                if (!std.mem.eql(u8, d[from..pos], "null")) field = f.pack(from, pos - from, false);
+                if (!sameName(d[from..pos], "null")) field = f.pack(from, pos - from, false);
             }
             if (field) |value| {
                 const hit: ?usize = if (guess < self.wanted.len and self.wanted[guess] != null and
-                    std.mem.eql(u8, self.wanted[guess].?, key))
+                    sameName(self.wanted[guess].?, key))
                     (if (self.canon[guess] >= 0) @as(usize, @intCast(self.canon[guess])) else null)
                 else
                     self.slotFor(key);
@@ -565,7 +588,6 @@ pub const RowParser = union(enum) {
         }
         return endOfJsonRow(d, pos, end);
     }
-
 };
 
 /// A header name is one of the few strings this engine owns; there is one per
