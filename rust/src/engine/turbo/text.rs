@@ -163,6 +163,10 @@ pub(super) fn json_header(slab: &Slab, path: &Path) -> Result<Vec<String>> {
 
 /// Skips one JSON string starting at its opening quote, returning the offset one
 /// past the closing quote and whether the string holds a backslash.
+// Inlined: the JSON parse calls it for every key and every string value --
+// a hundred million calls on the 2M ndjson pair, each a few dozen
+// instructions of which the call was a fair share.
+#[inline(always)]
 fn skip_json_string(data: &[u8], mut at: usize, end: usize) -> (usize, bool) {
     at += 1; // the opening quote
     let mut escaped = false;
