@@ -120,6 +120,43 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp delimiter cursor, fourth try) — C++ CSV 10–14% faster at one thread
+
+A `perf` profile on an EPYC 7763 (10M CSV, one thread, measuring branch
+`claude/cpp-csv-profile`) put 1.61 s of C++'s 2.93 s of CPU in `parse_csv`,
+against 1.32 s for C's `parse_csv_row` and its `next_of2` -- most of the 0.45 s
+between the two ports. The parsers are line for line the same but for one
+thing: C finds field ends with the delimiter cursor (one 32-byte load, the
+unreturned matches held as bits), and C++ scans sixteen bytes afresh per field.
+
+C++ had tried that cursor three times and dropped it ("cpp single slot" below:
+the AVX2 window made the join 10–15% *slower* on the 7763 and the 9V74). Each of those kept the cursor's state in a struct. A struct of
+`std::size_t` is a type every `Field` (`std::uint64_t`) store into `out` may
+alias, so the compiler has to reload it after each store. This version is the
+same cursor with its state in locals inside `parse_csv`, whose address never
+escapes, reached through an always-inlined lambda. Without AVX2 the lambda is
+the old `next_of2` call.
+
+`parse_csv` instructions −5.8% on a 200k pair (callgrind, x86-64-v3). Output
+identical to main on 2,000 generated CSV comparisons -- quoted fields holding
+delimiters, newlines and doubled quotes, CRLF, ragged rows -- at one and three
+threads; `cpp/test.sh` passes; it builds with clang, with gcc, and without AVX2.
+
+`ab.yml`, 10M rows, median of 7, main run a second time as the floor:
+
+| head / main, 1 / 4 threads | runner | head | main again (floor) |
+|---|---|---|---:|
+| run 17 | EPYC 7763 | **0.888** / 1.020 | 0.992 / 0.994 |
+| run 18 | EPYC 7763 | **0.897** / 1.013 | 1.005 / 1.004 |
+| run 19 | Xeon 8370C | **0.856** / 0.977 | 1.009 / 1.001 |
+
+One thread is 10–14% faster everywhere. The 7763 now measures 2.09–2.13 s against
+C's 1.92 s, where main measured 2.33–2.40 s. At four threads the Xeon gains 2%
+and the 7763 loses 1–2%, a little outside its floor. That loss is not
+explained here.
+
+---
+
 ## 2026-09-27 (compact ndjson separators, every port) — 2–10% on ndjson
 
 All four JSON parsers walked a member the same way: skip space, look for `}`,
