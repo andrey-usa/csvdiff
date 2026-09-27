@@ -89,8 +89,10 @@ static bool field_real(Field f) { return f != ABSENT && f != TOO_LONG; }
 /* for either. ndjson's fields are longer, so the scan was already finding hits */
 /* in one step, and the columnar path does not come through here at all.        */
 /*                                                                             */
-/* `next_of1` is left as SWAR on purpose. It did not appear in the profile, and */
-/* an unmeasured second copy of this is complexity with no number behind it.    */
+/* `next_of1` was left as SWAR because it did not appear in the CSV profile.   */
+/* ndjson is where it shows: once the key-only parse has its keys, the rest of  */
+/* a two-hundred-byte row is one scan for its newline, and that SWAR loop was   */
+/* 16% of the instructions on a 2m-row ndjson pair. It takes the same steps.    */
 /* ------------------------------------------------------------------------- */
 
 #define ONES UINT64_C(0x0101010101010101)
@@ -218,8 +220,29 @@ static inline size_t delims_next(Delims *c, size_t from) {
 }
 
 static size_t next_of1(const char *d, size_t from, size_t end, char t) {
-    uint64_t bt = broadcast((unsigned char)t);
     size_t at = from;
+    /* The same steps as `next_of2`, chosen the same way. */
+#if defined(__AVX2__)
+    {
+        const __m256i vt = _mm256_set1_epi8(t);
+        for (; at + 32 <= end; at += 32) {
+            const __m256i w = _mm256_loadu_si256((const __m256i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(w, vt));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+#if defined(__SSE2__)
+    {
+        const __m128i vt = _mm_set1_epi8(t);
+        for (; at + 16 <= end; at += 16) {
+            const __m128i w = _mm_loadu_si128((const __m128i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(w, vt));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+    uint64_t bt = broadcast((unsigned char)t);
     for (; at + 8 <= end; at += 8) {
         uint64_t w = load64(d + at);
         uint64_t hits = match_bits(w, bt);
