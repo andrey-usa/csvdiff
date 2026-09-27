@@ -120,6 +120,34 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp inline name compare) — C++'s ndjson called memcmp for every member name
+
+The same call C and Zig just lost: the JSON parse checked each member's name
+against its guessed slot with `std::string == std::string_view`, a `memcmp` of
+run-time length and so a libc call for every member of every row — 48M on a 2M
+ndjson pair, 0.96B instructions with the call. The same inline `same_name` now
+compares overlapping words; the table probe uses it too.
+
+callgrind, 2M ndjson pair, one thread: 16.32B → **15.10B (−7.5%)**. Output
+identical to main on 3,000 generated ndjson pairs at one and three threads;
+`cpp/test.sh` passes.
+
+CI, `phases.yml`, 10M ndjson, EPYC 7763 (branch runs 149 and 150; main run 146):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** C++ wall, 1 / 4 threads | 5.491 / 3.084 s | **4.815–4.825 / 2.643–2.683 s** | C 5.455 → 5.444–5.454 s, Rust 5.230 → 5.219–5.227 s, Zig 5.418 → 5.414–5.425 s |
+| C++ join and compare | 4.518 s | **3.890–3.893 s** | |
+
+C++ is 12% faster at one thread and 13% at four, against controls flat to
+0.2%. That is well beyond the instruction count; callgrind counts neither
+branch mispredictions nor stalls, and the call is the likelier place for those
+than the inline compare, but that was not measured. C++ is now the quickest
+port on ndjson. Two earlier branch runs drew processors main did not (9V74 run 145,
+8573C run 147).
+
+---
+
 ## 2026-09-27 (zig inline name compare) — Zig's ndjson called std.mem.eql for every member name
 
 Zig's JSON parse compared each member's name with `std.mem.eql` — for the
