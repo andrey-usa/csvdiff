@@ -44,9 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      # The workflow's own ref, for the tooling -- this file, the scripts and
+      # the setup actions. Head and base are built in worktrees of their own,
+      # since either may predate the tooling.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.head }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
@@ -65,6 +67,7 @@ jobs:
       - name: Build head, base and the generator
         env:
           PORT: ${{ inputs.port }}
+          HEAD_REF: ${{ inputs.head }}
           BASE: ${{ inputs.base }}
         run: |
           set -eu
@@ -75,13 +78,16 @@ jobs:
             zig)  bin=zig/zig-out/bin/csvdiff ;;
             *)    echo "unknown port $PORT" >&2; exit 2 ;;
           esac
-          ref=$(git rev-parse --verify -q "origin/$BASE" || git rev-parse --verify "$BASE")
-          git worktree add --detach /tmp/base "$ref"
-          echo "base $BASE = $ref, head = $(git rev-parse HEAD)"
-          # The generator comes from the head tree, and is the Rust port's.
-          targets=$PORT
-          [ "$PORT" = rust ] || targets="$PORT rust"
-          scripts/build_ports.sh $targets
+          resolve() { git rev-parse --verify -q "origin/$1^{commit}" || git rev-parse --verify "$1^{commit}"; }
+          head=$(resolve "$HEAD_REF")
+          base=$(resolve "$BASE")
+          echo "head $HEAD_REF = $head"
+          echo "base $BASE = $base"
+          git worktree add --detach /tmp/head "$head"
+          git worktree add --detach /tmp/base "$base"
+          # The generator is the Rust port's, built from the workflow's ref.
+          scripts/build_ports.sh rust
+          (cd /tmp/head && scripts/build_ports.sh "$PORT")
           (cd /tmp/base && scripts/build_ports.sh "$PORT")
           cp "/tmp/base/$bin" /tmp/base-again
           echo "BIN=$bin" >> "$GITHUB_ENV"
@@ -94,12 +100,13 @@ jobs:
           THREADS: ${{ inputs.threads }}
           ROUNDS: ${{ inputs.rounds }}
         run: |
+          set -o pipefail
           extra=()
           # Rust writes a report unless told not to; the others write nothing.
           [ "$PORT" = rust ] && extra=(--extra=--summary)
           python3 scripts/variants_ab.py --rows "$ROWS" --format "$FORMAT" \
             --threads "$THREADS" --rounds "$ROUNDS" "${extra[@]}" \
-            "$PORT base=/tmp/base/$BIN" "$PORT head=$BIN" "$PORT base-again=/tmp/base-again" \
+            "$PORT base=/tmp/base/$BIN" "$PORT head=/tmp/head/$BIN" "$PORT base-again=/tmp/base-again" \
             | tee /tmp/ab.txt
           {
             echo "## A/B — $PORT, $ROWS rows, $FORMAT"
