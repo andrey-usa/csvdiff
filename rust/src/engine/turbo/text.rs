@@ -340,9 +340,9 @@ fn name_hash(s: &[u8]) -> u64 {
 /// slots can agree on how many without agreeing on which. JSON has no such
 /// prefix -- its keys may come in any order -- so it never qualifies.
 ///
-/// Returns the slot holding the last wanted column, and the delimiter that ends
-/// it.
-pub(super) fn shared_tail(a: &RowParser, b: &RowParser) -> Option<(usize, u8)> {
+/// Returns the slot holding the last wanted column, the delimiter that ends
+/// it, and its column number in the file.
+pub(super) fn shared_tail(a: &RowParser, b: &RowParser) -> Option<(usize, u8, usize)> {
     match (a, b) {
         (
             RowParser::Csv {
@@ -356,7 +356,7 @@ pub(super) fn shared_tail(a: &RowParser, b: &RowParser) -> Option<(usize, u8)> {
                 slots_for: fb,
                 ..
             },
-        ) if da == db && fa == fb => fa[*la].first().map(|slot| (*slot as usize, *da)),
+        ) if da == db && fa == fb => fa[*la].first().map(|slot| (*slot as usize, *da, *la)),
         _ => None,
     }
 }

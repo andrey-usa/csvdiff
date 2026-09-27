@@ -402,6 +402,47 @@ pub(super) fn skip_quoted(data: &[u8], from: usize, end: usize) -> usize {
     }
 }
 
+/// Where source column `column` of the row at `lo` ends, found without parsing
+/// the row: the byte after its last one, which is the delimiter or newline that
+/// closes it, or `end` where nothing does. `None` where the row runs out first.
+///
+/// The join's byte proof needs only this one offset, and it used to parse every
+/// wanted column of every row of A to read it off the last field. Counting
+/// delimiters with the parse's own cursor, skipping a field that opens with a
+/// quote whole as the parse does, finds the same byte. The C and C++ ports have
+/// the same function (#178).
+///
+/// Exact on well-formed rows. Where the bytes are not well formed the answer can
+/// only be short of the parse's, and a proof over a short run either fails or
+/// holds for a mate whose bytes are the same through it -- whose parse is then
+/// the same as this row's, since it reads the same bytes the same way.
+pub(super) fn guard_span(
+    data: &[u8],
+    lo: usize,
+    end: usize,
+    delimiter: u8,
+    column: usize,
+) -> Option<usize> {
+    let mut delims = Delims::new(data, lo, end, delimiter, b'\n');
+    let mut at = lo;
+    let mut i = 0;
+    loop {
+        let cur = if at < end && data[at] == b'"' {
+            delims.next(skip_quoted(data, at + 1, end))
+        } else {
+            delims.next(at)
+        };
+        if i == column {
+            return Some(cur);
+        }
+        if cur >= end || data[cur] != delimiter {
+            return None;
+        }
+        at = cur + 1;
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

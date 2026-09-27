@@ -44,7 +44,7 @@ mod thrift;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
+use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, guard_span, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
     RowParser, csv_header, detect_delimiter, json_header, json_tail_is_clean, shared_tail,
@@ -716,6 +716,38 @@ impl RowIndex {
         }
     }
 
+    /// `lookup` for a caller that has not parsed its row: the first row whose
+    /// key hash is `hash`, and whether it opens with exactly `bytes` as
+    /// `row_matches` asks. A row that does has the same keys, so the answer is
+    /// final; one that does not may still be the mate, or a hash collision
+    /// ahead of it, and the caller parses its row and asks `lookup`. `None` is
+    /// final either way: no row with this hash has this key.
+    fn lookup_bytes(
+        &self,
+        side: &Side,
+        hash: u64,
+        bytes: &[u8],
+        delimiter: u8,
+    ) -> Option<(i32, bool)> {
+        let mut slot = self.slot(hash);
+        loop {
+            let word = self.table[slot];
+            if word == EMPTY_SLOT {
+                return None;
+            }
+            if tag_is(word, hash) {
+                let candidate = self.first_row[pos_of(word)];
+                if self.row_hash[candidate as usize] == hash {
+                    return Some((
+                        candidate,
+                        self.row_matches(side, candidate, bytes, delimiter),
+                    ));
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
     /// Whether `candidate`'s row opens with exactly `bytes` and names nothing this
     /// run tracks in what follows.
     ///
@@ -1321,35 +1353,74 @@ fn join(
             if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
                 bi.prefetch(ai.row_hash[soon as usize]);
             }
-            ai.fields_of(a, row, &mut fa);
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             let hash = ai.row_hash[row as usize];
+            // The proof before the parse: the run ends a fixed number of
+            // delimiters into the row, and most rows prove out on it and never
+            // pay for their fields. A row the bytes do not settle is parsed
+            // below and looked up by its keys, which also covers a hash
+            // collision `lookup_bytes` stopped at. Backed off like the JSON
+            // proof, so two files whose rows all differ pay for the parse only.
+            let mut spanned = false;
+            if let Some((_, delimiter, column)) = span_tail
+                && (refused < PROOF_BACKOFF || i & (PROOF_BACKOFF - 1) == 0)
+            {
+                let data = a.slab.data();
+                let from = ai.row_at[row as usize] as usize;
+                let end = row_end(ai, row, data.len());
+                if let Some(to) = guard_span(data, from, end, delimiter, column) {
+                    match bi.lookup_bytes(b, hash, &data[from..to], delimiter) {
+                        None => {
+                            out.removed_total += 1;
+                            if exporting || out.removed.len() <= cap {
+                                out.removed.push(Pick { row, mate: -1 });
+                            }
+                            continue;
+                        }
+                        Some((mate, true)) => {
+                            out.matched += 1;
+                            mark(mate);
+                            refused = 0;
+                            continue;
+                        }
+                        Some((_, false)) => {
+                            if refused < PROOF_BACKOFF {
+                                refused += 1;
+                            }
+                            spanned = true;
+                        }
+                    }
+                }
+            }
+            ai.fields_of(a, row, &mut fa);
             // `fb` is the lookup's scratch, and on a hit it already holds the
             // mate's fields: that is what the key columns were matched against.
             // A's row up to the end of the last column either file wants. The
             // end has to be a boundary in A as well: a quoted field ends on its
             // closing quote, and what follows is not part of the run.
-            let csv_span = span_tail.and_then(|(slot, delimiter)| {
-                let f = fa[slot];
-                if !field::is_real(f) {
-                    return None;
-                }
-                let data = a.slab.data();
-                let from = ai.row_at[row as usize] as usize;
-                let to = field::offset_of(f) + field::len_of(f);
-                if to < from || to > data.len() {
-                    return None;
-                }
-                if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
-                    return None;
-                }
-                Some(Proof::Csv {
-                    bytes: &data[from..to],
-                    delimiter,
-                })
-            });
+            let csv_span = span_tail
+                .filter(|_| !spanned)
+                .and_then(|(slot, delimiter, _)| {
+                    let f = fa[slot];
+                    if !field::is_real(f) {
+                        return None;
+                    }
+                    let data = a.slab.data();
+                    let from = ai.row_at[row as usize] as usize;
+                    let to = field::offset_of(f) + field::len_of(f);
+                    if to < from || to > data.len() {
+                        return None;
+                    }
+                    if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
+                        return None;
+                    }
+                    Some(Proof::Csv {
+                        bytes: &data[from..to],
+                        delimiter,
+                    })
+                });
             // Through the byte that closes the last value either file wants --
             // whichever it turns out to be, since two objects need not list their
             // names in the same order. `width` and not `nc`: the keys have to be
