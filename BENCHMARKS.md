@@ -120,6 +120,35 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp wide row skip) — the sweep skipped each CSV row sixteen bytes at a time
+
+Once the sweep's key-only parse has its two keys, the rest of the row -- about
+150 bytes of the twenty-column pair -- is skipped to its newline by
+`end_of_row`, which called `next_of2` for `\n` or `"`. `next_of2` steps sixteen
+bytes: right for the field-sized scans that are most of its calls, and ten steps
+for this one. `end_of_row` now takes a 32-byte AVX2 step of its own
+(`next_row_break`), the width C's `next_of2` uses everywhere and C++'s own
+`next_of1` uses for the ndjson row end; `next_of2` is unchanged.
+
+Instructions −3.9% on a 200k CSV pair (callgrind, x86-64-v3). Output identical to
+main on 2,000 generated CSV comparisons (quoted fields, CRLF, ragged rows) at
+one and three threads; `cpp/test.sh` passes; it builds with clang, gcc, and
+without AVX2.
+
+`ab.yml`, 10M rows, median of 7; all three runs drew an EPYC 7763:
+
+| head / main, 1 / 4 threads | head | main again (floor) |
+|---|---|---:|
+| run 20 | 0.977 / 0.967 | 1.003 / 0.997 |
+| run 21 | 0.977 / 0.970 | 0.994 / 0.995 |
+| run 22 | 0.976 / 0.966 | 0.998 / 1.002 |
+
+2.3% at one thread and 3.0–3.4% at four, which more than returns the 1–2% the
+delimiter cursor cost this CPU at four threads. C++'s CSV on the 7763 is now
+2.04–2.06 s at one thread.
+
+---
+
 ## 2026-09-27 (cpp delimiter cursor, fourth try) — C++ CSV 10–14% faster at one thread
 
 A `perf` profile on an EPYC 7763 (10M CSV, one thread, measuring branch

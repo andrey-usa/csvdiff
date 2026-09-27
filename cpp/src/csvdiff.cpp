@@ -1160,10 +1160,30 @@ class RowParser {
         }
     }
 
+    // The rest of a row once its last needed column is read -- on twenty
+    // columns keyed on two, the sweep's key-only parse skips about 150 bytes
+    // here per row. `next_of2` steps sixteen bytes, which is right for the
+    // field-sized scans that are most of its calls and slow for this one, so
+    // this span gets a 32-byte step of its own where the build has AVX2 -- the
+    // width C's `next_of2` takes everywhere, and C++'s `next_of1` for the
+    // ndjson row end.
+    static std::size_t next_row_break(std::string_view d, std::size_t at, std::size_t end) {
+#if defined(__AVX2__)
+        const __m256i vn = _mm256_set1_epi8('\n'), vq = _mm256_set1_epi8('"');
+        for (; at + 32 <= end; at += 32) {
+            const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
+            const auto hits = static_cast<std::uint32_t>(
+                _mm256_movemask_epi8(_mm256_or_si256(_mm256_cmpeq_epi8(w, vn), _mm256_cmpeq_epi8(w, vq))));
+            if (hits) return at + static_cast<std::size_t>(std::countr_zero(hits));
+        }
+#endif
+        return next_of2(d, at, end, '\n', '"');
+    }
+
     static std::size_t end_of_row(std::string_view d, std::size_t pos, std::size_t end) {
         std::size_t at = pos;
         while (at < end) {
-            const std::size_t next = next_of2(d, at, end, '\n', '"');
+            const std::size_t next = next_row_break(d, at, end);
             if (next >= end) return end;
             if (d[next] == '"') {
                 at = skip_quoted(d, next + 1, end);
