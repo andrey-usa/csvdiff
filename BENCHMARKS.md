@@ -120,6 +120,50 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (zig scan32 default) — Zig scanned eight bytes where every other port scanned thirty-two
+
+Zig's scan step was eight bytes of SWAR on every build; `-Dscan=32` put the same
+question to an AVX2 register but was left off, because on the local host it
+measured **bimodal** — four runs at parity, six 20% slower (the entry below,
+"Zig's scan step"). That measurement predates #143, which stopped A's and B's
+sweeps writing their key buffers into one cache line; the bimodality is gone
+with it. `build.zig` now picks 32 bytes wherever the target has AVX2 — which
+`zig build` does, since it targets the host — and SWAR everywhere else
+(`-Dcpu=baseline`, aarch64). `-Dscan` still overrides. The width also sets the
+Parquet mismatch-mask scan in `pqdiff.zig`.
+
+CI, `phases.yml`, 10M rows, grouped by CPU (branch runs 76–80, 83–84 against
+main's runs on the same processor; the other ports are the controls):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** CSV wall, 1 / 4 threads | 2.67–2.74 / 1.60–1.61 s | **2.239–2.356 / 1.403–1.473 s** | C 2.34–2.39 → 2.370–2.472 s, Rust 2.39–2.43 → 2.417–2.536 s |
+| CSV sweep, a side | 0.66–0.69 s | **0.493–0.508 s** | |
+| CSV join, 1 thread | 1.75–1.78 s | **1.481–1.533 s** | |
+| **EPYC 9V45** CSV wall, 1 / 4 threads | 1.819–1.876 / 1.024–1.055 s | **1.673 / 1.002 s** | Rust 1.568–1.594 / 0.956–0.983 → 1.605 / 0.981 s |
+| CSV sweep, a side | 0.400–0.407 s | **0.306 s** | |
+| **EPYC 7763** ndjson wall, 1 / 4 threads | 5.816 / 3.468 s | **5.427–5.469 / 3.072–3.106 s** | C 7.175 → 7.156–7.213 s, Rust 6.322 → 6.271–6.326 s |
+| ndjson sweep, a side | 1.046 s | **0.817 s** | |
+| **EPYC 7763** Parquet wall, 1 / 4 threads | 2.445 / 1.330 s | 2.470–2.498 / 1.355–1.363 s | C 2.521 → 2.530–2.555 s |
+
+CSV 13–17% faster at one thread and 8–12% at four, ndjson 6–7% and 10–11%; the
+sweep 22–27% faster on both formats and every CPU. Parquet moved with its
+controls (+1%): the mismatch mask is not where that path spends its time.
+Locally (the host that measured the bimodal split), nine interleaved rounds on
+the 10M CSV pair: one thread wall 1.14x [1.11–1.15], four threads 1.06x
+[1.05–1.11], no split.
+
+The ladder's `Zig v32` row (`-Dscan=32 -Dcpu=native`) is now the same build as
+`Zig` on every AVX2 runner.
+
+**A correction to the entry above.** It says Rust's stock build "tried the SSE2
+window too, and measured nothing either way (runs 64–66)". CI never ran that
+window: `scripts/build_ports.sh` builds Rust with `-C target-cpu=x86-64-v3` on
+x86 unless `RUSTFLAGS` is given, so those runs took the AVX2 path both before
+and after the change. The SSE2 window was not measured, on CI or anywhere.
+
+---
+
 ## 2026-09-27 (cpp single slot) — C++ walked a slot list for every field
 
 Two lines at the top of callgrind's C++ CSV profile, neither of them the work:

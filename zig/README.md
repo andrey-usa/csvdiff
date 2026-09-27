@@ -77,9 +77,10 @@ asked to produce. The Rust row is the only one that is not comparing like with
 like — its default run renders the report the other two do not produce at all,
 and that is the 0.8s between its two rows. Zig still holds the least memory.
 
-`-Dscan=32` builds the same engine with a 32-byte vector scanner instead of
-SWAR, which is worth about 7% at ten million rows on a runner with AVX2; the
-numbers and the reasoning are in the root README.
+The scanner is a 32-byte vector wherever the build targets a CPU with AVX2 --
+which `zig build` does by default, since it targets the host -- and SWAR
+everywhere else (`-Dcpu=baseline`, aarch64). `-Dscan=8`, `32` or `64` picks one
+explicitly; the numbers are in BENCHMARKS.md.
 
 ## Input formats
 
@@ -88,7 +89,7 @@ magic number, a leading `{`, or a CSV header.
 
 | Format | How it is read |
 |---|---|
-| CSV | mapped, scanned eight bytes at a time; a field is an offset and a length |
+| CSV | mapped, scanned 32 bytes at a time (8 without AVX2); a field is an offset and a length |
 | newline-delimited JSON | the same, addressed by key rather than by column number; `\uXXXX` is decoded, so a character written escaped and the same character written literally compare equal |
 | Parquet | pages decoded into an arena taken from the same allocator; a field is an offset into it, and a dictionary-encoded column points *at the dictionary entry* |
 
@@ -141,7 +142,7 @@ refused by name instead.
 
 | File | What it holds |
 |---|---|
-| `src/scan.zig` | delimiter scanning: SWAR, or a vector register with `-Dscan=32`/`64` |
+| `src/scan.zig` | delimiter scanning: a vector register where the target has one, SWAR otherwise |
 | `src/field.zig` | the packed field word |
 | `src/slab.zig` | the bytes a field points into, and how they are unescaped |
 | `src/text.zig` | the CSV and newline-delimited JSON readers |

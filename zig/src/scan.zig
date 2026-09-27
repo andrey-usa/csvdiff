@@ -10,8 +10,8 @@ const build_options = @import("build_options");
 
 /// How many bytes a scan step takes. Eight is SWAR -- ordinary 64-bit
 /// arithmetic, no CPU feature at all -- and 32 or 64 puts the same question to a
-/// vector register, which on x86 is AVX2 or AVX-512 as long as the build targets
-/// a CPU that has them (`zig build -Dscan=32 -Dcpu=native`).
+/// vector register, which on x86 is AVX2 or AVX-512. `build.zig` picks 32 when
+/// the target has AVX2 and 8 otherwise; `-Dscan` overrides it.
 ///
 /// It is a build option rather than a runtime switch because a benchmark of an
 /// instruction set should not be measuring a function pointer, and because each
