@@ -120,6 +120,33 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp wide next_of1) — C++ found ndjson's row ends eight bytes at a time too
+
+The same gap #155 closed in C. C++'s `next_of1` had AVX2 and AVX-512 steps only
+in the opt-in scanner builds (`-DCSVDIFF_SCAN_*`), and `next_of2`'s default
+SSE2 rung was never given to it, so the stock build fell straight to eight-byte
+SWAR. Its hot caller is the ndjson row end: once the key-only parse has its
+keys, the rest of a two-hundred-byte row is one scan for the newline. It now
+takes a 32-byte step wherever the build has AVX2 — the Makefile builds
+`-march=native`, so every runner — and a 16-byte SSE2 step below that.
+
+Output identical to main on 1,800 generated pairs at one and three threads,
+with and without `--trim --ignore-case`; `cpp/test.sh` passes.
+
+CI, `phases.yml`, 10M ndjson on an **AMD EPYC 7763** (run 106 against main's
+run 109 on the same processor):
+
+| AMD EPYC 7763 | main | this | controls, main → this |
+|---|---:|---:|---|
+| C++ ndjson wall, 1 / 4 threads | 5.781 / 3.306 s | **5.528 / 3.007 s** | C 6.052 → 5.986 s, Rust 6.306 → 6.284 s, Zig 5.484 → 5.434 s |
+| C++ ndjson sweep, a side | 1.072–1.082 s | **0.841–0.859 s** | |
+
+The sweep 21% faster; the run 4% at one thread and 9% at four, against
+controls that moved 1% the same way. The other two runs landed on a 9V74 and
+an 8370C, where main has no run of this commit to pair with.
+
+---
+
 ## 2026-09-27 (cpp proof before probe) — the same reordering, in C++
 
 C++ had C's order: `lookup` parsed the mate's keys and compared them, and the
