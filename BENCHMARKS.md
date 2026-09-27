@@ -120,6 +120,32 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (clang 23 for c++, latest lockfile) — lockfile taken, C++ stays on clang 22
+
+LLVM 23.1 is out (23.1.2, packaged on apt.llvm.org for noble), so the C++ port
+was built with `clang++-23` in place of `setup-cc`'s clang 22, on a branch that
+also carried `cargo update` (cc 1.5.1, find-msvc-tools 0.1.14, js-sys and the
+wasm-bindgen crates 0.2.129 — build-time or wasm-only). C stayed on gcc 16; Rust
+and Zig were the controls. 10M rows, `phases.yml`:
+
+| **EPYC 7763** | clang 22 (main) | clang 23 | controls, main → branch |
+|---|---:|---:|---|
+| C++, CSV, 1 / 4 threads (run 190 → 192, 193) | 2.336 / 1.258 s | 2.403–2.424 / 1.338–1.348 s | C 1.933 → 1.917–1.935 s, Rust 2.214 → 2.225–2.229 s, Zig 2.202 → 2.189–2.209 s |
+| C++, ndjson, 1 / 4 threads (run 191 → 194, 195) | 4.765 / 2.723 s | 4.873–4.893 / 2.931–2.997 s | C 5.245 → 5.247–5.284 s, Rust 5.312 → 5.267–5.307 s, Zig 5.298 → 5.329–5.344 s |
+
+With every control within 1%, clang 23 makes the C++ port 3–4% slower on CSV at
+one thread and 7% at four, and 2–3% slower on ndjson at one thread and 8–10% at
+four; the loss sits in "join and compare" (CSV 1.684 → 1.726–1.731 s at one
+thread, ndjson 1.865 → 2.054–2.056 s at four). The first two branch runs drew a
+9V74 and a Xeon 8573C with no main run to pair against and are left out.
+
+So `setup-cc` keeps clang 22 for C++, and the lockfile update goes in: the Rust
+port is flat with it, as expected. Every other toolchain and dependency was
+already on its latest release — gcc 16 (16.2), Rust 1.98.1, Zig 0.16.0, every
+direct crate and every GitHub Action.
+
+---
+
 ## 2026-09-27 (zig cc for c and c++) — measured, and not adopted
 
 An experiment: the C and C++ ports compiled with Zig 0.16's bundled toolchain —
