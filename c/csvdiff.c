@@ -152,6 +152,71 @@ static size_t next_of2(const char *d, size_t from, size_t end, char a, char b) {
     return end;
 }
 
+/*
+ * A left-to-right cursor over one row's delimiters, for a vector step only.
+ *
+ * `next_of2` starts a fresh scan at every field: two broadcasts, then a
+ * thirty-two-byte load of which a ten-byte field uses the first ten, and the
+ * next field loads most of the same bytes again. Fields are found strictly in
+ * order, so the cursor keeps the chunk's unreturned matches instead and every
+ * byte of the row is loaded once. The Rust and Zig ports measured the same
+ * cursor 15.0% and 12.9% faster at this width, and slower at SWAR's eight
+ * bytes, where a step rarely spans a field boundary and there is nothing to
+ * keep -- so without AVX2 `delims_next` is `next_of2` and the cursor is inert.
+ *
+ * `delims_next` takes the position to resume from rather than assuming the
+ * last answer, because a quoted field is walked by `skip_quoted` and the
+ * cursor has to drop the matches inside its body.
+ */
+typedef struct {
+    const char *d;
+    size_t      end;
+    char        a, b;
+    size_t      held;    /* where the held chunk begins */
+    uint32_t    bits;    /* its matches not yet returned, one bit per byte */
+    size_t      scanned; /* the first byte no chunk has covered */
+} Delims;
+
+static void delims_init(Delims *c, const char *d, size_t from, size_t end, char a, char b) {
+    c->d = d;
+    c->end = end;
+    c->a = a;
+    c->b = b;
+    c->held = from;
+    c->bits = 0;
+    c->scanned = from;
+}
+
+static inline size_t delims_next(Delims *c, size_t from) {
+#if defined(__AVX2__)
+    while (c->bits) {
+        const size_t at = c->held + (size_t)__builtin_ctz(c->bits);
+        c->bits &= c->bits - 1;
+        if (at >= from) return at;
+    }
+    size_t at = from > c->scanned ? from : c->scanned;
+    const __m256i va = _mm256_set1_epi8(c->a), vb = _mm256_set1_epi8(c->b);
+    for (; at + 32 <= c->end; at += 32) {
+        const __m256i w = _mm256_loadu_si256((const __m256i *)(c->d + at));
+        const uint32_t hits = (uint32_t)_mm256_movemask_epi8(
+            _mm256_or_si256(_mm256_cmpeq_epi8(w, va), _mm256_cmpeq_epi8(w, vb)));
+        c->scanned = at + 32;
+        if (hits) {
+            /* `at` is never below `from`, so every match in the chunk counts. */
+            c->held = at;
+            c->bits = hits & (hits - 1);
+            return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+    /* The last few bytes of the file: plain scanning, and nothing held. */
+    const size_t next = next_of2(c->d, at, c->end, c->a, c->b);
+    c->scanned = next < c->end ? next + 1 : c->end;
+    return next;
+#else
+    return next_of2(c->d, from, c->end, c->a, c->b);
+#endif
+}
+
 static size_t next_of1(const char *d, size_t from, size_t end, char t) {
     uint64_t bt = broadcast((unsigned char)t);
     size_t at = from;
@@ -789,6 +854,8 @@ static size_t parse_csv_row(const RowParser *p, const char *d, size_t start, siz
     for (size_t i = 0; i < slots; i++) out[i] = ABSENT;
     size_t pos = start;
     int column = 0;
+    Delims delims;
+    delims_init(&delims, d, start, end, p->delimiter, '\n');
 
     while (pos <= end) {
         Field field;
@@ -796,11 +863,11 @@ static size_t parse_csv_row(const RowParser *p, const char *d, size_t start, siz
         if (pos < end && d[pos] == '"') {
             size_t close = skip_quoted(d, pos + 1, end);
             size_t body_end = close > pos + 1 ? close - 1 : pos + 1;
-            next = next_of2(d, close, end, p->delimiter, '\n');
+            next = delims_next(&delims, close);
             field = pack(pos + 1, body_end - (pos + 1),
                          next_of1(d, pos + 1, body_end, '"') < body_end);
         } else {
-            next = next_of2(d, pos, end, p->delimiter, '\n');
+            next = delims_next(&delims, pos);
             size_t stop = next;
             if (stop > pos && d[stop - 1] == '\r') stop--; /* CRLF behaves like LF */
             field = pack(pos, stop - pos, false);

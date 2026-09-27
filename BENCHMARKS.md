@@ -120,6 +120,45 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c delim cursor) — C scanned every field from scratch
+
+A time profile on the CI machine itself found this. `phases.yml` on a measuring
+branch ran `perf record -e cpu-clock` over each port at one thread on the 10M
+CSV pair (the runners expose no hardware counters, but the software clock is
+enough). On the EPYC 7763, C spent **62% of its time finding field ends**:
+`parse_csv_row` 36%, and an out-of-line `next_of2` 26% — one call per field,
+two broadcasts, and a 32-byte AVX2 load of which a ten-byte field uses ten, with
+the next field loading most of the same bytes again. Rust and Zig have a cursor
+for exactly this (`Delims`), measured 15.0% and 12.9% faster at a 32-byte step;
+C never got one. It has one now, used under AVX2 only (C builds `-march=native`,
+so that is every CI runner); without it, `delims_next` is `next_of2`.
+
+Output identical to main on 1,400 generated CSV pairs — quoted fields holding
+delimiters, newlines and doubled quotes, CRLF, ragged rows — at one and three
+threads; `c/test.sh` and the 95 cross-port cases pass.
+
+CI, `phases.yml`, 10M CSV, grouped by CPU (runs 58–60 against main's runs 54
+and 55 on the same processors; the other ports are the controls):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** C wall, 1 thread | 2.752 s | **2.340 / 2.370 s** | Rust 2.487 → 2.394 / 2.414 s, C++ 3.076 → 2.930 / 2.935 s |
+| C join, 1 thread | 2.169 s | **1.785 / 1.796 s** | |
+| C wall, 4 threads | 1.625 s | **1.491 / 1.518 s** | Rust 1.570 → 1.520 / 1.545 s |
+| **EPYC 9V74** C wall, 1 / 4 threads | 2.272 / 1.215 s | **1.909 / 1.144 s** | Rust 2.073 / 1.311 → 2.059 / 1.304 s |
+
+The controls moved 1–4%; C moved 14–16% at one thread and 6–8% at four, and is
+now the quickest port at both thread counts on both processors. Locally (an
+AVX-512 host with a 260 MB L3, nine interleaved rounds): one thread CPU 1.07x
+[1.06–1.11], four threads 1.16x [1.06–1.20].
+
+**Why the join and not only the sweep.** The join parses every A row in full —
+twenty fields — to find the keys, the proof's guard column and the compared
+values, and parses the mate's too when the proof fails. That is where most of
+the per-field scans were; the sweep's key-only parse stops after two fields.
+
+---
+
 ## 2026-09-26 (adopt sweep lists) — Zig and Rust copied every row's address and hash twice
 
 The sweep builds, per chunk, the list of every row's offset and key hash in file
