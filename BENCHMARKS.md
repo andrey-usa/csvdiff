@@ -120,6 +120,35 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp hash tail) — C++ copied each key's last word into a buffer
+
+The fix Rust took in #159, in C++: `hash_bytes` built a key's last partial word
+by `memcpy` into a zeroed buffer, a copy of run-time length and so a libc call —
+two a row, 8M on a 2M CSV pair. It now uses `tail_word`, which makes the same
+word from loads inside the bytes, as the C, Rust and Zig ports already do. The
+word's value is unchanged, so the hash still agrees with the escaped branch of
+`hash_field`, which assembles it byte by byte.
+
+callgrind, 2M CSV pair, one thread: 6.526B → **6.390B (−2.1%)**. Locally inside
+the floor. Output identical to main on 2,880 generated CSV and 600 ndjson pairs
+at one and three threads; `cpp/test.sh` passes.
+
+CI, `phases.yml`, 10M CSV, EPYC 7763 (branch runs 129, 135 and 137; main run
+138):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** C++ wall, 1 thread | 2.436 s | **2.340 / 2.375 / 2.386 s** | C 1.957 → 1.933–1.991 s, Rust 2.253 → 2.219–2.279 s, Zig 2.221 → 2.189–2.250 s |
+| C++ sweep, a side | 0.551–0.553 s | **0.452–0.479 s** | |
+| C++ join and compare | 1.694 s | 1.693–1.707 s | |
+
+The sweep hashes every key of both files and is where the call was: 13–18%
+quicker. The wall at one thread is 2.5–4% quicker against controls within
+1.5%; at four threads (1.336 s on main, 1.306–1.351 s here) it is inside the
+noise. The join also hashes the probe keys, but there the saving does not show.
+
+---
+
 ## 2026-09-27 (c inline json string) — C's ndjson paid the same call Rust did
 
 The same call as Rust's, one layer down: `skip_json_string` stepped over each
