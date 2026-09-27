@@ -120,6 +120,64 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c inline name compare) — C's ndjson called memcmp for every member name
+
+The JSON parse checks each member's name against the slot it guesses comes
+next, and C did it with `memcmp` of a run-time length — a libc call through the
+PLT for every member of every row, 48.5M calls on a 2M ndjson pair. A small
+inline `same_name` now compares the name as two overlapping words (four-byte
+words, or bytes, for a shorter name); the table probe uses it too.
+
+callgrind, 2M ndjson pair, one thread: 15.05B → **13.98B (−7.1%)**. Locally
+1.04x, inside the floor. Output identical to main on 3,000 generated ndjson
+pairs at one and three threads; `c/test.sh` passes.
+
+CI, `phases.yml`, 10M ndjson, EPYC 7763, branch runs 139 and 141 against main
+runs 140 and 142 — all four on the same processor:
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** C wall, 1 / 4 threads | 5.658–5.672 / 3.115 s | **5.448–5.497 / 2.909–2.961 s** | C++ 5.489–5.504 → 5.507–5.574 s, Rust 5.215–5.233 → 5.223–5.285 s, Zig 5.417–5.428 → 5.427–5.474 s |
+| C join and compare | 4.731–4.741 s | **4.521–4.549 s** | |
+
+C is 3.4% faster at one thread and 5.8% at four, against controls within 1%.
+
+The same change in Rust was tried and dropped: its `==` on slices is also a
+`memcmp` call, but inlined with bounds checks it cost about as much (14.85B →
+14.71B, and 14.86B for a two-window variant), so there was nothing to measure.
+Zig's version is measured separately.
+
+---
+
+## 2026-09-27 (cpp hash tail) — C++ copied each key's last word into a buffer
+
+The fix Rust took in #159, in C++: `hash_bytes` built a key's last partial word
+by `memcpy` into a zeroed buffer, a copy of run-time length and so a libc call —
+two a row, 8M on a 2M CSV pair. It now uses `tail_word`, which makes the same
+word from loads inside the bytes, as the C, Rust and Zig ports already do. The
+word's value is unchanged, so the hash still agrees with the escaped branch of
+`hash_field`, which assembles it byte by byte.
+
+callgrind, 2M CSV pair, one thread: 6.526B → **6.390B (−2.1%)**. Locally inside
+the floor. Output identical to main on 2,880 generated CSV and 600 ndjson pairs
+at one and three threads; `cpp/test.sh` passes.
+
+CI, `phases.yml`, 10M CSV, EPYC 7763 (branch runs 129, 135 and 137; main run
+138):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** C++ wall, 1 thread | 2.436 s | **2.340 / 2.375 / 2.386 s** | C 1.957 → 1.933–1.991 s, Rust 2.253 → 2.219–2.279 s, Zig 2.221 → 2.189–2.250 s |
+| C++ sweep, a side | 0.551–0.553 s | **0.452–0.479 s** | |
+| C++ join and compare | 1.694 s | 1.693–1.707 s | |
+
+The sweep hashes every key of both files and is where the call was: 13–18%
+quicker. The wall at one thread is 2.5–4% quicker against controls within
+1.5%; at four threads (1.336 s on main, 1.306–1.351 s here) it is inside the
+noise. The join also hashes the probe keys, but there the saving does not show.
+
+---
+
 ## 2026-09-27 (c inline json string) — C's ndjson paid the same call Rust did
 
 The same call as Rust's, one layer down: `skip_json_string` stepped over each

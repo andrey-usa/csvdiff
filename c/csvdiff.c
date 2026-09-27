@@ -713,6 +713,33 @@ static bool parser_index_columns(RowParser *p) {
     return true;
 }
 
+/*
+ * Whether two names of length n are the same bytes, inline and a word at a
+ * time. The JSON parse checks its guessed slot for every member of every row,
+ * and as a `memcmp` of run-time length that was a libc call each time -- 48M
+ * calls on a 2M ndjson pair. Names are short, so the words overlap rather than
+ * loop far.
+ */
+static inline bool same_name(const char *a, const char *b, size_t n) {
+    if (n >= 8) {
+        size_t i = 0;
+        for (; i + 8 < n; i += 8)
+            if (load64(a + i) != load64(b + i)) return false;
+        return load64(a + n - 8) == load64(b + n - 8);
+    }
+    if (n >= 4) {
+        uint32_t a0, a1, b0, b1;
+        memcpy(&a0, a, 4);
+        memcpy(&b0, b, 4);
+        memcpy(&a1, a + n - 4, 4);
+        memcpy(&b1, b + n - 4, 4);
+        return a0 == b0 && a1 == b1;
+    }
+    for (size_t i = 0; i < n; i++)
+        if (a[i] != b[i]) return false;
+    return true;
+}
+
 static uint64_t name_hash(const char *p, size_t n) {
     uint64_t a = 0, b = 0;
     if (n >= 8) {
@@ -769,7 +796,7 @@ static int parser_slot_for(const RowParser *p, const char *key, size_t len) {
     for (;;) {
         const NameSlot *e = &p->slot[at];
         if (e->idx < 0) return -1;
-        if (e->hash == h && e->len == len && memcmp(p->want[e->idx], key, len) == 0)
+        if (e->hash == h && e->len == len && same_name(p->want[e->idx], key, len))
             return (int)e->idx;
         at = (at + 1) & p->slot_mask;
     }
@@ -847,7 +874,7 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
         if (!absent) {
             int slot;
             if (guess < p->want_n && p->want[guess] && p->want_len[guess] == key_len &&
-                memcmp(p->want[guess], d + key_from, key_len) == 0)
+                same_name(p->want[guess], d + key_from, key_len))
                 slot = p->want_slot[guess];
             else
                 slot = parser_slot_for(p, d + key_from, key_len);
