@@ -564,23 +564,30 @@ impl RowParser {
         pos += 1;
 
         loop {
-            while pos < end && json_space(data[pos]) {
+            // Compact ndjson separates members with a bare `,"`, which goes
+            // straight to the next key; the general path takes the comma, loops
+            // back and skips space twice to get there.
+            if pos + 1 < end && data[pos] == b',' && data[pos + 1] == b'"' {
                 pos += 1;
-            }
-            if pos >= end {
-                break;
-            }
-            match data[pos] {
-                b'}' => {
+            } else {
+                while pos < end && json_space(data[pos]) {
                     pos += 1;
+                }
+                if pos >= end {
                     break;
                 }
-                b',' => {
-                    pos += 1;
-                    continue;
+                match data[pos] {
+                    b'}' => {
+                        pos += 1;
+                        break;
+                    }
+                    b',' => {
+                        pos += 1;
+                        continue;
+                    }
+                    b'"' => {}
+                    _ => break, // malformed: stop reading this object
                 }
-                b'"' => {}
-                _ => break, // malformed: stop reading this object
             }
             let key_from = pos + 1;
             let key_end = skip_json_string(data, pos, end).0;
@@ -589,18 +596,23 @@ impl RowParser {
             }
             let key = &data[key_from..key_end - 1];
             pos = key_end;
-            while pos < end && json_space(data[pos]) {
+            // And `":"` between a key and a string value, likewise.
+            if pos + 1 < end && data[pos] == b':' && data[pos + 1] == b'"' {
                 pos += 1;
-            }
-            if pos >= end || data[pos] != b':' {
-                break;
-            }
-            pos += 1;
-            while pos < end && json_space(data[pos]) {
+            } else {
+                while pos < end && json_space(data[pos]) {
+                    pos += 1;
+                }
+                if pos >= end || data[pos] != b':' {
+                    break;
+                }
                 pos += 1;
-            }
-            if pos >= end {
-                break;
+                while pos < end && json_space(data[pos]) {
+                    pos += 1;
+                }
+                if pos >= end {
+                    break;
+                }
             }
 
             let field = if data[pos] == b'"' {
