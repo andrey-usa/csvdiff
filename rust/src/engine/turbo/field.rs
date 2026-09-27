@@ -210,6 +210,13 @@ impl<'a> Delims<'a> {
 
     /// The offset of the first byte at or after `from` that is `a` or `b`, or
     /// `end` -- the same answer [`next_of2`] gives, without rescanning.
+    ///
+    /// The held matches are the common answer -- a 32-byte chunk covers three
+    /// or four fields -- so that part is inlined into the parse loop and only a
+    /// new chunk is a call. As one function it was not inlined at all: 1.24B of
+    /// the CSV run's 7.1B instructions were this function, most of them the
+    /// call and the few lines below.
+    #[inline(always)]
     pub(super) fn next(&mut self, from: usize) -> usize {
         while self.bits != 0 {
             let at = self.lowest(self.bits);
@@ -218,6 +225,13 @@ impl<'a> Delims<'a> {
                 return at;
             }
         }
+        self.refill(from)
+    }
+
+    /// `next` once the held matches are spent: scans on from `from`, or from the
+    /// first byte no chunk has covered, whichever is later.
+    #[inline(never)]
+    fn refill(&mut self, from: usize) -> usize {
         let mut at = from.max(self.scanned);
         #[cfg(all(
             target_arch = "x86_64",

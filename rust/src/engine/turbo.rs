@@ -287,11 +287,13 @@ fn hash_bytes(bytes: &[u8], seed: u64) -> u64 {
         // is where the table's slot comes from.
         h ^= h >> 29;
     }
-    let tail = &bytes[bytes.len() - bytes.len() % 8..];
-    if !tail.is_empty() {
-        let mut word = [0u8; 8];
-        word[..tail.len()].copy_from_slice(tail);
-        h = (h ^ u64::from_le_bytes(word)).wrapping_mul(PRIME);
+    let rem = bytes.len() % 8;
+    if rem != 0 {
+        // The Parquet path's `tail_word`: the zero-padded tail from loads that
+        // stay inside the bytes, rather than a copy of a run-time length --
+        // a `memcpy` call per key column of every row of both files. It is the
+        // word the escaped branch of `hash_field` assembles byte by byte.
+        h = (h ^ super::pqdiff::tail_word(bytes, rem)).wrapping_mul(PRIME);
         h ^= h >> 29;
     }
     h

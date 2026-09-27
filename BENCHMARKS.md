@@ -120,6 +120,45 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (rust hash tail and cursor inline) — two calls Rust's CSV run made for nothing
+
+callgrind on Rust's CSV run (x86-64-v3, as CI builds it) against C's: 7.11B
+instructions to C's 5.63B, and two of the lines at the top were calls rather
+than work.
+
+- **`hash_bytes`** built a key's last partial word by copying the tail into a
+  zeroed buffer — a copy of a run-time length, so a `memcpy` call per key column
+  of every row of both files. It now uses the Parquet path's `tail_word`, which
+  makes the same word from loads that stay inside the bytes. It is the same
+  word, so the hash is unchanged and still agrees with the escaped branch of
+  `hash_field`, which assembles it byte by byte.
+- **`Delims::next`** — the delimiter cursor — was one large function the parse
+  loop called for every field, though most calls only pop a match the last
+  32-byte chunk already found (a chunk covers three or four fields). That part
+  is now inlined; only a new chunk is a call. 1.24B instructions had been this
+  function.
+
+callgrind, 2M CSV pair, one thread: 7.110B → **6.674B (−6.1%)**. Locally the
+clock did not show it (1.01x, inside the floor); CI did. Output identical to
+main on 1,800 generated pairs at one and three threads; `cargo test` passes.
+
+CI, `phases.yml`, 10M CSV, grouped by CPU (runs 110, 111, 113; main's run 112
+and earlier runs on the same processors):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **Xeon 8573C** Rust wall, 1 / 4 threads | 2.719 / 1.702 s | **2.668 / 1.613 s** | C 2.318 → 2.373 s, C++ 2.947 → 3.010 s, Zig 2.631 → 2.699 s |
+| Rust sweep, a side | 0.531 s | **0.476–0.478 s** | |
+| **EPYC 7763** Rust wall, 1 / 4 threads | 2.405–2.455 / 1.557–1.563 s | **2.243 / 1.417 s** | C 1.967 → 1.951 s, Zig 2.232–2.238 → 2.234 s |
+| Rust sweep, a side | 0.55–0.56 s | **0.436–0.439 s** | |
+| **EPYC 9V74** Rust wall, 1 thread | 2.153 s | **1.969 s** | Zig 2.193 → 2.097 s |
+
+On the one pair from the same run of machines, the 8573C, Rust moved 2% faster
+while every control moved 2–3% slower; on the 7763 it is 7% at one thread and
+9% at four against flat controls, the sweep a fifth quicker.
+
+---
+
 ## 2026-09-27 (cpp wide next_of1) — C++ found ndjson's row ends eight bytes at a time too
 
 The same gap #155 closed in C. C++'s `next_of1` had AVX2 and AVX-512 steps only
