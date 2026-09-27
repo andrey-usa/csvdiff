@@ -1520,6 +1520,11 @@ static bool json_tail_is_clean(const RowParser *p, const char *d, size_t at, siz
  * compared as `index_lookup` does. `*proven` says which of the two found it,
  * and a proven mate needs no comparing either: every compared column is inside
  * the same bytes.
+ *
+ * `fields` may be NULL, when the caller has the span but has not parsed the
+ * row: then a candidate the bytes do not settle is returned unproven, and the
+ * caller parses and re-looks-up with the key check, which also covers the
+ * hash-collision case the deferred check would have continued past.
  */
 static int32_t index_lookup_proof(const RowIndex *ix, const Slab *other, const Field *fields,
                                   uint64_t hash, Field *probe, const char *a_row, size_t need,
@@ -1540,6 +1545,7 @@ static int32_t index_lookup_proof(const RowIndex *ix, const Slab *other, const F
                 *proven = true;
                 return candidate;
             }
+            if (!fields) { *proven = false; return candidate; }
             index_keys(ix, candidate, probe);
             bool ok = true;
             for (size_t i = 0; i < ix->key_size && ok; i++) {
@@ -1606,6 +1612,10 @@ typedef struct {
      * objects, where the span is taken over every wanted value; on CSV when
      * every key sits at the same column in both files, before the guard. */
     bool            keys_in_proof;
+    /* Delimiters from the row start to the one that ends the guard column, so
+     * the join can count the proof's span without parsing the row. Only for
+     * the aligned CSV proof; 0 disables it. */
+    int             guard_commas;
 } CmpCtx;
 
 /*
@@ -1641,6 +1651,44 @@ static void compare_mate(const CmpCtx *c, CmpPart *out, int32_t mate) {
         }
     }
     if (any) out->changed++;
+}
+
+/*
+ * The proof's byte span without parsing the row.
+ *
+ * `proof_span` reads it off the guard field's packed offsets, which means
+ * parsing every column first -- and the join parses all ten million rows of A
+ * that way, though the proof only needs one offset: through the delimiter
+ * that ends the guard column. The guard is source column `guard_src`, so its
+ * end is the (`guard_src`+1)th delimiter from the row start -- countable with
+ * the delimiter cursor alone, skipping a quoted field the way the row parse
+ * does, and without packing a field or walking the slot map. Returns 0 when
+ * the row ends first -- a short row, or a malformed one -- which falls back
+ * to the parse.
+ *
+ * The count is exact on well-formed rows: a field that opens with a quote is
+ * skipped whole, so a comma inside one is never counted, and a quote anywhere
+ * else is data, exactly as the row parse treats it. Where the bytes are not
+ * well-formed the span can only come out short of the row end, and a short
+ * span fails the proof's length check and falls back -- it never proves.
+ */
+static size_t guard_span(const char *d, size_t lo, size_t hi, char delim, int commas) {
+    size_t at = lo;
+    Delims c;
+    delims_init(&c, d, lo, hi, delim, '\n');
+    for (int i = 0; i < commas; i++) {
+        size_t cur;
+        if (at < hi && d[at] == '"') {
+            const size_t close = skip_quoted(d, at + 1, hi);
+            cur = delims_next(&c, close);
+        } else {
+            cur = delims_next(&c, at);
+        }
+        if (cur >= hi || d[cur] != delim) return 0;
+        at = cur + 1;
+        if (i == commas - 1) return cur + 1 - lo;
+    }
+    return 0;
 }
 
 /*
@@ -1698,8 +1746,40 @@ static void compare_part(void *vctx, unsigned p) {
                     &c->bi->table[slot_of(c->bi,
                                           c->ai->row_hash[c->ai->first_row[k + PREFETCH_AHEAD]])],
                     0, 0);
-            index_fields(c->ai, row, out->fa);
             const bool attempt = refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0;
+            /*
+             * The proof's span without the parse: the guard's delimiter sits a
+             * fixed count past the keys, countable with the delimiter cursor
+             * alone. Most rows prove out here and never pay for fields; a row
+             * the bytes do not settle is parsed below.
+             */
+            if (attempt && c->guard_commas > 0) {
+                const size_t a_lo = (size_t)c->ai->row_start[row];
+                const size_t need = guard_span(c->a->data, a_lo, row_end(c->ai, row),
+                                               c->delim, c->guard_commas);
+                if (need) {
+                    bool proven = false;
+                    const int32_t mate = index_lookup_proof(
+                        c->bi, c->a, NULL, hash, out->probe,
+                        c->a->data + a_lo, need, false, &proven);
+                    if (mate < 0) { out->removed++; continue; }
+                    if (proven) { out->matched++; refused = 0; continue; }
+                    /*
+                     * A candidate the bytes did not settle: parse and let the
+                     * key check confirm it, which also covers the hash
+                     * collision the deferred check skipped past.
+                     */
+                    index_fields(c->ai, row, out->fa);
+                    const int32_t mate2 =
+                        index_lookup(c->bi, c->a, out->fa, hash, out->probe);
+                    if (mate2 < 0) { out->removed++; continue; }
+                    out->matched++;
+                    if (refused < PROOF_BACKOFF) refused++;
+                    compare_mate(c, out, mate2);
+                    continue;
+                }
+            }
+            index_fields(c->ai, row, out->fa);
             const size_t need = attempt && c->keys_in_proof ? proof_span(c, row, out->fa) : 0;
             if (need) {
                 bool proven = false;
@@ -2306,7 +2386,14 @@ int main(int argc, char **argv) {
                                 a_src[i] < a_src[width - 1];
         }
         CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts,
-                      aligned, width - 1, a_delim, json_proof, keys_in_proof };
+                      aligned, width - 1, a_delim, json_proof, keys_in_proof,
+                      /* Delimiters from the row start to the one that ends the
+                       * guard column: the guard is source column a_src[width-1],
+                       * so its end is the (a_src[width-1]+1)th delimiter. The
+                       * keys sit before it when keys_in_proof holds. */
+                      (aligned && keys_in_proof && !json_proof)
+                          ? (int)(a_src[width - 1] + 1)
+                          : 0 };
         run_parts(compare_part, &cc, ways + b_ways);
         phase_mark(&whole, "join and compare");
 
