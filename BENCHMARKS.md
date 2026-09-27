@@ -120,6 +120,28 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c with clang 22) — measured, and C stays on gcc 16
+
+The pinned-compilers entry below recorded that clang 18 built a faster C for
+ndjson and a slower one for CSV than gcc 13. The same question with the pinned
+releases, C built with `CC=clang-22` on a measuring branch against main's gcc 16,
+12 runs of `phases.yml`, 10M rows, paired by processor (C++, Rust and Zig are
+the controls — their builds did not change):
+
+| | gcc 16 (main) | clang 22 | controls, main → branch |
+|---|---:|---:|---|
+| **EPYC 7763** CSV, 1 / 4 threads (runs 169, 173 → 167, 171, 175) | 1.929–1.932 / 1.175–1.181 s | 2.055–2.076 / 1.372–1.395 s | C++ 2.323–2.325 → 2.317–2.365 s, Rust 2.212–2.219 → 2.221–2.277 s, Zig 2.175–2.194 → 2.206–2.254 s |
+| **EPYC 7763** ndjson, 1 / 4 threads (run 172 → 170, 174) | 5.235 / 2.658 s | 4.943–5.003 / 2.718–2.724 s | C++ 4.736 → 4.807–4.837 s, Rust 5.263 → 5.294–5.353 s, Zig 5.322 → 5.421–5.441 s |
+| **EPYC 9V45** ndjson, 1 / 4 threads (run 168 → 166) | 3.916 / 1.748 s | 3.555 / 1.667 s | C++ 3.702 → 3.480 s, Rust 3.850 → 3.631 s, Zig 4.251 → 3.934 s |
+
+Against the controls: clang 22 makes C **7% slower on CSV at one thread and 17%
+slower at four** (its join scales 1.97x on four cores to gcc's 2.25x), and on
+ndjson 3–6% faster at one thread and flat at four. CSV is the headline format
+and the loss there is larger than the ndjson gain, so C stays on gcc 16. The
+measuring branch (`claude/c-clang22-measure`) is not merged.
+
+---
+
 ## 2026-09-27 (pinned compilers) — C and C++ were built with compilers years behind the others
 
 **From here on the C and C++ numbers are from gcc 16 and clang 22, not gcc 13 and
