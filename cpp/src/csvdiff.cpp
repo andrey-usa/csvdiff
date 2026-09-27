@@ -196,6 +196,33 @@ std::size_t next_of1(std::string_view d, std::size_t from, std::size_t end, char
             if (hits) return at + static_cast<std::size_t>(__builtin_ctz(hits));
         }
     }
+#elif defined(__AVX2__)
+    // Unlike `next_of2`'s, this wide step is on wherever the build has AVX2
+    // (`-march=native`, so every runner). Its hot caller is the ndjson row end:
+    // once the key-only parse has its keys, the rest of the row -- two hundred
+    // bytes -- is one scan for the newline, which the SWAR loop below took
+    // eight bytes at a time. The C port measured the same change 26% faster on
+    // its ndjson sweep (#155).
+    {
+        const __m256i vt = _mm256_set1_epi8(target);
+        for (; at + 32 <= end; at += 32) {
+            const __m256i chunk =
+                _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
+            const unsigned hits =
+                static_cast<unsigned>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, vt)));
+            if (hits) return at + static_cast<std::size_t>(__builtin_ctz(hits));
+        }
+    }
+#endif
+#if defined(__SSE2__)
+    {
+        const __m128i vt = _mm_set1_epi8(target);
+        for (; at + 16 <= end; at += 16) {
+            const __m128i w = _mm_loadu_si128(reinterpret_cast<const __m128i*>(d.data() + at));
+            const unsigned hits = static_cast<unsigned>(_mm_movemask_epi8(_mm_cmpeq_epi8(w, vt)));
+            if (hits) return at + static_cast<std::size_t>(__builtin_ctz(hits));
+        }
+    }
 #endif
     const std::uint64_t bt = broadcast(static_cast<unsigned char>(target));
     for (; at + 8 <= end; at += 8) {
