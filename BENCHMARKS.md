@@ -120,6 +120,31 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (zig sweep push) — Zig's sweep called for room it had
+
+The sweep appends two values per row of both files, the row's offset and its key
+hash, and `ArrayList.append` made each one a call to `ensureTotalCapacity` that
+almost always found room. A small `push` now checks capacity inline and calls
+only when the list is full.
+
+callgrind, 2M CSV pair, one thread: 6.60B → **6.37B (−3.5%)**. Tried with it
+and dropped: splitting the delimiter cursor into an inline pop and a called
+refill (as Rust's cursor now is). It cut instructions further, but on CI it
+slowed Zig's join, so the cursor stays one function.
+
+CI, `phases.yml`, 10M CSV, EPYC 7763 (run 118; main runs 120 and 121 on the
+same processor):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** Zig wall, 1 / 4 threads | 2.223–2.242 / 1.396–1.408 s | **2.215 / 1.381 s** | C and Rust about 1% slower |
+| Zig sweep, a side | 0.491–0.495 s | **0.458–0.460 s** | |
+
+A small change: the sweep is 7% quicker, and the wall 1–2% at one thread, 1–3%
+at four, against controls that moved the other way.
+
+---
+
 ## 2026-09-27 (rust inline json string) — Rust's ndjson paid a call per string
 
 callgrind on Rust's ndjson run put `skip_json_string` near the top as a call:
