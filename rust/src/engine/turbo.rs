@@ -47,8 +47,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
-    RowParser, csv_header, detect_delimiter, json_header, json_tail_is_clean, shared_tail,
-    sniff_dialect,
+    RowParser, csv_header, detect_delimiter, guard_span, json_header, json_tail_is_clean,
+    shared_tail, sniff_dialect,
 };
 
 use crate::alloc;
@@ -674,7 +674,7 @@ impl RowIndex {
         &self,
         side: &Side,
         other: &Slab,
-        fields: &[Field],
+        fields: Option<&[Field]>,
         hash: u64,
         key_size: usize,
         opt: &Options,
@@ -706,6 +706,14 @@ impl RowIndex {
                     if proved {
                         return Some((candidate, true));
                     }
+                    // No fields: the caller has the span but has not parsed the
+                    // row. A candidate the bytes do not settle is returned
+                    // unproven; the caller parses and re-looks-up with the key
+                    // check, which also covers the hash collision this skips.
+                    let fields = match fields {
+                        Some(f) => f,
+                        None => return Some((candidate, false)),
+                    };
                     self.fields_of(side, candidate, probe);
                     if (0..key_size).all(|i| same(&side.slab, probe[i], other, fields[i], opt)) {
                         return Some((candidate, false));
@@ -1264,6 +1272,9 @@ fn join(
         (Some(pa), Some(pb)) => shared_tail(pa, pb),
         _ => None,
     };
+    // The proof's delimiter and delimiter count, for the fast path in the join
+    // below. `None` takes the old parse-first path.
+    let guard = span_tail.map(|(_, delimiter, last_needed)| (delimiter, last_needed + 1));
     // What JSON gets instead, since `shared_tail` cannot promise it an offset.
     // See `json_values_agree`.
     let json_proof =
@@ -1321,17 +1332,65 @@ fn join(
             if let Some(&soon) = keys.get(i + PREFETCH_AHEAD) {
                 bi.prefetch(ai.row_hash[soon as usize]);
             }
-            ai.fields_of(a, row, &mut fa);
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             let hash = ai.row_hash[row as usize];
+
+            // The proof's span without the parse: the guard's delimiter sits a
+            // fixed count from the row start, countable with the delimiter
+            // cursor alone. Most rows prove out here and never pay for fields;
+            // a row the bytes do not settle falls through to the parse below.
+            enum Fast {
+                Proved(i32),
+                Unproven,
+                Missed,
+                Skipped,
+            }
+            let fast = if let Some((delimiter, commas)) = guard {
+                let data = a.slab.data();
+                let from = ai.row_at[row as usize] as usize;
+                let end = row_end(ai, row, data.len());
+                match guard_span(data, from, end, delimiter, commas) {
+                    Some(len) => {
+                        let span = Some(Proof::Csv {
+                            bytes: &data[from..from + len],
+                            delimiter,
+                        });
+                        match bi.lookup(b, &a.slab, None, hash, key_size, opt, span, &mut fb) {
+                            Some((mate, true)) => Fast::Proved(mate),
+                            Some(_) => Fast::Unproven,
+                            None => Fast::Missed,
+                        }
+                    }
+                    None => Fast::Skipped,
+                }
+            } else {
+                Fast::Skipped
+            };
+            match fast {
+                Fast::Proved(mate) => {
+                    out.matched += 1;
+                    mark(mate);
+                    continue;
+                }
+                Fast::Missed => {
+                    out.removed_total += 1;
+                    if exporting || out.removed.len() <= cap {
+                        out.removed.push(Pick { row, mate: -1 });
+                    }
+                    continue;
+                }
+                Fast::Unproven | Fast::Skipped => {}
+            }
+
+            ai.fields_of(a, row, &mut fa);
             // `fb` is the lookup's scratch, and on a hit it already holds the
             // mate's fields: that is what the key columns were matched against.
             // A's row up to the end of the last column either file wants. The
             // end has to be a boundary in A as well: a quoted field ends on its
             // closing quote, and what follows is not part of the run.
-            let csv_span = span_tail.and_then(|(slot, delimiter)| {
+            let csv_span = span_tail.and_then(|(slot, delimiter, _)| {
                 let f = fa[slot];
                 if !field::is_real(f) {
                     return None;
@@ -1382,7 +1441,7 @@ fn join(
                 })
             });
             let Some((mate, same_bytes)) =
-                bi.lookup(b, &a.slab, &fa, hash, key_size, opt, span, &mut fb)
+                bi.lookup(b, &a.slab, Some(&fa), hash, key_size, opt, span, &mut fb)
             else {
                 out.removed_total += 1;
                 if exporting || out.removed.len() <= cap {

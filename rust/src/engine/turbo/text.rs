@@ -340,9 +340,10 @@ fn name_hash(s: &[u8]) -> u64 {
 /// slots can agree on how many without agreeing on which. JSON has no such
 /// prefix -- its keys may come in any order -- so it never qualifies.
 ///
-/// Returns the slot holding the last wanted column, and the delimiter that ends
-/// it.
-pub(super) fn shared_tail(a: &RowParser, b: &RowParser) -> Option<(usize, u8)> {
+/// Returns the slot holding the last wanted column, the delimiter that ends
+/// it, and the source column index of that column (so the caller can count
+/// delimiters to it without parsing).
+pub(super) fn shared_tail(a: &RowParser, b: &RowParser) -> Option<(usize, u8, usize)> {
     match (a, b) {
         (
             RowParser::Csv {
@@ -356,9 +357,57 @@ pub(super) fn shared_tail(a: &RowParser, b: &RowParser) -> Option<(usize, u8)> {
                 slots_for: fb,
                 ..
             },
-        ) if da == db && fa == fb => fa[*la].first().map(|slot| (*slot as usize, *da)),
+        ) if da == db && fa == fb => fa[*la].first().map(|slot| (*slot as usize, *da, *la)),
         _ => None,
     }
+}
+
+/// The proof's byte span without parsing the row.
+///
+/// `csv_span` in the join reads it off the guard field's offsets, which means
+/// parsing every column first. The guard is source column `guard_src`, so its
+/// end is the (`guard_src`+1)th delimiter from the row start -- countable with
+/// the delimiter cursor alone, skipping a quoted field the way the row parse
+/// does. Returns `None` when the row ends first (short or malformed), which
+/// falls back to the parse.
+///
+/// The span is the field bytes, not including the delimiter that ends them --
+/// the same `data[from..to]` the field-offset path builds -- so the proof's
+/// boundary check in `row_matches` applies unchanged. A guard that is the
+/// row's last column ends at the newline instead of a delimiter.
+pub(super) fn guard_span(
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+    delimiter: u8,
+    commas: usize,
+) -> Option<usize> {
+    use super::field::{Delims, skip_quoted};
+    let mut at = lo;
+    let mut delims = Delims::new(data, lo, hi, delimiter, b'\n');
+    for i in 0..commas {
+        let cur = if at < hi && data[at] == b'"' {
+            let close = skip_quoted(data, at + 1, hi);
+            delims.next(close)
+        } else {
+            delims.next(at)
+        };
+        if cur >= hi {
+            return None;
+        }
+        let last = i + 1 == commas;
+        if data[cur] == delimiter {
+            at = cur + 1;
+            if last {
+                return Some(cur - lo);
+            }
+        } else if last && data[cur] == b'\n' {
+            return Some(cur - lo);
+        } else {
+            return None;
+        }
+    }
+    None
 }
 
 impl RowParser {
