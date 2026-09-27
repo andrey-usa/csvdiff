@@ -825,17 +825,62 @@ class RowParser {
         std::size_t pos = start;
         int column = 0;
 
+#if defined(__AVX2__)
+        // The field ends, found as a cursor over the row rather than a fresh
+        // scan per field: one 32-byte load answers every delimiter in it, and
+        // the ones not yet asked for are held as bits. A ten-byte field used
+        // to load sixteen bytes and throw away all but the first match. C, Rust
+        // and Zig have this cursor; C++ tried it three times and dropped it
+        // (BENCHMARKS, 2026-09-27), each time with the state in a struct -- and
+        // a struct of `std::size_t` is a type every `Field` store into `out`
+        // may alias, so it was reloaded after each one. These are locals whose
+        // address never escapes, so they stay in registers. `from` is where to
+        // resume: a quoted field is walked by `skip_quoted`, and the matches
+        // inside its body are dropped here.
+        std::size_t held = start, scanned = start;
+        std::uint32_t bits = 0;
+        const __m256i va = _mm256_set1_epi8(delimiter_), vb = _mm256_set1_epi8('\n');
+        const auto next_delim = [&](std::size_t from) __attribute__((always_inline)) {
+            while (bits) {
+                const std::size_t at = held + static_cast<std::size_t>(std::countr_zero(bits));
+                bits &= bits - 1;
+                if (at >= from) return at;
+            }
+            std::size_t at = std::max(from, scanned);
+            for (; at + 32 <= end; at += 32) {
+                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
+                const auto hits = static_cast<std::uint32_t>(_mm256_movemask_epi8(
+                    _mm256_or_si256(_mm256_cmpeq_epi8(w, va), _mm256_cmpeq_epi8(w, vb))));
+                scanned = at + 32;
+                if (hits) {
+                    // `at` is never below `from`, so every match in it counts.
+                    held = at;
+                    bits = hits & (hits - 1);
+                    return at + static_cast<std::size_t>(std::countr_zero(hits));
+                }
+            }
+            // The last bytes of the range: a plain scan, and nothing held.
+            const std::size_t next = next_of2(d, at, end, delimiter_, '\n');
+            scanned = next < end ? next + 1 : end;
+            return next;
+        };
+#else
+        const auto next_delim = [&](std::size_t from) {
+            return next_of2(d, from, end, delimiter_, '\n');
+        };
+#endif
+
         while (pos <= end) {
             Field field;
             std::size_t next;
             if (pos < end && d[pos] == '"') {
                 const std::size_t close = skip_quoted(d, pos + 1, end);
                 const std::size_t body_end = close > pos + 1 ? close - 1 : pos + 1;
-                next = next_of2(d, close, end, delimiter_, '\n');
+                next = next_delim(close);
                 const bool escaped = next_of1(d, pos + 1, body_end, '"') < body_end;
                 field = pack(pos + 1, body_end - (pos + 1), escaped);
             } else {
-                next = next_of2(d, pos, end, delimiter_, '\n');
+                next = next_delim(pos);
                 std::size_t stop = next;
                 if (stop > pos && d[stop - 1] == '\r') --stop;  // CRLF behaves like LF
                 field = pack(pos, stop - pos, false);
