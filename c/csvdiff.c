@@ -111,7 +111,11 @@ static uint64_t load64(const char *p) {
     return w; /* x86-64 and aarch64 are little-endian; this port targets those */
 }
 
-static size_t next_of2(const char *d, size_t from, size_t end, char a, char b) {
+/* The scan, for callers that want it in their own loop. `skip_json_string`
+ * runs it for every key and string value of an ndjson row, a few bytes each,
+ * and as a call that was a sixth of the run's instructions. */
+static inline __attribute__((always_inline)) size_t scan_of2(const char *d, size_t from,
+                                                             size_t end, char a, char b) {
     size_t at = from;
     /* Chosen at compile time from what the build targets, so there is no
      * dispatch on the hot path. The Makefile builds with -march=native, which
@@ -152,6 +156,10 @@ static size_t next_of2(const char *d, size_t from, size_t end, char a, char b) {
     for (; at < end; at++)
         if (d[at] == a || d[at] == b) return at;
     return end;
+}
+
+static size_t next_of2(const char *d, size_t from, size_t end, char a, char b) {
+    return scan_of2(d, from, end, a, b);
 }
 
 /*
@@ -317,10 +325,11 @@ static bool json_space(char c) { return c == ' ' || c == '\t' || c == '\r' || c 
 
 /* Past the closing quote of the string starting at `at`. Sets *escaped when it
  * holds a backslash, which is what says the value has to be decoded. */
-static size_t skip_json_string(const char *d, size_t at, size_t end, bool *escaped) {
+static inline __attribute__((always_inline)) size_t skip_json_string(const char *d, size_t at,
+                                                                     size_t end, bool *escaped) {
     at++;                                        /* the opening quote */
     for (;;) {
-        size_t stop = next_of2(d, at, end, '"', '\\');
+        size_t stop = scan_of2(d, at, end, '"', '\\');
         if (stop >= end) return end;
         if (d[stop] == '"') return stop + 1;
         *escaped = true;
