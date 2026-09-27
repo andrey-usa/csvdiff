@@ -120,6 +120,37 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (zig cc for c and c++) — measured, and not adopted
+
+An experiment: the C and C++ ports compiled with Zig 0.16's bundled toolchain —
+`zig cc` and `zig c++`, which is clang 21.1 with Zig's own libc++ linked
+statically (the C++ binary is 9.6 MB) — against main's gcc 16 and clang 22. Rust
+and Zig were built as on main, as the controls. Both ports build with it and
+pass their test suites, and the output was identical to the stock builds on 960
+generated CSV and ndjson pairs. 10 runs of `phases.yml`, 10M rows, on a
+measuring branch (`claude/zig-cc-measure`, not merged):
+
+| **EPYC 7763** | main | zig cc / zig c++ | controls, main → branch |
+|---|---:|---:|---|
+| C, CSV, 1 / 4 threads (runs 180, 184 → 182, 186) | 1.918–1.927 / 1.181–1.182 s | 2.055–2.073 / 1.292–1.308 s | Rust 2.208–2.221 → 2.197–2.254 s, Zig 2.169–2.206 → 2.180–2.200 s |
+| C++, CSV, 1 / 4 threads | 2.307–2.374 / 1.241–1.248 s | 2.423–2.433 / 1.427–1.451 s | |
+| C, ndjson, 1 / 4 threads (main runs 159, 172 → 179, 187) | 5.235–5.254 / 2.658–2.718 s | 4.836–4.880 / 2.510–2.622 s | Rust 5.263–5.373 → 5.249–5.323 s, Zig 5.322 → 5.288–5.322 s |
+| C++, ndjson, 1 / 4 threads | 4.736–4.745 / 2.708–2.783 s | 4.697–4.739 / 2.812–2.839 s | |
+
+C under `zig cc` behaves as it did under clang 22: 7% slower on CSV at one thread
+and 10% at four, 7–8% faster on ndjson at one thread and 4% at four. C++ under
+`zig c++` is 4% slower on CSV at one thread and 16% at four, and flat to 3%
+slower on ndjson. The ndjson main runs on the 7763 are from an hour earlier on
+the same compilers (this round's main ndjson runs drew a Xeon 8573C and a
+9V74); the controls agree with them to within 1%. On the one 8573C pair (181 →
+183) every port was 16–18% slower on the branch runner, which leaves C and C++
+a few percent behind there too.
+
+So the stock compilers stay: `zig c++` loses on both formats, and `zig cc` trades
+a CSV loss for an ndjson gain, the same trade clang 22 made.
+
+---
+
 ## 2026-09-27 (c with clang 22) — measured, and C stays on gcc 16
 
 The pinned-compilers entry below recorded that clang 18 built a faster C for
