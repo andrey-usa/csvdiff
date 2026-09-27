@@ -120,6 +120,36 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (rust guard span) — the Rust join stopped parsing rows the proof settles
+
+The same change again. Rust's CSV proof is A's bytes through the end of the
+last wanted column, with B's next byte checked for a delimiter or newline, and
+`shared_tail` only offers it where both files map every column to the same
+slot -- so the keys are always inside the run. `guard_span` (field.rs) finds
+that column's end with the parse's own `Delims` cursor, `lookup_bytes` asks
+only for the first row with the same hash and whether its bytes agree, and a
+row they do not settle is parsed and goes through `lookup` as before. Unlike
+the old CSV proof the new path is backed off like the JSON one, so two files
+whose rows all differ pay for the parse and nothing more.
+
+Instructions on the 200k CSV pair: **635M → 511M (−19.6%)** (callgrind,
+x86-64-v3). Output identical to main on 11,780 generated comparisons (CSV and
+ndjson, keyed alone and with the last or a middle column ignored, 1 and 3
+threads, x86-64-v3 and baseline builds); `cargo test`, clippy and fmt pass.
+
+`ab.yml`, 10M rows, median of 7, main run a second time as the floor:
+
+| head / main, 1 / 4 threads | runner | head | main again (floor) |
+|---|---|---|---:|
+| run 35 | EPYC 7763 | **0.906 / 0.899** | 1.003 / 0.997 |
+| run 36 | EPYC 9V45 | **0.887 / 0.895** | 0.995 / 1.007 |
+| run 37 | EPYC 9V74 | **0.874 / 0.909** | 0.988 / 0.994 |
+
+9–13% at one thread, 9–10% at four. On the 7763 Rust goes from 2.09 s to
+1.89 s at one thread.
+
+---
+
 ## 2026-09-27 (cpp guard span) — the C++ join stopped parsing rows the proof settles
 
 The C change below, ported. `a_range` called `fields_of` on every row of A
