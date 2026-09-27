@@ -120,6 +120,39 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp proof before probe) — the same reordering, in C++
+
+C++ had C's order: `lookup` parsed the mate's keys and compared them, and the
+proof ran after. `lookup_proof` tries the proof's bytes on the hash-matched
+candidate first, over a span that covers the keys (every wanted value on
+objects; on CSV when each key sits at the same column in both files, ahead of
+the guard), and parses the candidate's keys only when the bytes differ. A
+proven candidate is the mate with nothing left to compare. C++'s key
+comparison normalises (`--trim`, `--ignore-case`); equal bytes are equal under
+any of it, so the proof stands in for it unchanged.
+
+Output identical to main on 4,800 generated pairs (CSV, ragged CSV, ndjson)
+with keys before, after and among the compared columns, a `--compare` naming
+the key and out of order, `--ignore`, `--trim --ignore-case` and
+`--empty-is-null`, at one and three threads; identical on the 2M pairs;
+`cpp/test.sh` passes.
+
+CI, `phases.yml`, 10M rows, all three runs (103–105) on an **AMD EPYC 7763**,
+against main's runs on the same processor (95–102):
+
+| AMD EPYC 7763 | main | this | controls, main → this |
+|---|---:|---:|---|
+| C++ CSV wall, 1 / 4 threads | 2.794–2.856 / 1.609–1.642 s | **2.461 / 2.472 s**, **1.416–1.431 s** | Rust 2.411–2.429 → 2.405–2.455 s, Zig 2.248–2.271 → 2.232–2.238 s |
+| C++ CSV join, 1 thread | 2.039–2.121 s | **1.720–1.725 s** | |
+| C++ ndjson wall, 1 / 4 threads | 6.691–6.707 / 3.82 s | **5.778 / 3.329 s** | Rust 6.313–6.338 → 6.347 s, Zig 5.475 → 5.482 s |
+| C++ ndjson join, 1 thread | 5.371–5.387 s | **4.465 s** | |
+
+12% on CSV at both thread counts, 13–14% on ndjson; the controls within 1%.
+C++ is now within 2% of Rust on CSV at one thread and ahead of it at four, and
+second only to Zig on ndjson.
+
+---
+
 ## 2026-09-27 (c proof before probe) — C parsed the mate's keys before the proof that makes them unnecessary
 
 The join's proof compares A's row with its mate's bytes from the front; when

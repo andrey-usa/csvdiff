@@ -1291,6 +1291,44 @@ class RowIndex {
         }
     }
 
+    /// `lookup`, with the proof tried first.
+    ///
+    /// `need` bytes from `a_row` cover every column either file wants, keys
+    /// included, so a candidate whose row begins with the same bytes carries
+    /// the same key: that is the key comparison, settled without parsing the
+    /// candidate's keys. Only a candidate the bytes do not settle is parsed and
+    /// compared as `lookup` does. `proven` says which of the two found it, and
+    /// a proven mate needs no comparing either -- the C and Zig ports do the
+    /// same.
+    int lookup_proof(const Slab& other, const Field* fields, std::uint64_t hash, Field* probe,
+                     const char* a_row, std::size_t need, bool json, bool& proven) const {
+        std::size_t slot = slot_of(hash);
+        for (;;) {
+            const std::uint32_t v = table_[slot];
+            if (v == kEmpty) return -1;
+            if (!slot_tag_is(v, hash)) {
+                slot = (slot + 1) & mask_;
+                continue;
+            }
+            const int candidate = first_row_[slot_pos(v)];
+            if (row_hash_[candidate] == hash) {
+                const std::size_t b_lo = row_begin(candidate);
+                const std::size_t b_n = row_end(candidate) - b_lo;
+                if (need <= b_n && common_prefix(a_row, slab_.bytes().data() + b_lo, need) == need &&
+                    (!json || parser_.json_tail_is_clean(slab_.bytes(), b_lo + need, b_lo + b_n))) {
+                    proven = true;
+                    return candidate;
+                }
+                keys_of(candidate, probe);
+                bool ok = true;
+                for (std::size_t i = 0; i < key_size_ && ok; ++i)
+                    ok = same(slab_, probe[i], other, fields[i], opt_);
+                if (ok) return candidate;
+            }
+            slot = (slot + 1) & mask_;
+        }
+    }
+
     /// The key hash the sweep computed for this row.
     std::uint64_t hash_of(int row) const { return row_hash_[static_cast<std::size_t>(row)]; }
 
@@ -1873,6 +1911,16 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     for (std::size_t i = key_size; aligned && i < width; ++i)
         aligned = a_src[i] >= 0 && a_src[i] == b_src[i] &&
                   (i == key_size || a_src[i] > a_src[i - 1]);
+    // Whether the proof's bytes also cover the keys, so that it can stand in
+    // for the key comparison and run before the mate is parsed: always on
+    // objects, where the run is taken over every wanted value; on CSV when
+    // every key sits at the same column in both files, ahead of the guard.
+    bool keys_in_proof = json_proof;
+    if (aligned) {
+        keys_in_proof = true;
+        for (std::size_t i = 0; keys_in_proof && i < key_size; ++i)
+            keys_in_proof = a_src[i] >= 0 && a_src[i] == b_src[i] && a_src[i] < a_src[width - 1];
+    }
 
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
@@ -2015,16 +2063,53 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             if (at + RowIndex::kLookupPrefetch < hi)
                 bi.prefetch(ai.hash_of(a_keys[at + RowIndex::kLookupPrefetch]));
             ai.fields_of(row, fa.data());
+            // How many bytes of A's row prove the whole row, keys included --
+            // through the byte that closes the last value either file wants --
+            // or 0 where this row cannot be proven that way.
+            std::size_t need = 0;
+            if (keys_in_proof && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+                const char* d = a.bytes().data();
+                const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+                std::size_t t = a_lo;
+                bool ok = true;
+                if (json_proof) {
+                    for (std::size_t i = 0; i < width; ++i) {
+                        if (!is_real(fa[i])) continue;
+                        const std::size_t e = offset_of(fa[i]) + len_of(fa[i]);
+                        if (e > t) t = e;
+                    }
+                } else {
+                    const Field g = fa[width - 1];
+                    ok = is_real(g);
+                    if (ok) {
+                        t = offset_of(g) + len_of(g);
+                        while (t < a_end && d[t] != a_delim && d[t] != '\n' && d[t] != '\r') ++t;
+                    }
+                }
+                if (ok && t < a_end) need = t + 1 - a_lo;
+            }
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
-            const int mate = bi.lookup(a, fa.data(), ai.hash_of(row), probe.data());
+            bool proven = false;
+            const int mate =
+                need ? bi.lookup_proof(a, fa.data(), ai.hash_of(row), probe.data(),
+                                       a.bytes().data() + ai.row_begin(row), need, json_proof,
+                                       proven)
+                     : bi.lookup(a, fa.data(), ai.hash_of(row), probe.data());
             if (mate < 0) {
                 ++out.removed_total;
                 if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
                 continue;
             }
             ++out.matched;
+            if (need) {
+                if (proven) {
+                    refused = 0;
+                    continue;
+                }
+                if (refused < kProofBackoff) ++refused;
+            }
             // The JSON form. It sits here rather than inside `lookup` because
             // this port's `lookup` compares only the keys -- `keys_of`, not
             // `fields_of` -- so the mate's row is still unparsed at this point
@@ -2033,7 +2118,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             // the mate's whole row to compare its keys, and a proof after that
             // saves only the column comparison. Same proof, different place,
             // because the surrounding code differs.
-            if (json_proof && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+            if (!need && json_proof &&
+                (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
                 const char* d = a.bytes().data();
                 const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
                 const std::size_t b_lo = bi.row_begin(mate);
@@ -2062,7 +2148,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             // where every row really has changed pay for it on every row -- so
             // after kProofBackoff failures in a row it is only attempted every
             // kProofBackoff rows, until one succeeds and it is on again.
-            if (aligned && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
+            if (!need && aligned && (refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0)) {
                 const Field g = fa[width - 1];
                 if (is_real(g)) {
                     const char* d = a.bytes().data();
