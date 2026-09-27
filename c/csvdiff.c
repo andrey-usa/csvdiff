@@ -834,11 +834,18 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
     pos++;
 
     for (;;) {
-        while (pos < end && json_space(d[pos])) pos++;
-        if (pos >= end) break;
-        if (d[pos] == '}') { pos++; break; }
-        if (d[pos] == ',') { pos++; continue; }
-        if (d[pos] != '"') break;                             /* malformed: stop this object */
+        /* Compact ndjson separates members with a bare `,"`, which goes
+         * straight to the next key; the general path takes the comma, loops
+         * back and skips space twice to get there. */
+        if (pos + 1 < end && d[pos] == ',' && d[pos + 1] == '"') {
+            pos++;
+        } else {
+            while (pos < end && json_space(d[pos])) pos++;
+            if (pos >= end) break;
+            if (d[pos] == '}') { pos++; break; }
+            if (d[pos] == ',') { pos++; continue; }
+            if (d[pos] != '"') break;                         /* malformed: stop this object */
+        }
 
         bool key_escaped = false;
         size_t key_from = pos + 1;
@@ -846,11 +853,16 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
         if (key_end > end || key_end < 2 || key_end - 1 < key_from) break;
         size_t key_len = key_end - 1 - key_from;
         pos = key_end;
-        while (pos < end && json_space(d[pos])) pos++;
-        if (pos >= end || d[pos] != ':') break;
-        pos++;
-        while (pos < end && json_space(d[pos])) pos++;
-        if (pos >= end) break;
+        /* And `":"` between a key and a string value, likewise. */
+        if (pos + 1 < end && d[pos] == ':' && d[pos + 1] == '"') {
+            pos++;
+        } else {
+            while (pos < end && json_space(d[pos])) pos++;
+            if (pos >= end || d[pos] != ':') break;
+            pos++;
+            while (pos < end && json_space(d[pos])) pos++;
+            if (pos >= end) break;
+        }
 
         size_t from, to;
         bool escaped = false, absent = false;

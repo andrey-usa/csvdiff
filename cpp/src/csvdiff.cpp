@@ -924,28 +924,40 @@ class RowParser {
         ++pos;
 
         for (;;) {
-            while (pos < end && json_space(d[pos])) ++pos;
-            if (pos >= end) break;
-            if (d[pos] == '}') {
+            // Compact ndjson separates members with a bare `,"`, which goes
+            // straight to the next key. The general path below takes the comma,
+            // loops back and skips space twice to get there.
+            if (pos + 1 < end && d[pos] == ',' && d[pos + 1] == '"') {
                 ++pos;
-                break;
+            } else {
+                while (pos < end && json_space(d[pos])) ++pos;
+                if (pos >= end) break;
+                if (d[pos] == '}') {
+                    ++pos;
+                    break;
+                }
+                if (d[pos] == ',') {
+                    ++pos;
+                    continue;
+                }
+                if (d[pos] != '"') break;  // malformed: stop reading this object
             }
-            if (d[pos] == ',') {
-                ++pos;
-                continue;
-            }
-            if (d[pos] != '"') break;  // malformed: stop reading this object
             bool key_escaped = false;
             const std::size_t key_from = pos + 1;
             const std::size_t key_end = skip_json_string(d, pos, end, &key_escaped);
             if (key_end > end || key_end < 2) break;
             const std::string_view key = d.substr(key_from, key_end - 1 - key_from);
             pos = key_end;
-            while (pos < end && json_space(d[pos])) ++pos;
-            if (pos >= end || d[pos] != ':') break;
-            ++pos;
-            while (pos < end && json_space(d[pos])) ++pos;
-            if (pos >= end) break;
+            // And `":"` between a key and a string value, likewise.
+            if (pos + 1 < end && d[pos] == ':' && d[pos + 1] == '"') {
+                ++pos;
+            } else {
+                while (pos < end && json_space(d[pos])) ++pos;
+                if (pos >= end || d[pos] != ':') break;
+                ++pos;
+                while (pos < end && json_space(d[pos])) ++pos;
+                if (pos >= end) break;
+            }
 
             JsonValue v;
             if (d[pos] == '"') {

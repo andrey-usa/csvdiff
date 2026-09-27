@@ -515,28 +515,40 @@ pub const RowParser = union(enum) {
         pos += 1;
 
         while (true) {
-            while (pos < end and jsonSpace(d[pos])) pos += 1;
-            if (pos >= end) break;
-            if (d[pos] == '}') {
+            // Compact ndjson separates members with a bare `,"`, which goes
+            // straight to the next key; the general path takes the comma, loops
+            // back and skips space twice to get there.
+            if (pos + 1 < end and d[pos] == ',' and d[pos + 1] == '"') {
                 pos += 1;
-                break;
+            } else {
+                while (pos < end and jsonSpace(d[pos])) pos += 1;
+                if (pos >= end) break;
+                if (d[pos] == '}') {
+                    pos += 1;
+                    break;
+                }
+                if (d[pos] == ',') {
+                    pos += 1;
+                    continue;
+                }
+                if (d[pos] != '"') break; // malformed: stop reading this object
             }
-            if (d[pos] == ',') {
-                pos += 1;
-                continue;
-            }
-            if (d[pos] != '"') break; // malformed: stop reading this object
 
             const key_from = pos + 1;
             const key_end = skipJsonString(d, pos, end)[0];
             if (key_end > end or key_end < 2) break;
             const key = d[key_from .. key_end - 1];
             pos = key_end;
-            while (pos < end and jsonSpace(d[pos])) pos += 1;
-            if (pos >= end or d[pos] != ':') break;
-            pos += 1;
-            while (pos < end and jsonSpace(d[pos])) pos += 1;
-            if (pos >= end) break;
+            // And `":"` between a key and a string value, likewise.
+            if (pos + 1 < end and d[pos] == ':' and d[pos + 1] == '"') {
+                pos += 1;
+            } else {
+                while (pos < end and jsonSpace(d[pos])) pos += 1;
+                if (pos >= end or d[pos] != ':') break;
+                pos += 1;
+                while (pos < end and jsonSpace(d[pos])) pos += 1;
+                if (pos >= end) break;
+            }
 
             var field: ?Field = null;
             if (d[pos] == '"') {
