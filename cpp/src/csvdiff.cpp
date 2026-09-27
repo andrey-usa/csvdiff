@@ -112,6 +112,32 @@ inline std::size_t common_prefix(const char* x, const char* y, std::size_t n) {
     return i;
 }
 
+// Whether two names are the same bytes, inline and a word at a time. A
+// `string == string_view` of run-time length is a `memcmp` call, and the JSON
+// parse checks its guessed slot for every member of every row: 48M calls on a
+// 2M ndjson pair. Names are short, so the words overlap rather than loop far.
+[[gnu::always_inline]] inline bool same_name(std::string_view a, std::string_view b) {
+    const std::size_t n = a.size();
+    if (n != b.size()) return false;
+    const char *x = a.data(), *y = b.data();
+    if (n >= 8) {
+        for (std::size_t i = 0; i + 8 < n; i += 8)
+            if (load64(x + i) != load64(y + i)) return false;
+        return load64(x + n - 8) == load64(y + n - 8);
+    }
+    if (n >= 4) {
+        std::uint32_t x0, x1, y0, y1;
+        std::memcpy(&x0, x, 4);
+        std::memcpy(&y0, y, 4);
+        std::memcpy(&x1, x + n - 4, 4);
+        std::memcpy(&y1, y + n - 4, 4);
+        return x0 == y0 && x1 == y1;
+    }
+    for (std::size_t i = 0; i < n; ++i)
+        if (x[i] != y[i]) return false;
+    return true;
+}
+
 // The three scanners, chosen at build time rather than dispatched at run time:
 // a benchmark of an instruction set should not be measuring a function pointer,
 // and each binary is what you would actually ship for that target. SWAR is the
@@ -944,7 +970,7 @@ class RowParser {
             }
             if (!v.absent) {
                 const int slot = guess < wanted_.size() && !wanted_[guess].empty() &&
-                                         wanted_[guess] == key
+                                         same_name(wanted_[guess], key)
                                      ? canon_[guess]
                                      : slot_for(key);
                 if (slot >= 0) guess = static_cast<std::size_t>(slot) + 1;
@@ -975,7 +1001,7 @@ class RowParser {
         for (;;) {
             const int i = slots_[at];
             if (i < 0) return -1;
-            if (wanted_[static_cast<std::size_t>(i)] == key) return i;
+            if (same_name(wanted_[static_cast<std::size_t>(i)], key)) return i;
             at = (at + 1) & slot_mask_;
         }
     }
