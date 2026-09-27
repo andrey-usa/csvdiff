@@ -56,8 +56,12 @@ jobs:
       - name: Install Zig
         uses: ./.github/actions/setup-zig
 
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+
       - name: Build every port as the ladder does
-        run: CXX=clang++ scripts/build_ports.sh c rust zig cpp
+        run: scripts/build_ports.sh c rust zig cpp
 
       - name: Phases
         env:

@@ -183,6 +183,9 @@ jobs:
 
       - name: Install Zig
         uses: ./.github/actions/setup-zig
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
 
       # The cleanup is I/O and the builds are CPU, so they run at the same time;
       # nothing needs the disk until the data is generated a step later. See
@@ -207,7 +210,7 @@ jobs:
             fi
           fi
 
-          if CXX=clang++ scripts/build_ports.sh $targets; then built=0; else built=1; fi
+          if scripts/build_ports.sh $targets; then built=0; else built=1; fi
 
           wait "$freeing" || true
           after=$(df --output=avail -m / | tail -1)

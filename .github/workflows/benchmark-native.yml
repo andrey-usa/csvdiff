@@ -125,6 +125,9 @@ jobs:
       - name: Install Zig
         if: env.ALL_PORTS == '1'
         uses: ./.github/actions/setup-zig
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
 
       # Ten million rows of ndjson is 8.5 GB, and the runner ships with tens of
       # gigabytes of toolchains this job never opens.
