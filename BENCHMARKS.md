@@ -120,6 +120,52 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (why clang 23 is slower; -O3, LTO and hardening) — measured, nothing adopted
+
+Two questions after clang 23 was measured slower: is it really the compiler, and
+are the C and C++ ports built with the wrong options? Rust is built at
+`opt-level=3` with thin LTO and one codegen unit, and Zig at ReleaseFast, while C
+and C++ are `-O2 -march=native` -- and Ubuntu's gcc also turns on CET
+(`-fcf-protection`), `-fstack-protector-strong`, stack-clash protection and
+`_FORTIFY_SOURCE=3` by default, which clang and rustc do not. A measuring branch
+(`claude/cc-flags-measure`, not merged) built every variant on one runner and ran
+them interleaved, 10M rows, median of 5 rounds, each against the current build
+(`scripts/variants_ab.py` there). Runs 196, 197 (CSV, EPYC 7763) and 198, 199
+(ndjson, two EPYC 9V74 runners):
+
+| C++ vs clang 22 -O2, 1 / 4 threads | CSV, 7763 | ndjson, 9V74 | ndjson, 9V74 (avx512) |
+|---|---|---|---|
+| clang 23 -O2 | 1.030–1.034 / 1.061–1.067 | 0.991 / 1.060 | 1.008 / 1.036 |
+| clang 22 -O3 | 1.005–1.009 / 1.019–1.030 | 0.998 / 0.960 | 1.013 / 1.005 |
+| clang 23 -O3 | 1.029–1.030 / 1.007–1.030 | 0.999 / 1.061 | 1.006 / 1.049 |
+| clang 22 -O2 ThinLTO | 0.996–1.002 / 1.061–1.076 | 0.978 / 1.001 | 0.974 / 1.004 |
+| clang 23 -O2 ThinLTO | 1.010–1.020 / 1.028–1.039 | 0.984 / 0.960 | 0.992 / 1.037 |
+| clang 22 -O3 ThinLTO | 0.995–1.004 / 1.012–1.021 | 0.990 / 1.031 | 0.989 / 1.014 |
+| clang 23 -O3 ThinLTO | 1.031–1.034 / 1.004–1.018 | 0.993 / 0.982 | 0.982 / 0.991 |
+
+| C vs gcc 16 -O2 (Ubuntu defaults), 1 / 4 threads | CSV, 7763 | ndjson, 9V74 | ndjson, 9V74 (avx512) |
+|---|---|---|---|
+| -O2, hardening off | 0.977–0.985 / 1.031–1.041 | 0.996 / 1.017 | 0.995 / 1.008 |
+| -O3, hardening off | 0.997–1.003 / 0.985–0.993 | 1.034 / 1.172 | 1.015 / 1.022 |
+| -O3 + LTO, hardening off | 1.003–1.012 / 0.984–0.987 | 1.053 / 1.171 | 1.034 / 1.030 |
+
+On one machine, clang 23 is slower: 3% on CSV at one thread, 6–7% at four,
+and 4–6% on ndjson at four threads. callgrind (1M rows, x86-64-v3 builds, one thread) puts
+the difference in the parser: clang 23's `parse_json` runs 5.438G instructions
+against clang 22's 5.250G (+3.6%, the whole program +2.2%), and its `parse_csv`
+1.963G against 1.908G, offset elsewhere to +0.4% for the whole CSV run -- so on
+CSV the loss is less work done per cycle rather than more work. It is the
+compiler's heuristics changing how the same source is compiled, not an option.
+
+None of the other options wins on both formats. `-O3` does nothing for C++ and
+costs C up to 17% on ndjson at four threads; ThinLTO gains C++ 2–3% on ndjson
+at one thread and loses up to 7% on CSV at four; Ubuntu's hardening is within
+the noise either way. So `-O2` stays for both ports, gcc 16 keeps its defaults,
+and C++ stays on clang 22. (The C++ outputs hashed differently between runs only
+because its summary line carries its own elapsed time; the counts agree.)
+
+---
+
 ## 2026-09-27 (clang 23 for c++, latest lockfile) — lockfile taken, C++ stays on clang 22
 
 LLVM 23.1 is out (23.1.2, packaged on apt.llvm.org for noble), so the C++ port
