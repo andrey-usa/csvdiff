@@ -120,6 +120,56 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c ndjson scans) — C found every ndjson row's end eight bytes at a time
+
+callgrind on C's 2M ndjson run had `next_of1` — the one-byte scan — at **15.7%**
+of 20.7B instructions. It was left as SWAR because it never showed in the CSV
+profile, and on ndjson it is most of the sweep: once the key-only parse has its
+two keys it stops, and the rest of a two-hundred-byte row is one scan for the
+newline. Zig and Rust do that scan a vector at a time. `next_of1` now takes the
+AVX2 and SSE2 steps `next_of2` already had: 20.73B → 18.36B (−11.4%).
+
+The same profile showed the probe that confirms a hash match doing that walk too.
+`index_keys` parsed a candidate's keys with the *file's* end as the row's, so
+after the keys it scanned on to the row's newline for an offset it threw away,
+once per lookup. `probe_keys` stops at the last key: CSV 6.58B → 6.45B (−2.0%),
+ndjson −0.8%.
+
+Output identical to main on 3,600 generated pairs (CSV with quoted delimiters,
+newlines and doubled quotes, CRLF, ragged rows, ndjson with escapes and shuffled
+keys) at one and three threads; `c/test.sh` passes.
+
+CI, `phases.yml`, 10M rows, grouped by CPU (runs 87–92; main's runs 81–82 and
+the earlier CSV runs on the same processors; the other ports are the controls):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** ndjson wall, 1 / 4 threads | 7.175 / 3.983 s | **6.448 / 3.498 s** (`next_of1` only) | Rust 6.322 → 6.285 s, C++ 6.680 → 6.656 s |
+| ndjson sweep | 1.005 s | **0.745 s** | |
+| ndjson join, 1 thread | 5.976 s | **5.517 s** | |
+| **Xeon 8370C** ndjson wall, 1 / 4 threads | 7.918 / 4.603 s | 7.726 / 4.274 s (`next_of1` only) | C++ 7.915 → 8.044 s, Rust 6.525 → 6.572 s |
+| **EPYC 7763** CSV wall, 1 / 4 threads | 2.34–2.39 / 1.49–1.52 s | 2.355 / 1.478 s (`next_of1`), **2.244 / 1.317 s** (both) | Rust 2.39–2.43 → 2.476 / 2.397 s, Zig 2.255 / 2.219 s |
+| CSV join, 1 thread | 1.785–1.796 s | **1.653 s** (both) | |
+| **EPYC 9V45** CSV wall, 1 / 4 threads | 1.454 s (#152) | **1.413 / 0.844 s** (both) | Rust 1.568–1.605 → 1.632 s |
+
+ndjson: 10% faster at one thread and 12% at four on the 7763, 3–4% against the
+controls on the 8370C, with the sweep 26% faster. CSV: the first change is flat,
+as its instruction count said; the probe is 5% at one thread and 11% at four
+on the 7763 against controls that moved 1–3%, more than its 2% of instructions.
+The tail it skips is B's row at a random offset, so what it saves is likelier
+cache lines than instructions — one run on that processor, so the four-thread
+number is the least settled.
+
+**And one thing noticed, not settled: Zig's ndjson on Intel.** The 8370C run
+above had Zig's ndjson join at 5.513 s against 4.884 s in main's run before
+#154, and this host (a Xeon) measures Zig's ndjson 0.96x with `scan=32` against
+`scan=8`, the join slower in every sample — the reverse of the 7763. A 16-byte
+step just for JSON strings did not recover it (0.99x against `scan=32`). CSV is
+faster at 32 bytes on this host too (1.14x), so the default stands; the ndjson
+join on Intel is the open question.
+
+---
+
 ## 2026-09-27 (zig scan32 default) — Zig scanned eight bytes where every other port scanned thirty-two
 
 Zig's scan step was eight bytes of SWAR on every build; `-Dscan=32` put the same

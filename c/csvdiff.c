@@ -89,8 +89,10 @@ static bool field_real(Field f) { return f != ABSENT && f != TOO_LONG; }
 /* for either. ndjson's fields are longer, so the scan was already finding hits */
 /* in one step, and the columnar path does not come through here at all.        */
 /*                                                                             */
-/* `next_of1` is left as SWAR on purpose. It did not appear in the profile, and */
-/* an unmeasured second copy of this is complexity with no number behind it.    */
+/* `next_of1` was left as SWAR because it did not appear in the CSV profile.   */
+/* ndjson is where it shows: once the key-only parse has its keys, the rest of  */
+/* a two-hundred-byte row is one scan for its newline, and that SWAR loop was   */
+/* 16% of the instructions on a 2m-row ndjson pair. It takes the same steps.    */
 /* ------------------------------------------------------------------------- */
 
 #define ONES UINT64_C(0x0101010101010101)
@@ -218,8 +220,29 @@ static inline size_t delims_next(Delims *c, size_t from) {
 }
 
 static size_t next_of1(const char *d, size_t from, size_t end, char t) {
-    uint64_t bt = broadcast((unsigned char)t);
     size_t at = from;
+    /* The same steps as `next_of2`, chosen the same way. */
+#if defined(__AVX2__)
+    {
+        const __m256i vt = _mm256_set1_epi8(t);
+        for (; at + 32 <= end; at += 32) {
+            const __m256i w = _mm256_loadu_si256((const __m256i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(w, vt));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+#if defined(__SSE2__)
+    {
+        const __m128i vt = _mm_set1_epi8(t);
+        for (; at + 16 <= end; at += 16) {
+            const __m128i w = _mm_loadu_si128((const __m128i *)(d + at));
+            const uint32_t hits = (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(w, vt));
+            if (hits) return at + (size_t)__builtin_ctz(hits);
+        }
+    }
+#endif
+    uint64_t bt = broadcast((unsigned char)t);
     for (; at + 8 <= end; at += 8) {
         uint64_t w = load64(d + at);
         uint64_t hits = match_bits(w, bt);
@@ -764,7 +787,7 @@ static size_t end_of_row(const char *d, size_t pos, size_t end) {
  * the object, one hash per key it holds -- not a search per wanted column.
  */
 static size_t parse_json_row(const RowParser *p, const char *d, size_t start, size_t end,
-                             Field *out, size_t slots) {
+                             Field *out, size_t slots, bool to_end) {
     for (size_t i = 0; i < slots; i++) out[i] = ABSENT;
     size_t found = 0;   /* key slots filled, for the early exit below */
     size_t guess = 0;   /* the slot the next member most likely fills */
@@ -838,7 +861,10 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
                         out[slot] = pack(from, to - from, escaped);
                         /* Every key found and nothing else wanted: the rest of
                          * the object is bytes to skip, not fields to parse. */
-                        if (++found == slots) break;
+                        if (++found == slots) {
+                            if (!to_end) return pos;
+                            break;
+                        }
                     }
                 } else {
                     out[slot] = pack(from, to - from, escaped);
@@ -850,7 +876,7 @@ static size_t parse_json_row(const RowParser *p, const char *d, size_t start, si
 }
 
 static size_t parse_csv_row(const RowParser *p, const char *d, size_t start, size_t end,
-                            Field *out, int last_needed, size_t slots) {
+                            Field *out, int last_needed, size_t slots, bool to_end) {
     for (size_t i = 0; i < slots; i++) out[i] = ABSENT;
     size_t pos = start;
     int column = 0;
@@ -881,6 +907,7 @@ static size_t parse_csv_row(const RowParser *p, const char *d, size_t start, siz
         if (d[next] == '\n') return next + 1;
         pos = next + 1;
         if (column > last_needed) {
+            if (!to_end) return pos;
             size_t eol = end_of_row(d, pos, end);
             return eol >= end ? end : eol + 1;
         }
@@ -889,8 +916,8 @@ static size_t parse_csv_row(const RowParser *p, const char *d, size_t start, siz
 }
 
 static size_t parse_row(const RowParser *p, const char *d, size_t start, size_t end, Field *out) {
-    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out, p->width);
-    return parse_csv_row(p, d, start, end, out, p->last_needed, p->width);
+    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out, p->width, true);
+    return parse_csv_row(p, d, start, end, out, p->last_needed, p->width, true);
 }
 
 /*
@@ -900,8 +927,21 @@ static size_t parse_row(const RowParser *p, const char *d, size_t start, size_t 
  */
 static size_t parse_keys(const RowParser *p, const char *d, size_t start, size_t end,
                          Field *out) {
-    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out, p->key_size);
-    return parse_csv_row(p, d, start, end, out, p->key_last, p->key_size);
+    if (p->dialect == DIALECT_JSON) return parse_json_row(p, d, start, end, out, p->key_size, true);
+    return parse_csv_row(p, d, start, end, out, p->key_last, p->key_size, true);
+}
+
+/*
+ * The key columns alone, for a row whose end is already known: the probe that
+ * confirms a hash match. It stops at the last key rather than walking the rest
+ * of the row to its newline for an offset nobody reads -- which, on a row of
+ * twenty columns keyed on the first two, was most of the bytes the probe
+ * touched. The return value is not a row boundary.
+ */
+static void probe_keys(const RowParser *p, const char *d, size_t start, size_t end,
+                       Field *out) {
+    if (p->dialect == DIALECT_JSON) (void)parse_json_row(p, d, start, end, out, p->key_size, false);
+    else (void)parse_csv_row(p, d, start, end, out, p->key_last, p->key_size, false);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -996,7 +1036,7 @@ static void index_fields(const RowIndex *ix, int32_t row, Field *out) {
 }
 
 static void index_keys(const RowIndex *ix, int32_t row, Field *out) {
-    parse_keys(ix->parser, ix->slab->data, (size_t)ix->row_start[row], ix->slab->size, out);
+    probe_keys(ix->parser, ix->slab->data, (size_t)ix->row_start[row], ix->slab->size, out);
 }
 
 /* ------------------------------------------------------------------------- */
