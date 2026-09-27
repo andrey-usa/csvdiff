@@ -1276,11 +1276,8 @@ const Sweep = struct {
                         _ = t.parser.parse(data, pos, data.len, fields);
                         for (fields) |field| if (field == TOO_LONG) return Error.FieldTooLong;
                     }
-                    try chunk.at.append(gpa, pos);
-                    try chunk.hash.append(
-                        gpa,
-                        try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a),
-                    );
+                    try push(u64, &chunk.at, gpa, pos);
+                    try push(u64, &chunk.hash, gpa, try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a));
                     if (next <= pos) break; // no progress: a malformed tail, not a loop
                     pos = next;
                 }
@@ -1288,6 +1285,14 @@ const Sweep = struct {
         }
     }
 };
+
+/// `append`, with the capacity check inline: two of these run per row of both
+/// files, and `append` makes each one a call to `ensureTotalCapacity` that
+/// almost always finds room. Only a full list pays for the call now.
+inline fn push(comptime T: type, list: *std.ArrayList(T), gpa: std.mem.Allocator, value: T) !void {
+    if (list.items.len == list.capacity) try list.ensureUnusedCapacity(gpa, 1);
+    list.appendAssumeCapacity(value);
+}
 
 fn sweep(
     gpa: std.mem.Allocator,
