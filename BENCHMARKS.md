@@ -125,8 +125,7 @@ other branch's agent that pointed this out.
 callgrind on Rust's ndjson run put `skip_json_string` near the top as a call:
 the JSON row parser stepped over every key and every string value through it,
 so a row of ten fields made about twenty calls, each to scan a few bytes. It is
-now `#[inline(always)]`, and the parser's loop keeps its state in registers
-across the string.
+now `#[inline(always)]`, so the string scan runs inside the parser's loop.
 
 callgrind, 2M ndjson pair, one thread: 19.23B → **14.85B (−22.8%)**. Locally
 1.03x. Output identical to main on 1,800 generated pairs at one and three
