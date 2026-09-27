@@ -120,6 +120,46 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (cpp single slot) — C++ walked a slot list for every field
+
+Two lines at the top of callgrind's C++ CSV profile, neither of them the work:
+
+- **`store`** placed each field by walking its column's run of slots — two
+  bounds loads and a loop per field, twenty fields a row — although every
+  column feeds exactly one slot unless `--compare` names a key. The loop header
+  alone was 784M of 8.47B instructions. A column's one slot is now precomputed,
+  as Rust's `single` already was, and the run is walked only for the others.
+- **`needs_normalising`** was asked three times a cell by `same` (through
+  `is_absent` for each side, then itself) and twice a key by `hash_field`: 307M.
+  Both now ask once and take the plain path directly.
+
+callgrind, 2M CSV pair, one thread: 8.468 B → **7.565 B (−10.7%)**. Output
+identical to main on 1,200 generated pairs (CSV, ragged CSV, ndjson) with no
+options, `--trim`, `--ignore-case --empty-is-null`, `--tolerance` and a
+`--compare` naming the key (the multi-slot path); `cpp/test.sh` and the 95
+cross-port cases pass.
+
+CI, `phases.yml`, 10M CSV; all three runs (73–75) landed on an **AMD EPYC 7763**,
+against main's runs on the same processor (58–60, 65, 71 as controls):
+
+| AMD EPYC 7763 | main | this | controls, main → this |
+|---|---:|---:|---|
+| C++ wall, 1 thread | 2.93–2.99 s | **2.785 / 2.802 / 2.804 s** | C 2.34–2.37 → 2.37–2.39 s |
+| C++ join, 1 thread | 2.18–2.19 s | **2.041 / 2.054 / 2.042 s** | Rust 2.39–2.41 → 2.41–2.43 s |
+| C++ wall, 4 threads | 1.73–1.77 s | **1.633 / 1.617 / 1.641 s** | Zig 2.70–2.72 → 2.72–2.74 s |
+
+**Tried first and dropped: the delimiter cursor that paid off in C.** Three
+versions, three rounds of CI each: two SSE2 compares per 32-byte window for
+every parse (the join 6–14% faster on EPYC 9V74/9V45, the sweep 15–20% slower on
+every CPU); the same for the full parse only (no gain on the 7763, four threads
+slower); an AVX2 window where the build has AVX2 (the join 10–15% *slower* on
+the 7763 and the 9V74). C++'s per-field scan was already a sixteen-byte SSE2
+step, inlined; C's was an out-of-line 32-byte AVX2 call per field, and that call
+was what the cursor removed. Rust's stock build tried the SSE2 window too, and
+measured nothing either way (runs 64–66).
+
+---
+
 ## 2026-09-27 (c delim cursor) — C scanned every field from scratch
 
 A time profile on the CI machine itself found this. `phases.yml` on a measuring
