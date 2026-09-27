@@ -91,7 +91,10 @@ jobs:
           key: contention-alone
       - name: Install Zig
         uses: ./.github/actions/setup-zig
-      - run: CXX=clang++ scripts/build_ports.sh c rust zig cpp cpp-gen
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+      - run: scripts/build_ports.sh c rust zig cpp cpp-gen
       - name: Measure, with nothing else running
         run: |
           echo "runner: $RUNNER_NAME  $(grep -m1 'model name' /proc/cpuinfo)"
@@ -124,7 +127,10 @@ jobs:
           key: contention-crowd-${{ matrix.n }}
       - name: Install Zig
         uses: ./.github/actions/setup-zig
-      - run: CXX=clang++ scripts/build_ports.sh c rust zig cpp cpp-gen
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
+      - run: scripts/build_ports.sh c rust zig cpp cpp-gen
       - name: Measure, with the rest of the crowd running
         run: |
           echo "runner: $RUNNER_NAME  $(grep -m1 'model name' /proc/cpuinfo)"

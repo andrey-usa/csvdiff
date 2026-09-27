@@ -126,6 +126,9 @@ jobs:
 
       - name: Install Zig
         uses: ./.github/actions/setup-zig
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
 
       # No disk cleanup here, unlike the ladder: two million rows of ndjson is
       # about 1.7 GB for the pair and the runner has room for it as it ships.
@@ -146,7 +149,7 @@ jobs:
               rm -f cpp/build/csvdiff-avx512
             fi
           fi
-          CXX=clang++ scripts/build_ports.sh $targets
+          scripts/build_ports.sh $targets
 
       - name: Run the table
         run: |

@@ -120,6 +120,44 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (pinned compilers) — C and C++ were built with compilers years behind the others
+
+**From here on the C and C++ numbers are from gcc 16 and clang 22, not gcc 13 and
+clang 18. Earlier entries are not comparable across that line for those ports.**
+
+The benchmark workflows built C with the runner image's `cc` (gcc 13.3) and C++
+with its `clang++` (clang 18.1.3) — ubuntu-24.04 ships gcc 12–14 and clang
+16–18 — while Rust built with the LLVM of current stable (22.1.8) and Zig with
+its pinned 0.16.0. `.github/actions/setup-cc` now installs gcc 16 (Ubuntu
+toolchain PPA) and clang 22 (apt.llvm.org) and exports `CC` and `CXX`; every
+benchmark workflow uses it, the way `setup-zig` pins Zig. The correctness and
+portability workflows (`ci-c`, `platforms`, `parity`, `formats`) keep their own
+compilers on purpose. Both builds are clean under `-Werror` with the new
+releases. `benchmark-native` had been building C++ with the image's default
+`c++`, which is g++; it now uses clang like the rest.
+
+CI, `phases.yml`, 10M rows (branch runs 159–162 against main on the same
+processor; Rust and Zig, whose compilers did not change, are the controls):
+
+| | C: gcc 13 → 16 | C++: clang 18 → 22 | controls |
+|---|---|---|---|
+| **EPYC 9V74** CSV, 1 / 4 threads (runs 163 → 162) | 1.650 / 0.993 → **1.597 / 0.971 s** | 2.150 / 1.115 → **2.119 / 1.102 s** | Rust 2.000 → 1.990 s, Zig 2.061 → 2.054 s |
+| **EPYC 7763** CSV, 1 / 4 threads (main 1.93–1.96 → run 160) | → 1.937 / 1.182 s | 2.34–2.38 → **2.333 / 1.283 s** | Rust 2.22–2.28 → 2.219 s, Zig 2.19–2.25 → 2.184 s |
+| **EPYC 7763** ndjson, 1 / 4 threads (runs 153/154 → 159) | 5.451–5.508 / 2.915–2.925 → **5.254 / 2.718 s** | 4.811–4.818 / 2.649–2.685 → **4.745** / 2.783 s | Rust 5.221–5.227 → 5.373 s, Zig 5.268–5.295 → 5.322 s |
+
+C is 3% faster on CSV on the 9V74, flat on the 7763, and 4% (one thread) to 7%
+(four) faster on ndjson against controls that ran 0.5–2.5% slower. C++ is 1–1.5%
+faster at one thread everywhere; its ndjson at four threads is 4% slower on the
+one pair there is.
+
+A side result, measured on the way here: the same C built with the image's clang
+18 instead of gcc 13 was 10% faster on ndjson on the 7763 (4.927 s) and 7%
+slower on CSV (2.085 s). The C port's compiler is still gcc; which compiler a
+port is measured with is a choice about what the benchmark means, not a tuning
+knob, and it is recorded here rather than taken.
+
+---
+
 ## 2026-09-27 (cpp inline name compare) — C++'s ndjson called memcmp for every member name
 
 The same call C and Zig just lost: the JSON parse checked each member's name

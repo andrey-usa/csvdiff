@@ -132,6 +132,9 @@ jobs:
       - name: Install Zig
         if: matrix.port == 'zig'
         uses: ./.github/actions/setup-zig
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
 
       # The C generator regardless of which port is measured: every generator
       # emits byte-identical files, and this one is the fastest and needs only a
@@ -141,7 +144,7 @@ jobs:
           make -C c gen-data
           case "${{ matrix.port }}" in
             c)    make -C c ;;
-            cpp)  CXX=clang++ make -C cpp ;;
+            cpp)  make -C cpp ;;
             rust) cargo build --release --manifest-path rust/Cargo.toml ;;
             zig)  (cd zig && zig build --release=fast) ;;
           esac
@@ -211,13 +214,16 @@ jobs:
       - name: Install Zig
         if: matrix.port == 'zig'
         uses: ./.github/actions/setup-zig
+      # Pinned gcc for C and clang for C++, exported as CC and CXX.
+      - name: Install C and C++ compilers
+        uses: ./.github/actions/setup-cc
 
       - name: Build
         run: |
           make -C c gen-data
           case "${{ matrix.port }}" in
             c)    make -C c ;;
-            cpp)  CXX=clang++ make -C cpp ;;
+            cpp)  make -C cpp ;;
             rust) cargo build --release --manifest-path rust/Cargo.toml ;;
             zig)  (cd zig && zig build --release=fast) ;;
           esac
