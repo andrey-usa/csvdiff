@@ -120,6 +120,35 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c inline name compare) — C's ndjson called memcmp for every member name
+
+The JSON parse checks each member's name against the slot it guesses comes
+next, and C did it with `memcmp` of a run-time length — a libc call through the
+PLT for every member of every row, 48.5M calls on a 2M ndjson pair. A small
+inline `same_name` now compares the name as two overlapping words (four-byte
+words, or bytes, for a shorter name); the table probe uses it too.
+
+callgrind, 2M ndjson pair, one thread: 15.05B → **13.98B (−7.1%)**. Locally
+1.04x, inside the floor. Output identical to main on 3,000 generated ndjson
+pairs at one and three threads; `c/test.sh` passes.
+
+CI, `phases.yml`, 10M ndjson, EPYC 7763, branch runs 139 and 141 against main
+runs 140 and 142 — all four on the same processor:
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** C wall, 1 / 4 threads | 5.658–5.672 / 3.115 s | **5.448–5.497 / 2.909–2.961 s** | C++ 5.489–5.504 → 5.507–5.574 s, Rust 5.215–5.233 → 5.223–5.285 s, Zig 5.417–5.428 → 5.427–5.474 s |
+| C join and compare | 4.731–4.741 s | **4.521–4.549 s** | |
+
+C is 3.4% faster at one thread and 5.8% at four, against controls within 1%.
+
+The same change in Rust was tried and dropped: its `==` on slices is also a
+`memcmp` call, but inlined with bounds checks it cost about as much (14.85B →
+14.71B, and 14.86B for a two-window variant), so there was nothing to measure.
+Zig's version is measured separately.
+
+---
+
 ## 2026-09-27 (cpp hash tail) — C++ copied each key's last word into a buffer
 
 The fix Rust took in #159, in C++: `hash_bytes` built a key's last partial word
