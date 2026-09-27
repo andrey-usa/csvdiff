@@ -120,6 +120,43 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (compact ndjson separators, every port) — 2–10% on ndjson
+
+All four JSON parsers walked a member the same way: skip space, look for `}`,
+take a `,` and loop back, skip space again, check for `"`, read the key, skip
+space, check for `:`, skip space again, read the value. Compact ndjson -- what
+every generator here writes, and what most producers do -- has no space
+anywhere, so each member paid for four whitespace loops and two passes over the
+separator checks to cross `,"` and `":"`. Each port now tests for those two byte
+pairs first and falls back to the general path for anything else, so spaced JSON
+parses exactly as before.
+
+Instructions on a 200k ndjson pair (callgrind, x86-64-v3 builds, one thread):
+Zig −17.7%, C++ −12.1% (its `parse_json` −16.5%), C −7.8% (`parse_json_row`
+−12.7%), Rust −5.2%. The outputs agreed with main on 600 generated ndjson pairs
+per port (400 for Rust) that mix compact and spaced separators, at one and four
+threads.
+
+Timed with the new `ab.yml` (main and the branch built and run interleaved on
+one runner, with main a second time as the floor), 10M rows, median of 7:
+
+| head / main, 1 / 4 threads | runner | head | main again (floor) |
+|---|---|---|---:|
+| C++ (run 10) | EPYC 9V74 | 0.941 / 0.921 | 0.999 / 0.997 |
+| C++ (run 9) | Xeon 8370C | 0.998 / 0.910 | 1.008 / 0.989 |
+| C (run 12) | EPYC 9V74 | 0.979 / 0.905 | 1.000 / 1.003 |
+| C (run 11) | Xeon 8573C | 1.005 / 0.976 | 0.993 / 0.988 |
+| Zig (run 16) | EPYC 9V45 | 0.973 / 0.943 | 0.993 / 1.001 |
+| Zig (run 15) | Xeon 8573C | 1.007 / 0.969 | 1.010 / 1.011 |
+| Rust (run 13) | EPYC 7763 | 0.992 / 0.995 | 1.007 / 1.002 |
+| Rust (run 14) | Xeon 8370C | 0.990 / 0.977 | 0.999 / 1.002 |
+
+Four threads gain on every runner, 2–10%. One thread gains 2–6% on the EPYCs
+and is inside the floor on the Xeons, where the loops this removes evidently
+cost less. Rust gains least, in line with its smaller cut in instructions.
+
+---
+
 ## 2026-09-27 (why clang 23 is slower; -O3, LTO and hardening) — measured, nothing adopted
 
 Two questions after clang 23 was measured slower: is it really the compiler, and
