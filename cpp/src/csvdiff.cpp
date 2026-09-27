@@ -489,9 +489,15 @@ bool same_normalised(const Slab& a, Field x, const Slab& b, Field y, const Optio
 }
 
 bool same(const Slab& a, Field x, const Slab& b, Field y, const Options& o) {
-    const bool xa = is_absent(a, x, o), yb = is_absent(b, y, o);
+    // The options are asked once. Through `is_absent` they were asked for each
+    // side and then again here, three times a cell on the path every run takes.
+    if (!needs_normalising(o)) {
+        const bool xa = !is_real(x) || len_of(x) == 0, yb = !is_real(y) || len_of(y) == 0;
+        if (xa || yb) return xa && yb;
+        return same_bytes(a, x, b, y);
+    }
+    const bool xa = absent_normalised(a, x, o), yb = absent_normalised(b, y, o);
     if (xa || yb) return xa && yb;
-    if (!needs_normalising(o)) return same_bytes(a, x, b, y);
     return same_normalised(a, x, b, y, o);
 }
 
@@ -570,13 +576,15 @@ std::uint64_t hash_bytes(const unsigned char* p, std::size_t n, std::uint64_t se
 std::uint64_t hash_field(const Slab& s, Field f, const Options& o, std::uint64_t seed) {
     constexpr std::uint64_t kPrime = 0x100000001b3ULL;
     std::uint64_t h = seed;
-    if (is_absent(s, f, o)) return (h ^ 0x9e3779b97f4a7c15ULL) * kPrime;
+    const bool normalising = needs_normalising(o);
+    const bool absent = !is_real(f) || len_of(f) == 0 || (normalising && absent_normalised(s, f, o));
+    if (absent) return (h ^ 0x9e3779b97f4a7c15ULL) * kPrime;
     std::uint64_t len = 0;
-    if (!needs_normalising(o) && !is_escaped(f)) {
+    if (!normalising && !is_escaped(f)) {
         const std::string_view raw = s.raw(f);
         h = hash_bytes(reinterpret_cast<const unsigned char*>(raw.data()), raw.size(), h);
         len = raw.size();
-    } else if (needs_normalising(o)) {
+    } else if (normalising) {
         const std::string v = value_of(s, f, o).value_or(std::string());
         for (unsigned char b : v) {
             h = (h ^ b) * kPrime;
@@ -689,6 +697,16 @@ class RowParser {
                                                 filled[static_cast<std::size_t>(c)])] =
                 static_cast<int>(slot);
             ++filled[static_cast<std::size_t>(c)];
+        }
+        // The common case pulled out of the runs above: a column that feeds
+        // exactly one slot, which is every column unless `--compare` names a key.
+        // Walking a run of one still cost two bounds loads and a loop per field,
+        // twenty fields a row -- 13% of the instructions of a 2M CSV pair.
+        csv_single_.assign(static_cast<std::size_t>(last_needed_) + 1, kNoSlot);
+        for (std::size_t c = 0; c < csv_single_.size(); ++c) {
+            const int n = csv_slot_starts_[c + 1] - csv_slot_starts_[c];
+            if (n == 1) csv_single_[c] = csv_slots_[static_cast<std::size_t>(csv_slot_starts_[c])];
+            if (n > 1) csv_single_[c] = kManySlots;
         }
     }
 
@@ -996,6 +1014,12 @@ class RowParser {
     void store(int column, Field f, Field* out, int last, std::size_t slots) const {
         if (column > last) return;
         const std::size_t at = static_cast<std::size_t>(column);
+        const int one = csv_single_[at];
+        if (one >= 0) {
+            if (static_cast<std::size_t>(one) < slots) out[one] = f;
+            return;
+        }
+        if (one == kNoSlot) return;
         for (int i = csv_slot_starts_[at]; i < csv_slot_starts_[at + 1]; ++i) {
             const std::size_t slot = static_cast<std::size_t>(csv_slots_[static_cast<std::size_t>(i)]);
             if (slot < slots) out[slot] = f;
@@ -1023,6 +1047,10 @@ class RowParser {
     std::size_t key_size_ = 0;
     // The inverse of `source_`: which slots each column of the file feeds.
     std::vector<int> csv_slot_starts_, csv_slots_;
+    // Per column: its one slot, or one of these.
+    static constexpr int kNoSlot = -1;
+    static constexpr int kManySlots = -2;
+    std::vector<int> csv_single_;
     Dialect dialect_ = Dialect::Csv;
     std::vector<std::string> wanted_;   // JSON: the key whose value goes in each slot
     std::vector<int> slots_;            // JSON: open-addressed name -> slot
