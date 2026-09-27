@@ -120,6 +120,39 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c guard span) — the join stopped parsing rows the proof settles
+
+The join parsed every row of A in full before trying the byte proof, though the
+CSV proof needs only one offset from it: the end of the guard column, through
+the delimiter that closes it. `guard_span` counts that many delimiters with the
+cursor alone -- quoted fields skipped the way the row parse skips them, no
+fields packed, no slot map walked -- and `index_lookup_proof` takes a NULL
+`fields` to mean "return the first hash match unproven". A row the bytes settle
+is never parsed; one they do not is parsed and looked up again with the full
+key check, which also covers a hash collision. Short rows, a guard that ends the
+row, and ndjson take the old path unchanged.
+
+Found and written by andrey-usa in a separate session (local `bench_ab.sh`: CPU
+1.04x, self-test floor 1.01x). Instructions on a 200k CSV pair: **565M → 449M
+(−20.5%)** (callgrind, x86-64-v3). Output identical to main on 6,000 generated
+CSV comparisons -- two generators with quoted fields, doubled quotes, CRLF and
+ragged rows, keyed alone and with the last or a middle column ignored so the
+guard moves, at one and three threads; the 73 `c/test.sh` checks pass.
+
+`ab.yml`, 10M rows, median of 7, main run a second time as the floor:
+
+| head / main, 1 / 4 threads | runner | head | main again (floor) |
+|---|---|---|---:|
+| run 29 | Xeon 8370C | **0.870 / 0.869** | 0.987 / 0.992 |
+| run 30 | EPYC 9V74 | **0.903 / 0.910** | 0.999 / 0.997 |
+| run 31 | Xeon 8573C | **0.887 / 0.868** | 1.002 / 0.984 |
+
+10–13% at one thread and at four, on every runner -- three times what the local
+harness measured. The C++ join has the same parse-before-proof order
+(`fields_of` in `a_range`), and so, likely, do Rust and Zig.
+
+---
+
 ## 2026-09-27 (rust and zig cursor inline) — the delimiter cursor lived on the stack
 
 The C++ cursor gained 10–14% once its state moved from a struct into locals.
