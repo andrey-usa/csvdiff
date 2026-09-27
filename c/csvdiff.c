@@ -1462,6 +1462,49 @@ static bool json_tail_is_clean(const RowParser *p, const char *d, size_t at, siz
 }
 
 /*
+ * `index_lookup`, with the proof tried first.
+ *
+ * `need` bytes from `a_row` cover every column either file wants, keys
+ * included, so a candidate whose row begins with the same bytes carries the
+ * same key: that is the key comparison, and it is settled without parsing the
+ * candidate's keys at all -- which was a tenth of the ndjson run's
+ * instructions. Only a candidate the bytes do not settle is parsed and
+ * compared as `index_lookup` does. `*proven` says which of the two found it,
+ * and a proven mate needs no comparing either: every compared column is inside
+ * the same bytes.
+ */
+static int32_t index_lookup_proof(const RowIndex *ix, const Slab *other, const Field *fields,
+                                  uint64_t hash, Field *probe, const char *a_row, size_t need,
+                                  bool json, bool *proven) {
+    size_t slot = slot_of(ix, hash);
+    for (;;) {
+        const uint32_t v = ix->table[slot];
+        if (v == TABLE_EMPTY) return -1;
+        if (!slot_tag_is(ix, v, hash)) { slot = (slot + 1) & ix->mask; continue; }
+        const size_t at = slot_pos(ix, v);
+        int32_t candidate = ix->first_row[at];
+        if (ix->row_hash[candidate] == hash) {
+            const size_t b_lo = (size_t)ix->row_start[candidate];
+            const size_t b_n = row_end(ix, candidate) - b_lo;
+            const char *b = ix->slab->data;
+            if (need <= b_n && common_prefix(a_row, b + b_lo, need) == need &&
+                (!json || json_tail_is_clean(ix->parser, b, b_lo + need, b_lo + b_n))) {
+                *proven = true;
+                return candidate;
+            }
+            index_keys(ix, candidate, probe);
+            bool ok = true;
+            for (size_t i = 0; i < ix->key_size && ok; i++) {
+                bool xa = is_absent(ix->slab, probe[i]), ya = is_absent(other, fields[i]);
+                ok = (xa || ya) ? (xa && ya) : same_bytes(ix->slab, probe[i], other, fields[i]);
+            }
+            if (ok) return candidate;
+        }
+        slot = (slot + 1) & ix->mask;
+    }
+}
+
+/*
  * One per thread, and padded so that two of them cannot share a cache line.
  *
  * Without the padding these sit in one `calloc`ed array about ninety bytes
@@ -1510,6 +1553,11 @@ typedef struct {
     /* The same proof, on objects: no column order to check, because a name maps
      * to the same slot in both files whatever order the objects list them in. */
     bool            json;
+    /* Whether the proof's bytes also cover the keys, so that it can stand in
+     * for the key comparison and run before the mate is parsed: always on
+     * objects, where the span is taken over every wanted value; on CSV when
+     * every key sits at the same column in both files, before the guard. */
+    bool            keys_in_proof;
 } CmpCtx;
 
 /*
@@ -1527,6 +1575,50 @@ typedef struct {
  * generated rows.
  */
 static int verify_added(void) { return getenv("CSVDIFF_VERIFY_ADDED") != NULL; }
+
+/* Parses the mate in full and counts the compared columns that differ. */
+static void compare_mate(const CmpCtx *c, CmpPart *out, int32_t mate) {
+    const size_t key_size = c->key_size, nc = c->nc;
+    index_fields(c->bi, mate, out->fb);
+    bool any = false;
+    for (size_t i = 0; i < nc; i++) {
+        const Field x = out->fa[key_size + i], y = out->fb[key_size + i];
+        const bool xa = is_absent(c->a, x), ya = is_absent(c->b, y);
+        const bool differs = (xa || ya) ? (xa != ya) : !same_bytes(c->a, x, c->b, y);
+        if (differs) {
+            any = true;
+            out->col_changed[i]++;
+            if (ya) out->col_blanked[i]++;
+            if (xa) out->col_filled[i]++;
+        }
+    }
+    if (any) out->changed++;
+}
+
+/*
+ * How many bytes of A's row the proof compares, keys included -- or 0 where
+ * this row cannot be proven that way. Through the byte that closes the last
+ * value either file wants, for the reason the CSV proof below gives.
+ */
+static size_t proof_span(const CmpCtx *c, int32_t row, const Field *fa) {
+    const size_t a_lo = (size_t)c->ai->row_start[row];
+    const size_t a_end = row_end(c->ai, row);
+    size_t t = a_lo;
+    if (c->json) {
+        for (size_t i = 0; i < c->width; i++) {
+            if (!field_real(fa[i])) continue;
+            const size_t e = field_off(fa[i]) + field_len(fa[i]);
+            if (e > t) t = e;
+        }
+    } else {
+        const Field g = fa[c->guard];
+        if (!field_real(g)) return 0;
+        const char *d = c->a->data;
+        t = field_off(g) + field_len(g);
+        while (t < a_end && d[t] != c->delim && d[t] != '\n' && d[t] != '\r') t++;
+    }
+    return t < a_end ? t + 1 - a_lo : 0;
+}
 
 static void compare_part(void *vctx, unsigned p) {
     CmpCtx *c = vctx;
@@ -1559,6 +1651,20 @@ static void compare_part(void *vctx, unsigned p) {
                                           c->ai->row_hash[c->ai->first_row[k + PREFETCH_AHEAD]])],
                     0, 0);
             index_fields(c->ai, row, out->fa);
+            const bool attempt = refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0;
+            const size_t need = attempt && c->keys_in_proof ? proof_span(c, row, out->fa) : 0;
+            if (need) {
+                bool proven = false;
+                const int32_t mate = index_lookup_proof(
+                    c->bi, c->a, out->fa, hash, out->probe,
+                    c->a->data + (size_t)c->ai->row_start[row], need, c->json, &proven);
+                if (mate < 0) { out->removed++; continue; }
+                out->matched++;
+                if (proven) { refused = 0; continue; }
+                if (refused < PROOF_BACKOFF) refused++;
+                compare_mate(c, out, mate);
+                continue;
+            }
             const int32_t mate = index_lookup(c->bi, c->a, out->fa, hash, out->probe);
             if (mate < 0) { out->removed++; continue; }
             out->matched++;
@@ -1622,20 +1728,7 @@ static void compare_part(void *vctx, unsigned p) {
                 }
                 if (refused < PROOF_BACKOFF) refused++;
             }
-            index_fields(c->bi, mate, out->fb);
-            bool any = false;
-            for (size_t i = 0; i < nc; i++) {
-                const Field x = out->fa[key_size + i], y = out->fb[key_size + i];
-                const bool xa = is_absent(c->a, x), ya = is_absent(c->b, y);
-                const bool differs = (xa || ya) ? (xa != ya) : !same_bytes(c->a, x, c->b, y);
-                if (differs) {
-                    any = true;
-                    out->col_changed[i]++;
-                    if (ya) out->col_blanked[i]++;
-                    if (xa) out->col_filled[i]++;
-                }
-            }
-            if (any) out->changed++;
+            compare_mate(c, out, mate);
         }
         return;
     }
@@ -2157,8 +2250,15 @@ int main(int argc, char **argv) {
                       (i == key_size || a_src[i] > a_src[i - 1]);
         const bool json_proof =
             a.dialect == DIALECT_JSON && b.dialect == DIALECT_JSON && nc > 0;
+        bool keys_in_proof = json_proof;
+        if (aligned) {
+            keys_in_proof = true;
+            for (size_t i = 0; keys_in_proof && i < key_size; i++)
+                keys_in_proof = a_src[i] >= 0 && a_src[i] == b_src[i] &&
+                                a_src[i] < a_src[width - 1];
+        }
         CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts,
-                      aligned, width - 1, a_delim, json_proof };
+                      aligned, width - 1, a_delim, json_proof, keys_in_proof };
         run_parts(compare_part, &cc, ways + b_ways);
         phase_mark(&whole, "join and compare");
 

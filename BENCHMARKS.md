@@ -120,6 +120,48 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c proof before probe) — C parsed the mate's keys before the proof that makes them unnecessary
+
+The join's proof compares A's row with its mate's bytes from the front; when
+they agree through the last compared value, the mate is never parsed. C ran it
+*after* `index_lookup`, which had already parsed the mate's keys to confirm the
+match. Zig's lookup runs it first, over a span that covers the keys as well —
+then equal bytes are the key comparison, and the only work on a matched,
+unchanged row is one `memcmp`-like scan. C now does the same:
+`index_lookup_proof` tries the bytes on the hash-matched candidate and parses
+its keys only when they differ. On objects the span covers every wanted value;
+on CSV it is used when every key sits at the same column in both files, ahead
+of the guard column (otherwise the old order stands).
+
+Output identical to main on 1,800 generated pairs and 4,320 more with keys
+before, after and among the compared columns, a `--compare` naming the key and
+out of order, and `--ignore`; identical on the 2M CSV and ndjson pairs;
+`c/test.sh` passes.
+
+CI, `phases.yml`, 10M rows (runs 99–102 against main's on the same processor;
+the other ports are the controls):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** CSV wall, 1 / 4 threads | 2.260–2.277 / 1.328–1.359 s | **1.967 / 1.189 s** | C++ 2.794–2.856 → 2.801 s, Rust 2.427–2.429 → 2.411 s, Zig 2.248–2.271 → 2.248 s |
+| CSV join, 1 thread | 1.656–1.664 s | **1.387 s** | |
+| **EPYC 7763** ndjson wall, 1 / 4 threads | 6.448 / 3.498 s | **5.994–6.034 / 3.276–3.304 s** | Rust 6.285 → 6.313–6.338 s, Zig 5.438 → 5.475 s |
+| ndjson join, 1 thread | 5.517 s | **5.061 s** | |
+
+13% at one thread and 11% at four on CSV, where C is now the quickest port by
+12%; 7% and 6% on ndjson. (The ndjson baseline is #155's first commit alone;
+its second is 0.8% of ndjson's instructions.) One CSV run landed on an EPYC
+9V74 exposing AVX2 but not AVX-512 and every port there ran 10–17% slower than
+main's 9V74 run, C least, so it is not in the table.
+
+**Tried and dropped: the probe fix in the other ports.** #155's `probe_keys`
+(stop the key probe at the last key) measured nothing in C++, Rust or Zig —
+CSV on the 7763, two runs against one, every port within 2%. Rust and Zig
+already try the proof before the probe, so theirs rarely runs, and C++ gets
+this entry's change instead.
+
+---
+
 ## 2026-09-27 (c ndjson scans) — C found every ndjson row's end eight bytes at a time
 
 callgrind on C's 2M ndjson run had `next_of1` — the one-byte scan — at **15.7%**
