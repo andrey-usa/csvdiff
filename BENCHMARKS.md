@@ -120,6 +120,32 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (zig inline name compare) — Zig's ndjson called std.mem.eql for every member name
+
+Zig's JSON parse compared each member's name with `std.mem.eql` — for the
+guessed slot, in the table probe, and for the `null` test — and the compiler
+kept it out of line: 48M calls on a 2M ndjson pair, 2.23B of 15.47B
+instructions. An inline `sameName` now checks the length and compares
+overlapping words, as C's `same_name` does.
+
+callgrind, 2M ndjson pair, one thread: 15.47B → **14.18B (−8.3%)**. Locally
+inside the floor. Output identical to main on 3,000 generated ndjson pairs at
+one and three threads; `zig build test` and `zig/test.sh` pass.
+
+CI, `phases.yml`, 10M ndjson, EPYC 7763 (branch run 144; main runs 140 and 142):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** Zig wall, 1 / 4 threads | 5.417–5.428 / 3.125 s | **5.323 / 2.869 s** | C 5.658–5.672 → 5.685 s, C++ 5.489–5.504 → 5.520 s, Rust 5.215–5.233 → 5.276 s |
+| Zig sweep, a side | 0.787–0.797 s | **0.746–0.754 s** | |
+| Zig join, 1 / 4 threads | 4.337–4.347 / 2.041–2.044 s | **4.280 / 1.823 s** | |
+
+Against controls 0.3–1% slower, Zig is 2% faster at one thread and 8% at four,
+where the join is 11% quicker. Three more runs drew processors main did not
+(9V74 run 133, 8370C run 134, 8573C run 143).
+
+---
+
 ## 2026-09-27 (c inline name compare) — C's ndjson called memcmp for every member name
 
 The JSON parse checks each member's name against the slot it guesses comes
