@@ -140,10 +140,10 @@ CI, `phases.yml`, 10M ndjson, EPYC 7763 (branch runs 149 and 150; main run 146):
 | C++ join and compare | 4.518 s | **3.890–3.893 s** | |
 
 C++ is 12% faster at one thread and 13% at four, against controls flat to
-0.2%. That is well beyond the instruction count: the call was more costly to the
-clock than to callgrind, which does not charge for the branch mispredictions of
-libc's length dispatch on names of a few bytes. C++ is now the quickest port on
-ndjson. Two earlier branch runs drew processors main did not (9V74 run 145,
+0.2%. That is well beyond the instruction count; callgrind counts neither
+branch mispredictions nor stalls, and the call is the likelier place for those
+than the inline compare, but that was not measured. C++ is now the quickest
+port on ndjson. Two earlier branch runs drew processors main did not (9V74 run 145,
 8573C run 147).
 
 ---
