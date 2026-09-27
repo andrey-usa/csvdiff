@@ -120,6 +120,33 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (c inline json string) — C's ndjson paid the same call Rust did
+
+The same call as Rust's, one layer down: `skip_json_string` stepped over each
+key and string value by calling `next_of2`, which gcc kept out of line, so an
+ndjson row made about twenty calls to scan a few bytes each (2.82B instructions
+of 16.77B). The scan's body is now `scan_of2`, forced inline into
+`skip_json_string`, which is forced inline into the row parse; `next_of2` wraps
+it for the CSV callers, whose code is unchanged. C++ needed nothing: clang
+already inlines its copy.
+
+callgrind, 2M ndjson pair, one thread: 16.77B → **15.05B (−10.3%)**. Locally
+1.20x on ndjson and no change on CSV. Output identical to main on 3,600
+generated ndjson pairs at one and three threads; `c/test.sh` passes.
+
+CI, `phases.yml`, 10M ndjson, EPYC 7763, branch run 126 and main run 127:
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** C wall, 1 / 4 threads | 6.038 / 3.259 s | **5.647 / 3.122 s** | C++ 5.493 → 5.511 s, Rust 5.220 → 5.243 s, Zig 5.404 → 5.426 s |
+| C join and compare | 5.092 s | **4.719 s** | |
+
+Against controls 0.3–0.4% slower, C is 6.5% faster at one thread and 4% at
+four. The other two runs drew unmatched processors (branch on a 9V45, C 3.858
+s; main on a 9V74, C 4.370 s).
+
+---
+
 ## 2026-09-27 (zig sweep push) — Zig's sweep called for room it had
 
 The sweep appends two values per row of both files, the row's offset and its key
