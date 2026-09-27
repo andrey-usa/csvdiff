@@ -4,7 +4,7 @@ description: >-
   steps that follow.
 
 # The C and C++ ports were built with whatever the runner image shipped as `cc`
-# and `clang++`: on ubuntu-24.04 that is gcc 13 and clang 18, three and four
+# and `clang++`: on ubuntu-24.04 that is gcc 13 and clang 18, three and five
 # major releases behind upstream, while the Rust port builds with the LLVM of the
 # current stable toolchain and Zig with its pinned release. A benchmark between
 # ports should not be a benchmark between compiler vintages, so the versions are
@@ -23,7 +23,7 @@ inputs:
   llvm:
     description: LLVM major release, whose clang++ is used as CXX.
     required: false
-    default: "22"
+    default: "23"
 
 runs:
   using: composite
