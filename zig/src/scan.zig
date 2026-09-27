@@ -157,23 +157,13 @@ pub const Delims = struct {
 
     /// The offset of the first byte at or after `from` that is `a` or `b`, or
     /// `end` -- the same answer `nextOf2` gives, without rescanning.
-    ///
-    /// The held matches are the common answer -- a 32-byte chunk covers three
-    /// or four fields -- so that part is inlined into the parse loop and only a
-    /// new chunk is a call. The Rust port's cursor is split the same way.
-    pub inline fn next(self: *Delims, from: usize) usize {
+    pub fn next(self: *Delims, from: usize) usize {
         // Matches already found and still ahead of the caller.
         while (self.bits != 0) {
             const at = self.lowest(self.bits);
             self.bits &= self.bits - 1;
             if (at >= from) return at;
         }
-        return self.refill(from);
-    }
-
-    /// `next` once the held matches are spent: scans on from `from`, or from
-    /// the first byte no chunk has covered, whichever is later.
-    noinline fn refill(self: *Delims, from: usize) usize {
         var at = if (from > self.scanned) from else self.scanned;
         if (width > 8) {
             while (at + width <= self.end) : (at += width) {
