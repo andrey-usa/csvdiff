@@ -203,7 +203,7 @@ fn fold_bytes(mut h: u64, v: &[u8]) -> u64 {
 /// halves, or as its first, middle and last byte. The Zig port does the same
 /// (`scan.tailWord`).
 #[inline]
-fn tail_word(v: &[u8], rem: usize) -> u64 {
+pub(super) fn tail_word(v: &[u8], rem: usize) -> u64 {
     let n = v.len();
     debug_assert!(rem > 0 && rem < 8 && rem <= n);
     if n >= 8 {
