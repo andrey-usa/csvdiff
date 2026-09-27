@@ -120,6 +120,29 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-27 (rust inline json string) — Rust's ndjson paid a call per string
+
+callgrind on Rust's ndjson run put `skip_json_string` near the top as a call:
+the JSON row parser stepped over every key and every string value through it,
+so a row of ten fields made about twenty calls, each to scan a few bytes. It is
+now `#[inline(always)]`, so the string scan runs inside the parser's loop.
+
+callgrind, 2M ndjson pair, one thread: 19.23B → **14.85B (−22.8%)**. Locally
+1.03x. Output identical to main on 1,800 generated pairs at one and three
+threads; `cargo test` passes.
+
+CI, `phases.yml`, 10M ndjson, EPYC 7763 (runs 122 and 123; main from earlier
+runs on the same processor — this round's main run, 124, drew a Xeon 8370C):
+
+| | main | this | controls, main → this |
+|---|---:|---:|---|
+| **EPYC 7763** Rust wall, 1 / 4 threads | about 6.29 s | **5.238–5.251 / 2.725–2.735 s** | C 5.99 → 5.989–5.991 s, C++ 5.51 → 5.525–5.533 s, Zig 5.45 → 5.429–5.457 s |
+
+Controls are flat to within half a percent; Rust is 17% faster at one thread
+and goes from last of the four on ndjson to first.
+
+---
+
 ## 2026-09-27 (rust hash tail and cursor inline) — two calls Rust's CSV run made for nothing
 
 callgrind on Rust's CSV run (x86-64-v3, as CI builds it) against C's: 7.11B
