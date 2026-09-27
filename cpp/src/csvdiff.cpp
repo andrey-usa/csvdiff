@@ -580,9 +580,35 @@ std::optional<double> as_number(std::string_view s) {
 //
 // The escaped and normalised paths stay byte-at-a-time, because there the bytes
 // are produced one at a time anyway.
+// The last `rem` bytes of p[0..len), one to seven of them, as a little-endian
+// word padded with zeros -- from loads rather than a copy into a zeroed buffer,
+// which is a call to memcpy for a length only known at run time: two a row in
+// the index build. A value of eight bytes or more has eight real bytes ending
+// where the tail does, so one load and a shift; a shorter one is two
+// overlapping halves, or its first, middle and last byte. The other three
+// ports read their tails the same way.
+[[gnu::always_inline]] inline std::uint64_t tail_word(const unsigned char* p, std::size_t len,
+                                                      std::size_t rem) {
+    if (len >= 8) return load64(reinterpret_cast<const char*>(p) + len - 8) >> (8 * (8 - rem));
+    if (len >= 4) {
+        std::uint32_t lo, hi;
+        std::memcpy(&lo, p, 4);
+        std::memcpy(&hi, p + len - 4, 4);
+        if constexpr (std::endian::native == std::endian::big) {
+            lo = __builtin_bswap32(lo);
+            hi = __builtin_bswap32(hi);
+        }
+        return std::uint64_t(lo) | (std::uint64_t(hi) << (8 * (len - 4)));
+    }
+    return std::uint64_t(p[0]) | (std::uint64_t(p[len / 2]) << (8 * (len / 2))) |
+           (std::uint64_t(p[len - 1]) << (8 * (len - 1)));
+}
+
 std::uint64_t hash_bytes(const unsigned char* p, std::size_t n, std::uint64_t seed) {
     constexpr std::uint64_t kPrime = 0x100000001b3ULL;
     std::uint64_t h = seed;
+    const unsigned char* const base = p;
+    const std::size_t total = n;
     while (n >= 8) {
         std::uint64_t word;
         std::memcpy(&word, p, sizeof word);
@@ -592,9 +618,7 @@ std::uint64_t hash_bytes(const unsigned char* p, std::size_t n, std::uint64_t se
         n -= 8;
     }
     if (n > 0) {
-        std::uint64_t tail = 0;
-        std::memcpy(&tail, p, n);
-        h = (h ^ tail) * kPrime;
+        h = (h ^ tail_word(base, total, n)) * kPrime;
         h ^= h >> 29;
     }
     return h;
