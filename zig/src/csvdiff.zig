@@ -800,14 +800,16 @@ const RowIndex = struct {
     fn slotFor(self: *const RowIndex, hash: u64, pos: usize) u32 {
         const p: u32 = @intCast(pos + 1);
         if (self.pos_bits == 32) return p;
+        const pb: u5 = @intCast(self.pos_bits);
         // `hash >> (32 + pos_bits)`: the top `32 - pos_bits` bits, now low.
-        return (@as(u32, @truncate(hash >> (32 + self.pos_bits))) << self.pos_bits) | p;
+        return (@as(u32, @truncate(hash >> (32 + pb))) << pb) | p;
     }
 
     /// Whether the slot's tag matches the hash's top bits.
     fn tagIs(self: *const RowIndex, slot: u32, hash: u64) bool {
         if (self.pos_bits == 32) return true;
-        return (slot >> self.pos_bits) == @as(u32, @truncate(hash >> (32 + self.pos_bits)));
+        const pb: u5 = @intCast(self.pos_bits);
+        return (slot >> pb) == @as(u32, @truncate(hash >> (32 + pb)));
     }
 
     /// The `first_row` position a non-empty slot holds.
@@ -861,7 +863,7 @@ const RowIndex = struct {
         if (total + 2 > (@as(u64, 1) << 32)) return error.OutOfMemory;
         var pos_bits: u6 = 1;
         while (pos_bits < 32 and (@as(u64, 1) << pos_bits) < total + 2) pos_bits += 1;
-        const pos_mask: u32 = if (pos_bits >= 32) std.math.maxInt(u32) else (@as(u32, 1) << pos_bits) - 1;
+        const pos_mask: u32 = if (pos_bits >= 32) std.math.maxInt(u32) else (@as(u32, 1) << @as(u5, @intCast(pos_bits))) - 1;
         const table = try gpa.alloc(u32, cap);
         @memset(table, EMPTY_SLOT);
         var self = RowIndex{

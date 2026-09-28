@@ -402,12 +402,14 @@ const Index = struct {
     fn slotFor(self: Index, h: u64, pos: usize) u32 {
         const p: u32 = @intCast(pos + 1);
         if (self.pos_bits == 32) return p;
+        const pb: u5 = @intCast(self.pos_bits);
         // `h >> (32 + pos_bits)`: the top `32 - pos_bits` bits, now low.
-        return (@as(u32, @truncate(h >> (32 + self.pos_bits))) << self.pos_bits) | p;
+        return (@as(u32, @truncate(h >> (32 + pb))) << pb) | p;
     }
     fn tagIs(self: Index, slot: u32, h: u64) bool {
         if (self.pos_bits == 32) return true;
-        return (slot >> self.pos_bits) == @as(u32, @truncate(h >> (32 + self.pos_bits)));
+        const pb: u5 = @intCast(self.pos_bits);
+        return (slot >> pb) == @as(u32, @truncate(h >> (32 + pb)));
     }
     fn posOf(self: Index, slot: u32) usize {
         return @intCast((slot & self.pos_mask) - 1);
@@ -471,7 +473,7 @@ fn buildIndex(
     var pos_bits: u6 = 1;
     while (pos_bits < 32 and (@as(u64, 1) << pos_bits) < s.rows + 2) pos_bits += 1;
     ix.pos_bits = pos_bits;
-    ix.pos_mask = if (pos_bits >= 32) std.math.maxInt(u32) else (@as(u32, 1) << pos_bits) - 1;
+    ix.pos_mask = if (pos_bits >= 32) std.math.maxInt(u32) else (@as(u32, 1) << @as(u5, @intCast(pos_bits))) - 1;
     ix.slots = try gpa.alloc(u32, cap);
     @memset(ix.slots, 0);
     ix.mask = cap - 1;
