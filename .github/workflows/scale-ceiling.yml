@@ -54,6 +54,9 @@ on:
       repeats:
         description: "Runs per size; the best is kept"
         default: "1"
+      mem_cap_mb:
+        description: "Optional RLIMIT_DATA cap in MB applied to the compare step (replicates the 2026-09-14 capped-ceiling methodology; empty = no cap)"
+        default: ""
 
 # The repository's rule is one benchmark at a time: two timing jobs on one host
 # measure each other's contention. These are separate hosted runners so they do
@@ -158,6 +161,12 @@ jobs:
             zig)  BIN=zig/zig-out/bin/csvdiff ;;
           esac
           mkdir -p out
+          # Optional memory cap, replicating the 2026-09-14 capped-ceiling
+          # methodology (RLIMIT_DATA = data-segment limit in KB).
+          if [ -n "${{ inputs.mem_cap_mb }}" ]; then
+            echo "applying RLIMIT_DATA cap: ${{ inputs.mem_cap_mb }} MB"
+            ulimit -d $(( ${{ inputs.mem_cap_mb }} * 1024 ))
+          fi
           # One size. No --stop-on-fail: there is nothing after this to stop.
           python3 scripts/bench_scale.py \
               --binary "$BIN" --label "${{ matrix.port }}" \

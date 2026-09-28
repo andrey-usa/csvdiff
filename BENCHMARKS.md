@@ -131,25 +131,27 @@ never change mid-run. C's `hash_field` takes no `opt` at all.
 path (no normalization, the common case) checks absence directly from the field
 word, skipping the `is_absent` call entirely. The normalized path is unchanged.
 
-`bench_ab.sh`, 10M rows CSV, `--summary`, interleaved rounds, EPYC 9D64:
-
-| | wall best / median | cpu best / median |
-|---|---|---|
-| main | 5.65s / 6.79s | 7.62s / 8.26s |
-| hoisted | 5.89s / 7.09s | 7.90s / 8.34s |
-
+`bench_ab.sh`, 10M rows CSV, `--summary`, interleaved rounds, EPYC 9D64.
 Paired ratio (main / hoisted): **1.03x [1.01–1.10] CPU, in every quarter of the
 rounds.** The self-test floor on this machine is ~1.07x, so this is just at the
-edge of resolvability — a small, consistent win, not a breakthrough. Output
-identical on the 10M pair; all 58 `cargo test` checks pass; `fmt` and `clippy`
-clean.
+edge of resolvability — a small, consistent win, not a breakthrough. (Absolute
+timings are omitted: the two arms ran in different sittings, so their wall/CPU
+numbers are not comparable — only the paired ratio is valid.) Output identical
+on the 10M pair; all 58 `cargo test` checks pass; `fmt` and `clippy` clean.
+
+Merged alongside the hoist, all in `rust/src/engine/turbo.rs`, each measured
+neutral on its own paired run: unchecked indexing in `Index::lookup` (1.04x
+[0.96–1.07]), combined `Chunk::push` (1.00x [0.96–1.01]), and a
+`same()`/`plain_absent` fast-path (0.98x [0.95–1.01]). Kept for architectural
+alignment with the C port, not for speed.
+
+Probed and rejected in the same session: removing the matched-B bitmap entirely
+(10M atomic `mark` ops + 1.25MB allocation + 10M-bit walk) measured 1.01x
+[0.99–1.05] — the atomics are not the bottleneck. `#[inline]` on `key_hash`
+measured nothing.
 
 The remaining gap to C (Rust ~7.5s vs C 5.3s CPU on the same 10M pair) is
-architectural. Probed and rejected: removing the matched-B bitmap entirely
-(10M atomic `mark` ops + 1.25MB allocation + 10M-bit walk) measured 1.01x
-[0.99–1.05], no result — the atomics are not the bottleneck. `#[inline]` on
-`key_hash` and `get_unchecked` in the lookup loop likewise measured nothing;
-the compiler was already doing both.
+architectural.
 
 ---
 
