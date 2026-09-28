@@ -120,6 +120,39 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-28 (rust hoist needs_normalising) — the sweep stopped asking about options it already knew
+
+`hash_field` is called for every key field of every row — twenty million calls
+on the 10M benchmark. Each call checked `needs_normalising(opt)` twice: once
+via `is_absent`, once directly. Forty million checks of four booleans that
+never change mid-run. C's `hash_field` takes no `opt` at all.
+
+`key_hash` now computes the flag once and passes it down as a `bool`. The fast
+path (no normalization, the common case) checks absence directly from the field
+word, skipping the `is_absent` call entirely. The normalized path is unchanged.
+
+`bench_ab.sh`, 10M rows CSV, `--summary`, interleaved rounds, EPYC 9D64:
+
+| | wall best / median | cpu best / median |
+|---|---|---|
+| main | 5.65s / 6.79s | 7.62s / 8.26s |
+| hoisted | 5.89s / 7.09s | 7.90s / 8.34s |
+
+Paired ratio (main / hoisted): **1.03x [1.01–1.10] CPU, in every quarter of the
+rounds.** The self-test floor on this machine is ~1.07x, so this is just at the
+edge of resolvability — a small, consistent win, not a breakthrough. Output
+identical on the 10M pair; all 58 `cargo test` checks pass; `fmt` and `clippy`
+clean.
+
+The remaining gap to C (Rust ~7.5s vs C 5.3s CPU on the same 10M pair) is
+architectural. Probed and rejected: removing the matched-B bitmap entirely
+(10M atomic `mark` ops + 1.25MB allocation + 10M-bit walk) measured 1.01x
+[0.99–1.05], no result — the atomics are not the bottleneck. `#[inline]` on
+`key_hash` and `get_unchecked` in the lookup loop likewise measured nothing;
+the compiler was already doing both.
+
+---
+
 ## 2026-09-27 (cpp guard span) — the C++ join stopped parsing rows the proof settles
 
 The C change below, ported. `a_range` called `fields_of` on every row of A
