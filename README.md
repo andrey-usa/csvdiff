@@ -818,3 +818,8 @@ the serial insert (blocked by allocation rather than ordering, and 1.4% of a
 200-column run), ndjson's cost per byte (the format, not a defect — name lookups
 are 12% of a 46% gap), and wide files (throughput flat from 20 columns to 200,
 and the SIMD question does not re-open there).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Contributions are welcome; see
+[CONTRIBUTING.md](CONTRIBUTING.md).

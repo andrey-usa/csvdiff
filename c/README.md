@@ -484,7 +484,7 @@ is picked over and replenished, so a number taken now and one taken twenty
 minutes ago compare machine states rather than builds. An earlier draft of this
 file quoted a 1.83x speedup that was really 1.50x for exactly that reason.
 
-`scripts/bench_ports_parquet.py` produces these, and fails if the ports disagree
+`scripts/bench_formats_ports.py` produces these, and fails if the ports disagree
 about how many rows changed.
 
 **Ten million rows, uncompressed Parquet** (2,074 MB of input), five rounds:

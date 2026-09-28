@@ -7,10 +7,15 @@ path adds up to the wall before believing any of it.
 """
 import subprocess, re, time, os, statistics, sys
 
-EXE = "/home/user/csvdiff/cpp/build/csvdiff"
-A, B = "/home/user/ab4m/c_a.csv", "/home/user/ab4m/c_b.csv"
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent  # repository root
+
+EXE = str(ROOT / "cpp/build/csvdiff")
+if len(sys.argv) < 3:
+    sys.exit(f"usage: {sys.argv[0]} <a.csv> <b.csv> [rounds]")
+A, B = sys.argv[1], sys.argv[2]
 K = ["-k", "account_id,txn_id", "-i", "updated_at"]
-ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 5
 env = dict(os.environ, CSVDIFF_PHASES="1")
 
 def one(thr):

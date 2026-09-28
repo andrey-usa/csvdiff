@@ -9,14 +9,19 @@ against the measured wall.
 """
 import subprocess, re, time, os, statistics, sys
 
-PORTS = {"C":    ("/home/user/csvdiff/c/csvdiff", []),
-         "C++":  ("/home/user/csvdiff/cpp/build/csvdiff", []),
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent  # repository root
+
+PORTS = {"C":    (str(ROOT / "c/csvdiff"), []),
+         "C++":  (str(ROOT / "cpp/build/csvdiff"), []),
          # `--summary`, not `-o /dev/null`: see `bench_formats_ports.py`.
-         "Rust": ("/home/user/csvdiff/rust/target/release/csvdiff", ["--summary"]),
-         "Zig":  ("/home/user/csvdiff/zig/zig-out/bin/csvdiff", [])}
-A, B = "/home/user/ab4m/c_a.csv", "/home/user/ab4m/c_b.csv"
+         "Rust": (str(ROOT / "rust/target/release/csvdiff"), ["--summary"]),
+         "Zig":  (str(ROOT / "zig/zig-out/bin/csvdiff"), [])}
+if len(sys.argv) < 3:
+    sys.exit(f"usage: {sys.argv[0]} <a.csv> <b.csv> [rounds]")
+A, B = sys.argv[1], sys.argv[2]
 K = ["-k", "account_id,txn_id", "-i", "updated_at"]
-ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 5
+ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 5
 env = dict(os.environ, CSVDIFF_PHASES="1")
 # Each port names its insert phase slightly differently.
 INSERT = re.compile(r'(index insert \(serial\)|insert in order)')

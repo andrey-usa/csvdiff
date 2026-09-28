@@ -8,9 +8,6 @@ __pycache__/
 /data/
 /bench/
 /out/
-/go/data/
-/go/bench/
-/go/out/
 /rust/data/
 /rust/bench/
 /rust/out/

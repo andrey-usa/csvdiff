@@ -6,11 +6,16 @@ Rust came last on ndjson. This holds everything else constant and varies the cap
 """
 import subprocess, time, resource, statistics, sys, collections
 
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent  # repository root
+
 PORTS = {
-    "Rust": "/home/user/csvdiff/rust/target/release/csvdiff",
-    "C":    "/home/user/csvdiff/c/csvdiff",
+    "Rust": str(ROOT / "rust/target/release/csvdiff"),
+    "C":    str(ROOT / "c/csvdiff"),
 }
-A, B = "/home/user/ab4m/n_a.ndjson", "/home/user/ab4m/n_b.ndjson"
+if len(sys.argv) < 3:
+    sys.exit(f"usage: {sys.argv[0]} <a.ndjson> <b.ndjson> [rounds]")
+A, B = sys.argv[1], sys.argv[2]
 K = ["compare", A, B, "-k", "account_id,txn_id", "-i", "updated_at"]
 # `--summary`, not `-o /dev/null`: that only moved the write. The render still
 # ran, and so did the row building behind it, none of which the C port does

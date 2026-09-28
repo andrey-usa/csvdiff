@@ -6,9 +6,14 @@ measures the same pair at 1 and 4 threads and looks at how each port scales.
 """
 import subprocess, time, resource, statistics, sys, collections
 
-PORTS = {"C":   "/home/user/csvdiff/c/csvdiff",
-         "C++": "/home/user/csvdiff/cpp/build/csvdiff"}
-A, B = "/home/user/ab4m/c_a.csv", "/home/user/ab4m/c_b.csv"
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent  # repository root
+
+PORTS = {"C":   str(ROOT / "c/csvdiff"),
+         "C++": str(ROOT / "cpp/build/csvdiff")}
+if len(sys.argv) < 3:
+    sys.exit(f"usage: {sys.argv[0]} <a.csv> <b.csv> [rounds]")
+A, B = sys.argv[1], sys.argv[2]
 BASE = ["compare", A, B, "-k", "account_id,txn_id", "-i", "updated_at"]
 ROUNDS = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 
