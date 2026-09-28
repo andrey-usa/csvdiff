@@ -60,7 +60,7 @@ KNOWN = {
         "a blanked value_date: C and C++ write `null`, Rust writes `\"\"`. Both "
         "readers treat null and empty as absent, so no answer changes. Settling "
         "it means choosing which spelling is right and regenerating. "
-        "FIXME: decide, then delete this entry.",
+        "FIXME (issue #181): decide, then delete this entry.",
 }
 
 
