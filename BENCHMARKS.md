@@ -3416,8 +3416,8 @@ the two builds apart from `meta.seconds`.
 
 ### The other three ports do not have this problem, and not because they gate it
 
-What `--json` costs each port on the same pair, measured rather than read --
-`scripts/json_sample_cost.py`:
+What `--json` costs each port on the same pair, measured with a one-off
+scratch script (not committed) rather than read off the code:
 
 | port | no `--json` | `--json` | samples cost |
 |---|---:|---:|---:|
