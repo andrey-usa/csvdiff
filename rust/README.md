@@ -16,8 +16,7 @@ Rust **edition 2024**, stable toolchain. `cargo fmt --check`, `cargo clippy -D w
 ## Install
 
 ```bash
-cd rust
-cargo build --release
+(cd rust && cargo build --release)
 ```
 
 A cold build is about twenty seconds and needs nothing but a Rust toolchain. It used to be
@@ -33,11 +32,11 @@ than failing obscurely, and `--engine auto` skips past it.
 ## Use
 
 ```bash
-cargo run --release -- compare data/p_a.csv data/p_b.csv -k account_id,txn_id -i updated_at
-cargo run --release -- compare data/p_a.csv data/p_b.csv -k account_id,txn_id \
-    --trim --tolerance 0.005
-cargo run --release -- compare data/p_a.csv data/p_b.csv --profile demo \
-    --json summary.json --export-dir out/
+(cd rust && cargo run --release -- compare ../data/p_a.csv ../data/p_b.csv -k account_id,txn_id -i updated_at)
+(cd rust && cargo run --release -- compare ../data/p_a.csv ../data/p_b.csv -k account_id,txn_id \
+    --trim --tolerance 0.005)
+(cd rust && cargo run --release -- compare ../data/p_a.csv ../data/p_b.csv --profile demo \
+    --json ../summary.json --export-dir ../out/)
 ```
 
 Exit code 0 = identical, 1 = differences, 2 = error, 3 = duplicate keys (with `--fail-on-dups`),
@@ -149,10 +148,10 @@ the memory.
 ## Development
 
 ```bash
-cargo test
-cargo fmt --check && cargo clippy --all-targets -- -D warnings
-cargo run --release --bin gen-data -- --rows 10k --out-dir data
-cargo run --release --bin bench -- --rows 10k --engine turbo
+(cd rust && cargo test)
+(cd rust && cargo fmt --check && cargo clippy --all-targets -- -D warnings)
+(cd rust && cargo run --release --bin gen-data -- --rows 10k --out-dir ../data)
+(cd rust && cargo run --release --bin bench -- --rows 10k --engine turbo)
 ```
 
 `gen-data` builds the same deterministic 20-column pair as the C, C++ and Zig generators, keyed on

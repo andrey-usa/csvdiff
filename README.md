@@ -95,6 +95,14 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > is `No such file or directory`, and `.\gen-data` would run but write its pair
 > into `c\data\` rather than the `data\` the commands below then read.
 
+For a small runnable example without generating anything, `examples/` holds a
+two-file pair (`orders_2026-08.csv`, `orders_2026-09.csv`) and a sample HTML
+report:
+
+```bash
+c/csvdiff compare examples/orders_2026-08.csv examples/orders_2026-09.csv -k order_id
+```
+
 ### What runs where
 
 Every cell below has a job behind it. `platforms.yml` runs all four ports on
@@ -705,19 +713,30 @@ tests/fixtures/          every shape that has broken an engine here
 
 3. **The ceiling is not one number, it is four.** This line used to say "CSV
    finishes at 150M and dies at 200M", as a fact about the tool. It is a fact
-   about the C port. On a 16 GB runner with each port capped at 13,941 MB:
+   about one run. On a 16 GB runner with each port capped at 13,941 MB
+   (`RLIMIT_DATA`), the 2026-09-14 run had only C finish at 150M. Two weeks of
+   memory work later, the 2026-09-28 rerun under the same cap had **all four
+   ports finish** with identical counts:
+
+   | port | wall | peak RSS |
+   |------|-----:|---------:|
+   | Rust | 289s | 13,881 MB |
+   | C    | 335s | 14,106 MB |
+   | Zig  | 343s | 15,007 MB |
+   | C++  | 583s | 13,939 MB |
+
+   The 09-14 table below is kept for the archaeology — it shows where the
+   ceiling *was*, not where it is:
 
    | rows |  C  | C++ | Rust | Zig |
    |-----:|:---:|:---:|:----:|:---:|
    | 100M | yes | yes | yes  | **no** |
    | 150M | yes | no  | no   | no  |
 
-   **Zig is the first to run out on CSV**, and it is the port that wins Parquet at
-   50M — fastest of the four and the most parallel, at 3.05x cores. At 150M only C
-   is left, at 335.07s and 13,357 MB. Each refusal names what did not fit: Rust's
-   `one hash per row needs 1144 MB` is 150,015,000 × 8 bytes. Where C's own ceiling
-   sits is untested and stays that way here — one port's ceiling is not the tool's,
-   which is the mistake this item is correcting.
+   Each refusal names what did not fit: Rust's `one hash per row needs 1144 MB`
+   is 150,015,000 × 8 bytes. Where C's own ceiling sits is untested and stays
+   that way here — one port's ceiling is not the tool's, which is the mistake
+   this item is correcting.
 
    **Why Zig goes first is settled, and it is not that it holds more.** It holds
    less than Rust. `--memory-cap` sets `RLIMIT_DATA`, which bounds `VmData` — the

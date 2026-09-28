@@ -89,5 +89,5 @@ including the ones in this repository's own README.
 | `src/json.cpp` | the JSON half of the result contract, written by hand |
 | `src/main.cpp` | the command line; exit 0 identical, 1 differences, 2 error |
 | `tools/pq_dump.cpp` | `make pq-dump` — dumps a Parquet file's schema, or one column as text, to check the reader against whatever wrote the file |
-| `tools/gen_data.cpp` | `make gen-data` — the benchmark generator: the same CSV bytes as the other five, or the same rows written straight to Parquet |
+| `tools/gen_data.cpp` | `make gen-data` — the benchmark generator: the same CSV bytes as the other two, or the same rows written straight to Parquet |
 | `tools/pq_write.hpp` `tools/pq_write.cpp` | the Parquet writer the generator uses — Thrift footer, dictionary and plain pages, RLE/bit-packing, snappy. Test scaffolding, not part of the engine |
