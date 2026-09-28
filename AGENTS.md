@@ -2,8 +2,8 @@
 
 This is the entry point for AI coding tools that read a repository's docs: Cline, Codex, Copilot,
 Cursor, Aider and the rest. Read it before editing anything, and then the README of the port you
-touch. Claude Code additionally reads `CLAUDE.md`, which is the thin Claude-specific layer over
-this file.
+touch. Claude Code reads this file directly (v2.1.277+); its slash commands, report skill and
+settings live in `.claude/`.
 
 ## What this repository is
 
@@ -25,7 +25,6 @@ gone. Do not reintroduce them; their measured verdicts are the point of `ARCHIVE
 |---|---|
 | `README.md` | the full user guide. Every command runs from the repository root, as written, on a fresh clone — keep it that way |
 | `AGENTS.md` | this file |
-| `CLAUDE.md` | the Claude Code layer: slash commands, the report skill, settings |
 | `RESULTS.md` | where the ports stand **today**: one full-size table per format, one host, one sitting. The snapshot |
 | `BENCHMARKS.md` | every kept benchmark run, newest first. Compare rows within a table, never across tables. The record |
 | `ARCHIVE.md` | what was tried, what it was worth, what was removed |
@@ -37,7 +36,7 @@ gone. Do not reintroduce them; their measured verdicts are the point of `ARCHIVE
 | `.github/workflows/` | the CI and benchmark workflows, listed in `README.md`; `parity.yml` and `formats.yml` are the repository-wide gates |
 | `.github/actions/` | composite actions the workflows share. `setup-zig` is the **only** place the Zig version is pinned — it was in ten |
 | `tests/fixtures/` | the awkward-input and multi-format fixtures every suite is held to |
-| `.claude/` | Claude Code only: slash commands, a report skill, `settings.json` |
+| `.claude/` | Claude Code only: slash commands, a report skill, `settings.json` — prefer them over improvising; they encode decisions this repository made and reversed |
 
 ## Building, testing and running
 
@@ -239,4 +238,3 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
 - `RESULTS.md` — where the four ports stand today, and which differences are established.
 - `BENCHMARKS.md` — what this machine can and cannot resolve.
 - `ARCHIVE.md` — everything removed, with the number that earned the verdict.
-- `CLAUDE.md` — Claude Code specifics.

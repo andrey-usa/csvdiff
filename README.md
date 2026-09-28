@@ -12,7 +12,7 @@ is what makes a number from one directly comparable with a number from another.
 - [RESULTS.md](RESULTS.md) — **where the ports stand today**: 10M rows, three formats, one host
 - [BENCHMARKS.md](BENCHMARKS.md) — how they got there: every run, newest first, with CPU and memory
 - [ARCHIVE.md](ARCHIVE.md) — what was tried, what it was worth, what was removed
-- [AGENTS.md](AGENTS.md) — the entry point for AI coding tools; `CLAUDE.md` adds the Claude Code specifics
+- [AGENTS.md](AGENTS.md) — the entry point for AI coding tools (Claude Code reads it directly; its slash commands and skills live in `.claude/`)
 
 ---
 
