@@ -87,9 +87,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -125,9 +126,10 @@ jobs:
         n: ${{ fromJSON(needs.plan.outputs.crowd) }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          cache: false
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

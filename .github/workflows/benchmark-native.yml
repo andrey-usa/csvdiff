@@ -111,9 +111,10 @@ jobs:
           ref: ${{ github.event.inputs.alt_ref }}
           path: alt
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          cache: false
         if: env.ALL_PORTS == '1'
       - uses: Swatinem/rust-cache@v2
         if: env.ALL_PORTS == '1'

@@ -125,9 +125,10 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          cache: false
         if: matrix.port == 'rust'
       - uses: Swatinem/rust-cache@v2
         if: matrix.port == 'rust'
@@ -215,9 +216,10 @@ jobs:
                       /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
           df -h / | tail -1
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: stable
+          cache: false
         if: matrix.port == 'rust'
       - uses: Swatinem/rust-cache@v2
         if: matrix.port == 'rust'
