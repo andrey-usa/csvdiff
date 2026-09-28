@@ -738,28 +738,22 @@ const Input = union(enum) {
 // The index
 // ---------------------------------------------------------------------------
 
-/// A slot holds the top bits of its key's hash and the position in `first_row`
-/// plus one, so zero means empty.
+/// A slot holds the top bits of its key's hash above `pos_bits` and the
+/// position in `first_row` plus one in the low `pos_bits`, so zero means
+/// empty.
 ///
 /// Carrying the tag is what makes a failed probe cheap: the word already loaded
 /// settles it. A table of bare positions has to follow each one into `first_row`
 /// and then into `row_hash` — two dependent random loads, over arrays far too big
 /// to cache at ten million keys — only to reject it.
-const POS_MASK: u64 = (1 << 40) - 1;
-const TAG_MASK: u64 = ~POS_MASK;
-const EMPTY_SLOT: u64 = 0;
-
-fn slotFor(hash: u64, pos: usize) u64 {
-    return (hash & TAG_MASK) | (@as(u64, pos) + 1);
-}
-
-fn tagIs(slot: u64, hash: u64) bool {
-    return (slot ^ hash) & TAG_MASK == 0;
-}
-
-fn posOf(slot: u64) usize {
-    return @intCast((slot & POS_MASK) - 1);
-}
+///
+/// The width is chosen from the row count rather than fixed, so the slot stays
+/// four bytes: at ten million rows the index needs 24 bits and the tag gets
+/// the other 8; at fifty million it needs 26 and the tag gets 6. A narrower tag
+/// lets more probes through to the key comparison behind it, which is
+/// unchanged — the answer cannot change, only how often the bytes are
+/// re-examined.
+const EMPTY_SLOT: u32 = 0;
 
 /// One chunk's rows, in the order they appear in it.
 const Chunk = struct {
@@ -785,7 +779,12 @@ const RowIndex = struct {
     opt: Options,
     row_at: std.ArrayList(u64),
     row_hash: std.ArrayList(u64),
-    table: []u64,
+    table: []u32,
+    /// Low bits of a slot holding `first_row` positions plus one; the high
+    /// bits hold the top of the key's hash as a tag. Chosen from the row count
+    /// in `build`, so the slot stays four bytes at any scale this port runs.
+    pos_bits: u6,
+    pos_mask: u32,
     mask: usize,
     first_row: std.ArrayList(i32),
     occurrences: std.ArrayList(u32),
@@ -794,6 +793,27 @@ const RowIndex = struct {
     rows: i64 = 0,
     dup_keys: i64 = 0,
     dup_rows: i64 = 0,
+
+    /// Packs a slot: the top `32 - pos_bits` bits of the hash above the
+    /// position plus one. Zero tag bits (past two billion rows) degrades to
+    /// no tag rather than a wrong answer.
+    fn slotFor(self: *const RowIndex, hash: u64, pos: usize) u32 {
+        const p: u32 = @intCast(pos + 1);
+        if (self.pos_bits == 32) return p;
+        // `hash >> (32 + pos_bits)`: the top `32 - pos_bits` bits, now low.
+        return (@as(u32, @truncate(hash >> (32 + self.pos_bits))) << self.pos_bits) | p;
+    }
+
+    /// Whether the slot's tag matches the hash's top bits.
+    fn tagIs(self: *const RowIndex, slot: u32, hash: u64) bool {
+        if (self.pos_bits == 32) return true;
+        return (slot >> self.pos_bits) == @as(u32, @truncate(hash >> (32 + self.pos_bits)));
+    }
+
+    /// The `first_row` position a non-empty slot holds.
+    fn posOf(self: *const RowIndex, slot: u32) usize {
+        return @intCast((slot & self.pos_mask) - 1);
+    }
 
     /// Finds and hashes every row in parallel, then inserts them on one thread in
     /// file order.
@@ -833,7 +853,16 @@ const RowIndex = struct {
         // keys the misses that costs are worth more than the probes it saves.
         var cap: usize = 1 << 12;
         while (cap * 2 < total * 3 + 16) cap <<= 1;
-        const table = try gpa.alloc(u64, cap);
+        // Wide enough to hold every key index plus the +1 that keeps 0 for
+        // empty, narrow enough to leave the rest of the 32-bit slot for the
+        // hash tag: 24 position bits at ten million rows, 26 at fifty. Past
+        // four billion keys no width fits, and that is refused rather than
+        // truncated.
+        if (total + 2 > (@as(u64, 1) << 32)) return error.OutOfMemory;
+        var pos_bits: u6 = 1;
+        while (pos_bits < 32 and (@as(u64, 1) << pos_bits) < total + 2) pos_bits += 1;
+        const pos_mask: u32 = if (pos_bits >= 32) std.math.maxInt(u32) else (@as(u32, 1) << pos_bits) - 1;
+        const table = try gpa.alloc(u32, cap);
         @memset(table, EMPTY_SLOT);
         var self = RowIndex{
             .gpa = gpa,
@@ -843,6 +872,8 @@ const RowIndex = struct {
             .row_at = .empty,
             .row_hash = .empty,
             .table = table,
+            .pos_bits = pos_bits,
+            .pos_mask = pos_mask,
             .mask = table.len - 1,
             .first_row = .empty,
             .occurrences = .empty,
@@ -925,7 +956,7 @@ const RowIndex = struct {
         while (true) {
             const word = self.table[slot];
             if (word == EMPTY_SLOT) {
-                self.table[slot] = slotFor(hash, self.first_row.items.len);
+                self.table[slot] = self.slotFor(hash, self.first_row.items.len);
                 try self.first_row.append(self.gpa, row);
                 try self.occurrences.append(self.gpa, 1);
                 // Two thirds, which is what `build` sizes the table for.
@@ -933,8 +964,8 @@ const RowIndex = struct {
                 return;
             }
             // The tag rejects almost every collision without leaving this word.
-            if (tagIs(word, hash)) {
-                const key = posOf(word);
+            if (self.tagIs(word, hash)) {
+                const key = self.posOf(word);
                 const candidate = self.first_row.items[key];
                 if (self.row_hash.items[@intCast(candidate)] == hash) {
                     // This row's fields are re-read rather than carried over from
@@ -994,7 +1025,7 @@ const RowIndex = struct {
     /// Only reached if the row count was underestimated: `build` sizes the table
     /// for the rows it is about to insert, so the common path never grows it.
     fn rehash(self: *RowIndex) !void {
-        const table = try self.gpa.alloc(u64, self.table.len * 2);
+        const table = try self.gpa.alloc(u32, self.table.len * 2);
         @memset(table, EMPTY_SLOT);
         self.gpa.free(self.table);
         self.table = table;
@@ -1003,7 +1034,7 @@ const RowIndex = struct {
             const hash = self.row_hash.items[@intCast(row)];
             var slot = self.slotOf(hash);
             while (self.table[slot] != EMPTY_SLOT) slot = (slot + 1) & self.mask;
-            self.table[slot] = slotFor(hash, key);
+            self.table[slot] = self.slotFor(hash, key);
         }
     }
 
@@ -1035,8 +1066,8 @@ const RowIndex = struct {
             const word = self.table[slot];
             if (word == EMPTY_SLOT) return null;
             // The tag rejects almost every collision without leaving this word.
-            if (tagIs(word, hash)) {
-                const candidate = self.first_row.items[posOf(word)];
+            if (self.tagIs(word, hash)) {
+                const candidate = self.first_row.items[self.posOf(word)];
                 if (self.row_hash.items[@intCast(candidate)] == hash) {
                     // The bytes first, where the caller offered them. A candidate
                     // whose row opens with the same bytes as far as either file

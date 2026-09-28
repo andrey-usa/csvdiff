@@ -382,8 +382,13 @@ fn rowEq(
 /// one into a separate array of hashes and take a second cache miss to reject
 /// it. At ten million keys those second misses were the join.
 const Index = struct {
-    slots: []u64 = &.{},
+    slots: []u32 = &.{},
     mask: u64 = 0,
+    /// Low bits of a slot holding `firsts` positions plus one; the high bits
+    /// hold the top of the key's hash as a tag. Chosen from the row count at
+    /// build time, so the slot stays four bytes at any scale this port runs.
+    pos_bits: u6 = 1,
+    pos_mask: u32 = 1,
     firsts: std.ArrayList(i32) = .empty,
     counts: std.ArrayList(u32) = .empty,
     /// Per distinct key, for probing the other side.
@@ -392,16 +397,20 @@ const Index = struct {
     dup_keys: i64 = 0,
     dup_rows: i64 = 0,
 
-    const pos_mask: u64 = (1 << 40) - 1;
+    const EMPTY_SLOT: u32 = 0;
 
-    fn slotFor(h: u64, pos: usize) u64 {
-        return (h & ~pos_mask) | (@as(u64, pos) + 1);
+    fn slotFor(self: Index, h: u64, pos: usize) u32 {
+        const p: u32 = @intCast(pos + 1);
+        if (self.pos_bits == 32) return p;
+        // `h >> (32 + pos_bits)`: the top `32 - pos_bits` bits, now low.
+        return (@as(u32, @truncate(h >> (32 + self.pos_bits))) << self.pos_bits) | p;
     }
-    fn tagIs(slot: u64, h: u64) bool {
-        return (slot ^ h) & ~pos_mask == 0;
+    fn tagIs(self: Index, slot: u32, h: u64) bool {
+        if (self.pos_bits == 32) return true;
+        return (slot >> self.pos_bits) == @as(u32, @truncate(h >> (32 + self.pos_bits)));
     }
-    fn posOf(slot: u64) usize {
-        return @intCast((slot & pos_mask) - 1);
+    fn posOf(self: Index, slot: u32) usize {
+        return @intCast((slot & self.pos_mask) - 1);
     }
     fn unique(self: Index) i64 {
         return @intCast(self.firsts.items.len);
@@ -454,7 +463,16 @@ fn buildIndex(
     // actually limited by.
     var cap: usize = 1 << 12;
     while (cap * 2 < s.rows * 3 + 16) cap <<= 1;
-    ix.slots = try gpa.alloc(u64, cap);
+    // Wide enough to hold every key index plus the +1 that keeps 0 for
+    // empty, narrow enough to leave the rest of the 32-bit slot for the
+    // hash tag. Past four billion keys no width fits, and that is refused
+    // rather than truncated.
+    if (s.rows + 2 > (@as(u64, 1) << 32)) return error.OutOfMemory;
+    var pos_bits: u6 = 1;
+    while (pos_bits < 32 and (@as(u64, 1) << pos_bits) < s.rows + 2) pos_bits += 1;
+    ix.pos_bits = pos_bits;
+    ix.pos_mask = if (pos_bits >= 32) std.math.maxInt(u32) else (@as(u32, 1) << pos_bits) - 1;
+    ix.slots = try gpa.alloc(u32, cap);
     @memset(ix.slots, 0);
     ix.mask = cap - 1;
     try ix.firsts.ensureTotalCapacity(gpa, s.rows);
@@ -474,14 +492,14 @@ fn buildIndex(
         while (true) {
             const slot = ix.slots[at];
             if (slot == 0) {
-                ix.slots[at] = Index.slotFor(h, ix.firsts.items.len);
+                ix.slots[at] = ix.slotFor(h, ix.firsts.items.len);
                 try ix.firsts.append(gpa, @intCast(r));
                 try ix.counts.append(gpa, 1);
                 try ix.hashes.append(gpa, h);
                 break;
             }
-            if (Index.tagIs(slot, h)) {
-                const pos = Index.posOf(slot);
+            if (ix.tagIs(slot, h)) {
+                const pos = ix.posOf(slot);
                 if (try rowEq(gpa, as_id, s, @intCast(ix.firsts.items[pos]), s, r, o, &sc)) {
                     ix.counts.items[pos] += 1;
                     if (ix.counts.items[pos] == 2) {
@@ -714,8 +732,8 @@ fn lookup(
     while (true) {
         const slot = into.slots[at];
         if (slot == 0) return -1;
-        if (Index.tagIs(slot, h)) {
-            const first = into.firsts.items[Index.posOf(slot)];
+        if (into.tagIs(slot, h)) {
+            const first = into.firsts.items[into.posOf(slot)];
             if (try rowEq(gpa, as_id, there, @intCast(first), here, row, o, sc)) return first;
         }
         at = (at + 1) & @as(usize, @intCast(into.mask));
