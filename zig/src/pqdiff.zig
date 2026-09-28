@@ -404,12 +404,12 @@ const Index = struct {
         if (self.pos_bits == 32) return p;
         const pb: u5 = @intCast(self.pos_bits);
         // `h >> (32 + pos_bits)`: the top `32 - pos_bits` bits, now low.
-        return (@as(u32, @truncate(h >> (32 + pb))) << pb) | p;
+        return (@as(u32, @truncate(h >> (32 + self.pos_bits))) << pb) | p;
     }
     fn tagIs(self: Index, slot: u32, h: u64) bool {
         if (self.pos_bits == 32) return true;
         const pb: u5 = @intCast(self.pos_bits);
-        return (slot >> pb) == @as(u32, @truncate(h >> (32 + pb)));
+        return (slot >> pb) == @as(u32, @truncate(h >> (32 + self.pos_bits)));
     }
     fn posOf(self: Index, slot: u32) usize {
         return @intCast((slot & self.pos_mask) - 1);

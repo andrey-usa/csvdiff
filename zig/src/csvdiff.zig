@@ -802,14 +802,15 @@ const RowIndex = struct {
         if (self.pos_bits == 32) return p;
         const pb: u5 = @intCast(self.pos_bits);
         // `hash >> (32 + pos_bits)`: the top `32 - pos_bits` bits, now low.
-        return (@as(u32, @truncate(hash >> (32 + pb))) << pb) | p;
+        // The u64 shift takes u6, so self.pos_bits stays; only the u32 shift needs u5.
+        return (@as(u32, @truncate(hash >> (32 + self.pos_bits))) << pb) | p;
     }
 
     /// Whether the slot's tag matches the hash's top bits.
     fn tagIs(self: *const RowIndex, slot: u32, hash: u64) bool {
         if (self.pos_bits == 32) return true;
         const pb: u5 = @intCast(self.pos_bits);
-        return (slot >> pb) == @as(u32, @truncate(hash >> (32 + pb)));
+        return (slot >> pb) == @as(u32, @truncate(hash >> (32 + self.pos_bits)));
     }
 
     /// The `first_row` position a non-empty slot holds.
