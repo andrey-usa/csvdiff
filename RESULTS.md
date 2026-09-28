@@ -1,14 +1,9 @@
 # Where the four ports stand
 
 **Ten million rows, all three formats, all four ports, measured on CI.**
-Run 2026-09-26 (second edition, evening), after #117–#143. The morning edition's
-numbers are kept beside them where the same CPU measured both.
-
-> **Stale as of 2026-09-28.** This snapshot predates three merged performance
-> PRs: C guard_span #178 (10–13% on CSV), C++ guard_span #179 (7–12%), and the
-> Rust guard_span + `needs_normalising` hoisting (1.03x). For the latest
-> per-port numbers see [BENCHMARKS.md](BENCHMARKS.md); a fresh CI snapshot has
-> not been run yet.
+Run 2026-09-28 (third edition), after #178, #179 and the Rust guard_span +
+`needs_normalising` hoisting. The 09-26 edition's numbers are kept beside them
+where the same CPU measured both.
 
 Measured with **no `--json`**, and with `--summary` for Rust, so every port is
 doing the job all four perform: count and compare, and write nothing. Both
@@ -64,6 +59,74 @@ duplicate keys 1,000 in A / 500 in B
 ---
 
 ## Results — 10m rows, three formats
+
+[Run 36388954996](https://github.com/andrey-usa/csvdiff/actions/runs/36388954996),
+`bench-ladder.yml` on `e784e23` (main: C guard_span #178, C++ guard_span #179,
+Rust guard_span + `needs_normalising` hoisting), three runs each, best kept,
+ports rotated.
+
+**Two processors again.** CSV and Parquet ran on an **AMD EPYC 7763** — the CPU
+the 09-26 evening edition used — so those two tables carry an `09-26 pm` column
+and read as before and after. ndjson landed on an **AMD EPYC 9V74** and is a
+table of its own.
+
+Every port compiled for the machine it ran on: `-march=native` for C and C++
+(clang), `-C target-cpu=x86-64-v3` for Rust, `-Dcpu=native` for Zig.
+
+### CSV — 3,509 MB a side, EPYC 7763
+
+| Port | Compare | CPU | Cores | Above the input | vs best | 09-26 pm |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **1.06s** | **3.4s** | 3.26x | **716 MB** | — | 1.71s |
+| C++ | 1.21s | 4.0s | 3.32x | 723 MB | 1.14x | 1.82s |
+| Rust | 1.21s | 4.0s | 3.28x | 725 MB | 1.14x | 1.62s |
+| Zig | 1.36s | 3.8s | 2.79x | 725 MB | 1.28x | 1.81s |
+
+### Parquet — 1,535 MB a side, EPYC 7763
+
+| Port | Compare | CPU | Cores | Above the input | vs best | 09-26 pm |
+|---|---:|---:|---:|---:|---:|---:|
+| **C** | **1.21s** | **3.7s** | 3.03x | 1,424 MB | — | 1.32s |
+| C++ | 1.36s | 4.3s | 3.13x | 1,386 MB | 1.12x | 1.61s |
+| Zig | 1.36s | 4.6s | **3.38x** | 1,312 MB | 1.12x | 1.46s |
+| Rust | 1.41s | 4.5s | 3.22x | **1,293 MB** | 1.17x | 1.77s |
+
+### ndjson — 8,487 MB a side, EPYC 9V74
+
+| Port | Compare | CPU | Cores | Above the input | vs best |
+|---|---:|---:|---:|---:|---:|
+| **C** | **2.42s** | 8.6s | 3.58x | **716 MB** | — |
+| C++ | 2.43s | 8.7s | 3.59x | 723 MB | 1.00x |
+| Rust | 2.67s | 9.6s | 3.60x | 725 MB | 1.10x |
+| Zig | 2.77s | **8.4s** | 3.03x | 719 MB | 1.14x |
+
+**A caution on the CSV column.** Every port is 25–38% faster than the 09-26
+evening edition on the same CPU — well beyond the isolated guard_span gains
+(10–13% C, 7–12% C++, ~neutral Rust). Both editions are best-of-three on an
+EPYC 7763, so the direction is real, but the size of the move likely mixes code
+gains with runner variance. Read the column as the new standing, not as the
+size of any one PR.
+
+## What the new tables say
+
+**CSV has a leader again.** C at 1.06s, then C++ and Rust tied at 1.21s
+(1.14x), then Zig at 1.36s (1.28x). The 09-26 evening edition was a four-way
+tie at 1.62–1.82s; guard_span broke it, and C took the most from it.
+
+**Parquet's spread stayed closed.** 1.21–1.41s, 1.17x first to last, C still
+first. Every port moved 8–20% on the same CPU.
+
+**ndjson is C and C++ tied**, 2.42s and 2.43s on the 9V74, Rust 1.10x behind,
+Zig 1.14x. By this file's rule the whole table is nearly a tie.
+
+**Memory above the input has converged on text.** All four ports now sit at
+716–725 MB on CSV and ndjson — Rust's old ~150 MB gap and Zig's ~300 MB gap
+are gone. On Parquet every port still pays over a gigabyte, 1,293–1,424 MB,
+with Rust now the lightest.
+
+---
+
+## The 09-26 edition
 
 [Run 36264523793](https://github.com/andrey-usa/csvdiff/actions/runs/36264523793),
 `bench-ladder.yml` on `015ecad` (#143 merged), three runs each, best kept,
@@ -126,6 +189,8 @@ default `c++`, which is g++, and every other table here is clang. It measured
 ---
 
 ## What this table says
+
+*The 09-26 edition's tables, analyzed when they were new.*
 
 **Parquet closed most of its spread.** On the same EPYC 7763 the four ports went
 from 1.26–2.42s (1.92x first to last) to 1.32–1.77s (1.34x). Zig moved furthest,
@@ -327,8 +392,8 @@ GitHub-runner reference point from 2026-09-09 and is not the latest measurement.
 ```sh
 # The ladder: one job per size and format, so FASTER but several CPUs.
 # Its collect job groups by processor and says so. This is what the tables
-# above came from; on 09-26 am it happened to land on one CPU, on 09-26 pm and
-# 09-20 on two.
+# above came from; on 09-26 am it happened to land on one CPU, on 09-26 pm,
+# 09-28 and 09-20 on two.
 gh workflow run bench-ladder.yml -f sizes=10m -f formats=csv,ndjson,parquet -f repeats=3
 
 # All three formats in ONE job, which is the only way to get one CPU
