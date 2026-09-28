@@ -243,7 +243,7 @@ inline fn sameName(a: []const u8, b: []const u8) bool {
 /// that projection before it is inverted, so comparing it settles the question
 /// outright. JSON has no such prefix -- its keys may come in any order -- so it
 /// never qualifies.
-pub const Tail = struct { slot: usize, delimiter: u8 };
+pub const Tail = struct { slot: usize, delimiter: u8, src: usize };
 
 pub fn sharedTail(a: RowParser, b: RowParser) ?Tail {
     const ca = switch (a) {
@@ -265,7 +265,36 @@ pub fn sharedTail(a: RowParser, b: RowParser) ?Tail {
     }
     const run = ca.slots[ca.starts[ca.last_needed]..ca.starts[ca.last_needed + 1]];
     if (run.len == 0) return null;
-    return .{ .slot = run[0], .delimiter = ca.delimiter };
+    return .{ .slot = run[0], .delimiter = ca.delimiter, .src = ca.last_needed };
+}
+
+/// The proof's byte span without parsing the row.
+///
+/// `sharedTail` reads the span off the guard field's packed offsets, which means
+/// parsing every column first — and the join parses all ten million rows of A
+/// that way, though the proof only needs one offset: through the delimiter that
+/// ends the guard column. The guard is source column `src`, so its end is the
+/// (`src`+1)th delimiter from the row start — countable with the delimiter
+/// cursor alone, skipping a quoted field the way the row parse does, and without
+/// packing a field or walking the slot map. Returns null when the row ends first
+/// — a short row, or a malformed one — which falls back to the parse.
+///
+/// The span is the field bytes, not including the delimiter that ends them —
+/// the same `data[from..to]` the field-offset path builds — so the proof's
+/// boundary check in `rowMatches` applies unchanged.
+pub fn guardSpan(data: []const u8, lo: usize, hi: usize, delimiter: u8, commas: usize) ?usize {
+    var at = lo;
+    var delims = scan.Delims.init(data, lo, hi, delimiter, '\n');
+    for (0..commas) |i| {
+        const cur = if (at < hi and data[at] == '"') blk: {
+            const close = scan.skipQuoted(data, at + 1, hi);
+            break :blk delims.next(close);
+        } else delims.next(at);
+        if (cur >= hi or data[cur] != delimiter) return null;
+        at = cur + 1;
+        if (i + 1 == commas) return cur - lo;
+    }
+    return null;
 }
 
 pub const RowParser = union(enum) {

@@ -1057,7 +1057,7 @@ const RowIndex = struct {
     fn lookup(
         self: *const RowIndex,
         other: Slab,
-        fields: []const Field,
+        fields: ?[]const Field,
         hash: u64,
         want: Want,
         span: ?Span,
@@ -1085,13 +1085,18 @@ const RowIndex = struct {
                         };
                         if (proved) return .{ .row = candidate, .same_bytes = true };
                     }
+                    // No parsed fields: the caller has the span but has not parsed
+                    // the row. A candidate the bytes did not settle is returned
+                    // unproven, and the caller parses and re-looks-up with the key
+                    // check, which also covers the hash collision this skipped.
+                    const fa = fields orelse return .{ .row = candidate, .same_bytes = false };
                     switch (want) {
                         .whole => self.fieldsOf(candidate, probe),
                         .keys => self.keysOf(candidate, probe),
                     }
                     var ok = true;
                     for (0..self.key_size) |i| {
-                        if (!(try same(self.side.slab, probe[i], other, fields[i], self.opt, s))) {
+                        if (!(try same(self.side.slab, probe[i], other, fa[i], self.opt, s))) {
                             ok = false;
                             break;
                         }
@@ -1519,11 +1524,40 @@ const Join = struct {
             if (at + PREFETCH_AHEAD < mine.len) {
                 self.bi.prefetch(self.ai.row_hash.items[@intCast(mine[at + PREFETCH_AHEAD])]);
             }
-            self.ai.fieldsOf(row, fa);
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             const hash = self.ai.row_hash.items[@intCast(row)];
+            // The proof's span without the parse: the guard's delimiter sits a
+            // fixed count from the row start, countable with the delimiter
+            // cursor alone. Most rows prove out here and never pay for fields;
+            // a row the bytes do not settle falls through to the parse below.
+            const guard = self.span_tail;
+            const attempt = guard != null and (refused < PROOF_BACKOFF or at & (PROOF_BACKOFF - 1) == 0);
+            if (attempt) {
+                const t = guard.?;
+                const data = self.a.slab.data;
+                const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
+                const end = self.ai.rowEnd(row);
+                if (text.guardSpan(data, from, end, t.delimiter, t.src + 1)) |need| {
+                    const span: Span = .{ .csv = .{ .bytes = data[from .. from + need], .delimiter = t.delimiter } };
+                    if (try self.bi.lookup(self.a.slab, null, hash, .whole, span, &s, fb)) |hit| {
+                        if (hit.same_bytes) {
+                            out.matched += 1;
+                            refused = 0;
+                            continue;
+                        }
+                        // A candidate the bytes did not settle: fall through to
+                        // the parse and the key-checking lookup below, which also
+                        // covers the hash collision this skipped past.
+                        if (refused < PROOF_BACKOFF) refused += 1;
+                    } else {
+                        out.removed += 1;
+                        continue;
+                    }
+                }
+            }
+            self.ai.fieldsOf(row, fa);
             // A's row up to the end of the last column either file wants. The
             // end has to be a boundary in A as well: a quoted field ends on its
             // closing quote, and what follows is not part of the run.
