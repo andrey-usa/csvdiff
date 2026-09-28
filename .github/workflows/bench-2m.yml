@@ -1,5 +1,8 @@
 name: Benchmark 2M
 
+permissions:
+  contents: read
+
 # Two million rows, every native port, every scanner, every format -- one job
 # per format, all three at once.
 #
@@ -116,7 +119,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

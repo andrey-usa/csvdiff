@@ -1,5 +1,8 @@
 name: Cross-language parity
 
+permissions:
+  contents: read
+
 # One dataset, every native port, the same answer.
 #
 # This used to build five implementations -- Python, Java, TypeScript, Go and
@@ -55,7 +58,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

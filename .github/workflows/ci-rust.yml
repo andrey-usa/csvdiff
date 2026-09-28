@@ -1,5 +1,8 @@
 name: CI (Rust)
 
+permissions:
+  contents: read
+
 # `claude/**` as well as main, like ci-c.yml and parity.yml: a Rust change on a
 # feature branch had no Rust gate at all until this line, which is how a commit
 # that deleted two engines and rewrote the Engine enum reached the remote with
@@ -43,7 +46,7 @@ jobs:
         with:
           python-version: "3.14"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         with:
           components: rustfmt, clippy
 
@@ -103,7 +106,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -138,7 +141,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

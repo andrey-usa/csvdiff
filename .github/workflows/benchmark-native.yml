@@ -1,5 +1,8 @@
 name: Benchmark (native)
 
+permissions:
+  contents: read
+
 # The one benchmark this project runs.
 #
 # It replaces four separate workflows that each measured one language against
@@ -108,7 +111,7 @@ jobs:
           ref: ${{ github.event.inputs.alt_ref }}
           path: alt
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
         if: env.ALL_PORTS == '1'
       - uses: Swatinem/rust-cache@v2
         if: env.ALL_PORTS == '1'

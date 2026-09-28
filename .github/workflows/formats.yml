@@ -1,5 +1,8 @@
 name: Formats (Rust, Zig, C++)
 
+permissions:
+  contents: read
+
 # The three native ports read CSV, newline-delimited JSON and Parquet, and the
 # only claim worth CI time is that they cannot disagree: every port, on every
 # format, has to return the same counts and the same per-column stats for the
@@ -46,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

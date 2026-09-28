@@ -1,5 +1,8 @@
 name: Benchmark ladder (10M and up)
 
+permissions:
+  contents: read
+
 # A rung per size, all rungs at once, on request only.
 #
 # This is what `bench-10m.yml` became. Ten million rows on every pull request
@@ -175,7 +178,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
