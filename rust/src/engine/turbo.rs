@@ -424,35 +424,29 @@ fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
 /// the dependent load chain the prefetch is there to hide. Faulting them in order
 /// instead is work the kernel is far better at: at ten million rows it halves the
 /// insert, 1.55s to 0.74s.
-fn empty_table(cap: usize) -> Result<Vec<u64>> {
+fn empty_table(cap: usize) -> Result<Vec<u32>> {
     let mut table = alloc::sized(cap, "the key index")?;
     table.resize(cap, EMPTY_SLOT);
     Ok(table)
 }
 
-/// A slot holds the top bits of its key's hash and the position in `first_row`
-/// plus one, so zero means empty.
+/// A slot holds the top bits of its key's hash above `pos_bits` and the
+/// position in `first_row` plus one in the low `pos_bits`, so zero means
+/// empty.
 ///
 /// Carrying the tag is what makes a failed probe cheap: the word already loaded
 /// settles it. A table of bare positions has to follow each one into
 /// `first_row` and then into `row_hash` -- two dependent random loads, over
-/// arrays far too big to cache at ten million keys -- only to reject it. The
-/// Zig and C++ ports both do this; this port did not, and it cost more the
-/// larger the file got.
-const POS_MASK: u64 = (1 << 40) - 1;
-const EMPTY_SLOT: u64 = 0;
-
-fn slot_for(hash: u64, pos: usize) -> u64 {
-    (hash & !POS_MASK) | (pos as u64 + 1)
-}
-
-fn tag_is(slot: u64, hash: u64) -> bool {
-    (slot ^ hash) & !POS_MASK == 0
-}
-
-fn pos_of(slot: u64) -> usize {
-    ((slot & POS_MASK) - 1) as usize
-}
+/// arrays far too big to cache at ten million keys -- only to reject it.
+///
+/// The width is chosen from the row count rather than fixed, so the slot stays
+/// four bytes: at ten million rows the index needs 24 bits and the tag gets
+/// the other 8; at fifty million it needs 26 and the tag gets 6. A narrower tag
+/// lets more probes through to the key comparison behind it, which is
+/// unchanged -- the answer cannot change, only how often the bytes are
+/// re-examined. Past four billion keys there are no bits left for a position;
+/// `build` refuses that rather than truncating it.
+const EMPTY_SLOT: u32 = 0;
 
 /// One chunk's rows, in the order they appear in it.
 struct Chunk {
@@ -483,7 +477,12 @@ impl Chunk {
 struct RowIndex {
     row_at: Vec<u64>,
     row_hash: Vec<u64>,
-    table: Vec<u64>,
+    table: Vec<u32>,
+    /// Low bits of a slot holding `first_row` positions plus one; the high
+    /// bits hold the top of the key's hash as a tag. Chosen from the row count
+    /// in `build`, so the slot stays four bytes at any scale this port runs.
+    pos_bits: u32,
+    pos_mask: u32,
     mask: usize,
     /// The row that first carried each distinct key, in first-appearance order.
     first_row: Vec<i32>,
@@ -494,6 +493,33 @@ struct RowIndex {
 }
 
 impl RowIndex {
+    /// Packs a slot: the top `32 - pos_bits` bits of the hash above the
+    /// position plus one. Zero tag bits (past two billion rows) degrades to
+    /// no tag rather than a wrong answer.
+    fn slot_for(&self, hash: u64, pos: usize) -> u32 {
+        let pos = pos as u32 + 1;
+        let tag_bits = 32 - self.pos_bits;
+        if tag_bits == 0 {
+            pos
+        } else {
+            (((hash >> (64 - tag_bits)) as u32) << self.pos_bits) | pos
+        }
+    }
+
+    /// Whether the slot's tag matches the hash's top bits.
+    fn tag_is(&self, word: u32, hash: u64) -> bool {
+        let tag_bits = 32 - self.pos_bits;
+        if tag_bits == 0 {
+            return true;
+        }
+        (word >> self.pos_bits) == (hash >> (64 - tag_bits)) as u32
+    }
+
+    /// The `first_row` position a non-empty slot holds.
+    fn pos_of(&self, word: u32) -> usize {
+        ((word & self.pos_mask) - 1) as usize
+    }
+
     /// Finds and hashes every row in parallel, then inserts them on one thread in
     /// file order.
     ///
@@ -531,6 +557,23 @@ impl RowIndex {
         while cap * 2 < total * 3 + 16 {
             cap <<= 1;
         }
+        // Wide enough to hold every key index plus the +1 that keeps 0 for
+        // empty, narrow enough to leave the rest of the 32-bit slot for the
+        // hash tag: 24 position bits at ten million rows, 26 at fifty. Past
+        // four billion keys no width fits, and that is refused rather than
+        // truncated.
+        if total as u64 + 2 > 1u64 << 32 {
+            return Err(Error::new("too many rows for the 32-bit key index"));
+        }
+        let mut pos_bits: u32 = 1;
+        while pos_bits < 32 && (1u64 << pos_bits) < total as u64 + 2 {
+            pos_bits += 1;
+        }
+        let pos_mask = if pos_bits >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << pos_bits) - 1
+        };
         // A chunk's two lists are already `row_at` and `row_hash` for its rows:
         // every row the sweep saw, in file order. So the first chunk's are taken
         // over rather than copied, and the rest appended a slice at a time, each
@@ -555,6 +598,8 @@ impl RowIndex {
             row_at,
             row_hash,
             table: empty_table(cap)?,
+            pos_bits,
+            pos_mask,
             mask: cap - 1,
             first_row: alloc::sized(total, "one row per distinct key")?,
             occurrences: alloc::sized(total, "one count per distinct key")?,
@@ -594,7 +639,7 @@ impl RowIndex {
         loop {
             let word = self.table[slot];
             if word == EMPTY_SLOT {
-                self.table[slot] = slot_for(hash, self.first_row.len());
+                self.table[slot] = self.slot_for(hash, self.first_row.len());
                 self.first_row.push(row);
                 self.occurrences.push(1);
                 // Two thirds, which is what `build` sizes the table for. Half was
@@ -607,8 +652,8 @@ impl RowIndex {
                 return Ok(());
             }
             // The tag rejects almost every collision without leaving this word.
-            if tag_is(word, hash) {
-                let key = pos_of(word);
+            if self.tag_is(word, hash) {
+                let key = self.pos_of(word);
                 let candidate = self.first_row[key];
                 if self.row_hash[candidate as usize] == hash {
                     // This row's fields are re-parsed rather than carried over from
@@ -680,7 +725,7 @@ impl RowIndex {
             while self.table[slot] != EMPTY_SLOT {
                 slot = (slot + 1) & self.mask;
             }
-            self.table[slot] = slot_for(hash, key);
+            self.table[slot] = self.slot_for(hash, key);
         }
         Ok(())
     }
@@ -716,10 +761,10 @@ impl RowIndex {
             if word == EMPTY_SLOT {
                 return None;
             }
-            if tag_is(word, hash) {
+            if self.tag_is(word, hash) {
                 // Safety: `word` is not empty (checked above), so it was
                 // written by the index builder with a position < first_row.len().
-                let candidate = unsafe { *self.first_row.get_unchecked(pos_of(word)) };
+                let candidate = unsafe { *self.first_row.get_unchecked(self.pos_of(word)) };
                 // Safety: `candidate` is a row index from first_row, which only
                 // holds indices < row_hash.len() by construction.
                 if unsafe { *self.row_hash.get_unchecked(candidate as usize) } == hash {
@@ -1160,20 +1205,29 @@ struct Capped {
     cap: usize,
     unbounded: bool,
     total: i64,
+    /// Whether to store picks at all. With `--summary` the lists are
+    /// discarded (see the `row_lists` check at the end of `join`), so
+    /// populating them is pure allocation -- and under a memory cap, the
+    /// allocation that aborts instead of refusing.
+    keep: bool,
 }
 
 impl Capped {
-    fn new(cap: usize, unbounded: bool) -> Self {
+    fn new(cap: usize, unbounded: bool, keep: bool) -> Self {
         Capped {
             held: Vec::new(),
             cap,
             unbounded,
             total: 0,
+            keep,
         }
     }
 
     fn push(&mut self, pick: Pick) {
         self.total += 1;
+        if !self.keep {
+            return;
+        }
         // One past the cap, so a section can still report that it was truncated.
         if self.unbounded || self.held.len() <= self.cap {
             self.held.push(pick);
@@ -1280,6 +1334,9 @@ fn join(
     let nc = compared.len();
     let width = key_size + nc;
     let cap = opt.max_rows;
+    // The pick lists are only read for the report (`row_lists`) or a full
+    // export; with `--summary` they are discarded, so do not build them.
+    let keep_picks = opt.row_lists || exporting;
     // Nothing to normalise: the cell comparison is two bit tests and a memcmp,
     // and neither the absence checks nor the value decoding are reachable.
     let plain = !needs_normalising(opt);
@@ -1404,7 +1461,7 @@ fn join(
                 }
                 Fast::Missed => {
                     out.removed_total += 1;
-                    if exporting || out.removed.len() <= cap {
+                    if keep_picks && (exporting || out.removed.len() <= cap) {
                         out.removed.push(Pick { row, mate: -1 });
                     }
                     continue;
@@ -1472,7 +1529,7 @@ fn join(
                 bi.lookup(b, &a.slab, Some(&fa), hash, key_size, opt, span, &mut fb)
             else {
                 out.removed_total += 1;
-                if exporting || out.removed.len() <= cap {
+                if keep_picks && (exporting || out.removed.len() <= cap) {
                     out.removed.push(Pick { row, mate: -1 });
                 }
                 continue;
@@ -1532,7 +1589,7 @@ fn join(
             }
             if any {
                 out.changed_total += 1;
-                if exporting || out.changed.len() <= cap {
+                if keep_picks && (exporting || out.changed.len() <= cap) {
                     out.changed.push(Pick { row, mate });
                 }
             }
@@ -1541,7 +1598,7 @@ fn join(
     };
 
     let b_range = |p: usize| -> Capped {
-        let mut added = Capped::new(cap, exporting);
+        let mut added = Capped::new(cap, exporting, keep_picks);
         let lo = b_keys * p / b_ways;
         let hi = b_keys * (p + 1) / b_ways;
         // `first_row` is in file order, so the bits are read in ascending order
@@ -1586,7 +1643,7 @@ fn join(
     chunks.sort_by_key(|(t, _)| *t);
 
     let parts: Vec<Part> = parts.into_iter().map(|(_, part)| part).collect();
-    let mut added = Capped::new(cap, exporting);
+    let mut added = Capped::new(cap, exporting, keep_picks);
     for (_, chunk) in chunks {
         for pick in &chunk.held {
             added.push(*pick);
@@ -1597,8 +1654,8 @@ fn join(
     phases.mark("  join chunks (par)");
     // Merged in chunk order, so the rows kept under the cap are the same rows
     // one thread would have kept.
-    let mut changed = Capped::new(cap, exporting);
-    let mut removed = Capped::new(cap, exporting);
+    let mut changed = Capped::new(cap, exporting, keep_picks);
+    let mut removed = Capped::new(cap, exporting, keep_picks);
     let mut matched = 0i64;
     let mut changed_per = vec![0i64; nc];
     let mut blanked_per = vec![0i64; nc];

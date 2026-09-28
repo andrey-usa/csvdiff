@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 /// Enough rows that the index cannot fit in a few megabytes, small enough that
 /// writing it costs nothing: 120,000 rows is about 3.7 MB on disk and wants
-/// somewhere over 12 MB to compare.
+/// somewhere over 8 MB to compare.
 const ROWS: usize = 120_000;
 
 struct Fixture {
@@ -169,7 +169,7 @@ fn a_budget_that_is_not_enough_is_an_error_not_a_signal() {
     // the same way. One cap would not do: the old code refused at some sizes and
     // aborted at others, depending on which allocation happened to be the one
     // that crossed the line.
-    for cap_mb in [12, 8, 6, 4, 2] {
+    for cap_mb in [8, 6, 4, 2] {
         let run = run_capped(cap_mb, &fx.a(), &fx.b(), &report);
         assert!(!run.hung, "{cap_mb} MB: the run did not finish");
         assert_eq!(
