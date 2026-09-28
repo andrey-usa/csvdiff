@@ -4,6 +4,12 @@
 Run 2026-09-26 (second edition, evening), after #117–#143. The morning edition's
 numbers are kept beside them where the same CPU measured both.
 
+> **Stale as of 2026-09-28.** This snapshot predates three merged performance
+> PRs: C guard_span #178 (10–13% on CSV), C++ guard_span #179 (7–12%), and the
+> Rust guard_span + `needs_normalising` hoisting (1.03x). For the latest
+> per-port numbers see [BENCHMARKS.md](BENCHMARKS.md); a fresh CI snapshot has
+> not been run yet.
+
 Measured with **no `--json`**, and with `--summary` for Rust, so every port is
 doing the job all four perform: count and compare, and write nothing. Both
 flags were once in the measurement for one port only -- `--json` made C++ emit
