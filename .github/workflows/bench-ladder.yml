@@ -183,6 +183,10 @@ jobs:
           toolchain: stable
           cache: false
       - uses: Swatinem/rust-cache@v2
+        # The 150m rungs fill the disk with benchmark data; a cache save that
+        # then hits "no space left" must not fail a rung whose results are
+        # already published.
+        continue-on-error: true
         with:
           workspaces: rust
           key: ladder-${{ matrix.size }}-${{ matrix.format }}
