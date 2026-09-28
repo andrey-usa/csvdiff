@@ -68,6 +68,8 @@ jobs:
       # first` -- cpp/test.sh checks for it in its opening lines, same as the
       # others.
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -169,6 +171,8 @@ jobs:
       # The oracle. Every check below is this port's answer against the Rust
       # port's on the same file, so it is built first and on every lane.
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

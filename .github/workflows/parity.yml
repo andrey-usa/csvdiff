@@ -59,6 +59,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

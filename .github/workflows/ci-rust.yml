@@ -48,6 +48,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       # A cold build is about twenty seconds now that the dataframe engines are
@@ -107,6 +108,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
@@ -142,6 +145,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
