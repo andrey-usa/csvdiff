@@ -119,6 +119,10 @@ jobs:
         working-directory: rust
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
+          # setup-rust-toolchain sets this to `deny`. Building Miri's own
+          # sysroot prints a cargo warning ("unused dependency `sysroot`") that
+          # is not ours and that `deny` turns into an error before any test runs.
+          CARGO_BUILD_WARNINGS: warn
         run: |
           cargo miri test --lib -- \
             --skip an_impossible_size_refuses \
