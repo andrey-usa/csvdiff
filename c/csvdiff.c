@@ -1201,13 +1201,27 @@ typedef struct {
     size_t           key_size;
     const size_t    *bounds;
     Chunk           *chunk;
+    /* Per-thread timing, nanoseconds. Aggregated after the join. */
+    uint64_t        *parse_ns;
+    uint64_t        *hash_ns;
+    uint64_t        *push_ns;
+    uint64_t        *rows;
 } SweepCtx;
 
 /*
  * Parses and hashes every row that *starts* in this chunk, running past its end
  * to finish the last one. This is the work worth splitting: it reads the file
  * and writes only its own chunk, so any number of threads may be inside it.
+ *
+ * When CSVDIFF_PHASES is set, each thread records where its nanoseconds go --
+ * parsing, hashing, pushing -- so a slow sweep can be blamed on the right part.
  */
+static inline uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
 static void sweep_part(void *vctx, unsigned p) {
     SweepCtx *c = vctx;
     Chunk *out = &c->chunk[p];
@@ -1216,10 +1230,15 @@ static void sweep_part(void *vctx, unsigned p) {
     Field *fields = malloc(c->parser->width * sizeof *fields);
     if (!fields) { out->oom = true; return; }
 
+    const bool timed = c->parse_ns != NULL;
+    uint64_t t_parse = 0, t_hash = 0, t_push = 0, n_rows = 0;
+    uint64_t t0 = timed ? now_ns() : 0;
+
     size_t pos = c->bounds[p];
     while (pos < stop) {
         if (d[pos] == '\n') { pos++; continue; }            /* an empty line is not a row */
         if (d[pos] == '\r' && pos + 1 < end && d[pos + 1] == '\n') { pos += 2; continue; }
+        if (timed) t0 = now_ns();
         const size_t next = parse_keys(c->parser, d, pos, end, fields);
         for (size_t i = 0; i < c->key_size; i++)
             if (fields[i] == TOO_LONG) out->failed = true;
@@ -1234,14 +1253,25 @@ static void sweep_part(void *vctx, unsigned p) {
             for (size_t i = 0; i < c->parser->width; i++)
                 if (fields[i] == TOO_LONG) out->failed = true;
         }
+        if (timed) t_parse += now_ns() - t0;
         if (out->failed) break;
+        if (timed) t0 = now_ns();
         uint64_t hash = UINT64_C(0xcbf29ce484222325);
         for (size_t i = 0; i < c->key_size; i++) hash = hash_field(c->slab, fields[i], hash);
+        if (timed) { t_hash += now_ns() - t0; t0 = now_ns(); }
         if (!chunk_push(out, pos, hash)) { out->oom = true; break; }
+        if (timed) t_push += now_ns() - t0;
+        n_rows++;
         if (next <= pos) break; /* no progress: a malformed tail, not an endless loop */
         pos = next;
     }
     free(fields);
+    if (timed) {
+        c->parse_ns[p] = t_parse;
+        c->hash_ns[p] = t_hash;
+        c->push_ns[p] = t_push;
+        c->rows[p] = n_rows;
+    }
 }
 
 /*
@@ -1278,10 +1308,28 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
 
     Phases ph;
     phases_init(&ph);
-    SweepCtx sc = { slab, parser, key_size, bounds, chunks };
+    /* Per-thread sweep timings, only when the phase breakdown is on. */
+    const bool timed = ph.on;
+    uint64_t *t_parse = timed ? calloc(ways, sizeof *t_parse) : NULL;
+    uint64_t *t_hash = timed ? calloc(ways, sizeof *t_hash) : NULL;
+    uint64_t *t_push = timed ? calloc(ways, sizeof *t_push) : NULL;
+    uint64_t *t_rows = timed ? calloc(ways, sizeof *t_rows) : NULL;
+    SweepCtx sc = { slab, parser, key_size, bounds, chunks,
+                    t_parse, t_hash, t_push, t_rows };
     run_parts(sweep_part, &sc, ways);
     free(bounds);
     phase_mark(&ph, "sweep rows");
+    if (timed) {
+        uint64_t p = 0, h = 0, u = 0, r = 0;
+        for (unsigned i = 0; i < ways; i++) {
+            p += t_parse[i]; h += t_hash[i]; u += t_push[i]; r += t_rows[i];
+        }
+        /* ru_minflt/ru_majflt from getrusage would need a before/after pair;
+         * the per-part split is the actionable half. */
+        fprintf(stderr, "    sweep detail: parse %.3fs hash %.3fs push %.3fs (%llu rows)\n",
+                p / 1e9, h / 1e9, u / 1e9, (unsigned long long)r);
+        free(t_parse); free(t_hash); free(t_push); free(t_rows);
+    }
 
     bool ok = true;
     for (unsigned p = 0; p < ways; p++) {
