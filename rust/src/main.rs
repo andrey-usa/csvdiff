@@ -69,9 +69,20 @@ Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --
 /// output mid-word, which is how `memory allocation of 800040080004008000400
 /// bytes failed` got printed.
 ///
-/// So: one line, one write, no backtrace. `RUST_BACKTRACE` still asks for one,
-/// and that capture is the caller's risk to take -- but it does not hold the
-/// lock that made this a deadlock rather than a crash.
+/// So: one line, one write, no backtrace -- and `RUST_BACKTRACE` does not change
+/// that. It used to: this hook printed `Backtrace::force_capture()` whenever
+/// the variable was set, on the theory that it did not take the lock. It does.
+/// `Backtrace`'s `Display` resolves symbols under the same backtrace lock, the
+/// allocation error hook reaches for it, and the thread waits on itself; a
+/// second panicking thread then waits on the stderr lock and `main` on `join`.
+/// Measured at a 4.5 MB `ulimit -d`: 4 hangs in 30 runs with `RUST_BACKTRACE`
+/// set, none in 30 without. And "the caller's risk" was nobody's choice:
+/// `setup-rust-toolchain` exports `RUST_BACKTRACE` to every CI job, and plenty
+/// of shells set it globally, which is how `tests/out_of_memory.rs` came to
+/// fail intermittently on pull requests that touched nothing near it.
+///
+/// A backtrace is still there for whoever asks for this program's one by name:
+/// `CSVDIFF_BACKTRACE=1`. It can hang under a memory cap, for the reason above.
 fn quiet_panics() {
     std::panic::set_hook(Box::new(|info| {
         let what = info
@@ -94,7 +105,7 @@ fn quiet_panics() {
                 let _ = writeln!(err, "error: internal: {what}");
             }
         }
-        if std::env::var_os("RUST_BACKTRACE").is_some() {
+        if std::env::var_os("CSVDIFF_BACKTRACE").is_some() {
             let _ = writeln!(err, "{}", std::backtrace::Backtrace::force_capture());
         }
         let _ = err.flush();
