@@ -46,7 +46,6 @@ import json
 import os
 import platform
 import resource
-import shutil
 import subprocess
 import sys
 import time
@@ -180,10 +179,14 @@ def host() -> dict[str, object]:
     except OSError:
         pass  # not Linux; the fields below degrade to "unknown" rather than fail
 
-    if "avx512bw" in flags:  isa = "avx512"
-    elif "avx2" in flags:    isa = "avx2"
-    elif "sse2" in flags:    isa = "sse2"
-    else:                    isa = "baseline"
+    if "avx512bw" in flags:
+        isa = "avx512"
+    elif "avx2" in flags:
+        isa = "avx2"
+    elif "sse2" in flags:
+        isa = "sse2"
+    else:
+        isa = "baseline"
 
     # How much RAM, because a rung whose input does not fit in it is not
     # measuring the engines. See `fits_in_ram` below.

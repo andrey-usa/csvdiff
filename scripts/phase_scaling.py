@@ -5,7 +5,12 @@ fraction is unexplained. This scales every phase separately, taking the max of
 the two concurrent index sides rather than their sum, and checks the critical
 path adds up to the wall before believing any of it.
 """
-import subprocess, re, time, os, statistics, sys
+import subprocess
+import re
+import time
+import os
+import statistics
+import sys
 
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent  # repository root
@@ -26,7 +31,8 @@ def one(thr):
     ph = {}
     for line in r.stderr.splitlines():
         m = re.match(r'\s+(.+?)\s+([\d.]+)s$', line)
-        if m: ph[m.group(1)] = float(m.group(2))
+        if m:
+            ph[m.group(1)] = float(m.group(2))
     # The two index sides run concurrently: the critical path is the longer one.
     a = ph.get('A sweep (parallel)', 0) + ph.get('A index insert (serial)', 0)
     b = ph.get('B sweep (parallel)', 0) + ph.get('B index insert (serial)', 0)

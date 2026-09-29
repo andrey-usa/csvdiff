@@ -506,7 +506,7 @@ way, and its report names the reader that ran too.
 reader, snappy is 1.10x an uncompressed run, gzip 1.19x, lz4 1.04x, and zstd
 1.00x while reading 3.82x fewer bytes — so the 3.5-4x a default zstd run shows
 is the routing below, not the decompression. Write zstd. The numbers are in
-[BENCHMARKS.md](BENCHMARKS.md#2026-09-09-codecs--what-compression-costs-and-what-the-fall-through-costs).
+[BENCHMARKS.md](docs/benchmarks/2026-W37.md#2026-09-09-codecs--what-compression-costs-and-what-the-fall-through-costs).
 
 By default a Parquet pair goes to the columnar path, and **falls through to
 `turbo` when that path does not read the file** — a codec it does not carry, a
@@ -825,14 +825,14 @@ repository's own C suite, where the counts came out the same either way and
 nothing could see it.
 
 **Compression has been measured off this list**, and the numbers are in
-[BENCHMARKS.md](BENCHMARKS.md#2026-09-09-codecs--what-compression-costs-and-what-the-fall-through-costs).
+[BENCHMARKS.md](docs/benchmarks/2026-W37.md#2026-09-09-codecs--what-compression-costs-and-what-the-fall-through-costs).
 The short answer is that a codec costs between nothing and 19% of wall time with
 the reader held still, and zstd costs nothing measurable while reading 3.82x
 fewer bytes. The 3.5-4x a default run shows for gzip, zstd and lz4 is the
 fall-through to the row reader, not the codec.
 
 Three other things have been measured off it, and those numbers are in
-[BENCHMARKS.md](BENCHMARKS.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
+[BENCHMARKS.md](docs/benchmarks/2026-W37.md#2026-09-09-profiling--three-questions-and-what-the-answers-cost):
 the serial insert (blocked by allocation rather than ordering, and 1.4% of a
 200-column run), ndjson's cost per byte (the format, not a defect — name lookups
 are 12% of a 46% gap), and wide files (throughput flat from 20 columns to 200,

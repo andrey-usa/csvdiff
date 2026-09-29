@@ -7,7 +7,12 @@ two to one. This takes the max of the two sides instead, which is what the
 critical path sees, and checks the arithmetic by comparing the sum of all phases
 against the measured wall.
 """
-import subprocess, re, time, os, statistics, sys
+import subprocess
+import re
+import time
+import os
+import statistics
+import sys
 
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent  # repository root
@@ -34,9 +39,11 @@ def one(exe, extra, thr):
     total, inserts = 0.0, []
     for line in r.stderr.splitlines():
         m = re.match(r'\s+(.+?)\s+([\d.]+)s$', line)
-        if not m: continue
+        if not m:
+            continue
         total += float(m.group(2))
-        if INSERT.search(m.group(1)): inserts.append(float(m.group(2)))
+        if INSERT.search(m.group(1)):
+            inserts.append(float(m.group(2)))
     return wall, total, inserts
 
 print(f"{'port':<5} {'wall':>7} {'phase sum':>10} {'insert sum':>11} {'insert max':>11}"

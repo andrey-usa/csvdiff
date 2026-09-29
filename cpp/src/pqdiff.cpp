@@ -644,6 +644,12 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
     for (const auto& k : opt.key)
         if (!has(ameta.names, k) || !has(bmeta.names, k))
             throw Error("key column(s) missing from one of the files: " + k);
+    // The text path's rule, which this path had not carried: a name in neither
+    // file is a misspelling, and a misspelled --ignore silently compares the
+    // column it meant to drop and calls it changed on every row.
+    for (const auto& c : opt.ignore)
+        if (!has(ameta.names, c) && !has(bmeta.names, c))
+            throw Error("ignore column(s) present in neither file: " + c);
 
     Result r;
     r.key = opt.key;
@@ -655,6 +661,7 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
         for (const auto& c : opt.compare) {
             if (!has(ameta.names, c) || !has(bmeta.names, c))
                 throw Error("compared column missing from one of the files: " + c);
+            if (has(opt.key, c) || has(opt.ignore, c)) continue;  // as on the text path
             r.compared.push_back(c);
         }
     } else {

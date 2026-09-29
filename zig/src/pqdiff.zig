@@ -44,8 +44,6 @@ const Phases = csvdiff.Phases;
 const PREFETCH_AHEAD = csvdiff.PREFETCH_AHEAD;
 
 pub const Error = error{
-    ParquetKeyColumnMissing,
-    ParquetComparedColumnMissing,
     ParquetRowCountMismatch,
     ParquetMixedWithText,
 };
@@ -963,9 +961,9 @@ pub fn compare(
     opt: Options,
 ) !Result {
     var phases = Phases.start("");
-    var a_slab = try csvdiff.Slab.map(io, a_path);
+    var a_slab = csvdiff.Slab.map(io, a_path) catch |e| return csvdiff.named(e, a_path);
     defer a_slab.close();
-    var b_slab = try csvdiff.Slab.map(io, b_path);
+    var b_slab = csvdiff.Slab.map(io, b_path) catch |e| return csvdiff.named(e, b_path);
     defer b_slab.close();
     const a_map = a_slab.data;
     const b_map = b_slab.data;
@@ -976,14 +974,21 @@ pub fn compare(
     defer b_meta.deinit(gpa);
 
     for (opt.key) |k| {
-        if (!has(a_meta.names, k) or !has(b_meta.names, k)) return Error.ParquetKeyColumnMissing;
+        if (!has(a_meta.names, k) or !has(b_meta.names, k)) return csvdiff.named(csvdiff.Error.KeyColumnMissing, k);
+    }
+    // The text path's rule, which this path had not carried: a name in neither
+    // file is a misspelling, and a misspelled --ignore silently compares the
+    // column it meant to drop and calls it changed on every row.
+    for (opt.ignore) |c| {
+        if (!has(a_meta.names, c) and !has(b_meta.names, c)) return csvdiff.named(csvdiff.Error.IgnoredColumnMissing, c);
     }
 
     var compared: std.ArrayList([]const u8) = .empty;
     defer compared.deinit(gpa);
     if (opt.compare.len > 0) {
         for (opt.compare) |c| {
-            if (!has(a_meta.names, c) or !has(b_meta.names, c)) return Error.ParquetComparedColumnMissing;
+            if (!has(a_meta.names, c) or !has(b_meta.names, c)) return csvdiff.named(csvdiff.Error.ComparedColumnMissing, c);
+            if (has(opt.key, c) or has(opt.ignore, c)) continue; // as on the text path
             try compared.append(gpa, c);
         }
     } else {
