@@ -60,3 +60,8 @@ byte for byte between matched rows. Rust folds Unicode and answers all of it. So
 `scripts/option_matrix.py` holds C++ and Zig to refusing where the rule says, and to Rust's counts
 everywhere else. Each row sits on one side of that line; `scripts/make_fold_fixtures.py` lists
 which, and writes the files.
+
+Its `pad` column holds values that are only whitespace, which generated data never does. Under
+`--trim` such a value is `""`, and `""` is a value: only `--empty-is-null` makes it absent. Rust's
+and Zig's Parquet paths once read it as absent under `--trim` alone, and gave a different answer
+for the same rows as Parquet than as CSV.
