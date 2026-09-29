@@ -66,7 +66,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # tests/parquet.rs holds the Parquet readers to the CSV of the same rows,
+      # and takes both files from the C++ generator. Without it built, all but
+      # one of those tests skip -- by name, and green -- which is what they had
+      # been doing here. The variable turns a missing generator into a failure.
+      - name: Build the Parquet test data generator
+        run: make -C ../cpp gen-data
+
       - name: Test
+        env:
+          CSVDIFF_REQUIRE_GEN_DATA: "1"
         run: cargo test
 
       - name: Build

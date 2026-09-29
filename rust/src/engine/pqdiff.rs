@@ -82,10 +82,14 @@ fn value_of(c: Look<'_>, opt: &Options) -> Val {
     if opt.ignore_case {
         text = text.to_lowercase();
     }
+    // A value that trims to nothing is still a value, "", as it is in the CSV
+    // engines: only --empty-is-null makes it absent. Reading it as absent made
+    // `"  "` against an empty cell no change here and a change on the same rows
+    // as CSV.
     if text.is_empty() && opt.empty_is_null {
         return None;
     }
-    if text.is_empty() { None } else { Some(text) }
+    Some(text)
 }
 
 // `absent` and `same` run for every key cell the index and the join touch, and
