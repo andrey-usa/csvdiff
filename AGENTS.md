@@ -80,8 +80,13 @@ rust/target/release/csvdiff head data/p_a.parquet -n 10
 
 - **The result contract is the API.** `rust/src/contract.rs` defines the result shape; the report
   renders that and nothing else. Every port must return identical `counts` and `columns` on the
-  same input — `parity.yml` gates it. A build that disagrees about row counts is a bug: count
-  changes are bugs, not tweaks.
+  same input — `parity.yml` gates it on a generated dataset, and `conformance.yml` on inputs built
+  to break parsers (`scripts/fuzz_diff.py`). The shape is `docs/contract.schema.json` and the
+  arithmetic that must also hold is `scripts/contract.py`; every port's `--json` is checked against
+  both. A build that disagrees about row counts is a bug: count changes are bugs, not tweaks.
+  Replay a failure with `scripts/fuzz_diff.py --seeds N-N --ports c,cpp,rust,zig`, and check a
+  change against main with `--ref main-build --cand your-build` before you say the output is
+  identical.
 - **Duplicate keys are first-class.** The *first occurrence* of each key joins; the rest are
   counted and listed separately. Changing that changes matched/added/removed and is a behaviour
   change, not a fix.
