@@ -1956,9 +1956,16 @@ Resolved resolve(const std::vector<std::string>& a, const std::vector<std::strin
         if (!has(a, c) && !has(opt.key, c)) out.only_in_b.push_back(c);
 
     if (!opt.compare.empty()) {
+        // Named explicitly: the order is the caller's, and a name that is not in
+        // both files is an error. A key or an ignored column is dropped rather
+        // than compared -- `-k id -c id,a` compares `a`, and `-c a,b -i b`
+        // compares `a` -- which is the rule the C and Rust ports apply. This port
+        // used to compare them, and with `-i` that is a wrong answer: every row
+        // whose ignored column differs was counted as changed.
         for (const auto& c : opt.compare) {
             if (!has(a, c) || !has(b, c))
                 throw Error("compared column missing from one of the files: " + c);
+            if (has(opt.key, c) || has(opt.ignore, c)) continue;
             out.compared.push_back(c);
         }
         return out;
