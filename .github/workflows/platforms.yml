@@ -120,14 +120,43 @@ jobs:
         if: matrix.port == 'zig'
         run: make -C cpp gen-data
 
+      # cpp/test.sh writes the Parquet for two of its sections with duckdb, and
+      # skips them by name when there is none -- which is what it did on every
+      # run here, on every platform: eleven checks, among them the one that
+      # holds C++'s columnar Parquet path to the CSV of the same rows. A pinned
+      # CLI from duckdb's own releases, so they run.
+      - name: Install duckdb for the C++ suite
+        if: matrix.port == 'cpp'
+        run: |
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)  asset=linux-amd64 ;;
+            Linux-aarch64) asset=linux-arm64 ;;
+            Darwin-*)      asset=osx-universal ;;
+            *) echo "::error::no duckdb build for $(uname -s)-$(uname -m)"; exit 1 ;;
+          esac
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/duckdb.zip" \
+            "https://github.com/duckdb/duckdb/releases/download/v1.5.5/duckdb_cli-$asset.zip"
+          mkdir -p "$RUNNER_TEMP/duckdb"
+          unzip -q -o "$RUNNER_TEMP/duckdb.zip" -d "$RUNNER_TEMP/duckdb"
+          echo "$RUNNER_TEMP/duckdb" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/duckdb/duckdb" --version
+
+      # A skip is not a pass. The suites print one per check that declined to
+      # run for want of a tool; this job builds or installs every one of them,
+      # so any skip here means a step went missing and a check went with it.
       - name: Test
         run: |
           case "${{ matrix.port }}" in
-            c)    (cd c   && ./test.sh) ;;
-            cpp)  (cd cpp && ./test.sh) ;;
-            zig)  (cd zig && ./test.sh) ;;
+            c)    (cd c   && ./test.sh) | tee "$RUNNER_TEMP/suite.txt" ;;
+            cpp)  (cd cpp && ./test.sh) | tee "$RUNNER_TEMP/suite.txt" ;;
+            zig)  (cd zig && ./test.sh) | tee "$RUNNER_TEMP/suite.txt" ;;
             rust) cargo test --release --manifest-path rust/Cargo.toml ;;
           esac
+          if [ -f "$RUNNER_TEMP/suite.txt" ] && grep -qE '^ *skip' "$RUNNER_TEMP/suite.txt"; then
+            echo "::error::a check skipped itself rather than ran:"
+            grep -E '^ *skip' "$RUNNER_TEMP/suite.txt"
+            exit 1
+          fi
 
       - name: Say so
         if: always()
