@@ -3,6 +3,7 @@
 
     scripts/option_matrix.py                 # c,cpp,rust,zig on csv, ndjson and parquet
     scripts/option_matrix.py --ports c,zig   # a subset; the first is the reference
+    scripts/option_matrix.py --bin zig=zig/zig-out-debug/bin/csvdiff   # a port's other build
 
 `scripts/fuzz_diff.py` varies the *input* and keeps the options simple. This
 varies the *options* and keeps the input simple: one generated pair per format
@@ -98,6 +99,12 @@ FOLD_CASES: list[tuple[str, list[str], bool]] = [
 ]
 
 
+# What a checked build prints when it finds a memory error, and may print while
+# still exiting with the status the run deserved: Zig's debug allocator logs a
+# double free or a leak and carries on. A release build prints none of these.
+MEMORY_ERRORS = ("error(DebugAllocator)", "AddressSanitizer", "LeakSanitizer", "runtime error:")
+
+
 def run(port: str, a: Path, b: Path, flags: list[str], work: Path):
     """(exit status, contract slice, stderr, contract problems)."""
     doc = work / f"{port}.json"
@@ -113,7 +120,12 @@ def run(port: str, a: Path, b: Path, flags: list[str], work: Path):
             problems = contract.check(d)
         except (OSError, ValueError) as err:
             problems = [f"no readable --json document: {err}"]
-    return proc.returncode, got, proc.stderr.decode(errors="replace").strip(), problems
+    err = proc.stderr.decode(errors="replace").strip()
+    for line in err.splitlines():
+        if any(m in line for m in MEMORY_ERRORS):
+            problems.append(f"reported a memory error: {line.strip()}")
+            break
+    return proc.returncode, got, err, problems
 
 
 def judge(results: dict, flags: list[str], must_name: str | None = None,
@@ -148,7 +160,17 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--ports", default="c,cpp,rust,zig")
     ap.add_argument("--rows", default="2k")
+    ap.add_argument("--bin", action="append", default=[], metavar="PORT=PATH",
+                    help="run this build for PORT instead of its release binary; repeatable. "
+                         "The sanitizer job runs the matrix this way: it is the one runner that "
+                         "reaches the refusals and the normalising paths, which the fuzzer never does")
     args = ap.parse_args()
+    for spec in args.bin:
+        port, sep, path = spec.partition("=")
+        if not sep or port not in PORTS:
+            print(f"--bin wants PORT=PATH with PORT one of {', '.join(PORTS)}: {spec!r}", file=sys.stderr)
+            return 2
+        PORTS[port] = Path(path).resolve()
     ports = [p for p in args.ports.split(",") if p]
     missing = [p for p in ports if p not in PORTS or not PORTS[p].exists()]
     if missing or len(ports) < 2 or not GEN.exists():

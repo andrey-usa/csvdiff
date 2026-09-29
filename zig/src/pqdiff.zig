@@ -1240,9 +1240,19 @@ pub fn compare(
     defer gpa.free(any);
     @memset(any, 0);
 
+    // The names are owned too, so an error from here on -- a refusal from a
+    // column worker, say -- frees each one it made; freeing the array alone
+    // leaked them, one per compared column.
     const columns = try gpa.alloc(ColumnStat, nc);
-    errdefer gpa.free(columns);
-    for (columns, compared.items) |*col, name| col.* = .{ .name = try gpa.dupe(u8, name) };
+    var named: usize = 0;
+    errdefer {
+        for (columns[0..named]) |c| gpa.free(c.name);
+        gpa.free(columns);
+    }
+    for (columns, compared.items) |*col, name| {
+        col.* = .{ .name = try gpa.dupe(u8, name) };
+        named += 1;
+    }
 
     {
         // Each worker owns whole columns, so nothing is shared but the pair
