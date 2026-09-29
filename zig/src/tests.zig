@@ -11,6 +11,10 @@
 //! workflows, which check this port's answers against the other three rather than
 //! its parts against themselves. Worth knowing before trusting `zig build test`
 //! to have exercised a change to the join.
+//!
+//! `pqdiff.zig` is the exception, for its value rules only: what a Parquet cell
+//! normalises to and when it counts as absent, which is small enough to state
+//! beside the code and was wrong without any end-to-end input to show it.
 
 test {
     _ = @import("scan.zig");
@@ -21,4 +25,5 @@ test {
     _ = @import("codec.zig");
     _ = @import("encoding.zig");
     _ = @import("pqread.zig");
+    _ = @import("pqdiff.zig");
 }
