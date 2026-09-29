@@ -40,6 +40,13 @@ const TOO_LONG = fld.TOO_LONG;
 pub const Slab = slab_mod.Slab;
 const Dialect = slab_mod.Dialect;
 
+/// What the last refusal was about -- the column that is missing, the file that
+/// would not open -- for `main` to print after the message, as the C++ and Rust
+/// ports do. Zig errors carry no payload, so it rides beside the error: set on
+/// the line that returns it. The checks run on the calling thread before any
+/// worker starts, and the name points at the command line, which outlives the run.
+pub threadlocal var subject: ?[]const u8 = null;
+
 pub const Error = error{
     KeyColumnMissing,
     ComparedColumnMissing,
@@ -211,6 +218,16 @@ pub fn isUnsupported(err: anyerror) bool {
         => true,
         else => false,
     };
+}
+
+/// Returns `err` with `name` recorded as what it is about. Only the refusals a
+/// name explains get one; any other error passes through untouched.
+pub fn named(err: anyerror, name: []const u8) anyerror {
+    switch (err) {
+        Error.KeyColumnMissing, Error.ComparedColumnMissing, Error.IgnoredColumnMissing, Error.CannotReadFile => subject = name,
+        else => {},
+    }
+    return err;
 }
 
 /// What went wrong, in words, for any error this engine or its readers can
@@ -1709,15 +1726,15 @@ pub fn compare(
 ) !Result {
     const total = if (opt.threads > 0) opt.threads else @max(1, std.Thread.getCpuCount() catch 1);
 
-    const a_input = try Input.open(gpa, io, a_path, opt);
+    const a_input = Input.open(gpa, io, a_path, opt) catch |e| return named(e, a_path);
     defer a_input.freeNames(gpa);
-    const b_input = try Input.open(gpa, io, b_path, opt);
+    const b_input = Input.open(gpa, io, b_path, opt) catch |e| return named(e, b_path);
     defer b_input.freeNames(gpa);
     const a_names = a_input.names();
     const b_names = b_input.names();
 
     for (opt.key) |k| {
-        if (!has(a_names, k) or !has(b_names, k)) return Error.KeyColumnMissing;
+        if (!has(a_names, k) or !has(b_names, k)) return named(Error.KeyColumnMissing, k);
     }
 
     // A name in neither file is a typo, and this is the typo that hides. `--key`
@@ -1729,14 +1746,20 @@ pub fn compare(
     // only one side carries is real and does no harm -- that column is not
     // compared either way. Only a name nothing has can be a mistake.
     for (opt.ignore) |c| {
-        if (!has(a_names, c) and !has(b_names, c)) return Error.IgnoredColumnMissing;
+        if (!has(a_names, c) and !has(b_names, c)) return named(Error.IgnoredColumnMissing, c);
     }
 
     var compared: std.ArrayList([]const u8) = .empty;
     defer compared.deinit(gpa);
     if (opt.compare.len > 0) {
+        // Named explicitly: the order is the caller's, and a name not in both files
+        // is an error. A key or an ignored column is dropped rather than compared
+        // -- `-k id -c id,a` compares `a`, `-c a,b -i b` compares `a` -- the rule
+        // the C and Rust ports apply. This port used to compare them, and with
+        // `-i` that miscounted: every row whose ignored column differed was changed.
         for (opt.compare) |c| {
-            if (!has(a_names, c) or !has(b_names, c)) return Error.ComparedColumnMissing;
+            if (!has(a_names, c) or !has(b_names, c)) return named(Error.ComparedColumnMissing, c);
+            if (has(opt.key, c) or has(opt.ignore, c)) continue;
             try compared.append(gpa, c);
         }
     } else {
