@@ -74,3 +74,23 @@ two and attach the smallest input that reproduces it.
 ## Code of conduct
 
 Be kind and precise. The full text is in `CODE_OF_CONDUCT.md`.
+
+## Releasing
+
+Nothing is released automatically, and nothing is published without a person.
+Pushing a tag `vX.Y.Z` runs `release.yml`, which builds all four ports for the
+baseline of each architecture (never `-march=native`; see
+`scripts/package_release.sh`), packs them, writes `SHA256SUMS`, and attaches
+everything to a **draft** release. Read the draft, then publish it.
+
+```bash
+git tag v1.2.3 && git push origin v1.2.3
+```
+
+To try the packaging without a tag, run the workflow from the Actions tab (it
+uploads the archives as artifacts and stops), or run
+`scripts/package_release.sh PORT VERSION` for the host you are on.
+
+The archives are the baseline builds. They leave out the wide scanners the ports
+choose at compile time (AVX2 and up), so they are slower than a build made for
+your machine; build from source with the port's README for that.

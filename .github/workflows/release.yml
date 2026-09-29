@@ -1,0 +1,116 @@
+name: Release
+
+permissions:
+  contents: read
+
+# Binaries for all four ports, built for the baseline of each architecture (see
+# scripts/package_release.sh for why never `-march=native`), packed, checksummed,
+# and attached to a DRAFT GitHub release. Nothing is published by this workflow:
+# a person reads the draft and presses the button.
+#
+#   git tag v1.2.3 && git push origin v1.2.3     -> a draft release named v1.2.3
+#
+# Run from the Actions tab (workflow_dispatch), or on a pull request that touches
+# the packaging, it builds and uploads the archives as workflow artifacts and
+# stops there -- which is how the packaging gets tested without a tag.
+#
+# Platforms: linux x86_64 and aarch64 and macOS aarch64 for all four ports; Windows
+# for Rust only (C and C++ build there under MSYS2 in platforms.yml, Zig does not
+# build for Windows yet, and none of that is packaged here).
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  pull_request:
+    paths:
+      - "scripts/package_release.sh"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string for the archive names (default: dev-<sha>)"
+        required: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF_NAME#v}"
+          elif [ -n "$INPUT" ]; then v="$INPUT"
+          else v="dev-${GITHUB_SHA::7}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "version: $v"
+
+  build:
+    name: ${{ matrix.port }} on ${{ matrix.os }}
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        port: [c, cpp, rust, zig]
+        include:
+          - os: windows-latest
+            port: rust
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        if: matrix.port == 'rust'
+        with:
+          toolchain: stable
+          cache: false
+      - name: Install Zig
+        if: matrix.port == 'zig'
+        uses: ./.github/actions/setup-zig
+      - name: Package
+        shell: bash
+        run: scripts/package_release.sh "${{ matrix.port }}" "${{ needs.meta.outputs.version }}" dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: csvdiff-${{ matrix.port }}-${{ matrix.os }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: checksums${{ startsWith(github.ref, 'refs/tags/v') && ' and a draft release' || ' (dry run)' }}
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS
+          cat SHA256SUMS
+          # Every port on every platform it is built for: 3 x 4 + 1.
+          [ "$(grep -c tar.gz SHA256SUMS)" -eq 13 ] || { echo "::error::expected 13 archives"; exit 1; }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-files
+          path: dist/*
+      - name: Draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --generate-notes \
+            --title "csvdiff $GITHUB_REF_NAME"
