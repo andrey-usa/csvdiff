@@ -186,10 +186,14 @@ jobs:
           # are the port's own names; they show where the wall time goes when
           # the run is I/O-bound and the total alone cannot say. The pair is
           # named by size (bench_scale.py's loop label), not by port.
+          # Rust gets --summary so it does not build the HTML report the other
+          # ports never produce; without it the phase times include report work.
           echo "--- phase breakdown ---" | tee -a "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt"
+          PHASE_FLAGS=""
+          if [ "${{ matrix.port }}" = "rust" ]; then PHASE_FLAGS="--summary"; fi
           CSVDIFF_PHASES=1 "$BIN" compare \
               "$RUNNER_TEMP/scale/${{ matrix.size }}_a.csv" "$RUNNER_TEMP/scale/${{ matrix.size }}_b.csv" \
-              -k account_id,txn_id --threads "$(nproc)" \
+              -k account_id,txn_id --threads "$(nproc)" $PHASE_FLAGS \
               2>&1 | tee -a "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt" || true
           # The harness kept the pair for the phase run; remove it now so the
           # disk is clean for whatever runs next.
