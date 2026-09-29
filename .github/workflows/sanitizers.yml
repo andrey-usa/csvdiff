@@ -91,3 +91,36 @@ jobs:
       - name: Zig
         shell: bash
         run: python3 scripts/fuzz_diff.py --seeds "$SEEDS" --ref zig/zig-out/bin/csvdiff --cand zig/zig-out-debug/bin/csvdiff
+
+  rust-miri:
+    name: rust unit tests under Miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # Miri interprets the program, so it can neither call C nor map a file, and
+      # it is a few hundred times slower. That leaves the unit tests, which is
+      # where the `unsafe` blocks that do not touch the filesystem are. Of the 58
+      # lib tests, 54 run (about a minute); the four skipped, and why:
+      #   an_impossible_size_refuses   allocates an impossible size on purpose,
+      #                                which Miri reports as an abort
+      #   gzip_and_zstd_go_through...  calls the zstd C library
+      #   gzip_tests (two)             compress megabytes; over two minutes each
+      # Add a skip here only with its reason, and keep the count above true.
+      - name: cargo miri test --lib
+        working-directory: rust
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo miri test --lib -- \
+            --skip an_impossible_size_refuses \
+            --skip gzip_and_zstd_go_through_the_libraries_already_here \
+            --skip gzip_tests
