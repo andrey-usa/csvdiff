@@ -76,8 +76,8 @@ to show the wall, not the ranking.
 | C++ | 7.81s | 21.9s | 2.81x | 6,237 MB | 1.29x |
 | C | 12.13s | 30.0s | 2.47x | 6,191 MB | 2.00x |
 
-Rust leads on wall time *and* memory after the u32 slot conversion
-(`174c28f`) — 6.06s wall (was 8.02s) and 5,966 MB above the input, the
+Rust leads on wall time *and* memory in this run after the u32 slot conversion
+(`174c28f`) — 6.06s wall and 5,966 MB above the input, the
 leanest of the four. C, C++ and Rust all closed Zig's former memory lead
 (6,201 MB vs 6,953–7,178 MB before); C's wall time here is runner noise —
 local A/B on 2M and 10M Parquet shows the u32 change is performance-neutral

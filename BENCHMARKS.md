@@ -235,7 +235,7 @@ First measurement after `174c28f`:
 Pre-u32 (same workflow, 09-28): Zig 7.37s/6,201 MB, Rust 8.02s/6,953 MB,
 C++ 8.43s/6,964 MB, C 8.88s/7,178 MB.
 
-Rust is now fastest *and* leanest — a 24% wall win (8.02s → 6.06s) and the
+Rust is fastest *and* leanest in this run — 6.06s wall and the
 smallest footprint at 5,966 MB. C and C++ closed Zig's former memory lead as
 expected. C's 12.13s wall (vs 8.88s before) is runner noise, not a regression:
 local A/B of the u32 change on 2M and 10M Parquet pairs shows no measurable
