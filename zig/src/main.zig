@@ -180,6 +180,9 @@ pub fn main(init: std.process.Init) !u8 {
             early = r;
         } else |err| {
             if (!csvdiff.isUnsupported(err)) return failRun(&stderr, err, max_memory_mb);
+            // A capability refusal names nothing today, but whatever the next
+            // reader fails on must not be printed with this one's subject.
+            csvdiff.subject = null;
             columnar_ran = false;
         }
     }
@@ -199,8 +202,8 @@ pub fn main(init: std.process.Init) !u8 {
         var w = file.writer(io, &buf);
         try w.interface.print(
             \\{{"counts":{{"a_rows":{d},"b_rows":{d},"a_keys":{d},"b_keys":{d},"matched":{d},
-            ++ "\"unchanged\":{d},\"changed\":{d},\"added\":{d},\"removed\":{d}," ++
-                "\"a_dup_keys\":{d},\"a_dup_rows\":{d},\"b_dup_keys\":{d},\"b_dup_rows\":{d}}},\"columns\":[",
+        ++ "\"unchanged\":{d},\"changed\":{d},\"added\":{d},\"removed\":{d}," ++
+            "\"a_dup_keys\":{d},\"a_dup_rows\":{d},\"b_dup_keys\":{d},\"b_dup_rows\":{d}}},\"columns\":[",
             .{ c.a_rows, c.b_rows, c.a_keys, c.b_keys, c.matched, c.unchanged, c.changed, c.added, c.removed, c.a_dup_keys, c.a_dup_rows, c.b_dup_keys, c.b_dup_rows },
         );
         for (result.columns, 0..) |col, n| {
@@ -219,8 +222,8 @@ pub fn main(init: std.process.Init) !u8 {
     try stdout.interface.print(
         "A {d} rows | B {d} rows | matched {d} (changed {d}) | added {d} | removed {d} | dup keys A {d} B {d} | {s}\n",
         .{
-            c.a_rows,       c.b_rows,   c.matched,       c.changed,
-            c.added,        c.removed,  c.a_dup_keys,    c.b_dup_keys,
+            c.a_rows,                                                  c.b_rows,  c.matched,    c.changed,
+            c.added,                                                   c.removed, c.a_dup_keys, c.b_dup_keys,
             if (columnar_ran) @as([]const u8, "parquet") else "turbo",
         },
     );
@@ -240,6 +243,11 @@ fn failRun(stderr: anytype, err: anyerror, max_memory_mb: ?usize) !u8 {
             try stderr.interface.flush();
             return 2;
         }
+    }
+    if (csvdiff.subject) |name| {
+        try stderr.interface.print("error: {s}: {s}\n", .{ csvdiff.message(err), name });
+        try stderr.interface.flush();
+        return 2;
     }
     return fail(stderr, csvdiff.message(err));
 }

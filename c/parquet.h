@@ -106,6 +106,8 @@ const char *pq_error(void);
 
 /* Sets it, and returns -1 so a caller can `return pq_set_error(...)`. */
 int pq_set_error(const char *why);
+/* The same, naming what it is about: `<why>: <name>`, as the text path says it. */
+int pq_set_errorf(const char *why, const char *name);
 
 /* Both return 0, or -1 with pq_error() set. */
 int  pq_read_meta(const char *data, size_t size, PqMeta *out);

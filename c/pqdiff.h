@@ -44,7 +44,8 @@ typedef struct {
     size_t     ncols;
 } PqResult;
 
-/* True when the file begins with Parquet's `PAR1` magic. Cheap: four bytes. */
+/* Whether the file begins with Parquet's `PAR1` magic: 1 yes, 0 no, -1 it cannot be
+ * opened. Cheap: four bytes. */
 int pq_is_parquet(const char *path);
 
 /*

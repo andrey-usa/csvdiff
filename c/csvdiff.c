@@ -2040,6 +2040,15 @@ static int fail(const char *message) {
     return 2;
 }
 
+/* A refusal that names the thing refused -- the column that is missing, the
+ * file that would not open -- in the form the C++ and Rust ports use:
+ * `<message>: <name>`. "Key column(s) missing" on a twelve-column key was a
+ * search; the name makes it a fix. */
+static int fail_named(const char *message, const char *name) {
+    fprintf(stderr, "error: %s: %s\n", message, name);
+    return 2;
+}
+
 /* The one refusal worth naming in full: it is the answer to the question
  * --max-memory asked. */
 static int fail_budget(void) {
@@ -2193,6 +2202,14 @@ int main(int argc, char **argv) {
      * than half-answered. */
     {
         const int ap = pq_is_parquet(a_path), bp = pq_is_parquet(b_path);
+        /* A file that will not open is neither format, and reporting it as a
+         * format mismatch sent people looking for a conversion they did not need. */
+        if (ap < 0 || bp < 0) {
+            names_free(&key);
+            names_free(&ignore);
+            names_free(&compare);
+            return fail_named("cannot read one of the files", ap < 0 ? a_path : b_path);
+        }
         if (ap != bp) {
             names_free(&key);
             names_free(&ignore);
@@ -2227,7 +2244,8 @@ int main(int argc, char **argv) {
 
     Phases whole;
     phases_init(&whole);
-    if (!slab_open(&a, a_path) || !slab_open(&b, b_path)) { fail("cannot read one of the files"); goto done; }
+    if (!slab_open(&a, a_path)) { fail_named("cannot read one of the files", a_path); goto done; }
+    if (!slab_open(&b, b_path)) { fail_named("cannot read one of the files", b_path); goto done; }
 
     a.dialect = detect_dialect(&a);
     b.dialect = detect_dialect(&b);
@@ -2245,7 +2263,7 @@ int main(int argc, char **argv) {
     }
     for (size_t i = 0; i < key.len; i++)
         if (name_index(&a_head, key.items[i]) < 0 || name_index(&b_head, key.items[i]) < 0) {
-            fail("key column(s) missing from one of the files");
+            fail_named("key column(s) missing from one of the files", key.items[i]);
             goto done;
         }
     /* A name in neither file is a typo, and this is the typo that hides: --key
@@ -2255,7 +2273,7 @@ int main(int argc, char **argv) {
      * subtractive, so a name only one side carries is real and harmless. */
     for (size_t i = 0; i < ignore.len; i++)
         if (name_index(&a_head, ignore.items[i]) < 0 && name_index(&b_head, ignore.items[i]) < 0) {
-            fail("ignore column(s) present in neither file");
+            fail_named("ignore column(s) present in neither file", ignore.items[i]);
             goto done;
         }
     if (compare.len > 0) {
@@ -2267,7 +2285,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < compare.len; i++) {
             const char *c = compare.items[i];
             if (name_index(&a_head, c) < 0 || name_index(&b_head, c) < 0) {
-                fail("compare column(s) not present in both files");
+                fail_named("compare column(s) not present in both files", c);
                 goto done;
             }
             if (name_index(&key, c) >= 0 || name_index(&ignore, c) >= 0) continue;

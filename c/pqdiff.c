@@ -42,13 +42,13 @@ static int map_open(Map *m, const char *path) {
     m->data = NULL;
     m->size = 0;
     m->fd = open(path, O_RDONLY | O_BINARY);
-    if (m->fd < 0) return pq_set_error("cannot read one of the files");
+    if (m->fd < 0) return pq_set_errorf("cannot read one of the files", path);
     struct stat st;
-    if (fstat(m->fd, &st) != 0) { close(m->fd); m->fd = -1; return pq_set_error("cannot read one of the files"); }
+    if (fstat(m->fd, &st) != 0) { close(m->fd); m->fd = -1; return pq_set_errorf("cannot read one of the files", path); }
     m->size = (size_t)st.st_size;
     if (m->size > 0) {
         void *p = mmap(NULL, m->size, PROT_READ, MAP_PRIVATE, m->fd, 0);
-        if (p == MAP_FAILED) { close(m->fd); m->fd = -1; return pq_set_error("cannot map one of the files"); }
+        if (p == MAP_FAILED) { close(m->fd); m->fd = -1; return pq_set_errorf("cannot map one of the files", path); }
         madvise(p, m->size, MADV_WILLNEED);
         m->data = p;
     }
@@ -766,7 +766,7 @@ static void column_part(void *vctx, unsigned p) {
 
 int pq_is_parquet(const char *path) {
     int fd = open(path, O_RDONLY | O_BINARY);
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
     char magic[4] = {0};
     const ssize_t got = read(fd, magic, 4);
     close(fd);
@@ -818,7 +818,7 @@ int pq_compare(const char *a_path, const char *b_path,
     for (size_t j = 0; j < nkey; j++)
         if (name_slot(&ameta, key[j]) == ameta.names_len ||
             name_slot(&bmeta, key[j]) == bmeta.names_len) {
-            pq_set_error("key column(s) missing from one of the files");
+            pq_set_errorf("key column(s) missing from one of the files", key[j]);
             goto done;
         }
     /* Same rule as the text path: a name in neither file is a misspelling, and
@@ -826,7 +826,7 @@ int pq_compare(const char *a_path, const char *b_path,
     for (size_t j = 0; j < nignore; j++)
         if (name_slot(&ameta, ignore[j]) == ameta.names_len &&
             name_slot(&bmeta, ignore[j]) == bmeta.names_len) {
-            pq_set_error("ignore column(s) present in neither file");
+            pq_set_errorf("ignore column(s) present in neither file", ignore[j]);
             goto done;
         }
 
@@ -845,7 +845,7 @@ int pq_compare(const char *a_path, const char *b_path,
         for (size_t j = 0; j < ncompare; j++) {
             const size_t sa = name_slot(&ameta, compare[j]);
             if (sa == ameta.names_len || name_slot(&bmeta, compare[j]) == bmeta.names_len) {
-                pq_set_error("compare column(s) not present in both files");
+                pq_set_errorf("compare column(s) not present in both files", compare[j]);
                 goto done;
             }
             if (has_name(key, nkey, compare[j]) || has_name(ignore, nignore, compare[j])) continue;

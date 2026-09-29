@@ -26,8 +26,9 @@ zig-out/bin/csvdiff compare a.parquet b.parquet -k account_id,txn_id
 ```
 
 **Build it with `--release=fast`.** A plain `zig build` is a Debug build and is
-about four times slower on the Parquet path; Zig 0.16 spells the flag
-`--release`, not `-Doptimize`.
+about four times slower on the Parquet path. `--release=safe` keeps the bounds
+and overflow checks at release speed (useful when chasing a crash), and
+`-Doptimize=<mode>` names any mode directly.
 
 ## Why this port exists
 

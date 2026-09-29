@@ -23,7 +23,7 @@
 set -uo pipefail
 
 port=${1:?usage: win_smoke.sh c|cpp|zig}
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 EXE=${EXE-.exe}
 
 RUST=rust/target/release/csvdiff$EXE
@@ -86,6 +86,8 @@ else
   #
   # CSV is where the hazard actually lives anyway: \r\n translation happens on a
   # text-mode handle, and that is the file written through one.
+  # One format today; a loop so that adding one is a word, not a restructure.
+  # shellcheck disable=SC2043
   for fmt in csv; do
     mine=$tmp/mine-$fmt theirs=$tmp/theirs-$fmt
     mkdir -p "$mine" "$theirs"
