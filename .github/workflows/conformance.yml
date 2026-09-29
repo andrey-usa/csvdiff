@@ -37,6 +37,7 @@ on:
       - "zig/build.zig*"
       - "scripts/fuzz_diff.py"
       - "scripts/contract.py"
+      - "scripts/option_matrix.py"
       - "docs/contract.schema.json"
       - ".github/workflows/conformance.yml"
   pull_request:
@@ -49,6 +50,7 @@ on:
       - "zig/build.zig*"
       - "scripts/fuzz_diff.py"
       - "scripts/contract.py"
+      - "scripts/option_matrix.py"
       - "docs/contract.schema.json"
       - ".github/workflows/conformance.yml"
   schedule:
@@ -87,6 +89,13 @@ jobs:
 
       - name: Build the native ports
         run: scripts/build_ports.sh c cpp rust zig
+
+      # The options, where the fuzzer keeps them simple: --compare, --ignore and
+      # --key together and misspelled, on CSV, ndjson and Parquet. Two ports once
+      # compared a column they were told to ignore, and two accepted a misspelled
+      # --ignore on Parquet; this is the check that would have said so.
+      - name: Every option combination, every format
+        run: python3 scripts/option_matrix.py
 
       # The checker has to be able to fail before its silence means anything.
       - name: The contract checker rejects what it should
