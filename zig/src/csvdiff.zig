@@ -919,6 +919,19 @@ const RowIndex = struct {
         };
         errdefer self.deinit();
 
+        // `first_row` and `occurrences` are pre-sized to `total`. They grow
+        // one entry per distinct key in the insert loop below, and growing
+        // them via `append` under `FixedBufferAllocator` does an
+        // alloc+memcpy+abandon per growth (the two lists leapfrog each other,
+        // so `remap` never succeeds). At 150M rows that is ~46 growths per
+        // list, ~3.6GB of memcpy interleaved with inserts, disrupting the
+        // hash table's cache working set. Pre-sizing eliminates it.
+        //
+        // `row_at`/`row_hash` stay unreserved: they are taken over from the
+        // sweep chunks, not grown.
+        try self.first_row.ensureTotalCapacity(gpa, total);
+        try self.occurrences.ensureTotalCapacity(gpa, total);
+
         // The four lists are *not* reserved to `total`, and used to be. Sizing
         // the table once is measured and stays; sizing these was assumed from
         // it, by an analogy that does not hold.
