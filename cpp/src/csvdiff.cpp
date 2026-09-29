@@ -2029,6 +2029,199 @@ std::vector<Val> row_values(const Slab& s, const RowIndex& idx, int row, std::si
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// The byte proof
+// ---------------------------------------------------------------------------
+//
+// Two rows that agree byte for byte through the end of the last column either
+// file wants are equal in every column that matters, and neither needs parsing
+// to say so. In two files that mostly agree that is most of the rows, which is
+// why the join tries it before it parses anything. Three pieces: what the
+// proof can promise for this pair of files (ProofPlan), when to stop trying it
+// (ProofBackoff), and the ways a row can be proven (ProofRows).
+
+// What the proof can promise for one pair of files, decided once.
+struct ProofPlan {
+    // Both files are ndjson. No fixed offset to promise, so the run is built per
+    // row and the mate's tail is scanned. See `RowParser::json_tail_is_clean`.
+    bool json = false;
+    // Both files are CSV read with the same delimiter and every compared column
+    // sits at the same column number on both sides, ascending -- then equal
+    // bytes mean equal columns, and the last compared column is the one that
+    // closes last. Two headers that order the same columns differently would
+    // put the same bytes under different names, which is exactly what this
+    // refuses. JSON is excluded: it has no fixed offset to be aligned about. A
+    // value there is found by name, and a name repeated in one object takes its
+    // last value for a compared column, so a duplicate past the diverging byte
+    // could carry a value the prefix never saw; the bounded tail scan is what
+    // rules that out.
+    bool aligned = false;
+    // Whether the proof's bytes also cover the keys, so that it can stand in for
+    // the key comparison and run before the mate is parsed: always on objects,
+    // where the run is taken over every wanted value; on CSV when every key sits
+    // at the same column in both files, ahead of the guard.
+    bool keys_in_proof = false;
+    // How many delimiters from a CSV row's start close its guard column: where
+    // `guard_span` can find the proof's span without the parse. 0 where it
+    // cannot -- JSON, keys the proof does not cover, or a guard that is the last
+    // column of A, which no delimiter closes: `guard_span` would scan every row
+    // to its end and return 0, and the proof that follows the lookup resets the
+    // backoff, so nothing would ever stop the scan.
+    std::size_t guard_commas = 0;
+};
+
+// `a_src[i]` is the CSV column slot `i` is read from in A, -1 where A lacks it;
+// `a_columns` is how many columns A's header has.
+ProofPlan plan_proof(const Slab& a, const Slab& b, char a_delim, char b_delim, std::size_t nc,
+                     std::size_t width, std::size_t key_size, const std::vector<int>& a_src,
+                     const std::vector<int>& b_src, std::size_t a_columns) {
+    ProofPlan plan;
+    plan.json = a.dialect() == Dialect::Json && b.dialect() == Dialect::Json && nc > 0;
+    plan.aligned = a.dialect() != Dialect::Json && b.dialect() != Dialect::Json &&
+                   a_delim == b_delim && nc > 0 && a_src.size() == width && b_src.size() == width;
+    for (std::size_t i = key_size; plan.aligned && i < width; ++i)
+        plan.aligned = a_src[i] >= 0 && a_src[i] == b_src[i] &&
+                       (i == key_size || a_src[i] > a_src[i - 1]);
+    plan.keys_in_proof = plan.json;
+    if (plan.aligned) {
+        plan.keys_in_proof = true;
+        for (std::size_t i = 0; plan.keys_in_proof && i < key_size; ++i)
+            plan.keys_in_proof =
+                a_src[i] >= 0 && a_src[i] == b_src[i] && a_src[i] < a_src[width - 1];
+    }
+    if (plan.keys_in_proof && !plan.json &&
+        static_cast<std::size_t>(a_src[width - 1]) + 1 < a_columns)
+        plan.guard_commas = static_cast<std::size_t>(a_src[width - 1]) + 1;
+    return plan;
+}
+
+// A proof that keeps failing is a scan for nothing -- two files where every row
+// really has changed pay for it on every row -- so after kProofBackoff failures
+// in a row it is only attempted every kProofBackoff rows, until one succeeds and
+// it is on again.
+class ProofBackoff {
+  public:
+    // Whether to try the proof on the row at position `at` of this worker's range.
+    bool attempt(std::size_t at) const {
+        return refused_ < kProofBackoff || (at & (kProofBackoff - 1)) == 0;
+    }
+    void proved() { refused_ = 0; }
+    void failed() {
+        if (refused_ < kProofBackoff) ++refused_;
+    }
+
+  private:
+    unsigned refused_ = 0;
+};
+
+// The furthest end of any real field among `n` fields, or `floor` if none reaches it.
+inline std::size_t run_end(const Field* fields, std::size_t n, std::size_t floor) {
+    std::size_t t = floor;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!is_real(fields[i])) continue;
+        const std::size_t e = offset_of(fields[i]) + len_of(fields[i]);
+        if (e > t) t = e;
+    }
+    return t;
+}
+
+// From the end of a CSV field's value to the delimiter or line ending that closes it.
+inline std::size_t field_close(const char* d, std::size_t t, std::size_t end, char delim) {
+    while (t < end && d[t] != delim && d[t] != '\n' && d[t] != '\r') ++t;
+    return t;
+}
+
+// The ways one row of A can be proven equal to its mate in B without comparing
+// its columns. Each takes the row and answers; the caller keeps the counts and
+// the backoff, so this holds no state of its own.
+struct ProofRows {
+    const Slab& a;
+    const Slab& b;
+    const RowIndex& ai;
+    const RowIndex& bi;
+    const ProofPlan plan;  // a copy: four words, and the loop reads them from here
+    char a_delim;
+    std::size_t width, key_size, nc;
+
+    enum class Guard {
+        Untried,   // the span could not be found (a short row, or no guard); parse as before
+        Removed,   // no row of B has this key
+        Proven,    // B's first hash match opens with the same bytes
+        Unsettled  // a candidate the bytes do not settle: parse, and look up by the keys
+    };
+
+    // The proof's span found by counting delimiters, without parsing the row.
+    Guard guard(int row, Field* probe) const {
+        if (!plan.guard_commas) return Guard::Untried;
+        const std::size_t a_lo = ai.row_begin(row);
+        const std::size_t span =
+            guard_span(a.bytes(), a_lo, ai.row_end(row), a_delim, plan.guard_commas);
+        if (!span) return Guard::Untried;
+        bool proven = false;
+        const int mate = bi.lookup_proof(a, nullptr, ai.hash_of(row), probe,
+                                         a.bytes().data() + a_lo, span, false, proven);
+        if (mate < 0) return Guard::Removed;
+        return proven ? Guard::Proven : Guard::Unsettled;
+    }
+
+    // How many bytes of A's row prove the whole row, keys included -- through the
+    // byte that closes the last value either file wants -- or 0 where this row
+    // cannot be proven that way. Needs the row's fields.
+    std::size_t run_before_lookup(int row, const Field* fa) const {
+        if (!plan.keys_in_proof) return 0;
+        const char* d = a.bytes().data();
+        const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+        std::size_t t = a_lo;
+        if (plan.json) {
+            t = run_end(fa, width, a_lo);
+        } else {
+            const Field g = fa[width - 1];
+            if (!is_real(g)) return 0;
+            t = field_close(d, offset_of(g) + len_of(g), a_end, a_delim);
+        }
+        return t < a_end ? t + 1 - a_lo : 0;
+    }
+
+    enum class Proof { NotTried, Proven, Failed };
+
+    // The JSON form, after the lookup has compared the keys: through the byte that
+    // closes the last compared value -- whichever it turns out to be, since two
+    // objects need not list their names in the same order. The keys are not in the
+    // run and do not need to be.
+    Proof json_after_lookup(int row, int mate, const Field* fa) const {
+        const char* d = a.bytes().data();
+        const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+        const std::size_t b_lo = bi.row_begin(mate);
+        const std::size_t b_n = bi.row_end(mate) - b_lo;
+        const std::size_t t = run_end(fa + key_size, nc, a_lo);
+        const std::size_t need = t + 1 - a_lo;
+        const bool same = t < a_end && need <= b_n &&
+                          common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need &&
+                          bi.parser().json_tail_is_clean(b.bytes(), b_lo + need, b_lo + b_n);
+        return same ? Proof::Proven : Proof::Failed;
+    }
+
+    // The CSV form, after the lookup: through the byte that closes the last
+    // compared column, not up to it. Agreeing as far as the field's last byte says
+    // only that the mate's field starts the same way: `cc` is a prefix of
+    // `cccccccc`, and a quoted field the mate carries on with a doubled quote reads
+    // the same that far too. It is the delimiter or the line ending after it that
+    // says the mate's field stopped where this one did.
+    Proof csv_after_lookup(int row, int mate, const Field* fa) const {
+        const Field g = fa[width - 1];
+        if (!is_real(g)) return Proof::NotTried;
+        const char* d = a.bytes().data();
+        const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+        const std::size_t b_lo = bi.row_begin(mate);
+        const std::size_t b_n = bi.row_end(mate) - b_lo;
+        const std::size_t t = field_close(d, offset_of(g) + len_of(g), a_end, a_delim);
+        const std::size_t need = t + 1 - a_lo;
+        const bool same = t < a_end && need <= b_n &&
+                          common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need;
+        return same ? Proof::Proven : Proof::Failed;
+    }
+};
+
 }  // namespace
 
 Result compare(const std::string& a_path, const std::string& b_path, const Options& opt) {
@@ -2106,52 +2299,9 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     ap.set_key_size(key_size);
     bp.set_key_size(key_size);
 
-    // Can a prefix prove a row equal? Only where both files are CSV read with
-    // the same delimiter and every compared column sits at the same column
-    // number on both sides, ascending -- then equal bytes mean equal columns,
-    // and the last compared column is the one that closes last. Two headers
-    // that order the same columns differently would put the same bytes under
-    // different names, which is exactly what this refuses.
-    //
-    // JSON is excluded from `aligned` -- it has no fixed offset to be aligned
-    // about -- and gets `json_proof` below instead. A value there is found by
-    // name, and a name repeated in one object takes its last value for a
-    // compared column, so a duplicate past the diverging byte could carry a
-    // value the prefix never saw; the bounded tail scan is what rules that out.
-    const std::vector<int>& a_src = ap.source();
-    const std::vector<int>& b_src = bp.source();
-    // What JSON gets instead of `aligned`: no fixed offset to promise, so the run
-    // is built per row and the mate's tail is scanned. See
-    // `RowParser::json_tail_is_clean`.
-    const bool json_proof =
-        a.dialect() == Dialect::Json && b.dialect() == Dialect::Json && nc > 0;
-    bool aligned = a.dialect() != Dialect::Json && b.dialect() != Dialect::Json &&
-                   a_delim == b_delim && nc > 0 && a_src.size() == width &&
-                   b_src.size() == width;
-    for (std::size_t i = key_size; aligned && i < width; ++i)
-        aligned = a_src[i] >= 0 && a_src[i] == b_src[i] &&
-                  (i == key_size || a_src[i] > a_src[i - 1]);
-    // Whether the proof's bytes also cover the keys, so that it can stand in
-    // for the key comparison and run before the mate is parsed: always on
-    // objects, where the run is taken over every wanted value; on CSV when
-    // every key sits at the same column in both files, ahead of the guard.
-    bool keys_in_proof = json_proof;
-    if (aligned) {
-        keys_in_proof = true;
-        for (std::size_t i = 0; keys_in_proof && i < key_size; ++i)
-            keys_in_proof = a_src[i] >= 0 && a_src[i] == b_src[i] && a_src[i] < a_src[width - 1];
-    }
-    // How many delimiters from a CSV row's start close its guard column: where
-    // `guard_span` can find the proof's span without the parse. 0 where it
-    // cannot -- JSON, keys the proof does not cover, or a guard that is the last
-    // column of A, which no delimiter closes: `guard_span` would scan every row
-    // to its end and return 0, and the proof that follows the lookup resets the
-    // backoff, so nothing would ever stop the scan.
-    const std::size_t guard_commas =
-        keys_in_proof && !json_proof &&
-                static_cast<std::size_t>(a_src[width - 1]) + 1 < a_header.size()
-            ? static_cast<std::size_t>(a_src[width - 1]) + 1
-            : 0;
+    // Can a prefix prove a row equal, and how? See ProofPlan.
+    const ProofPlan plan = plan_proof(a, b, a_delim, b_delim, nc, width, key_size, ap.source(),
+                                      bp.source(), a_header.size());
 
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
@@ -2284,77 +2434,57 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     for (auto& part : parts) part.columns.resize(nc);
 
     auto a_range = [&](unsigned p) {
+        // Built here, once per worker, and not outside the lambda: as a local its
+        // references are known to the loop, where a captured one is loaded again
+        // after every call the compiler cannot see through (about 1% of the
+        // instructions on a 200k pair).
+        const ProofRows proof{a, b, ai, bi, plan, a_delim, width, key_size, nc};
         Part& out = parts[p];
         const std::size_t lo = a_keys.size() * p / join_ways;
         const std::size_t hi = a_keys.size() * (p + 1) / join_ways;
         std::vector<Field> fa(width), fb(width), probe(width);
-        unsigned refused = 0;
+        ProofBackoff backoff;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
             if (at + RowIndex::kLookupPrefetch < hi)
                 bi.prefetch(ai.hash_of(a_keys[at + RowIndex::kLookupPrefetch]));
-            const bool attempt = refused < kProofBackoff || (at & (kProofBackoff - 1)) == 0;
+            const bool attempt = backoff.attempt(at);
             // The proof's span without the parse: the guard's delimiter sits a
             // fixed count from the row start. Most rows prove out here and never
             // pay for their fields; a row the bytes do not settle is parsed
             // below, looked up again by its keys -- which also covers the hash
             // collision `lookup_proof` passed over -- and compared.
             bool spanned = false;
-            if (guard_commas && attempt) {
-                const std::size_t a_lo = ai.row_begin(row);
-                const std::size_t span =
-                    guard_span(a.bytes(), a_lo, ai.row_end(row), a_delim, guard_commas);
-                if (span) {
-                    bool proven = false;
-                    const int mate = bi.lookup_proof(a, nullptr, ai.hash_of(row), probe.data(),
-                                                     a.bytes().data() + a_lo, span, false, proven);
-                    if (mate < 0) {
+            if (attempt) {
+                switch (proof.guard(row, probe.data())) {
+                    case ProofRows::Guard::Untried:
+                        break;
+                    case ProofRows::Guard::Removed:
                         ++out.removed_total;
                         if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
                         continue;
-                    }
-                    if (proven) {
+                    case ProofRows::Guard::Proven:
                         ++out.matched;
-                        refused = 0;
+                        backoff.proved();
                         continue;
-                    }
-                    if (refused < kProofBackoff) ++refused;
-                    spanned = true;
+                    case ProofRows::Guard::Unsettled:
+                        backoff.failed();
+                        spanned = true;
+                        break;
                 }
             }
             ai.fields_of(row, fa.data());
             // How many bytes of A's row prove the whole row, keys included --
             // through the byte that closes the last value either file wants --
             // or 0 where this row cannot be proven that way.
-            std::size_t need = 0;
-            if (keys_in_proof && !spanned && attempt) {
-                const char* d = a.bytes().data();
-                const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
-                std::size_t t = a_lo;
-                bool ok = true;
-                if (json_proof) {
-                    for (std::size_t i = 0; i < width; ++i) {
-                        if (!is_real(fa[i])) continue;
-                        const std::size_t e = offset_of(fa[i]) + len_of(fa[i]);
-                        if (e > t) t = e;
-                    }
-                } else {
-                    const Field g = fa[width - 1];
-                    ok = is_real(g);
-                    if (ok) {
-                        t = offset_of(g) + len_of(g);
-                        while (t < a_end && d[t] != a_delim && d[t] != '\n' && d[t] != '\r') ++t;
-                    }
-                }
-                if (ok && t < a_end) need = t + 1 - a_lo;
-            }
+            const std::size_t need = !spanned && attempt ? proof.run_before_lookup(row, fa.data()) : 0;
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             bool proven = false;
             const int mate =
                 need ? bi.lookup_proof(a, fa.data(), ai.hash_of(row), probe.data(),
-                                       a.bytes().data() + ai.row_begin(row), need, json_proof,
+                                       a.bytes().data() + ai.row_begin(row), need, proof.plan.json,
                                        proven)
                      : bi.lookup(a, fa.data(), ai.hash_of(row), probe.data());
             if (mate < 0) {
@@ -2365,72 +2495,29 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             ++out.matched;
             if (need) {
                 if (proven) {
-                    refused = 0;
+                    backoff.proved();
                     continue;
                 }
-                if (refused < kProofBackoff) ++refused;
+                backoff.failed();
             }
-            // The JSON form. It sits here rather than inside `lookup` because
-            // this port's `lookup` compares only the keys -- `keys_of`, not
-            // `fields_of` -- so the mate's row is still unparsed at this point
-            // and the proof saves the whole of it. The Rust and Zig ports had to
-            // put theirs *inside* the lookup for that reason: theirs materialise
-            // the mate's whole row to compare its keys, and a proof after that
-            // saves only the column comparison. Same proof, different place,
-            // because the surrounding code differs.
-            if (!need && json_proof && attempt) {
-                const char* d = a.bytes().data();
-                const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
-                const std::size_t b_lo = bi.row_begin(mate);
-                const std::size_t b_n = bi.row_end(mate) - b_lo;
-                // Through the byte that closes the last compared value --
-                // whichever it turns out to be, since two objects need not list
-                // their names in the same order. The keys are not in the run and
-                // do not need to be: `lookup` has already compared them.
-                std::size_t t = a_lo;
-                for (std::size_t i = 0; i < nc; ++i) {
-                    const Field x = fa[key_size + i];
-                    if (!is_real(x)) continue;
-                    const std::size_t e = offset_of(x) + len_of(x);
-                    if (e > t) t = e;
-                }
-                const std::size_t need = t + 1 - a_lo;
-                if (t < a_end && need <= b_n &&
-                    common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need &&
-                    bi.parser().json_tail_is_clean(b.bytes(), b_lo + need, b_lo + b_n)) {
-                    refused = 0;
+            // The proofs that need the mate. They sit here rather than inside
+            // `lookup` because this port's `lookup` compares only the keys --
+            // `keys_of`, not `fields_of` -- so the mate's row is still unparsed
+            // at this point and a proof saves the whole of it. The Rust and Zig
+            // ports had to put theirs *inside* the lookup for that reason:
+            // theirs materialise the mate's whole row to compare its keys, and a
+            // proof after that saves only the column comparison. Same proof,
+            // different place, because the surrounding code differs.
+            if (!need && attempt) {
+                const ProofRows::Proof after = proof.plan.json ? proof.json_after_lookup(row, mate, fa.data())
+                                               : !spanned && proof.plan.aligned
+                                                   ? proof.csv_after_lookup(row, mate, fa.data())
+                                                   : ProofRows::Proof::NotTried;
+                if (after == ProofRows::Proof::Proven) {
+                    backoff.proved();
                     continue;
                 }
-                if (refused < kProofBackoff) ++refused;
-            }
-            // A proof that keeps failing is a scan for nothing -- two files
-            // where every row really has changed pay for it on every row -- so
-            // after kProofBackoff failures in a row it is only attempted every
-            // kProofBackoff rows, until one succeeds and it is on again.
-            if (!need && !spanned && aligned && attempt) {
-                const Field g = fa[width - 1];
-                if (is_real(g)) {
-                    const char* d = a.bytes().data();
-                    const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
-                    const std::size_t b_lo = bi.row_begin(mate);
-                    const std::size_t b_n = bi.row_end(mate) - b_lo;
-                    // Through the byte that closes the last compared column,
-                    // not up to it. Agreeing as far as the field's last byte
-                    // says only that the mate's field starts the same way: `cc`
-                    // is a prefix of `cccccccc`, and a quoted field the mate
-                    // carries on with a doubled quote reads the same that far
-                    // too. It is the delimiter or the line ending after it that
-                    // says the mate's field stopped where this one did.
-                    std::size_t t = offset_of(g) + len_of(g);
-                    while (t < a_end && d[t] != a_delim && d[t] != '\n' && d[t] != '\r') ++t;
-                    const std::size_t need = t + 1 - a_lo;
-                    if (t < a_end && need <= b_n &&
-                        common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need) {
-                        refused = 0;
-                        continue;
-                    }
-                    if (refused < kProofBackoff) ++refused;
-                }
+                if (after == ProofRows::Proof::Failed) backoff.failed();
             }
             bi.fields_of(mate, fb.data());
             bool any = false;
