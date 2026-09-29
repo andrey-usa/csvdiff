@@ -40,19 +40,11 @@ on:
       - "scripts/option_matrix.py"
       - "docs/contract.schema.json"
       - ".github/workflows/conformance.yml"
+  # Every pull request, with no path filter: this is a required check on `main`,
+  # and a required check whose workflow never starts waits forever. A PR that
+  # touches none of the paths above gets a quick pass from the `scope` step
+  # below instead of the build.
   pull_request:
-    paths:
-      - "c/**"
-      - "cpp/**"
-      - "rust/src/**"
-      - "rust/Cargo.*"
-      - "zig/src/**"
-      - "zig/build.zig*"
-      - "scripts/fuzz_diff.py"
-      - "scripts/contract.py"
-      - "scripts/option_matrix.py"
-      - "docs/contract.schema.json"
-      - ".github/workflows/conformance.yml"
   schedule:
     # A longer sweep once a week, on the default branch, for the seeds a pull
     # request does not have time for.
@@ -74,20 +66,51 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Whether this run has anything to check. Pushes, the weekly sweep and a
+      # manual run always do (the push trigger is already path-filtered). A pull
+      # request does when it changes a port, the build, or the checker itself --
+      # the same list as the push filter above; keep the two in step.
+      - name: Does this change touch a port or the contract?
+        id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only "$BASE...$HEAD")
+          echo "$changed"
+          if echo "$changed" | grep -qE '^(c/|cpp/|rust/src/|rust/Cargo\.|zig/src/|zig/build\.zig|scripts/(fuzz_diff|contract|option_matrix)\.py$|docs/contract\.schema\.json$|\.github/workflows/conformance\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing here changes what the ports answer; the contract is unaffected." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - uses: actions/setup-python@v7
+        if: steps.scope.outputs.run == 'true'
         with:
           python-version: "3.14"
       - uses: actions-rust-lang/setup-rust-toolchain@v2
+        if: steps.scope.outputs.run == 'true'
         with:
           toolchain: stable
           cache: false
       - uses: Swatinem/rust-cache@v2
+        if: steps.scope.outputs.run == 'true'
         with:
           workspaces: rust
       - name: Install Zig
+        if: steps.scope.outputs.run == 'true'
         uses: ./.github/actions/setup-zig
 
       - name: Build the native ports
+        if: steps.scope.outputs.run == 'true'
         run: scripts/build_ports.sh c cpp rust zig
 
       # The options, where the fuzzer keeps them simple: --compare, --ignore and
@@ -95,13 +118,16 @@ jobs:
       # compared a column they were told to ignore, and two accepted a misspelled
       # --ignore on Parquet; this is the check that would have said so.
       - name: Every option combination, every format
+        if: steps.scope.outputs.run == 'true'
         run: python3 scripts/option_matrix.py
 
       # The checker has to be able to fail before its silence means anything.
       - name: The contract checker rejects what it should
+        if: steps.scope.outputs.run == 'true'
         run: python3 scripts/contract.py --self-test
 
       - name: Fuzz
+        if: steps.scope.outputs.run == 'true'
         shell: bash
         env:
           SEEDS: ${{ github.event_name == 'schedule' && '1-3000' || github.event.inputs.seeds || '1-400' }}
