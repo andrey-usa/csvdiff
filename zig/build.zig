@@ -2,7 +2,22 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    // `--release` alone means ReleaseFast, which is what this port is measured as.
+    // An explicit `--release=safe` or `--release=small` must mean what it says:
+    // `standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast })`
+    // returns the preferred mode for *any* `--release=X`, so `--release=safe`
+    // built a binary byte-identical to `--release=fast` -- a request for bounds
+    // and overflow checks that quietly got none. Plain `zig build` stays Debug.
+    // Both options are declared up front so `zig build -h` lists them and
+    // passing one never reads as unknown.
+    const optimize_opt = b.option(std.builtin.OptimizeMode, "optimize", "Debug, ReleaseSafe, ReleaseFast or ReleaseSmall; overrides --release");
+    const release_opt = b.option(bool, "release", "ReleaseFast when true, Debug when false (same as --release)");
+    const optimize: std.builtin.OptimizeMode = optimize_opt orelse switch (b.release_mode) {
+        .off => if (release_opt orelse false) .ReleaseFast else .Debug,
+        .any, .fast => .ReleaseFast,
+        .safe => .ReleaseSafe,
+        .small => .ReleaseSmall,
+    };
 
     // How many bytes a scan step takes: 8 is SWAR, 32 and 64 are a vector
     // register's worth, which on x86 needs a CPU target that has them. A build
