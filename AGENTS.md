@@ -27,7 +27,7 @@ What makes that affordable is that the contract is executable, not remembered:
 
 - `conformance.yml` runs `scripts/fuzz_diff.py` across all four on every change to any of them and
   validates every `--json` document against `docs/contract.schema.json` and its arithmetic. It is the
-  gate, and it should be a required check on `main`.
+  gate, and it is a required check on `main`: every change goes through a pull request.
 - `parity.yml` and `formats.yml` do the same on generated datasets in every format.
 - `sanitizers.yml` runs C and C++ under ASan/UBSan, Zig as a Debug build and Rust's unit tests under
   Miri, on the same fuzzed inputs.
