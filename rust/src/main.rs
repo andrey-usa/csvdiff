@@ -48,10 +48,11 @@ compare options:
       --engine E          auto | turbo | sortmerge | native
       --threads N
       --export-dir DIR    Write full changed/added/removed CSVs here
-  -o, --out PATH          Report path (default: <a>__vs__<b>.html)
+  -o, --out PATH          Report path (default: <a>__vs__<b>.html in the current directory)
       --json PATH         Also write a JSON summary (counts + column stats) here
       --no-compress       Embed plain JSON instead of gzip (older browsers)
-      --summary           Print the counts and write nothing: no report, no rows
+      --summary           Print the counts and write nothing: no report, no rows (the way to
+                          run without leaving a file behind)
       --fail-on-dups      Exit 3 when either file has duplicate keys
 
 Exit codes: 0 identical, 1 differences found, 2 error, 3 duplicate keys (with --fail-on-dups).
