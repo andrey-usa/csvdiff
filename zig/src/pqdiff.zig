@@ -121,10 +121,24 @@ fn normalised(
     return buf.items;
 }
 
+/// Decided without `--ignore-case`, as in the CSV path: absence never depends on
+/// case, and a test that folded refused a non-ASCII value for being there.
 fn isAbsent(gpa: std.mem.Allocator, v: Look, o: Options, buf: *std.ArrayList(u8)) !bool {
     if (v.is_null or v.bytes.len == 0) return true;
     if (!needsNormalising(o)) return false;
-    return (try normalised(gpa, v, o, buf)) == null;
+    return (try normalised(gpa, v, unfolded(o), buf)) == null;
+}
+
+/// The options without `--ignore-case`, for the questions case cannot change.
+fn unfolded(o: Options) Options {
+    var u = o;
+    u.ignore_case = false;
+    return u;
+}
+
+fn ascii(bytes: []const u8) bool {
+    for (bytes) |c| if (c >= 0x80) return false;
+    return true;
 }
 
 fn same(gpa: std.mem.Allocator, x: Look, y: Look, o: Options, s: *Scratch) !bool {
@@ -132,6 +146,9 @@ fn same(gpa: std.mem.Allocator, x: Look, y: Look, o: Options, s: *Scratch) !bool
     const yb = try isAbsent(gpa, y, o, &s.b);
     if (xa or yb) return xa and yb;
     if (!needsNormalising(o)) return std.mem.eql(u8, x.bytes, y.bytes);
+    // Identical bytes normalise identically; asked before the fold, so an
+    // unchanged value outside ASCII is not a reason to refuse.
+    if (std.mem.eql(u8, x.bytes, y.bytes)) return true;
     const nx = (try normalised(gpa, x, o, &s.a)) orelse "";
     const ny = (try normalised(gpa, y, o, &s.b)) orelse "";
     return std.mem.eql(u8, nx, ny);
@@ -163,9 +180,10 @@ fn cellDiffers(gpa: std.mem.Allocator, x: Look, y: Look, o: Options, s: *Scratch
     const yb = try isAbsent(gpa, y, o, &s.b);
     if (xa and yb) return false;
     if (o.tolerance > 0 and !xa and !yb) {
-        const tx = (try normalised(gpa, x, o, &s.a)) orelse "";
+        // A number reads the same in either case, so no fold here either.
+        const tx = (try normalised(gpa, x, unfolded(o), &s.a)) orelse "";
         const nx = asNumber(tx);
-        const ty = (try normalised(gpa, y, o, &s.b)) orelse "";
+        const ty = (try normalised(gpa, y, unfolded(o), &s.b)) orelse "";
         const ny = asNumber(ty);
         if (nx != null and ny != null) return @abs(nx.? - ny.?) > o.tolerance;
     }
@@ -279,6 +297,13 @@ const Ids = struct {
         return id;
     }
 };
+
+/// Whether coding this column's dictionary folds only what can be folded.
+fn foldable(col: Col, o: Options) bool {
+    if (!o.ignore_case) return true;
+    for (0..col.c.dict.len) |k| if (!ascii(col.dictAt(k).bytes)) return false;
+    return true;
+}
 
 /// Codes one column's dictionary into `ids`, with -1 for an absent value.
 fn codeDict(
@@ -887,7 +912,13 @@ const Worker = struct {
         // The fast path: both sides dictionary encoded, so the two dictionaries
         // go into one id space and the per-row work is two gathers and an
         // integer compare.
-        const coded = a_col.c.dictionary and b_col.c.dictionary and opt.tolerance == 0;
+        //
+        // Not under --ignore-case with a dictionary entry outside ASCII: coding
+        // folds every entry, including ones only an unchanged or unmatched row
+        // holds, and this port refuses to fold those. The row path folds only a
+        // cell that differs byte for byte, which is where the refusal belongs.
+        const coded = a_col.c.dictionary and b_col.c.dictionary and opt.tolerance == 0 and
+            foldable(a_col, opt) and foldable(b_col, opt);
         if (coded) {
             var ids = Ids{};
             defer ids.deinit(gpa);
