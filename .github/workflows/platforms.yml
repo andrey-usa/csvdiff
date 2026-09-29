@@ -26,13 +26,6 @@ name: Platforms
 on:
   workflow_dispatch:
   pull_request:
-    paths:
-      - "c/**"
-      - "cpp/**"
-      - "zig/**"
-      - "rust/src/**"
-      - "rust/Cargo.toml"
-      - ".github/workflows/platforms.yml"
   schedule:
     # Weekly, because the thing this catches is a runner image changing under
     # a claim that used to be true.
@@ -46,8 +39,41 @@ permissions:
   contents: read
 
 jobs:
+  # Whether this pull request has anything for the jobs below to check. The
+  # pull_request trigger has no path filter, so `platforms` reports on every pull
+  # request and can be a required check: a PR that touches none of these paths
+  # is settled here in seconds and every other job is skipped. The pattern is
+  # the path filter the pull_request trigger here used to carry.
+  scope:
+    name: scope
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed=$(git diff --name-only "$BASE...$HEAD")
+          if echo "$changed" | grep -qE '^(c/|cpp/|zig/|rust/src/|rust/Cargo\.toml$|\.github/workflows/platforms\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing here is built or run by this workflow." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   build:
     name: "${{ matrix.port }} on ${{ matrix.os }}"
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -170,6 +196,8 @@ jobs:
 
   windows:
     name: "${{ matrix.port }} on windows"
+    needs: scope
+    if: needs.scope.outputs.run == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -253,3 +281,24 @@ jobs:
             echo "| --- | --- | --- | --- |"
             echo "| ${{ matrix.port }} | windows-latest | x86_64 | $mark |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The one check to require. Matrix lanes that are skipped never expand into
+  # their names, so a required "cpp on macos-latest" would wait forever on a
+  # pull request that skipped it; this job always runs and reports for all of
+  # them: it fails if any lane failed or was cancelled, and passes otherwise.
+  result:
+    name: platforms
+    needs: [scope, build, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "jobs: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a job ended '$r'"; exit 1 ;;
+            esac
+          done

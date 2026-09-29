@@ -29,6 +29,9 @@ What makes that affordable is that the contract is executable, not remembered:
   validates every `--json` document against `docs/contract.schema.json` and its arithmetic. It is the
   gate, and it is a required check on `main`: every change goes through a pull request.
 - `parity.yml` and `formats.yml` do the same on generated datasets in every format.
+- `platforms.yml` and `sanitizers.yml` each end in a job, `platforms` and `sanitizers`, that
+  reports on every pull request whether or not it touched their paths, so each can be required as
+  one check; the lanes behind them run only when a pull request gives them something to build.
 - `sanitizers.yml` runs C and C++ under ASan/UBSan, Zig as a Debug build and Rust's unit tests under
   Miri, on the same fuzzed inputs.
 
