@@ -105,20 +105,29 @@ std::string_view trimmed(std::string_view s) {
     return s;
 }
 
-Val value_of(Cell c, const Options& o) {
+bool ascii(std::string_view s) {
+    return std::none_of(s.begin(), s.end(), [](unsigned char c) { return c >= 0x80; });
+}
+
+// As csvdiff.cpp's: `compare` refuses a value outside ASCII under --ignore-case,
+// `display` shows it unfolded, for a value that decides nothing.
+enum class Fold { compare, display };
+
+Val value_of(Cell c, const Options& o, Fold fold = Fold::compare) {
     if (c.null) return std::nullopt;
     std::string text(c.view());
     if (text.empty()) return std::nullopt;
     if (o.trim) text = std::string(trimmed(text));
     if (o.ignore_case) {
-        for (unsigned char ch : text)
-            if (ch >= 0x80)
-                throw Error(
-                    "--ignore-case on a field outside ASCII needs Unicode case folding, which "
-                    "this port does not carry; use another implementation for that data");
-        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
-            return static_cast<char>(std::tolower(ch));
-        });
+        const bool plain = ascii(text);
+        if (!plain && fold == Fold::compare)
+            throw Error(
+                "--ignore-case on a field outside ASCII needs Unicode case folding, which "
+                "this port does not carry; use another implementation for that data");
+        if (plain)
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+                return static_cast<char>(std::tolower(ch));
+            });
     }
     if (o.empty_is_null && text.empty()) return std::nullopt;
     return text;
@@ -130,8 +139,10 @@ Val value_of(Cell c, const Options& o) {
 // line. As one function each, neither inlined, and the call was most of the
 // cost -- 1.18B instructions of a 2M-row Parquet run, once per key cell in the
 // index and the join and once per compared cell outside the dictionary path.
+// Absence never depends on case, so this does not fold (see csvdiff.cpp).
 [[gnu::noinline]] bool absent_normalised(Cell c, const Options& o) {
-    return !value_of(c, o).has_value();
+    if (c.null || c.n == 0) return true;
+    return o.empty_is_null && o.trim && trimmed(c.view()).empty();
 }
 
 [[gnu::noinline]] bool same_normalised(Cell x, Cell y, const Options& o) {
@@ -146,8 +157,10 @@ Val value_of(Cell c, const Options& o) {
 [[gnu::always_inline]] inline bool same(Cell x, Cell y, const Options& o) {
     const bool xa = absent(x, o), ya = absent(y, o);
     if (xa || ya) return xa && ya;
-    if (!needs_normalising(o)) return x.n == y.n && std::memcmp(x.p, y.p, x.n) == 0;
-    return same_normalised(x, y, o);
+    // Identical bytes normalise identically; asked before the fold, so an
+    // unchanged value outside ASCII is not a reason to refuse.
+    if (x.n == y.n && std::memcmp(x.p, y.p, x.n) == 0) return true;
+    return needs_normalising(o) && same_normalised(x, y, o);
 }
 
 std::optional<double> as_number(std::string_view s) {
@@ -960,15 +973,27 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
                         if (absent(x, opt)) ++out.filled;
                         out.bits[p >> 6] |= 1ULL << (p & 63);
                         if (out.held.size() <= opt.max_rows)
-                            out.held.emplace_back(p, std::make_pair(value_of(x, opt),
-                                                                    value_of(y, opt)));
+                            out.held.emplace_back(p, std::make_pair(value_of(x, opt, Fold::display),
+                                                                    value_of(y, opt, Fold::display)));
                     };
 
                     // The fast path: both sides dictionary encoded, so the two
                     // dictionaries go into one id space and the per-row work is
                     // two gathers and an integer compare.
-                    const bool coded =
-                        A.dictionary() && B.dictionary() && opt.tolerance == 0.0;
+                    //
+                    // Not under --ignore-case with a dictionary entry outside
+                    // ASCII: coding folds every entry, including ones only an
+                    // unchanged or unmatched row holds, and this port refuses
+                    // to fold those. The row path folds only a cell that
+                    // differs byte for byte, which is where the refusal belongs.
+                    const auto foldable = [&](const Col& col) {
+                        if (!opt.ignore_case) return true;
+                        for (std::size_t k = 0; k < col.dict_size(); ++k)
+                            if (!ascii(col.dict_cell(k).view())) return false;
+                        return true;
+                    };
+                    const bool coded = A.dictionary() && B.dictionary() &&
+                                       opt.tolerance == 0.0 && foldable(A) && foldable(B);
                     if (coded) {
                         Ids ids(A.dict_size() + B.dict_size());
                         std::vector<std::string> owned;
@@ -1026,10 +1051,12 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
                     // column is in memory.
                     out.added_vals.reserve(added.held.size());
                     for (std::int32_t row : added.held)
-                        out.added_vals.push_back(value_of(B.at(static_cast<std::size_t>(row)), opt));
+                        out.added_vals.push_back(
+                            value_of(B.at(static_cast<std::size_t>(row)), opt, Fold::display));
                     out.removed_vals.reserve(removed.held.size());
                     for (std::int32_t row : removed.held)
-                        out.removed_vals.push_back(value_of(A.at(static_cast<std::size_t>(row)), opt));
+                        out.removed_vals.push_back(
+                            value_of(A.at(static_cast<std::size_t>(row)), opt, Fold::display));
                 } catch (...) {
                     col_failures[c] = std::current_exception();
                 }
@@ -1090,7 +1117,7 @@ Result compare_parquet(const std::string& a_path, const std::string& b_path, con
         std::vector<Val> out;
         out.reserve(key_size);
         for (std::size_t j = 0; j < key_size; ++j)
-            out.push_back(value_of(s.col[j].at(static_cast<std::size_t>(row)), opt));
+            out.push_back(value_of(s.col[j].at(static_cast<std::size_t>(row)), opt, Fold::display));
         return out;
     };
 

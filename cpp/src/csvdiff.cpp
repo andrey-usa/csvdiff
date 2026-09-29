@@ -502,7 +502,10 @@ std::string text_of(const Slab& s, Field f) {
     return out;
 }
 
-bool same_bytes(const Slab& a, Field x, const Slab& b, Field y) {
+// Forced inline: `same` is the call that matters, and a second caller in the
+// normalising path was enough for GCC to emit one shared copy and call it --
+// 8% more instructions on a 200k CSV pair, none of it on a path that normalises.
+[[gnu::always_inline]] inline bool same_bytes(const Slab& a, Field x, const Slab& b, Field y) {
     const bool ex = is_real(x) && is_escaped(x);
     const bool ey = is_real(y) && is_escaped(y);
     if (!ex && !ey) return a.raw(x) == b.raw(y);
@@ -528,9 +531,18 @@ std::string_view trimmed(std::string_view s) {
     return s;
 }
 
+// How `value_of` treats a byte outside ASCII under --ignore-case.
+//
+// `compare` is for a value whose folded form decides an answer -- a key, which
+// is hashed folded, and a cell that differs byte for byte. `display` is for a
+// value that is only shown: a row sample, or a cell already known to differ.
+// Refusing there made the exit status depend on `--json`, since only a run that
+// writes samples builds them.
+enum class Fold { compare, display };
+
 // The field as the value a row-at-a-time engine would have built for it: empty
 // is absent, then --trim, then --ignore-case, then --empty-is-null.
-Val value_of(const Slab& s, Field f, const Options& o) {
+Val value_of(const Slab& s, Field f, const Options& o, Fold fold = Fold::compare) {
     if (!is_real(f)) return std::nullopt;
     std::string text = text_of(s, f);
     if (text.empty()) return std::nullopt;
@@ -541,15 +553,18 @@ Val value_of(const Slab& s, Field f, const Options& o) {
         // cafe with an acute would compare equal in the ports that do fold and
         // unequal here, and nothing in the output would say why. So the ASCII
         // path is taken where it is provably right, and anything else is
-        // refused by name. See cpp/README.md.
-        for (unsigned char c : text)
-            if (c >= 0x80)
-                throw Error(
-                    "--ignore-case on a field outside ASCII needs Unicode case folding, which "
-                    "this port does not carry; use another implementation for that data");
-        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
+        // refused by name -- where the fold decides something. A value that is
+        // only displayed is shown as it is, unfolded. See cpp/README.md.
+        const bool ascii = std::none_of(text.begin(), text.end(),
+                                        [](unsigned char c) { return c >= 0x80; });
+        if (!ascii && fold == Fold::compare)
+            throw Error(
+                "--ignore-case on a field outside ASCII needs Unicode case folding, which "
+                "this port does not carry; use another implementation for that data");
+        if (ascii)
+            std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
     }
     if (o.empty_is_null && text.empty()) return std::nullopt;
     return text;
@@ -581,8 +596,14 @@ Val value_of(const Slab& s, Field f, const Options& o) {
 // `--empty-is-null` and `--tolerance` are all off by default, and
 // `needs_normalising` is what decides. Where one is on, the cost is the call it
 // always was.
+//
+// Absence never depends on case, so this does not fold: an absent test that
+// folded refused a non-ASCII value whose only question was whether it was there.
 bool absent_normalised(const Slab& s, Field f, const Options& o) {
-    return !value_of(s, f, o).has_value();
+    if (!is_real(f)) return true;
+    const std::string text = text_of(s, f);
+    if (text.empty()) return true;
+    return o.empty_is_null && o.trim && trimmed(text).empty();
 }
 
 inline bool is_absent(const Slab& s, Field f, const Options& o) {
@@ -594,6 +615,10 @@ inline bool is_absent(const Slab& s, Field f, const Options& o) {
 // Split out for the same reason, but `same` itself stays out of line -- see
 // above for the measurement that decided it.
 bool same_normalised(const Slab& a, Field x, const Slab& b, Field y, const Options& o) {
+    // Identical bytes normalise identically, whatever they hold. Asked first, a
+    // value outside ASCII that did not change is not a reason to refuse the run
+    // under --ignore-case: the port that folds it gives the same answer.
+    if (same_bytes(a, x, b, y)) return true;
     return value_of(a, x, o) == value_of(b, y, o);
 }
 
@@ -2015,7 +2040,7 @@ std::vector<Val> key_values(const Slab& s, const RowIndex& idx, int row, std::si
     idx.fields_of(row, fields.data());
     std::vector<Val> out;
     out.reserve(key_size);
-    for (std::size_t i = 0; i < key_size; ++i) out.push_back(value_of(s, fields[i], o));
+    for (std::size_t i = 0; i < key_size; ++i) out.push_back(value_of(s, fields[i], o, Fold::display));
     return out;
 }
 
@@ -2025,7 +2050,7 @@ std::vector<Val> row_values(const Slab& s, const RowIndex& idx, int row, std::si
     idx.fields_of(row, fields.data());
     std::vector<Val> out;
     out.reserve(width);
-    for (Field f : fields) out.push_back(value_of(s, f, o));
+    for (Field f : fields) out.push_back(value_of(s, f, o, Fold::display));
     return out;
 }
 
@@ -2747,7 +2772,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             for (std::size_t i = 0; i < nc; ++i) {
                 const Field x = fa[key_size + i], y = fb[key_size + i];
                 if (cell_differs(a, x, b, y, opt))
-                    out.cells.push_back({i, value_of(a, x, opt), value_of(b, y, opt)});
+                    out.cells.push_back(
+                        {i, value_of(a, x, opt, Fold::display), value_of(b, y, opt, Fold::display)});
             }
             r.changed.push_back(std::move(out));
         }

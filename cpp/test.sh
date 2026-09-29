@@ -89,6 +89,28 @@ proof "a difference confined to an ignored column" \
 proof "the key written after the last compared value" \
   '{"v":"5","w":"x","k":"1"}' '{"v":"6","w":"x","k":"1"}' "changed 1"
 
+# --ignore-case refuses a value outside ASCII only where folding it decides the
+# answer: a key, or a compared value that differs byte for byte. A value that is
+# unchanged, or in a row only one side has, is answered -- with or without
+# --json, which used to refuse the second while building the row samples.
+echo "--ignore-case outside ASCII:"
+fold() { # name, a-rows, b-rows (printf %b escapes), expected exit status
+  printf 'k,v\n1,alpha\n%b\n' "$2" > "$tmpj/fa.csv"
+  printf 'k,v\n1,ALPHA\n%b\n' "$3" > "$tmpj/fb.csv"
+  for json in "" "--json $tmpj/fold.json"; do
+    # shellcheck disable=SC2086  # $json is zero words or two
+    code=0; ./build/csvdiff compare "$tmpj/fa.csv" "$tmpj/fb.csv" -k k --ignore-case $json \
+      >/dev/null 2>&1 || code=$?
+    if [ "$code" = "$4" ]; then echo "  ok    $1${json:+, --json}"
+    else echo "  FAIL  $1${json:+, --json}: exit $code, wanted $4"; fail=1; fi
+  done
+}
+fold "unchanged, outside ASCII" '2,CAF\xc3\x89' '2,CAF\xc3\x89' 0
+fold "only in an added row" '2,x' '2,x\n3,na\xc3\xafve' 1
+fold "absent on one side" '2,' '2,\xc3\x89' 1
+fold "differs, outside ASCII: refused" '2,CAF\xc3\x89' '2,caf\xc3\xa9' 2
+fold "a key outside ASCII: refused" '\xc3\x89,x' '\xc3\x89,x' 2
+
 rm -rf "$tmpj"
 
 echo "the threaded csv sweep, over quoted newlines and chunk boundaries:"
