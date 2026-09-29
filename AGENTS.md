@@ -220,8 +220,9 @@ Most wrong turns here have been measurement, not code. The full reasoning is in 
 - **A panic under a tight budget used to hang rather than crash**, which on a runner is worse:
   `RUST_BACKTRACE=1` makes the default hook take the backtrace lock and then symbolise, symbolising
   allocates, the allocation fails, and the allocation error hook reaches for the lock its own thread
-  holds. `main.rs` installs a hook that writes one line and no backtrace. Do not put the default
-  hook back.
+  holds. `main.rs` installs a hook that writes one line and no backtrace, and it must not honour
+  `RUST_BACKTRACE` either: it once did, and hung the same way on CI, which exports that variable to
+  every job. `CSVDIFF_BACKTRACE=1` is the opt-in. Do not put the default hook back.
 - In C, `--compare`/`--key`/`--ignore` live in **two resolvers** — `csvdiff.c` for text and
   `pqdiff.c` for the columnar path. Change both, or the flag works on CSV and is ignored on Parquet.
 - A compressed Parquet column in C means `owned`, and `pq_base()` is the only correct base — never

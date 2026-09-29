@@ -17,6 +17,9 @@
 //!   * printing that panic with `RUST_BACKTRACE=1` set took the backtrace lock,
 //!     allocated to symbolise, failed, and reached for the same lock from the
 //!     allocation error hook. The process hung, which no timeout of its own ends.
+//!     It came back once, through the hook's own `RUST_BACKTRACE` branch, and
+//!     showed up only on runners that export the variable -- so every run here
+//!     now sets it, and the hook is expected to ignore it (see `quiet_panics`).
 //!
 //! So this test asserts three things about the same run: an exit code of 2, a
 //! message that says what ran out, and that it finishes at all.
@@ -120,6 +123,10 @@ fn run_script(cap_kb: usize, a: &Path, b: &Path, out_flag: &str) -> Run {
     let mut child = Command::new("bash")
         .arg("-c")
         .arg(&script)
+        // The environment that deadlocked: set on every run rather than
+        // inherited, so the test does not pass or fail with the shell it ran in.
+        .env("RUST_BACKTRACE", "1")
+        .env_remove("CSVDIFF_BACKTRACE")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
