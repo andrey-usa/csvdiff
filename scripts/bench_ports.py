@@ -107,7 +107,7 @@ def extras() -> list[tuple[str, list[str], list[str]]]:
         return []
     try:
         spec = json.loads(raw)
-        items = [(str(l), [str(p)], [str(f) for f in fl]) for l, p, fl in spec]
+        items = [(str(label), [str(p)], [str(f) for f in fl]) for label, p, fl in spec]
     except (ValueError, TypeError) as exc:
         raise SystemExit(f"CSVDIFF_PORTS_EXTRA is not [[label, path, [flags]]]: {exc}")
     out = []
@@ -208,7 +208,7 @@ def main() -> int:
         raise SystemExit("no port read the pair")
     builds = reads
 
-    times: dict[str, list[tuple[float, float, float]]] = {l: [] for l, _, _ in builds}
+    times: dict[str, list[tuple[float, float, float]]] = {label: [] for label, _, _ in builds}
     broken: dict[str, str] = {}
     # The starting port rotates between rounds. With a fixed order someone is
     # always first into a cold cache and someone always last, and position
@@ -260,16 +260,16 @@ def main() -> int:
 
     # The correctness gate. Ports that disagree about how many rows changed mean
     # a bug in one of them, not an interesting benchmark, so say which.
-    have = {l: a for l, a in answers.items() if a}
+    have = {label: a for label, a in answers.items() if a}
     if len(have) > 1:
         first = next(iter(have.values()))
-        odd = [l for l, a in have.items() if a != first]
+        odd = [label for label, a in have.items() if a != first]
         print(f"\ncounts agree across {len(have)} ports: {not odd}")
         if odd:
             print(f"  disagreeing: {', '.join(odd)}")
             print(f"  {json.dumps(first, sort_keys=True)}")
-            for l in odd:
-                print(f"  {l}: {json.dumps(have[l], sort_keys=True)}")
+            for label in odd:
+                print(f"  {label}: {json.dumps(have[label], sort_keys=True)}")
             return 1
         print(f"  {json.dumps(first, sort_keys=True)}")
     if broken:

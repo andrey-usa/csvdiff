@@ -3,7 +3,7 @@
 # at every thread count -- and checks that the memory budget is a bound rather
 # than a suggestion. Run from zig/.
 set -uo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 2
 ZIG=${ZIG:-zig}
 "$ZIG" build --release=fast || exit 2
 RUST=../rust/target/release/csvdiff
@@ -144,6 +144,8 @@ PYEOF
     fi
     rm -f "$pq"/t_*
   }
+  # A comma inside one word is the key list ("a,b"), not two array elements.
+  # shellcheck disable=SC2054
   K=(-k account_id,txn_id -i updated_at)
   same "snappy"                  "--format parquet --compression snappy" .parquet "${K[@]}"
   same "uncompressed"            "--format parquet --compression none"   .unc.parquet "${K[@]}"

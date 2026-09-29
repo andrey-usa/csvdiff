@@ -4,7 +4,12 @@ Both C and C++ measured ~1.7x from 1 to 4 threads while using ~3 cores of CPU.
 That is a bigger prize than anything else found in the C++ gap work, and it is
 not language-specific. This sweeps every thread count and fits Amdahl.
 """
-import subprocess, time, resource, statistics, sys, collections
+import subprocess
+import time
+import resource
+import statistics
+import sys
+import collections
 
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent  # repository root
@@ -23,10 +28,12 @@ THREADS = [1, 2, 3, 4]
 ROUNDS = int(sys.argv[3]) if len(sys.argv) > 3 else 5
 
 def run(exe, port, t):
-    r0 = resource.getrusage(resource.RUSAGE_CHILDREN); t0 = time.perf_counter()
+    r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    t0 = time.perf_counter()
     subprocess.run([exe, *BASE, "--threads", str(t), *EXTRA.get(port, [])],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    t1 = time.perf_counter(); r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    t1 = time.perf_counter()
+    r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     return t1 - t0, (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
 
 res = collections.defaultdict(list)
@@ -43,7 +50,8 @@ for name in PORTS:
     for t in THREADS:
         w = statistics.median(v[0] for v in res[(name, t)])
         c = statistics.median(v[1] for v in res[(name, t)])
-        if t == 1: w1 = w
+        if t == 1:
+            w1 = w
         cells.append(f"{w:6.2f}s/{c/w:4.2f}x")
     w4 = statistics.median(v[0] for v in res[(name, 4)])
     sp = w1 / w4
