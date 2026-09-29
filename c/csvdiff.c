@@ -2513,15 +2513,31 @@ int main(int argc, char **argv) {
 
     {
         /*
-         * Both files at once, each on half the budget. The sweep inside a build
-         * is parallel but the insertion after it is not, so run one after the
-         * other the machine sits half idle through both serial tails; overlapped,
-         * one file's insertion runs against the other's sweep.
+         * Both files at once, each on half the budget -- except when the input
+         * is larger than page cache. The sweep inside a build is parallel but
+         * the insertion after it is not, so run one after the other the machine
+         * sits half idle through both serial tails; overlapped, one file's
+         * insertion runs against the other's sweep.
+         *
+         * That overlap helps when both files fit in cache. When they do not --
+         * 52GB of input against 14GB of RAM -- the two parallel sweeps thrash
+         * the cache against each other, each evicting the other's pages, and
+         * the overlap costs far more than the serial tails it hides. Sequential
+         * keeps one file's pages hot through its sweep and insert before the
+         * other starts.
+         *
+         * The threshold is deliberately simple: if the two files together exceed
+         * 8GB, they are unlikely to both stay resident, so build sequentially.
          */
         unsigned budget = threads ? threads : cpu_count();
         BuildCtx bc = { { &ai, &bi }, { &a, &b }, { &ap, &bp }, { a_start, b_start },
                         key_size, budget > 1 ? budget / 2 : 1, &norm, { false, false } };
-        run_parts(build_part, &bc, 2);
+        if (a.size + b.size > (size_t)8 << 30) {
+            build_part(&bc, 0);
+            build_part(&bc, 1);
+        } else {
+            run_parts(build_part, &bc, 2);
+        }
         phase_mark(&whole, "both indexes");
         if (!bc.ok[0] || !bc.ok[1]) {
             if (budget_exceeded()) fail_budget();
