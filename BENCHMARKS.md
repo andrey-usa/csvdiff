@@ -202,6 +202,8 @@ effect invisible in the source, and local 10M A/B cannot resolve it. C's
 insert is asymmetric (5.9s vs 20.1s); C's join is also slow at 202s vs
 Rust's 131s.
 
+## 2026-09-29 (parquet u32 hash slots) — the same conversion, three more ports
+
 The CSV ports all had u32 slots by 09-28, but the Parquet ports were still on
 64-bit: C `pqdiff`, C++ `pqdiff`, Rust `pqdiff`. Zig's `pqdiff` already had
 u32 (`4f80fa2`) — which is why Zig led the 50M Parquet memory table in the
