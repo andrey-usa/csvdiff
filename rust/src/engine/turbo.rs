@@ -754,20 +754,13 @@ impl RowIndex {
     ) -> Option<(i32, bool)> {
         let mut slot = self.slot(hash);
         loop {
-            // Safety: `slot` is masked to the table length (a power of two),
-            // so it is always in bounds. The bounds check was pure overhead
-            // in this hot loop.
-            let word = unsafe { *self.table.get_unchecked(slot) };
+            let word = self.table[slot];
             if word == EMPTY_SLOT {
                 return None;
             }
             if self.tag_is(word, hash) {
-                // Safety: `word` is not empty (checked above), so it was
-                // written by the index builder with a position < first_row.len().
-                let candidate = unsafe { *self.first_row.get_unchecked(self.pos_of(word)) };
-                // Safety: `candidate` is a row index from first_row, which only
-                // holds indices < row_hash.len() by construction.
-                if unsafe { *self.row_hash.get_unchecked(candidate as usize) } == hash {
+                let candidate = self.first_row[self.pos_of(word)];
+                if self.row_hash[candidate as usize] == hash {
                     // The bytes first, where the caller offered them. A candidate
                     // whose row opens with the same bytes as far as either file
                     // reads has the same keys and the same columns, and neither
