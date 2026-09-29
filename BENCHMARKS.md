@@ -192,6 +192,25 @@ yet — the local machine cannot fit a meaningful Parquet pair (2 GB free), and
 the improvement is primarily memory: at 50M Parquet the slot table is ~400 MB
 per side, halved by this change.
 
+## 2026-09-29 (capped 150M re-run) — the u32 slots do not move the ceiling
+
+Run `36512611216`, same methodology as 09-28 (`mem_cap_mb=13941` via
+`RLIMIT_DATA`, 52.6 GB CSV input, 16 GB runner). All four ports pass:
+
+- Rust: 287s / 13,655 MB (09-28: 289s / 13,881 MB)
+- C: 378s / 14,045 MB (09-28: 335s / 14,106 MB)
+- Zig: 341s / 14,982 MB (09-28: 343s / 15,007 MB)
+- C++: 363s / 13,985 MB (09-28: 583s / 13,939 MB)
+
+The CSV u32 slots (Rust `9d89c95`, Zig `4f80fa2`, both merged 09-28 after the
+previous capped run) do not move the 150M ceiling in any meaningful way —
+times and peak RSS are in the same band. Expected: under a 14 GB cap with
+52 GB of input, the run is bound by page-cache eviction and I/O, not by the
+slot table. The u32 win lives at 10M–50M, where the table is a real fraction
+of the working set. C++'s jump from 583s to 363s is runner variability on the
+09-28 sitting (a throttled runner), not a code change — C++ CSV already had
+u32 slots before both runs.
+
 A drive-by fix rode with the Rust change: `--summary` no longer builds the
 pick lists it then discards (an 11 MB abort on small caps).
 
