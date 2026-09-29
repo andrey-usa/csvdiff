@@ -78,6 +78,27 @@ done
 [ $fail -eq 0 ] && echo "  ok    one answer at 1, 2, 3, 4 and 8 threads"
 check "and it is the answer rust gives" "$tmp/a.csv" "$tmp/b.csv" -k k
 
+# --ignore-case refuses a value outside ASCII only where folding it decides the
+# answer: a key, or a compared value that differs byte for byte. A value that is
+# unchanged, or in a row only one side has, or whose mate is empty, is answered.
+echo "--ignore-case outside ASCII:"
+fold() { # name, a-rows, b-rows (printf %b escapes), expected exit status
+  printf 'k,v\n1,alpha\n%b\n' "$2" > "$tmp/fa.csv"
+  printf 'k,v\n1,ALPHA\n%b\n' "$3" > "$tmp/fb.csv"
+  for json in "" "--json $tmp/fold.json"; do
+    # shellcheck disable=SC2086  # $json is zero words or two
+    $BIN compare "$tmp/fa.csv" "$tmp/fb.csv" -k k --ignore-case $json >/dev/null 2>&1
+    code=$?
+    if [ "$code" = "$4" ]; then echo "  ok    $1${json:+, --json}"
+    else echo "  FAIL  $1${json:+, --json}: exit $code, wanted $4"; fail=1; fi
+  done
+}
+fold "unchanged, outside ASCII" '2,CAF\xc3\x89' '2,CAF\xc3\x89' 0
+fold "only in an added row" '2,x' '2,x\n3,na\xc3\xafve' 1
+fold "absent on one side" '2,' '2,\xc3\x89' 1
+fold "differs, outside ASCII: refused" '2,CAF\xc3\x89' '2,caf\xc3\xa9' 2
+fold "a key outside ASCII: refused" '\xc3\x89,x' '\xc3\x89,x' 2
+
 echo "the memory budget is a bound, not a target:"
 # Enough rows that an index cannot fit in a very small budget.
 { echo "k,v"; for i in $(seq 1 20000); do echo "$i,value-$i"; done; } > "$tmp/small_a.csv"

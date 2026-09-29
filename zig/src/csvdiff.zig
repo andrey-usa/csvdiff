@@ -341,7 +341,9 @@ fn normalised(slab: Slab, f: Field, o: Options, buf: []u8) Error!?[]const u8 {
         // Folding case outside ASCII needs a Unicode table this port does not
         // carry, and folding it partially is worse than not folding it at all:
         // CAFE and cafe with an acute would compare equal in the ports that do
-        // fold and unequal here, with nothing in the output to say why.
+        // fold and unequal here, with nothing in the output to say why. Only a
+        // value whose fold decides something gets here: absence is decided
+        // without folding and identical bytes before it (see `same`).
         for (s) |c| if (c >= 0x80) return Error.NonAsciiCaseFold;
         for (s, 0..) |c, i| s[i] = std.ascii.toLower(c);
     }
@@ -356,10 +358,20 @@ const Scratch = struct {
     const MAX_INLINE = 4096;
 };
 
+/// Absence never depends on case, so it is decided without `--ignore-case`: a
+/// test that folded refused a non-ASCII value whose only question was whether it
+/// was there.
 fn isAbsent(slab: Slab, f: Field, o: Options, buf: []u8) Error!bool {
     if (!fld.isReal(f) or fld.lenOf(f) == 0) return true;
     if (!needsNormalising(o)) return false;
-    return (try normalised(slab, f, o, buf)) == null;
+    return (try normalised(slab, f, unfolded(o), buf)) == null;
+}
+
+/// The options without `--ignore-case`, for the questions case cannot change.
+fn unfolded(o: Options) Options {
+    var u = o;
+    u.ignore_case = false;
+    return u;
 }
 
 fn same(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Error!bool {
@@ -367,6 +379,10 @@ fn same(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Error!boo
     const yb = try isAbsent(b, y, o, &s.b);
     if (xa or yb) return xa and yb;
     if (!needsNormalising(o)) return slab_mod.sameBytes(a, x, b, y);
+    // Identical bytes normalise identically, whatever they hold. Asked before
+    // the fold, so an unchanged value outside ASCII is not a reason to refuse
+    // the run under --ignore-case: the port that folds it gives the same answer.
+    if (slab_mod.sameBytes(a, x, b, y)) return true;
     const nx = (try normalised(a, x, o, &s.a)) orelse "";
     const ny = (try normalised(b, y, o, &s.b)) orelse "";
     return std.mem.eql(u8, nx, ny);
@@ -417,9 +433,10 @@ fn cellDiffers(a: Slab, x: Field, b: Slab, y: Field, o: Options, s: *Scratch) Er
     const yb = try isAbsent(b, y, o, &s.b);
     if (xa and yb) return false;
     if (o.tolerance > 0 and !xa and !yb) {
-        const tx = (try normalised(a, x, o, &s.a)) orelse "";
+        // A number reads the same in either case, so no fold here either.
+        const tx = (try normalised(a, x, unfolded(o), &s.a)) orelse "";
         const nx = asNumber(tx);
-        const ty = (try normalised(b, y, o, &s.b)) orelse "";
+        const ty = (try normalised(b, y, unfolded(o), &s.b)) orelse "";
         const ny = asNumber(ty);
         if (nx != null and ny != null) return @abs(nx.? - ny.?) > o.tolerance;
     }

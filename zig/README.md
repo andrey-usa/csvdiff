@@ -136,8 +136,12 @@ report the Rust port produces.
 `--ignore-case` is ASCII-only. Folding outside ASCII needs a Unicode table this
 port does not carry, and folding partially is worse than not folding at all —
 `CAFÉ` and `café` would compare equal in the ports that do fold and unequal here,
-with nothing in the output to say why. A non-ASCII byte in a folded field is
-refused by name instead.
+with nothing in the output to say why. So a non-ASCII byte is refused by name
+wherever the fold would decide the answer: in a key, or in a compared value that
+differs byte for byte between two matched rows. Anywhere else the fold changes
+nothing and the run is answered: a value that did not change, a row only one side
+has, a value whose mate is empty, a column left out of the comparison, a number
+under `--tolerance`.
 
 ## Layout
 
