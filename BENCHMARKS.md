@@ -120,6 +120,82 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-28 (zig guard span) — the Zig join stopped parsing rows the proof settles
+
+The C change from 09-27, ported to Zig. `Join.range` called `fieldsOf` on every
+row of A before the byte proof; now `text.guardSpan` counts the guard column's
+delimiters with the delimiter cursor alone — no slot map, no field packing —
+and rows the bytes settle never parse. On the 2M CSV pair 93.8% of attempted
+rows prove out, matching the 94% identical rows in the data.
+
+One bug found by the numbers, not the compiler: the first version returned
+`cur + 1 - lo`, including the delimiter in the span, the way C's does — but
+Zig's `rowMatches` expects the span to end at the field boundary and checks the
+*next* byte is a delimiter, so the proof never fired (`proved=0` on every
+row). Corrected to `cur - lo`; the proof then succeeded on 60,526 of 64,516
+attempts per thread.
+
+`bench_ab.sh`, 2M rows CSV, `--threads 1`, 7 interleaved rounds, two binaries.
+Paired ratio (baseline / guard_span): **1.10x [1.09–1.12] CPU, every quarter
+above 1.00.** `--self-test` on the same machine: 1.00x [0.96–1.02] — the gain
+is well above the floor. All 44 `zig/test.sh` checks pass; counts identical
+(matched 1,998,000, changed 119,625, added/removed 2,000 each).
+
+That closes the port set: guard_span now ships in C (#178), C++ (#179), Rust
+and Zig. It pays where the parser is expensive (C, C++) and where the join
+parsed every row regardless (Zig); Rust's parser was already cheap enough that
+the counting ate the win.
+
+Committed as `f39da04`, pushed straight to main.
+
+---
+
+## 2026-09-28 (rust and zig u32 hash slots) — the index stopped spending 64 bits per slot
+
+Both ports kept one `u64` per hash-table slot: 40 bits of row position, the
+rest hash tag. Forty position bits address a trillion rows; the largest input
+this project has measured is 150M. C and C++ already sized their slots to the
+row count. Rust (`9d89c95`) and Zig (`4f80fa2`) now do the same: the table is
+`Vec<u32>` when 32 bits of position suffice, with the tag taking the high bits
+that remain, and the build refuses rather than truncates past ~4 billion rows.
+
+`bench_ab.sh`, 2M rows CSV, `--threads 1`, interleaved rounds, two binaries
+each port. Paired ratios (baseline / u32):
+
+- Rust: **1.04x [1.03–1.08] CPU** against a self-test floor of 1.00x [0.98–1.03]
+  — at the edge of resolvability, kept for the memory: peak RSS 4,218 → 4,099
+  MB (−119 MB on one side; the saving doubles at 50M).
+- Zig: **1.07x [1.05–1.08] CPU** against a floor of 1.03x [0.99–1.04] — a real
+  win, and larger than Rust's.
+
+Counts identical in both ports. One bug caught before the push: Zig computed
+`64 - tag_bits` into a `u6`, which cannot shift a `u32` — fixed with a guarded
+`@intCast` to `u5` at every u32 shift site, `u6` kept where the shift is u64.
+The bug survived this long because no local Zig toolchain existed to compile
+it; CI caught nothing either, since the branch had never built Zig there.
+
+A drive-by fix rode with the Rust change: `--summary` no longer builds the
+pick lists it then discards (an 11 MB abort on small caps).
+
+---
+
+## 2026-09-28 (withdrawn: the C sweep gap) — a 2.5x parser lead that was not there
+
+An earlier entry in the working notes claimed the C sweep parsed 2M CSV rows in
+0.165s against 0.385–0.425s for Rust, Zig and C++ — a 2–2.5x lead, and the
+obvious next target. It does not reproduce. A fresh `phases_ports.py` run on
+the same machine, five rounds at one and two threads, puts all four sweeps at
+0.16–0.21s. The gap was a measurement artefact, most likely machine load during
+the first sitting — the numbers were never re-run before being written down.
+
+Withdrawn in full. There is no sweep investigation to continue.
+
+What survived the re-measurement is the join gap on larger inputs: 10M CSV,
+Zig 0.433s against 0.365s for the other three (+19%). That is what the Zig
+guard_span entry above addresses.
+
+---
+
 ## 2026-09-28 (rust hoist needs_normalising) — the sweep stopped asking about options it already knew
 
 `hash_field` is called for every key field of every row — twenty million calls
