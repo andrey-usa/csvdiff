@@ -119,7 +119,9 @@ rust/target/release/csvdiff head data/p_a.parquet -n 10
 - **The packed field is the representation.** A field is an offset and a length in a 64-bit word;
   nothing becomes a heap string until the report. Memory is this project's argument.
 - **`--ignore-case` is ASCII-only in C, C++ and Zig.** A non-ASCII byte in a folded field is
-  refused by name: folding it partially would be worse than not folding.
+  refused by name: folding it partially would be worse than not folding. C++ refuses only where
+  the fold decides the answer -- a key, or a compared value that differs byte for byte in a matched
+  row -- and answers everywhere else, the same whether or not `--json` is asked for.
 - **Parquet capability refusals route; real errors fail.** The fast columnar path (uncompressed +
   snappy) falls through to `turbo` on capability only. A corrupt file or a missing key column must
   keep failing, as its own error. Check the report's engine field before reading any codec number.

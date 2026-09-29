@@ -462,7 +462,7 @@ compared against another Parquet file; CSV and ndjson compare against each other
 | | Reads | Notable | Not there |
 |---|---|---|---|
 | **[`c/`](c/)** | CSV, ndjson, Parquet (uncompressed, snappy, lz4) | fastest on all three formats, and on every codec it reads; lowest peak memory of the four; `--max-memory MB` bounds what grows with the input; threaded on every path; writes all three formats itself (`c/gen-data`) | no HTML report, no `--trim` / `--ignore-case` / `--tolerance`; gzip and zstd |
-| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name | no HTML report; no codec but snappy |
+| **[`cpp/`](cpp/)** | CSV, ndjson, Parquet (snappy) | the full normalisation flags; `--ignore-case` is ASCII-only and refuses non-ASCII by name where folding decides the answer | no HTML report; no codec but snappy |
 | **[`rust/`](rust/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | the full contract with the **HTML report**; engines `turbo` (default), `sortmerge` (spills to disk) and `native` | brotli, and LZO |
 | **[`zig/`](zig/)** | CSV, ndjson, Parquet (uncompressed, snappy, gzip, zstd, lz4) | `--max-memory MB` is **enforced** by a fixed buffer, not hoped for | no HTML report; brotli, and LZO |
 
