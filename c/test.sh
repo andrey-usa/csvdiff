@@ -752,7 +752,7 @@ mdir=$(mktemp -d)
 "$GEN" --rows 60k --out-dir "$mdir" --prefix m >/dev/null 2>&1
 
 out=$(./csvdiff compare "$mdir/m_a.csv" "$mdir/m_b.csv" -k account_id,txn_id \
-        -i updated_at --max-memory 1 2>&1 | head -1); rc=$?
+        -i updated_at --max-memory 1 2>&1 | head -1)
 case "$out" in
   *"needs more than the 1 MB"*) echo "  ok    a ceiling too small is refused, naming the ceiling" ;;
   *) echo "  FAIL  expected a refusal naming the ceiling, got: $out"; fail=1 ;;
