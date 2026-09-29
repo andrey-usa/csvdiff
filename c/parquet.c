@@ -27,6 +27,11 @@ int pq_set_error(const char *why) {
     return -1;
 }
 
+int pq_set_errorf(const char *why, const char *name) {
+    snprintf(g_error, sizeof g_error, "%s: %s", why, name);
+    return -1;
+}
+
 /* The name the rest of this file reads better under. */
 static int fail(const char *why) { return pq_set_error(why); }
 
