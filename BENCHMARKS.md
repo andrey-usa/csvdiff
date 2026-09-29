@@ -194,6 +194,28 @@ yet — the local machine cannot fit a meaningful Parquet pair (2 GB free), and
 the improvement is primarily memory: at 50M Parquet the slot table is ~400 MB
 per side, halved by this change.
 
+## 2026-09-29 (50M Parquet, post-u32) — Rust takes the table
+
+Run `36560345563`, `bench-ladder.yml`, 50M Parquet, one sitting (EPYC 7763).
+First measurement after `174c28f`:
+
+| Port | Wall | CPU | Above the input |
+|---|---:|---:|---:|
+| Rust | 6.06s | 19.7s | 5,966 MB |
+| Zig | 6.25s | 20.6s | 6,202 MB |
+| C++ | 7.81s | 21.9s | 6,237 MB |
+| C | 12.13s | 30.0s | 6,191 MB |
+
+Pre-u32 (same workflow, 09-28): Zig 7.37s/6,201 MB, Rust 8.02s/6,953 MB,
+C++ 8.43s/6,964 MB, C 8.88s/7,178 MB.
+
+Rust is now fastest *and* leanest — a 24% wall win (8.02s → 6.06s) and the
+smallest footprint at 5,966 MB. C and C++ closed Zig's former memory lead as
+expected. C's 12.13s wall (vs 8.88s before) is runner noise, not a regression:
+local A/B of the u32 change on 2M and 10M Parquet pairs shows no measurable
+difference for C (harness: "no result" both times), and the change is
+memory-only by construction.
+
 ## 2026-09-29 (capped 150M re-run) — the u32 slots do not move the ceiling
 
 Run `36512611216`, same methodology as 09-28 (`mem_cap_mb=13941` via
