@@ -38,6 +38,8 @@ on:
       - "scripts/fuzz_diff.py"
       - "scripts/contract.py"
       - "scripts/option_matrix.py"
+      - "scripts/make_fold_fixtures.py"
+      - "tests/fixtures/fold/**"
       - "docs/contract.schema.json"
       - ".github/workflows/conformance.yml"
   # Every pull request, with no path filter: this is a required check on `main`,
@@ -85,7 +87,7 @@ jobs:
           fi
           changed=$(git diff --name-only "$BASE...$HEAD")
           echo "$changed"
-          if echo "$changed" | grep -qE '^(c/|cpp/|rust/src/|rust/Cargo\.|zig/src/|zig/build\.zig|scripts/(fuzz_diff|contract|option_matrix)\.py$|docs/contract\.schema\.json$|\.github/workflows/conformance\.yml$)'; then
+          if echo "$changed" | grep -qE '^(c/|cpp/|rust/src/|rust/Cargo\.|zig/src/|zig/build\.zig|scripts/(fuzz_diff|contract|option_matrix|make_fold_fixtures)\.py$|tests/fixtures/fold/|docs/contract\.schema\.json$|\.github/workflows/conformance\.yml$)'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"

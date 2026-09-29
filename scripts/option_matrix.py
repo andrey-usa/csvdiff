@@ -21,6 +21,17 @@ that status is 0 or 1 the same `counts` and `columns`, and a document that
 passes scripts/contract.py. A refusal (exit 2) must also say which column or
 file it is about, the one thing a user needs from it.
 
+The normalisation flags -- --trim, --ignore-case, --empty-is-null, --tolerance
+-- run on the ports that carry them (C refuses each as an unknown option; see
+c/README.md), with Rust as the reference. They run on the generated pairs and on
+tests/fixtures/fold, a pair written to sit on the one place the ports are
+allowed to differ: C++ and Zig fold case in ASCII only, and refuse a value
+outside it where the fold decides the answer -- a key, or a compared value that
+differs byte for byte. There they must refuse and name --ignore-case; anywhere
+else on that pair they must answer, with Rust's counts. Before this, C++ refused
+a row it only displayed, and only under --json, and Zig refused a value that had
+not changed; nothing ran the flags, so nothing noticed.
+
 Exit status: 0 all agree, 1 at least one disagreement, 2 usage.
 """
 
@@ -61,6 +72,31 @@ CASES: list[tuple[str, list[str], str | None]] = [
     ("unknown compare", ["-k", KEY, "-c", "amount,no_such_compare"], "no_such_compare"),
 ]
 
+# The ports that carry the normalisation flags, the reference first: Rust folds
+# Unicode, so its answer is the one the ASCII-only ports are held to.
+NORMALISING_PORTS = ["rust", "cpp", "zig"]
+ASCII_FOLDERS = {"cpp", "zig"}
+ALL_FOUR = ["--trim", "--ignore-case", "--empty-is-null", "--tolerance", "0.5"]
+NORMALISING = [["--trim"], ["--ignore-case"], ["--empty-is-null"], ["--tolerance", "0.5"], ALL_FOUR]
+FOLD = ROOT / "tests" / "fixtures" / "fold"
+FOLD_PAIRS = {
+    "csv": (FOLD / "a.csv", FOLD / "b.csv"),
+    "ndjson": (FOLD / "a.ndjson", FOLD / "b.ndjson"),
+    "parquet, dictionary": (FOLD / "a_dict.parquet", FOLD / "b_dict.parquet"),
+    "parquet, plain": (FOLD / "a_plain.parquet", FOLD / "b_plain.parquet"),
+}
+# (label, flags, whether the ASCII-only folders must refuse). See
+# scripts/make_fold_fixtures.py for what each row of the pair is there for.
+FOLD_CASES: list[tuple[str, list[str], bool]] = [
+    ("--ignore-case, the value differing outside ASCII ignored", ["-k", "id", "--ignore-case", "-i", "note"], False),
+    ("--ignore-case, a value differing outside ASCII", ["-k", "id", "--ignore-case"], True),
+    ("--ignore-case, a key outside ASCII", ["-k", "id,name", "--ignore-case", "-i", "note"], True),
+    ("--trim", ["-k", "id", "--trim"], False),
+    ("--empty-is-null", ["-k", "id", "--empty-is-null"], False),
+    ("--tolerance", ["-k", "id", "--tolerance", "0.5"], False),
+    ("all four, the value differing outside ASCII ignored", ["-k", "id", *ALL_FOUR, "-i", "note"], False),
+]
+
 
 def run(port: str, a: Path, b: Path, flags: list[str], work: Path):
     """(exit status, contract slice, stderr, contract problems)."""
@@ -78,6 +114,34 @@ def run(port: str, a: Path, b: Path, flags: list[str], work: Path):
         except (OSError, ValueError) as err:
             problems = [f"no readable --json document: {err}"]
     return proc.returncode, got, proc.stderr.decode(errors="replace").strip(), problems
+
+
+def judge(results: dict, flags: list[str], must_name: str | None = None,
+          refusers: frozenset[str] = frozenset()) -> list[str]:
+    """What is wrong with one invocation's results, against the first port's.
+
+    A port in `refusers` must refuse and name --ignore-case instead of agreeing."""
+    ref_port = next(iter(results))
+    ref = results[ref_port]
+    problems = []
+    for p, (code, got, err, contract_problems) in results.items():
+        problems += [f"{p}: {c}" for c in contract_problems]
+        first = err.splitlines()[0] if err else "(nothing)"
+        if p in refusers:
+            if code != 2:
+                problems.append(f"{p} exits {code} on {' '.join(flags)}; it must refuse")
+            elif "--ignore-case" not in err:
+                problems.append(f"{p} refuses without naming --ignore-case: {first}")
+            continue
+        if code != ref[0]:
+            problems.append(f"{p} exits {code}, {ref_port} exits {ref[0]}" + (f" ({first})" if code > 1 else ""))
+        elif code <= 1 and got != ref[1]:
+            problems.append(f"{p} counts/columns differ from {ref_port}: {got} vs {ref[1]}")
+        if must_name and code == 2 and must_name not in err:
+            problems.append(f"{p} refuses without naming {must_name!r}: {first}")
+        if must_name and code != 2:
+            problems.append(f"{p} accepts {' '.join(flags)} (exit {code}); it must refuse")
+    return problems
 
 
 def main() -> int:
@@ -101,31 +165,28 @@ def main() -> int:
                             "--format", fmt], check=True, capture_output=True)
             pairs[fmt] = (work / f"m_a.{ext}", work / f"m_b.{ext}")
 
-        for fmt, (a, b) in pairs.items():
-            for label, flags, must_name in CASES:
-                total += 1
-                results = {p: run(p, a, b, flags, work) for p in ports}
-                ref_port = ports[0]
-                ref = results[ref_port]
-                problems = []
-                for p, (code, got, err, contract_problems) in results.items():
-                    problems += [f"{p}: {c}" for c in contract_problems]
-                    if code != ref[0]:
-                        problems.append(f"{p} exits {code}, {ref_port} exits {ref[0]}"
-                                        + (f" ({err.splitlines()[0] if err else 'no message'})" if code > 1 else ""))
-                    elif code <= 1 and got != ref[1]:
-                        problems.append(f"{p} counts/columns differ from {ref_port}: {got} vs {ref[1]}")
-                    if must_name and code == 2 and must_name not in err:
-                        problems.append(f"{p} refuses without naming {must_name!r}: {err.splitlines()[0] if err else '(nothing)'}")
-                    if must_name and code != 2:
-                        problems.append(f"{p} accepts {' '.join(flags)} (exit {code}); it must refuse")
-                status = "ok  " if not problems else "FAIL"
-                print(f"{status} {fmt:8} {label}")
-                for line in problems:
-                    print(f"       {line}")
-                    if os.environ.get("GITHUB_ACTIONS"):
-                        print(f"::error::{fmt} / {label}: {line}")
-                bad += bool(problems)
+        # (format, label, a, b, flags, the ports in reference-first order, must_name, refusers)
+        plan = [(fmt, label, a, b, flags, ports, must_name, frozenset())
+                for fmt, (a, b) in pairs.items() for label, flags, must_name in CASES]
+        norm_ports = [p for p in NORMALISING_PORTS if p in ports]
+        if len(norm_ports) >= 2:
+            plan += [(fmt, " ".join(f), a, b, ["-k", KEY, *f], norm_ports, None, frozenset())
+                     for fmt, (a, b) in pairs.items() for f in NORMALISING]
+            plan += [(f"fold, {fmt}", label, a, b, flags, norm_ports, None,
+                      frozenset(ASCII_FOLDERS) if refuse else frozenset())
+                     for fmt, (a, b) in FOLD_PAIRS.items() for label, flags, refuse in FOLD_CASES]
+
+        for fmt, label, a, b, flags, order, must_name, refusers in plan:
+            total += 1
+            results = {p: run(p, a, b, flags, work) for p in order}
+            problems = judge(results, flags, must_name, refusers)
+            status = "ok  " if not problems else "FAIL"
+            print(f"{status} {fmt:8} {label}")
+            for line in problems:
+                print(f"       {line}")
+                if os.environ.get("GITHUB_ACTIONS"):
+                    print(f"::error::{fmt} / {label}: {line}")
+            bad += bool(problems)
     print(f"{total - bad}/{total} agree across {', '.join(ports)}")
     return 1 if bad else 0
 
