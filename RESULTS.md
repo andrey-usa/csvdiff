@@ -1,6 +1,128 @@
 # Where the four ports stand
 
-**Ten million rows, all three formats, all four ports, measured on CI.**
+**Ten, fifty and one hundred fifty million rows, CSV and Parquet, all four
+ports, measured on CI.**
+Run 2026-09-29 (fourth edition), after the Zig guard_span (`f39da04`) and the
+Rust/Zig u32 hash slots (`9d89c95`, `4f80fa2`). The 09-28 edition's numbers are
+kept in the section below.
+
+Measured with **no `--json`**, and with `--summary` for Rust, so every port is
+doing the job all four perform: count and compare, and write nothing.
+
+> **A note on CPUs.** This ladder's rungs landed on three different processors:
+> 10M CSV on an Intel Xeon 6973P-C, 10M/50M Parquet on an AMD EPYC 7763, 50M
+> CSV on an AMD EPYC 9V74. Per the project's own rule — compare rows within a
+> table, never across tables — the tables below stand alone. The 09-28 column
+> is omitted where the CPU differs.
+
+---
+
+## Results — 10M rows, CSV and Parquet
+
+[Run 36505346798](https://github.com/andrey-usa/csvdiff/actions/runs/36505346798),
+`bench-ladder.yml` on `244be60` (main: Zig guard_span, Rust/Zig u32 slots),
+two runs each, best kept, ports rotated.
+
+### CSV — 3,509 MB a side, Xeon 6973P-C
+
+| Port | Compare | CPU | Cores | Above the input | vs best |
+|---|---:|---:|---:|---:|---:|
+| **C** | **0.96s** | **3.0s** | 3.18x | 716 MB | — |
+| **Rust** | **0.96s** | 3.2s | 3.34x | **591 MB** | — |
+| C++ | 1.11s | 3.5s | 3.15x | 723 MB | 1.16x |
+| Zig | 1.21s | 3.1s | 2.57x | 599 MB | 1.26x |
+
+Rust ties C on wall time. Both u32 ports dropped ~130 MB above the input
+(Rust 725 → 591 MB, Zig 725 → 599 MB) — the slot conversion paying in memory
+as designed.
+
+### Parquet — 1,535 MB a side, EPYC 7763
+
+| Port | Compare | CPU | Cores | Above the input | vs best |
+|---|---:|---:|---:|---:|---:|
+| **C** | **1.27s** | **3.8s** | 3.00x | 1,413 MB | — |
+| C++ | 1.42s | 4.3s | 3.05x | 1,362 MB | 1.12x |
+| Rust | 1.42s | 4.7s | 3.29x | 1,283 MB | 1.12x |
+| Zig | 1.42s | 4.8s | 3.37x | **1,129 MB** | 1.12x |
+
+Three ports tie at 1.42s behind C. Zig uses the least memory by a clear margin
+(1,129 MB vs 1,283–1,413 MB).
+
+---
+
+## Results — 50M rows, CSV and Parquet
+
+### CSV — 17,544 MB a side, EPYC 9V74
+
+| Port | Compare | CPU | Cores | Peak RSS | Above the input |
+|---|---:|---:|---:|---:|---:|
+| C | 47.14s | 28.8s | 0.61x | 15,187 MB | **-2,357 MB** |
+| C++ | 44.28s | 30.8s | 0.69x | 15,069 MB | **-2,475 MB** |
+| Rust | 35.13s | 27.6s | 0.78x | 15,107 MB | **-2,438 MB** |
+| Zig | 76.87s | 33.8s | 0.44x | 15,186 MB | **-2,358 MB** |
+
+**Not a benchmark.** Every port peaked *below* its mapped input — the kernel
+was taking pages back while they ran. Per [BENCHMARKS.md](BENCHMARKS.md), a
+negative *above the input* ranks page faults, not parsing. The 17.5 GB input
+does not fit the 16 GB runner with the indexes on top. These numbers are kept
+to show the wall, not the ranking.
+
+### Parquet — 7,673 MB a side, EPYC 7763
+
+| Port | Compare | CPU | Cores | Above the input | vs best |
+|---|---:|---:|---:|---:|---:|
+| **Zig** | **7.37s** | 25.2s | 3.42x | **6,201 MB** | — |
+| Rust | 8.02s | 25.6s | 3.18x | 6,953 MB | 1.09x |
+| C++ | 8.43s | 25.1s | 2.98x | 6,964 MB | 1.14x |
+| C | 8.88s | 25.1s | 2.83x | 7,178 MB | 1.20x |
+
+Zig leads on wall time *and* memory — 750 MB less above the input than the
+next port. The u32 slots and guard_span compound at this size: Zig's index is
+the smallest and its join parses the least.
+
+---
+
+## Results — 150M rows
+
+### Parquet — 23,020 MB a side
+
+All four ports failed with out-of-memory: the input alone exceeds the 16 GB
+runner. Rust reported `one count per distinct key needs 572 MB`; C and Zig
+said `out of memory`; C++ threw `std::bad_alloc`. This size needs the
+`scale-ceiling` workflow's memory cap, not the ladder.
+
+### CSV — 52,634 MB a side
+
+The rung completed its benchmark but the job hung in the `Swatinem/rust-cache`
+post-step — the 52 GB of generated data left no disk for the cache save — and
+was cancelled before the artifact uploaded. The 50M CSV rung above already
+showed this size does not fit a 16 GB runner (all ports paged); 150M CSV on
+the ladder is a larger version of the same wall. The meaningful 150M CSV
+comparison remains the capped run from 09-28 (all four ports, identical
+counts, `RLIMIT_DATA` methodology).
+
+---
+
+## What the fourth edition says
+
+**The u32 slots paid in memory, as designed.** Rust and Zig dropped 120–130 MB
+above the input at 10M CSV; at 50M Parquet the gap widened to 750 MB between
+Zig and the next port. The slots were kept for this, not for speed — but both
+ports also got faster (Rust 1.04x, Zig 1.07x on the 2M A/B).
+
+**Zig's guard_span shows at 50M Parquet.** Zig leads the 50M Parquet table on
+both wall time and memory — the first time any port but C has led a table in
+this file. The 10% join win measured at 2M CSV compounds with the smaller
+index at larger sizes.
+
+**50M CSV does not fit a 16 GB runner.** All four ports paged. The meaningful
+large-row CSV comparison remains the capped 150M run from 09-28 (all four
+ports, identical counts, RLIMIT_DATA methodology).
+
+---
+
+## Previous editions
+
 Run 2026-09-28 (third edition), after #178, #179 and the Rust guard_span +
 `needs_normalising` hoisting. The 09-26 edition's numbers are kept beside them
 where the same CPU measured both.
