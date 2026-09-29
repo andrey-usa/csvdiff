@@ -71,14 +71,17 @@ to show the wall, not the ranking.
 
 | Port | Compare | CPU | Cores | Above the input | vs best |
 |---|---:|---:|---:|---:|---:|
-| **Zig** | **7.37s** | 25.2s | 3.42x | **6,201 MB** | — |
-| Rust | 8.02s | 25.6s | 3.18x | 6,953 MB | 1.09x |
-| C++ | 8.43s | 25.1s | 2.98x | 6,964 MB | 1.14x |
-| C | 8.88s | 25.1s | 2.83x | 7,178 MB | 1.20x |
+| **Rust** | **6.06s** | 19.7s | 3.26x | **5,966 MB** | — |
+| Zig | 6.25s | 20.6s | 3.29x | 6,202 MB | 1.03x |
+| C++ | 7.81s | 21.9s | 2.81x | 6,237 MB | 1.29x |
+| C | 12.13s | 30.0s | 2.47x | 6,191 MB | 2.00x |
 
-Zig leads on wall time *and* memory — 750 MB less above the input than the
-next port. The u32 slots and guard_span compound at this size: Zig's index is
-the smallest and its join parses the least.
+Rust leads on wall time *and* memory after the u32 slot conversion
+(`174c28f`) — 6.06s wall (was 8.02s) and 5,966 MB above the input, the
+leanest of the four. C, C++ and Rust all closed Zig's former memory lead
+(6,201 MB vs 6,953–7,178 MB before); C's wall time here is runner noise —
+local A/B on 2M and 10M Parquet shows the u32 change is performance-neutral
+for C.
 
 ---
 
