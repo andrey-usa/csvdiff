@@ -107,8 +107,12 @@ fn normalised(
         while (s.len > 0 and isSpace(s[0])) s = s[1..];
         while (s.len > 0 and isSpace(s[s.len - 1])) s = s[0 .. s.len - 1];
     }
+    // A value that trims to nothing is still a value, "", as it is in the CSV
+    // path: only --empty-is-null makes it absent. Reading it as absent made
+    // `"  "` against an empty cell no change here and a change on the same rows
+    // as CSV.
     if (!o.ignore_case) {
-        if (s.len == 0) return null;
+        if (s.len == 0 and o.empty_is_null) return null;
         return s;
     }
     buf.clearRetainingCapacity();
@@ -117,7 +121,7 @@ fn normalised(
         if (c >= 0x80) return csvdiff.Error.NonAsciiCaseFold;
         buf.appendAssumeCapacity(std.ascii.toLower(c));
     }
-    if (buf.items.len == 0) return null;
+    if (buf.items.len == 0 and o.empty_is_null) return null;
     return buf.items;
 }
 
@@ -1315,4 +1319,31 @@ pub fn compare(
         },
         .columns = columns,
     };
+}
+
+test "a value that trims to nothing is present under --trim, absent under --empty-is-null" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const blank: Look = .{ .bytes = "  \t", .is_null = false };
+    const padded: Look = .{ .bytes = " b ", .is_null = false };
+
+    const trim: Options = .{ .key = &.{}, .trim = true };
+    try std.testing.expectEqualStrings("", (try normalised(gpa, blank, trim, &buf)) orelse return error.TrimmedToNothingReadAsAbsent);
+    try std.testing.expect(!try isAbsent(gpa, blank, trim, &buf));
+    try std.testing.expectEqualStrings("b", (try normalised(gpa, padded, trim, &buf)) orelse return error.TrimmedValueReadAsAbsent);
+
+    const folded: Options = .{ .key = &.{}, .trim = true, .ignore_case = true };
+    try std.testing.expectEqualStrings("", (try normalised(gpa, blank, folded, &buf)) orelse return error.TrimmedToNothingReadAsAbsent);
+
+    inline for (.{
+        Options{ .key = &.{}, .trim = true, .empty_is_null = true },
+        Options{ .key = &.{}, .trim = true, .ignore_case = true, .empty_is_null = true },
+    }) |o| {
+        try std.testing.expect((try normalised(gpa, blank, o, &buf)) == null);
+        try std.testing.expect(try isAbsent(gpa, blank, o, &buf));
+    }
+    // Null and the empty string are absent whatever is asked.
+    try std.testing.expect(try isAbsent(gpa, .{}, trim, &buf));
+    try std.testing.expect(try isAbsent(gpa, .{ .bytes = "", .is_null = false }, trim, &buf));
 }

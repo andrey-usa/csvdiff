@@ -1876,12 +1876,18 @@ pub fn compare(
     // its own any more: see `counts.added` below.
     const a_ways = waysFor(ai.first_row.items.len);
     const parts = try gpa.alloc(Part, a_ways);
+    // One release, of the parts that were built, on every path. This was a
+    // `defer` over all of them beside an `errdefer` over the built ones, so any
+    // error from here on freed each part's columns twice -- and an allocation
+    // failing part way freed the unbuilt ones, which were never set. It stayed
+    // hidden while no error came after this point: the allocator the release
+    // build uses on Linux let the second free pass, and macOS's trapped (exit
+    // 133) once --ignore-case began refusing in the join rather than before it.
+    var built: usize = 0;
     defer {
-        for (parts) |p| gpa.free(p.columns);
+        for (parts[0..built]) |p| gpa.free(p.columns);
         gpa.free(parts);
     }
-    var built: usize = 0;
-    errdefer for (parts[0..built]) |p| gpa.free(p.columns);
     for (parts) |*p| {
         const stats = try gpa.alloc(ColumnStat, nc);
         for (stats, compared.items) |*stat, name| stat.* = .{ .name = name };
