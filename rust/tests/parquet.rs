@@ -9,7 +9,8 @@
 //!
 //! The files come from `cpp/build/gen-data`, which writes CSV and Parquet from
 //! one field-by-field recipe. Where it has not been built the tests skip by
-//! name rather than silently passing: `(cd cpp && make gen-data)`.
+//! name rather than silently passing: `(cd cpp && make gen-data)`. With
+//! `CSVDIFF_REQUIRE_GEN_DATA` set, as CI sets it, a missing generator fails.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,7 +22,17 @@ use csvdiff::options::{Engine, Options};
 fn generator() -> Option<PathBuf> {
     // The tests run from `rust/`, so the C++ build is one level up.
     let p = Path::new("../cpp/build/gen-data");
-    p.is_file().then(|| p.to_path_buf())
+    if p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    // CI sets this: there a skip is a green check that tested nothing, and most
+    // of this file was exactly that until the workflow built the generator.
+    assert!(
+        std::env::var_os("CSVDIFF_REQUIRE_GEN_DATA").is_none(),
+        "CSVDIFF_REQUIRE_GEN_DATA is set but ../cpp/build/gen-data is not built: \
+         (cd cpp && make gen-data)"
+    );
+    None
 }
 
 struct Fixture {
@@ -90,10 +101,42 @@ fn contract(r: &CompareResult) -> String {
     serde_json::to_string(&v).unwrap()
 }
 
-fn run(path_a: &Path, path_b: &Path, mut opt: Options, engine: Engine) -> String {
+fn run(path_a: &Path, path_b: &Path, opt: Options, engine: Engine) -> String {
+    run_labelled(path_a, path_b, opt, engine).0
+}
+
+/// The contract, and the engine that actually ran.
+fn run_labelled(
+    path_a: &Path,
+    path_b: &Path,
+    mut opt: Options,
+    engine: Engine,
+) -> (String, String) {
     opt.engine = engine.to_string();
     let r = compare(path_a, path_b, &mut opt).expect("the comparison runs");
-    contract(&r)
+    (contract(&r), r.meta.engine.clone())
+}
+
+/// A Parquet pair has two readers behind it: the columnar path, which `auto`
+/// takes, and `turbo`'s row decoder, which `--engine turbo` asks for. Both have
+/// to give the answer the CSV of the same rows gives, and each is asked for by
+/// name and checked to have run -- a test that asks for one and silently gets
+/// the other covers half of what it says.
+fn same_from_both_readers(
+    from_csv: &str,
+    a: &Path,
+    b: &Path,
+    opt: impl Fn() -> Options,
+    what: &str,
+) {
+    for (engine, label) in [(Engine::Auto, "parquet"), (Engine::Turbo, "turbo")] {
+        let (from_parquet, ran) = run_labelled(a, b, opt(), engine);
+        assert_eq!(ran, label, "{what}: asked for {engine:?}, ran {ran}");
+        assert_eq!(
+            from_csv, from_parquet,
+            "{what}: the {label} reader's report differs from the csv one"
+        );
+    }
 }
 
 /// One case: generate CSV and one Parquet flavour, and require the two reports
@@ -113,17 +156,12 @@ fn same_report(rows: &str, gen_flags: &[&str], ext: &str, key: &[&str], tweak: f
         options(key, tweak),
         Engine::Turbo,
     );
-    let from_parquet = run(
+    same_from_both_readers(
+        &from_csv,
         &f.path("a", ext),
         &f.path("b", ext),
-        options(key, tweak),
-        // The engine asked for is ignored on a Parquet pair; naming turbo here
-        // is what proves that.
-        Engine::Turbo,
-    );
-    assert_eq!(
-        from_csv, from_parquet,
-        "the parquet report differs from the csv one ({rows} rows, {gen_flags:?})"
+        || options(key, tweak),
+        &format!("{rows} rows, {gen_flags:?}"),
     );
 }
 
@@ -526,4 +564,76 @@ fn skipping_the_added_sample_does_not_change_the_counts() {
             "this pair has neither added nor removed rows, so it proves nothing"
         );
     }
+}
+
+/// A value that is only whitespace trims to "", and "" is a value: only
+/// `--empty-is-null` makes it absent. The CSV engines and `turbo`'s Parquet
+/// decoder always read it that way; the columnar path read it as absent under
+/// `--trim` alone, so `"  "` against an empty cell was a change as CSV and no
+/// change as Parquet.
+///
+/// `gen-data` never writes such a value, which is why `with_trim` above could
+/// not see it; this writes its own pair, in both formats, from one table.
+#[test]
+fn trim_keeps_a_value_that_trims_to_nothing() {
+    use csvdiff::gendata::parquet::{Compression, Writer};
+
+    const COLUMNS: [&str; 3] = ["id", "v", "w"];
+    let a = [
+        ["k1", "  ", "x"],
+        ["k2", "a", "y"],
+        ["k3", "  ", "z"],
+        ["k4", " b ", "w"],
+    ];
+    let b = [
+        ["k1", "", "x"],
+        ["k2", "a", "y"],
+        ["k3", "\t", "z"],
+        ["k4", "b", "w"],
+    ];
+    let dir = std::env::temp_dir().join(format!("csvdiff-pq-trim-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (side, rows) in [("a", &a), ("b", &b)] {
+        let mut csv = COLUMNS.join(",") + "\n";
+        for row in rows.iter() {
+            csv += &(row.join(",") + "\n");
+        }
+        std::fs::write(dir.join(format!("{side}.csv")), csv).unwrap();
+        let mut w = Writer::create(
+            &dir.join(format!("{side}.parquet")),
+            &COLUMNS,
+            Compression::None,
+            1024,
+        )
+        .unwrap();
+        for row in rows.iter() {
+            w.write_row(row.iter().copied()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    // (trim, empty_is_null, changed rows): under --trim alone, k1 is "" against
+    // an empty cell -- a change -- and k3 is "" against "", which is not.
+    for (trim, empty_is_null, changed) in [(true, false, 1), (true, true, 0), (false, false, 3)] {
+        let opt = || {
+            let mut o = Options::with_key(["id"]);
+            o.trim = trim;
+            o.empty_is_null = empty_is_null;
+            o
+        };
+        let from_csv = run(&dir.join("a.csv"), &dir.join("b.csv"), opt(), Engine::Turbo);
+        let counted: serde_json::Value = serde_json::from_str(&from_csv).unwrap();
+        assert_eq!(
+            counted["counts"]["changed"], changed,
+            "csv, trim={trim} empty_is_null={empty_is_null}: {from_csv}"
+        );
+        same_from_both_readers(
+            &from_csv,
+            &dir.join("a.parquet"),
+            &dir.join("b.parquet"),
+            opt,
+            &format!("trim={trim} empty_is_null={empty_is_null}"),
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
