@@ -265,8 +265,6 @@ static int row_eq(const Keys *k, const KeySide *x, size_t rx, const KeySide *y, 
 /* it. At ten million keys those second misses were the join.                   */
 /* ------------------------------------------------------------------------- */
 
-#define POS_MASK ((UINT64_C(1) << 40) - 1)
-
 /*
  * How many rows ahead to start the load for. Measured, not reasoned: at ten
  * million rows the index build is flat within noise from 8 to 64, but the join
@@ -277,30 +275,45 @@ static int row_eq(const Keys *k, const KeySide *x, size_t rx, const KeySide *y, 
  */
 #define PREFETCH_AHEAD 24
 
-static inline uint64_t slot_for(uint64_t h, size_t pos) { return (h & ~POS_MASK) | (pos + 1); }
-static inline int      tag_is(uint64_t slot, uint64_t h) { return ((slot ^ h) & ~POS_MASK) == 0; }
-static inline size_t   pos_of(uint64_t slot) { return (size_t)(slot & POS_MASK) - 1; }
-
 /*
  * The slot table, zeroed. `alloc_huge` puts it on 2 MB pages where the kernel
  * will, which is the difference between an insert costing 123 ns and 37 ns --
  * see parallel.h for why, and c/README.md for the measurement.
  */
-static uint64_t *alloc_slots(size_t n) {
-    uint64_t *p = alloc_huge(n * sizeof *p);
+static uint32_t *alloc_slots(size_t n) {
+    uint32_t *p = alloc_huge(n * sizeof *p);
     if (p) memset(p, 0, n * sizeof *p);
     return p;
 }
 
-typedef struct {
-    uint64_t *slots;
+struct Index {
+    uint32_t *slots;
     uint64_t  mask;
+    unsigned  pos_bits;
+    uint32_t  pos_mask;
     int32_t  *firsts;
     uint32_t *counts;
     uint64_t *hashes;             /* per distinct key, for probing the other side */
     size_t    unique;
     int64_t   rows, dup_keys, dup_rows;
-} Index;
+};
+typedef struct Index Index;
+
+static inline uint32_t slot_pack(const Index *ix, uint64_t hash, size_t pos) {
+    const unsigned tag_bits = 32u - ix->pos_bits;
+    const uint32_t tag = tag_bits ? (uint32_t)(hash >> (64u - tag_bits)) : 0u;
+    return (tag << ix->pos_bits) | (uint32_t)(pos + 1);
+}
+
+static inline int slot_tag_is(const Index *ix, uint32_t v, uint64_t hash) {
+    const unsigned tag_bits = 32u - ix->pos_bits;
+    if (!tag_bits) return 1;
+    return (v >> ix->pos_bits) == (uint32_t)(hash >> (64u - tag_bits));
+}
+
+static inline size_t slot_pos(const Index *ix, uint32_t v) {
+    return (size_t)(v & ix->pos_mask) - 1;
+}
 
 static void index_free(Index *ix) {
     free(ix->slots); free(ix->firsts); free(ix->counts); free(ix->hashes);
@@ -387,6 +400,10 @@ static int build_index(const Keys *k, const KeySide *s, unsigned threads, Index 
         return pq_set_error("out of memory");
     }
     ix->mask = cap - 1;
+    /* Adaptive slot width: position bits from the row count, the rest is hash tag. */
+    ix->pos_bits = 1;
+    while (ix->pos_bits < 32 && ((size_t)1 << ix->pos_bits) < (size_t)s->rows + 2) ix->pos_bits++;
+    ix->pos_mask = ix->pos_bits >= 32 ? 0xFFFFFFFFu : (uint32_t)(((uint64_t)1 << ix->pos_bits) - 1);
 
     /*
      * Insertion is one DRAM miss per row and nothing else.
@@ -405,17 +422,17 @@ static int build_index(const Keys *k, const KeySide *s, unsigned threads, Index 
         const uint64_t h = hs[r];
         size_t at = h & ix->mask;
         for (;;) {
-            const uint64_t slot = ix->slots[at];
+            const uint32_t slot = ix->slots[at];
             if (slot == 0) {
-                ix->slots[at] = slot_for(h, ix->unique);
+                ix->slots[at] = slot_pack(ix, h, ix->unique);
                 ix->firsts[ix->unique] = (int32_t)r;
                 ix->counts[ix->unique] = 1;
                 ix->hashes[ix->unique] = h;
                 ix->unique++;
                 break;
             }
-            if (tag_is(slot, h)) {
-                const size_t pos = pos_of(slot);
+            if (slot_tag_is(ix, slot, h)) {
+                const size_t pos = slot_pos(ix, slot);
                 if (row_eq(k, s, (size_t)ix->firsts[pos], s, r)) {
                     if (++ix->counts[pos] == 2) {
                         ix->dup_keys++;
@@ -458,10 +475,10 @@ static int32_t lookup(const Keys *k, const Index *into, const KeySide *there,
                       const KeySide *here, size_t row, uint64_t h) {
     size_t at = h & into->mask;
     for (;;) {
-        const uint64_t slot = into->slots[at];
+        const uint32_t slot = into->slots[at];
         if (slot == 0) return -1;
-        if (tag_is(slot, h)) {
-            const int32_t first = into->firsts[pos_of(slot)];
+        if (slot_tag_is(into, slot, h)) {
+            const int32_t first = into->firsts[slot_pos(into, slot)];
             if (row_eq(k, there, (size_t)first, here, row)) return first;
         }
         at = (at + 1) & into->mask;

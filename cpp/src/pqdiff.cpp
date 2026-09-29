@@ -381,22 +381,34 @@ bool row_eq(const Keys& k, const KeySide& x, std::size_t rx, const KeySide& y, s
 inline constexpr std::size_t kPrefetchAhead = 24;
 
 struct Index {
-    std::vector<std::uint64_t> slots;
+    std::vector<std::uint32_t> slots;
     std::uint64_t mask = 0;
+    unsigned pos_bits = 1;
+    std::uint32_t pos_mask = 1;
     std::vector<std::int32_t> firsts;
     std::vector<std::uint32_t> counts;
     std::vector<std::uint64_t> hashes;   // per distinct key, for probing the other side
     std::int64_t rows = 0, dup_keys = 0, dup_rows = 0;
 
-    static constexpr std::uint64_t kPosMask = (1ULL << 40) - 1;
-    static std::uint64_t slot_for(std::uint64_t h, std::size_t pos) {
-        return (h & ~kPosMask) | (pos + 1);
+    void set_pos_bits(std::size_t n) {
+        pos_bits = 1;
+        while (pos_bits < 32 && (n + 1) > ((std::size_t{1} << pos_bits) - 1)) ++pos_bits;
+        pos_mask = pos_bits >= 32 ? 0xFFFFFFFFu
+                                  : static_cast<std::uint32_t>((1u << pos_bits) - 1);
     }
-    static bool tag_is(std::uint64_t slot, std::uint64_t h) {
-        return ((slot ^ h) & ~kPosMask) == 0;
+    std::uint32_t slot_pack(std::uint64_t hash, std::size_t pos) const {
+        const unsigned tag_bits = 32u - pos_bits;
+        const std::uint32_t tag =
+            tag_bits ? static_cast<std::uint32_t>(hash >> (64u - tag_bits)) : 0u;
+        return (tag << pos_bits) | static_cast<std::uint32_t>(pos + 1);
     }
-    static std::size_t pos_of(std::uint64_t slot) {
-        return static_cast<std::size_t>(slot & kPosMask) - 1;
+    bool slot_tag_is(std::uint32_t v, std::uint64_t hash) const {
+        const unsigned tag_bits = 32u - pos_bits;
+        if (!tag_bits) return true;
+        return (v >> pos_bits) == static_cast<std::uint32_t>(hash >> (64u - tag_bits));
+    }
+    std::size_t slot_pos(std::uint32_t v) const {
+        return static_cast<std::size_t>(v & pos_mask) - 1;
     }
 
     std::int64_t unique() const { return static_cast<std::int64_t>(firsts.size()); }
@@ -444,6 +456,7 @@ Index build_index(const Keys& k, const KeySide& s, const Options& o, unsigned th
     while (cap * 2 < s.rows * 3 + 16) cap <<= 1;
     ix.slots.assign(cap, 0);
     ix.mask = cap - 1;
+    ix.set_pos_bits(s.rows ? s.rows : 1);
     ix.firsts.reserve(s.rows);
     ix.counts.reserve(s.rows);
     ix.hashes.reserve(s.rows);
@@ -457,16 +470,16 @@ Index build_index(const Keys& k, const KeySide& s, const Options& o, unsigned th
         const std::uint64_t h = hs[r];
         std::size_t at = h & ix.mask;
         for (;;) {
-            const std::uint64_t slot = ix.slots[at];
+            const std::uint32_t slot = ix.slots[at];
             if (slot == 0) {
-                ix.slots[at] = Index::slot_for(h, ix.firsts.size());
+                ix.slots[at] = ix.slot_pack(h, ix.firsts.size());
                 ix.firsts.push_back(static_cast<std::int32_t>(r));
                 ix.counts.push_back(1);
                 ix.hashes.push_back(h);
                 break;
             }
-            if (Index::tag_is(slot, h)) {
-                const std::size_t pos = Index::pos_of(slot);
+            if (ix.slot_tag_is(slot, h)) {
+                const std::size_t pos = ix.slot_pos(slot);
                 if (row_eq(k, s, static_cast<std::size_t>(ix.firsts[pos]), s, r, o)) {
                     if (++ix.counts[pos] == 2) {
                         ++ix.dup_keys;
@@ -487,10 +500,10 @@ std::int32_t lookup(const Keys& k, const Index& into, const KeySide& there, cons
                     std::size_t row, std::uint64_t h, const Options& o) {
     std::size_t at = h & into.mask;
     for (;;) {
-        const std::uint64_t slot = into.slots[at];
+        const std::uint32_t slot = into.slots[at];
         if (slot == 0) return -1;
-        if (Index::tag_is(slot, h)) {
-            const std::int32_t first = into.firsts[Index::pos_of(slot)];
+        if (into.slot_tag_is(slot, h)) {
+            const std::int32_t first = into.firsts[into.slot_pos(slot)];
             if (row_eq(k, there, static_cast<std::size_t>(first), here, row, o)) return first;
         }
         at = (at + 1) & into.mask;

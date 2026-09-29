@@ -411,8 +411,13 @@ fn row_eq(
 /// it. At ten million keys those second misses were the join.
 #[derive(Default)]
 struct Index {
-    slots: Vec<u64>,
+    slots: Vec<u32>,
     mask: u64,
+    /// Low bits of a slot holding positions plus one; the high bits hold the
+    /// top of the key's hash as a tag. Chosen from the row count in `build`,
+    /// so the slot stays four bytes at any scale this port runs.
+    pos_bits: u32,
+    pos_mask: u32,
     firsts: Vec<i32>,
     counts: Vec<u32>,
     /// Per distinct key, for probing the other side.
@@ -423,16 +428,46 @@ struct Index {
 }
 
 impl Index {
-    const POS_MASK: u64 = (1 << 40) - 1;
-    fn slot_for(h: u64, pos: usize) -> u64 {
-        (h & !Self::POS_MASK) | (pos as u64 + 1)
+    fn set_pos_bits(&mut self, n: usize) {
+        let mut bits = 1u32;
+        while bits < 32 && (n + 1) > ((1usize << bits) - 1) {
+            bits += 1;
+        }
+        self.pos_bits = bits;
+        self.pos_mask = if bits >= 32 {
+            0xFFFF_FFFF
+        } else {
+            ((1u64 << bits) - 1) as u32
+        };
     }
-    fn tag_is(slot: u64, h: u64) -> bool {
-        (slot ^ h) & !Self::POS_MASK == 0
+
+    /// Packs a slot: the top `32 - pos_bits` bits of the hash above the
+    /// position plus one. Zero tag bits (past two billion rows) degrades to
+    /// no tag rather than a wrong answer.
+    fn slot_for(&self, hash: u64, pos: usize) -> u32 {
+        let pos = pos as u32 + 1;
+        let tag_bits = 32 - self.pos_bits;
+        if tag_bits == 0 {
+            pos
+        } else {
+            (((hash >> (64 - tag_bits)) as u32) << self.pos_bits) | pos
+        }
     }
-    fn pos_of(slot: u64) -> usize {
-        (slot & Self::POS_MASK) as usize - 1
+
+    /// Whether the slot's tag matches the hash's top bits.
+    fn tag_is(&self, word: u32, hash: u64) -> bool {
+        let tag_bits = 32 - self.pos_bits;
+        if tag_bits == 0 {
+            return true;
+        }
+        (word >> self.pos_bits) == (hash >> (64 - tag_bits)) as u32
     }
+
+    /// The `firsts` position a non-empty slot holds.
+    fn pos_of(&self, word: u32) -> usize {
+        ((word & self.pos_mask) - 1) as usize
+    }
+
     fn unique(&self) -> i64 {
         self.firsts.len() as i64
     }
@@ -458,7 +493,7 @@ fn panicked() -> Error {
     Error::new("a comparison worker panicked")
 }
 
-fn prefetch_slot(slots: &[u64], mask: u64, h: u64) {
+fn prefetch_slot(slots: &[u32], mask: u64, h: u64) {
     #[cfg(target_arch = "x86_64")]
     // Safety: the index is masked into the table's length, so the pointer is in
     // bounds, and a prefetch has no architectural effect in any case.
@@ -523,8 +558,9 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
     // to it, and nothing reads this table before the inserts start, so every one
     // of its pages would be first touched by a random probe.
     ix.slots = alloc::sized(cap, "the key index")?;
-    ix.slots.resize(cap, 0u64);
+    ix.slots.resize(cap, 0u32);
     ix.mask = cap as u64 - 1;
+    ix.set_pos_bits(n);
     alloc::grow(&mut ix.firsts, n, "one row per distinct key")?;
     alloc::grow(&mut ix.counts, n, "one count per distinct key")?;
     alloc::grow(&mut ix.hashes, n, "one hash per distinct key")?;
@@ -537,14 +573,14 @@ fn build_index(as_id: &[bool], s: &KeySide<'_>, opt: &Options, threads: usize) -
         loop {
             let slot = ix.slots[at];
             if slot == 0 {
-                ix.slots[at] = Index::slot_for(h, ix.firsts.len());
+                ix.slots[at] = ix.slot_for(h, ix.firsts.len());
                 ix.firsts.push(r as i32);
                 ix.counts.push(1);
                 ix.hashes.push(h);
                 break;
             }
-            if Index::tag_is(slot, h) {
-                let pos = Index::pos_of(slot);
+            if ix.tag_is(slot, h) {
+                let pos = ix.pos_of(slot);
                 if row_eq(as_id, s, ix.firsts[pos] as usize, s, r, opt) {
                     ix.counts[pos] += 1;
                     if ix.counts[pos] == 2 {
@@ -577,8 +613,8 @@ fn lookup(
         if slot == 0 {
             return -1;
         }
-        if Index::tag_is(slot, h) {
-            let first = into.firsts[Index::pos_of(slot)];
+        if into.tag_is(slot, h) {
+            let first = into.firsts[into.pos_of(slot)];
             if row_eq(as_id, there, first as usize, here, row, opt) {
                 return first;
             }
