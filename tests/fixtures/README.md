@@ -50,3 +50,13 @@ tested only against files its own writer produced tests nothing. `typed.csv` is 
 expectation for how a typed column becomes text — integers and decimals in full, floats in the
 shortest round-trip form, dates `YYYY-MM-DD`, timestamps ISO 8601 — so a change to that rule fails
 a test rather than passing quietly in both ports at once.
+
+# Fold
+
+`fold/` is one small pair, written as CSV, newline-delimited JSON and dictionary and plain Parquet,
+for the one place the ports are allowed to differ. C++ and Zig fold case in ASCII only and refuse a
+value outside it where the fold decides the answer: in a key, or in a compared value that differs
+byte for byte between matched rows. Rust folds Unicode and answers all of it. So on this pair,
+`scripts/option_matrix.py` holds C++ and Zig to refusing where the rule says, and to Rust's counts
+everywhere else. Each row sits on one side of that line; `scripts/make_fold_fixtures.py` lists
+which, and writes the files.
