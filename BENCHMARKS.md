@@ -176,7 +176,31 @@ Counts identical in both ports. One bug caught before the push: Zig computed
 The bug survived this long because no local Zig toolchain existed to compile
 it; CI caught nothing either, since the branch had never built Zig there.
 
-## 2026-09-29 (parquet u32 hash slots) — the same conversion, three more ports
+## 2026-09-29 (phased 150M) — where the seconds go, all four ports
+
+Run `36551803636`, `scale-ceiling.yml` with `CSVDIFF_PHASES=1` — one extra
+run per port after the timed run, phases from the port's own instrumentation.
+Caveat: the phase run did not pass `--summary` to Rust, so Rust's phases
+include HTML report work the others skip; fixed after this run.
+
+| Port | Sweep A | Sweep B | Insert A | Insert B | Join |
+|---|---:|---:|---:|---:|---:|
+| Rust | ~128s | — | 6.02s | 8.49s | 130.89s |
+| Zig | ~141s | — | 26.51s | 26.63s | 161.59s |
+| C++ | 131.52s | 129.94s | 6.71s | 9.78s | 131.83s |
+| C | 215.51s | 208.99s | 5.94s | 20.08s | 202.13s |
+
+(C++ also pays a chunk-bounds pre-pass, 61.45s + 64.50s, which the other
+ports do not have; phases overlap, so the rows do not sum to the total.)
+
+The sweep is I/O-bound and broadly similar — except C, whose 215s+209s is
+~60% slower than the others for reasons not yet understood. The clearest
+gap is Zig's serial index insert: 26.5s+26.6s vs Rust's 6.0s+8.5s, ~38s.
+The insert functions are structurally identical (same probing, same
+prefetch distance, same slot math) — the gap is in codegen or a subtle
+effect invisible in the source, and local 10M A/B cannot resolve it. C's
+insert is asymmetric (5.9s vs 20.1s); C's join is also slow at 202s vs
+Rust's 131s.
 
 The CSV ports all had u32 slots by 09-28, but the Parquet ports were still on
 64-bit: C `pqdiff`, C++ `pqdiff`, Rust `pqdiff`. Zig's `pqdiff` already had
