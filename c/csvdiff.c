@@ -42,6 +42,21 @@
 #include "parquet.h"
 #include "pqdiff.h"
 
+/*
+ * Text normalisation options: --trim, --ignore-case, --empty-is-null (which is
+ * C's default: is_absent already treats empty as absent), --tolerance.
+ *
+ * The normalisation is applied where the bytes are read: the key hash folds
+ * over the normalised bytes, and cell comparison uses the normalised form.
+ * --tolerance is different: it applies at comparison time, where both sides
+ * parse as numbers.
+ */
+typedef struct {
+    bool   trim;
+    bool   ignore_case;
+    double tolerance;
+} Norm;
+
 /* ------------------------------------------------------------------------- */
 /* A field packed into one word: offset, length, and whether it needs           */
 /* unescaping. 40 bits of offset addresses a terabyte and 23 bits of length a   */
@@ -556,6 +571,38 @@ static bool same_bytes(const Slab *a, Field x, const Slab *b, Field y) {
     return memcmp(sx, sy, n) == 0;
 }
 
+/*
+ * Field equality under a Norm: --trim and --ignore-case normalise the bytes
+ * before comparing; --tolerance applies where both sides parse as numbers.
+ */
+static size_t norm_copy(const Slab *s, Field f, const Norm *n, char *out, size_t cap);
+static bool same_norm(const Slab *a, Field x, const Slab *b, Field y, const Norm *n) {
+    if (!n->trim && !n->ignore_case && n->tolerance <= 0.0)
+        return same_bytes(a, x, b, y);
+    /* --tolerance: if both sides parse as doubles, compare within tolerance. */
+    if (n->tolerance > 0.0 && field_real(x) && field_real(y)) {
+        char sx[4096], sy[4096];
+        size_t lx = norm_copy(a, x, n, sx, sizeof sx - 1);
+        size_t ly = norm_copy(b, y, n, sy, sizeof sy - 1);
+        if (lx != (size_t)-1 && ly != (size_t)-1) {
+            sx[lx] = '\0'; sy[ly] = '\0';
+            char *ex, *ey;
+            double dx = strtod(sx, &ex), dy = strtod(sy, &ey);
+            if (*ex == '\0' && *ey == '\0') {
+                double d = dx - dy;
+                if (d < 0) d = -d;
+                return d <= n->tolerance;
+            }
+        }
+    }
+    /* --trim / --ignore-case: normalise both sides, then compare bytes. */
+    char nx[4096], ny[4096];
+    size_t lx = norm_copy(a, x, n, nx, sizeof nx);
+    size_t ly = norm_copy(b, y, n, ny, sizeof ny);
+    if (lx == (size_t)-1 || ly == (size_t)-1) return false; /* non-ASCII: refused */
+    return lx == ly && memcmp(nx, ny, lx) == 0;
+}
+
 static bool is_absent(const Slab *s, Field f) {
     (void)s;
     return !field_real(f) || field_len(f) == 0;
@@ -597,27 +644,75 @@ static inline uint64_t tail_word(const char *p, size_t len, size_t rem) {
  * have done all along; an escaped value is decoded first -- the rare case, a
  * doubled quote or a backslash -- and folded by the same loop.
  */
-static uint64_t hash_field(const Slab *s, Field f, uint64_t seed) {
+/*
+ * Normalises a field's bytes into `out`: unescapes if needed, then applies
+ * --trim (strip bytes <= ' ') and --ignore-case (ASCII fold A-Z to a-z).
+ * Returns the normalised length, or (size_t)-1 if --ignore-case meets a
+ * non-ASCII byte (which this port refuses by name, like C++ and Zig).
+ */
+static size_t norm_copy(const Slab *s, Field f, const Norm *n, char *out, size_t cap) {
+    char tmp[4096];
+    const char *p;
+    size_t len;
+    if (field_escaped(f)) {
+        len = logical_copy(s, f, tmp, sizeof tmp);
+        p = tmp;
+    } else {
+        p = s->data + field_off(f);
+        len = field_len(f);
+    }
+    /* --trim: strip leading/trailing whitespace (bytes <= ' '). */
+    if (n->trim) {
+        while (len > 0 && (unsigned char)p[0] <= ' ') { p++; len--; }
+        while (len > 0 && (unsigned char)p[len - 1] <= ' ') len--;
+    }
+    if (len > cap) len = cap; /* refused upstream by the length cap */
+    if (n->ignore_case) {
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)p[i];
+            if (c >= 0x80) return (size_t)-1; /* non-ASCII: refused */
+            out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+        }
+    } else {
+        memcpy(out, p, len);
+    }
+    return len;
+}
+
+static uint64_t hash_field_norm(const Slab *s, Field f, uint64_t seed, const Norm *n) {
     const uint64_t PRIME = UINT64_C(0x100000001b3);
     uint64_t h = seed;
     if (is_absent(s, f)) return (h ^ UINT64_C(0x9e3779b97f4a7c15)) * PRIME;
-    const char *p = s->data + field_off(f);
-    size_t len = field_len(f);
-    char tmp[4096];
-    if (field_escaped(f)) {
-        /* A longer value is refused upstream by the length cap. */
-        len = logical_copy(s, f, tmp, sizeof tmp);
-        p = tmp;
+    /* Fast path: no normalisation, no escaping -- hash the bytes in place. */
+    if (!n->trim && !n->ignore_case && !field_escaped(f)) {
+        const char *p = s->data + field_off(f);
+        size_t len = field_len(f);
+        size_t i = 0;
+        for (; i + 8 <= len; i += 8) {
+            uint64_t w;
+            memcpy(&w, p + i, 8);
+            h = (h ^ w) * PRIME;
+            h ^= h >> 29;
+        }
+        if (i < len) {
+            h = (h ^ tail_word(p, len, len - i)) * PRIME;
+            h ^= h >> 29;
+        }
+        return (h ^ (uint64_t)len) * PRIME;
     }
+    /* Slow path: normalise into a buffer, then hash it. */
+    char buf[4096];
+    size_t len = norm_copy(s, f, n, buf, sizeof buf);
+    if (len == (size_t)-1) return 0; /* non-ASCII under --ignore-case: caller refuses */
     size_t i = 0;
     for (; i + 8 <= len; i += 8) {
         uint64_t w;
-        memcpy(&w, p + i, 8);
+        memcpy(&w, buf + i, 8);
         h = (h ^ w) * PRIME;
-        h ^= h >> 29; /* spreads a whole word into the low bits, where the slot comes from */
+        h ^= h >> 29;
     }
     if (i < len) {
-        h = (h ^ tail_word(p, len, len - i)) * PRIME;
+        h = (h ^ tail_word(buf, len, len - i)) * PRIME;
         h ^= h >> 29;
     }
     return (h ^ (uint64_t)len) * PRIME;
@@ -1054,6 +1149,7 @@ typedef struct {
     Field *probe2;     /* the other side of a lazy equality check, same reason */
     int64_t dup_keys, dup_rows;
     bool failed;       /* a field too long for the packed length */
+    const Norm *norm;  /* text normalisation for key comparison */
 } RowIndex;
 
 #define TABLE_EMPTY 0u
@@ -1201,6 +1297,7 @@ typedef struct {
     size_t           key_size;
     const size_t    *bounds;
     Chunk           *chunk;
+    const Norm      *norm;
     /* Per-thread timing, nanoseconds. Aggregated after the join. */
     uint64_t        *parse_ns;
     uint64_t        *hash_ns;
@@ -1257,7 +1354,7 @@ static void sweep_part(void *vctx, unsigned p) {
         if (out->failed) break;
         if (timed) t0 = now_ns();
         uint64_t hash = UINT64_C(0xcbf29ce484222325);
-        for (size_t i = 0; i < c->key_size; i++) hash = hash_field(c->slab, fields[i], hash);
+        for (size_t i = 0; i < c->key_size; i++) hash = hash_field_norm(c->slab, fields[i], hash, c->norm);
         if (timed) { t_hash += now_ns() - t0; t0 = now_ns(); }
         if (!chunk_push(out, pos, hash)) { out->oom = true; break; }
         if (timed) t_push += now_ns() - t0;
@@ -1291,11 +1388,12 @@ static void sweep_part(void *vctx, unsigned p) {
  * thousand parses rather than ten million.
  */
 static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser, size_t from,
-                        size_t key_size, unsigned threads) {
+                        size_t key_size, unsigned threads, const Norm *norm) {
     memset(ix, 0, sizeof *ix);
     ix->slab = slab;
     ix->parser = parser;
     ix->key_size = key_size;
+    ix->norm = norm;
     ix->probe = malloc(parser->width * sizeof *ix->probe);
     ix->probe2 = malloc(parser->width * sizeof *ix->probe2);
     if (!ix->probe || !ix->probe2) return false;
@@ -1314,7 +1412,7 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     uint64_t *t_hash = timed ? calloc(ways, sizeof *t_hash) : NULL;
     uint64_t *t_push = timed ? calloc(ways, sizeof *t_push) : NULL;
     uint64_t *t_rows = timed ? calloc(ways, sizeof *t_rows) : NULL;
-    SweepCtx sc = { slab, parser, key_size, bounds, chunks,
+    SweepCtx sc = { slab, parser, key_size, bounds, chunks, norm,
                     t_parse, t_hash, t_push, t_rows };
     run_parts(sweep_part, &sc, ways);
     free(bounds);
@@ -1420,7 +1518,7 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
                     const bool xa = is_absent(slab, ix->probe[i]);
                     const bool ya = is_absent(slab, ix->probe2[i]);
                     same = (xa || ya) ? (xa && ya)
-                                      : same_bytes(slab, ix->probe[i], slab, ix->probe2[i]);
+                                      : same_norm(slab, ix->probe[i], slab, ix->probe2[i], ix->norm);
                 }
                 if (same) {
                     if (++ix->occurrences[at] == 2) {
@@ -1446,13 +1544,14 @@ typedef struct {
     size_t           from[2];
     size_t           key_size;
     unsigned         threads;
+    const Norm      *norm;
     bool             ok[2];
 } BuildCtx;
 
 static void build_part(void *vctx, unsigned p) {
     BuildCtx *c = vctx;
     c->ok[p] = index_build(c->ix[p], c->slab[p], c->parser[p], c->from[p], c->key_size,
-                           c->threads);
+                           c->threads, c->norm);
 }
 
 /*
@@ -1474,7 +1573,7 @@ static int32_t index_lookup(const RowIndex *ix, const Slab *other, const Field *
             bool ok = true;
             for (size_t i = 0; i < ix->key_size && ok; i++) {
                 bool xa = is_absent(ix->slab, probe[i]), ya = is_absent(other, fields[i]);
-                ok = (xa || ya) ? (xa && ya) : same_bytes(ix->slab, probe[i], other, fields[i]);
+                ok = (xa || ya) ? (xa && ya) : same_norm(ix->slab, probe[i], other, fields[i], ix->norm);
             }
             if (ok) return candidate;
         }
@@ -1598,7 +1697,7 @@ static int32_t index_lookup_proof(const RowIndex *ix, const Slab *other, const F
             bool ok = true;
             for (size_t i = 0; i < ix->key_size && ok; i++) {
                 bool xa = is_absent(ix->slab, probe[i]), ya = is_absent(other, fields[i]);
-                ok = (xa || ya) ? (xa && ya) : same_bytes(ix->slab, probe[i], other, fields[i]);
+                ok = (xa || ya) ? (xa && ya) : same_norm(ix->slab, probe[i], other, fields[i], ix->norm);
             }
             if (ok) return candidate;
         }
@@ -1664,6 +1763,7 @@ typedef struct {
      * the join can count the proof's span without parsing the row. Only for
      * the aligned CSV proof; 0 disables it. */
     int             guard_commas;
+    const Norm     *norm;
 } CmpCtx;
 
 /*
@@ -1690,7 +1790,7 @@ static void compare_mate(const CmpCtx *c, CmpPart *out, int32_t mate) {
     for (size_t i = 0; i < nc; i++) {
         const Field x = out->fa[key_size + i], y = out->fb[key_size + i];
         const bool xa = is_absent(c->a, x), ya = is_absent(c->b, y);
-        const bool differs = (xa || ya) ? (xa != ya) : !same_bytes(c->a, x, c->b, y);
+        const bool differs = (xa || ya) ? (xa != ya) : !same_norm(c->a, x, c->b, y, c->norm);
         if (differs) {
             any = true;
             out->col_changed[i]++;
@@ -2200,6 +2300,8 @@ int main(int argc, char **argv) {
     const char *a_path = NULL, *b_path = NULL, *json_path = NULL;
     unsigned threads = 0;   /* 0 means one per core, on the Parquet path */
     size_t   max_memory_mb = 0;   /* 0 means no ceiling */
+    bool trim = false, ignore_case = false;
+    double tolerance = 0.0;
     /* Three lists to release now, and a fourth would be a fourth place to
      * forget one: every exit from the scan goes through here. */
 #define ARGS_FAIL(msg) \
@@ -2217,6 +2319,7 @@ int main(int argc, char **argv) {
             !strcmp(f, "--json") ||
             !strcmp(f, "-t") || !strcmp(f, "--threads") ||
             !strcmp(f, "--max-memory") ||
+            !strcmp(f, "--tolerance") ||
             !strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine");
         if (wants_value && i + 1 >= argc) {
             if (!strcmp(f, "-k") || !strcmp(f, "--key")) ARGS_FAIL("--key needs a value");
@@ -2225,6 +2328,7 @@ int main(int argc, char **argv) {
             if (!strcmp(f, "--json")) ARGS_FAIL("--json needs a value");
             if (!strcmp(f, "-t") || !strcmp(f, "--threads")) ARGS_FAIL("--threads needs a value");
             if (!strcmp(f, "--max-memory")) ARGS_FAIL("--max-memory needs a value");
+            if (!strcmp(f, "--tolerance")) ARGS_FAIL("--tolerance needs a value");
             ARGS_FAIL("that option needs a value");
         }
         if (!strcmp(f, "-k") || !strcmp(f, "--key")) key = split_commas(argv[++i]);
@@ -2234,6 +2338,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(f, "-t") || !strcmp(f, "--threads"))
             threads = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(f, "--max-memory")) max_memory_mb = strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(f, "--trim")) trim = true;
+        else if (!strcmp(f, "--ignore-case")) ignore_case = true;
+        else if (!strcmp(f, "--empty-is-null")) { /* C's default: is_absent treats empty as absent */ }
+        else if (!strcmp(f, "--tolerance")) tolerance = strtod(argv[++i], NULL);
         else if (!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) i++;
         else if (f[0] == '-') ARGS_FAIL("unknown option");
         else if (!a_path) a_path = f;
@@ -2374,6 +2482,7 @@ int main(int argc, char **argv) {
     ap.delimiter = a_delim; ap.source = a_src; ap.width = width; ap.dialect = a.dialect;
     bp.delimiter = b_delim; bp.source = b_src; bp.width = width; bp.dialect = b.dialect;
     ap.key_size = bp.key_size = key_size;
+    Norm norm = { trim, ignore_case, tolerance };
     ap.last_needed = bp.last_needed = ap.key_last = bp.key_last = -1;
     for (size_t i = 0; i < width; i++) {
         if (a_src[i] > ap.last_needed) ap.last_needed = a_src[i];
@@ -2411,7 +2520,7 @@ int main(int argc, char **argv) {
          */
         unsigned budget = threads ? threads : cpu_count();
         BuildCtx bc = { { &ai, &bi }, { &a, &b }, { &ap, &bp }, { a_start, b_start },
-                        key_size, budget > 1 ? budget / 2 : 1, { false, false } };
+                        key_size, budget > 1 ? budget / 2 : 1, &norm, { false, false } };
         run_parts(build_part, &bc, 2);
         phase_mark(&whole, "both indexes");
         if (!bc.ok[0] || !bc.ok[1]) {
@@ -2459,7 +2568,8 @@ int main(int argc, char **argv) {
                        * keys sit before it when keys_in_proof holds. */
                       (aligned && keys_in_proof && !json_proof)
                           ? (int)(a_src[width - 1] + 1)
-                          : 0 };
+                          : 0,
+                      &norm };
         run_parts(compare_part, &cc, ways + b_ways);
         phase_mark(&whole, "join and compare");
 
