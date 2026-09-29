@@ -2136,9 +2136,15 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     }
     // How many delimiters from a CSV row's start close its guard column: where
     // `guard_span` can find the proof's span without the parse. 0 where it
-    // cannot -- JSON, or keys the proof does not cover.
+    // cannot -- JSON, keys the proof does not cover, or a guard that is the last
+    // column of A, which no delimiter closes: `guard_span` would scan every row
+    // to its end and return 0, and the proof that follows the lookup resets the
+    // backoff, so nothing would ever stop the scan.
     const std::size_t guard_commas =
-        keys_in_proof && !json_proof ? static_cast<std::size_t>(a_src[width - 1]) + 1 : 0;
+        keys_in_proof && !json_proof &&
+                static_cast<std::size_t>(a_src[width - 1]) + 1 < a_header.size()
+            ? static_cast<std::size_t>(a_src[width - 1]) + 1
+            : 0;
 
     // The two indexes share nothing, so they are built at the same time, and
     // each is split further into chunks. Two files across N cores is N/2 chunks
