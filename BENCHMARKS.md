@@ -174,6 +174,24 @@ Counts identical in both ports. One bug caught before the push: Zig computed
 The bug survived this long because no local Zig toolchain existed to compile
 it; CI caught nothing either, since the branch had never built Zig there.
 
+## 2026-09-29 (parquet u32 hash slots) — the same conversion, three more ports
+
+The CSV ports all had u32 slots by 09-28, but the Parquet ports were still on
+64-bit: C `pqdiff`, C++ `pqdiff`, Rust `pqdiff`. Zig's `pqdiff` already had
+u32 (`4f80fa2`) — which is why Zig led the 50M Parquet memory table in the
+fourth ladder edition (6,201 MB above the input vs 6,953–7,178 MB for the
+other three).
+
+Commit `174c28f` converts all three to the adaptive u32 scheme: position bits
+from the row count, hash tag in the high bits, refuse past ~4B rows. Same
+pattern as the CSV conversion, same guarantee — slot width is not in the
+comparison contract, so counts are identical by construction.
+
+Tests: C 73 ok, C++ 25 ok, Rust 58 unit + 15 integration ok. No A/B on speed
+yet — the local machine cannot fit a meaningful Parquet pair (2 GB free), and
+the improvement is primarily memory: at 50M Parquet the slot table is ~400 MB
+per side, halved by this change.
+
 A drive-by fix rode with the Rust change: `--summary` no longer builds the
 pick lists it then discards (an 11 MB abort on small caps).
 
