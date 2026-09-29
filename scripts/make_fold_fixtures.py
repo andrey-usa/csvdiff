@@ -20,7 +20,16 @@ Every row is one of the places the rule draws a line:
 
 `name` holds a value outside ASCII in most rows, so `-k id,name` is a key that
 must be refused. `amount` and `tag` exercise --tolerance and --trim on the same
-rows (never a value that is only whitespace: see the Parquet --trim issue).
+rows.
+
+`pad` holds values that are only whitespace, which generated data never does.
+Under --trim such a value is "", and "" is a value; only --empty-is-null makes
+it absent. Rust's and Zig's Parquet paths read it as absent under --trim alone,
+so the same rows gave a different answer as Parquet than as CSV:
+
+    k1  spaces in A, null in B       a change under --trim, none with --empty-is-null
+    k2  spaces in A, "" in B         the same in CSV; in Parquet "" is not null
+    k3  spaces in A and in B         equal under --trim, whatever their length
 
 The output is committed, because the tests must run without pyarrow installed.
 Regenerate with:
@@ -33,20 +42,20 @@ import sys
 
 from make_parquet_fixtures import write_csv, write_ndjson
 
-COLUMNS = ("id", "name", "note", "amount", "tag")
+COLUMNS = ("id", "name", "note", "amount", "tag", "pad")
 A = [
-    ("k1", "Alpha", "plain", "10.0", "x"),
-    ("k2", "CAFÉ", "same", "20.0", "y"),
-    ("k3", None, "left", "30.0", "z"),
-    ("k4", "Delta", "Crème", "40.0", "w"),
-    ("k5", "naïve", "gone", "50.0", "v"),
+    ("k1", "Alpha", "plain", "10.0", "x", "  "),
+    ("k2", "CAFÉ", "same", "20.0", "y", "  "),
+    ("k3", None, "left", "30.0", "z", "  "),
+    ("k4", "Delta", "Crème", "40.0", "w", "p"),
+    ("k5", "naïve", "gone", "50.0", "v", "p"),
 ]
 B = [
-    ("k1", "ALPHA", "plain", "10.3", " x "),
-    ("k2", "CAFÉ", "same", "20.0", "y"),
-    ("k3", "Été", "left", "30.0", "z"),
-    ("k4", "delta", "crème", "40.0", "w"),
-    ("k6", "Ñandú", "new", "60.0", "u"),
+    ("k1", "ALPHA", "plain", "10.3", " x ", None),
+    ("k2", "CAFÉ", "same", "20.0", "y", ""),
+    ("k3", "Été", "left", "30.0", "z", "   "),
+    ("k4", "delta", "crème", "40.0", "w", "p"),
+    ("k6", "Ñandú", "new", "60.0", "u", "p"),
 ]
 
 
