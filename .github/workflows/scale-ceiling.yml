@@ -179,6 +179,14 @@ jobs:
               --data-dir "$RUNNER_TEMP/scale" \
               --json-out "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.json" \
               2>&1 | tee "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt"
+          # Phase breakdown, one extra run with CSVDIFF_PHASES=1. The phases
+          # are the port's own names; they show where the wall time goes when
+          # the run is I/O-bound and the total alone cannot say.
+          echo "--- phase breakdown ---" | tee -a "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt"
+          CSVDIFF_PHASES=1 "$BIN" compare \
+              "$RUNNER_TEMP/scale/${{ matrix.port }}_a.csv" "$RUNNER_TEMP/scale/${{ matrix.port }}_b.csv" \
+              -k account_id,txn_id --threads "$(nproc)" \
+              2>&1 | tee -a "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt" || true
 
       - name: This rung, in the summary
         if: always()
