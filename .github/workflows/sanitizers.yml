@@ -1,0 +1,130 @@
+name: Sanitizers
+
+permissions:
+  contents: read
+
+# The ports map their input files and index into them by offset, so an
+# out-of-bounds read is the failure that matters most and the one a green suite
+# says least about. Each port is run here under its own runtime checks on the
+# inputs scripts/fuzz_diff.py builds to break parsers, and held against the
+# ordinary build of the same port:
+#
+#   c, cpp  AddressSanitizer + UndefinedBehaviorSanitizer (`make asan`)
+#   zig     a Debug build, which keeps every safety check the fast build drops:
+#           bounds, overflow, undefined behaviour. (build.zig's
+#           `--release=safe` does not change the binary, so Debug it is.)
+#   rust    Miri over the unit tests, in the second job. Miri cannot map files
+#           or call C, so it covers the modules that hold `unsafe` and nothing
+#           that touches the filesystem.
+#
+# ci-c.yml also runs C under ASan on generated data. This adds what it does not
+# have: C++ and Zig at all, and C on hostile input.
+#
+# An ASan report exits 99 and a UBSan one 98 (see the env below), because the
+# default 1 already means "differences found". Any of those, or a change in
+# stderr, is a difference from the ordinary build and fails the run.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "c/**"
+      - "cpp/**"
+      - "rust/src/**"
+      - "zig/src/**"
+      - "scripts/fuzz_diff.py"
+      - "scripts/contract.py"
+      - ".github/workflows/sanitizers.yml"
+  pull_request:
+    paths:
+      - "c/**"
+      - "cpp/**"
+      - "rust/src/**"
+      - "zig/src/**"
+      - "scripts/fuzz_diff.py"
+      - "scripts/contract.py"
+      - ".github/workflows/sanitizers.yml"
+  schedule:
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: c, c++ and zig under their checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # exitcode: see the header. detect_leaks off: a comparison that exits with
+      # its index still allocated is not a bug worth failing a run over.
+      ASAN_OPTIONS: exitcode=99:detect_leaks=0
+      UBSAN_OPTIONS: halt_on_error=1:exitcode=98:print_stacktrace=1
+      SEEDS: ${{ github.event_name == 'schedule' && '1-1500' || '1-300' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install Zig
+        uses: ./.github/actions/setup-zig
+
+      - name: Build the ordinary binaries
+        run: scripts/build_ports.sh c cpp zig
+
+      - name: Build the checked binaries
+        run: |
+          CC=gcc make -C c asan
+          CXX=g++ make -C cpp asan
+          (cd zig && zig build -Drelease=false --prefix zig-out-debug)
+
+      - name: C
+        shell: bash
+        run: python3 scripts/fuzz_diff.py --seeds "$SEEDS" --ref c/csvdiff --cand c/csvdiff-asan
+
+      - name: C++
+        shell: bash
+        run: python3 scripts/fuzz_diff.py --seeds "$SEEDS" --ref cpp/build/csvdiff --cand cpp/build/csvdiff-asan
+
+      - name: Zig
+        shell: bash
+        run: python3 scripts/fuzz_diff.py --seeds "$SEEDS" --ref zig/zig-out/bin/csvdiff --cand zig/zig-out-debug/bin/csvdiff
+
+  rust-miri:
+    name: rust unit tests under Miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # Miri interprets the program, so it can neither call C nor map a file, and
+      # it is a few hundred times slower. That leaves the unit tests, which is
+      # where the `unsafe` blocks that do not touch the filesystem are. Of the 58
+      # lib tests, 54 run (about a minute); the four skipped, and why:
+      #   an_impossible_size_refuses   allocates an impossible size on purpose,
+      #                                which Miri reports as an abort
+      #   gzip_and_zstd_go_through...  calls the zstd C library
+      #   gzip_tests (two)             compress megabytes; over two minutes each
+      # Add a skip here only with its reason, and keep the count above true.
+      - name: cargo miri test --lib
+        working-directory: rust
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+          # setup-rust-toolchain sets this to `deny`. Building Miri's own
+          # sysroot prints a cargo warning ("unused dependency `sysroot`") that
+          # is not ours and that `deny` turns into an error before any test runs.
+          CARGO_BUILD_WARNINGS: warn
+        run: |
+          cargo miri test --lib -- \
+            --skip an_impossible_size_refuses \
+            --skip gzip_and_zstd_go_through_the_libraries_already_here \
+            --skip gzip_tests

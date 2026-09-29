@@ -59,6 +59,19 @@ build/csvdiff-avx512$(EXE): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) -DCSVDIFF_SCAN_AVX512 -mavx512f -mavx512bw -o $@ $(SRC)
 
+# The engine under AddressSanitizer and UndefinedBehaviorSanitizer, as C has
+# had since it was added there. -O1 and no -march=native: the point is the
+# checks, and a native build cannot run on a machine other than the one that made
+# it. A report exits 99 (ASan) or 98 (UBSan) instead of the default 1, because 1
+# already means "differences found" -- see scripts/fuzz_diff.py and sanitizers.yml.
+asan: build/csvdiff-asan$(EXE)
+
+build/csvdiff-asan$(EXE): $(SRC) src/csvdiff.hpp src/pqdiff.hpp src/parquet.hpp
+	@mkdir -p build
+	$(CXX) -std=c++20 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined \
+	    -fno-sanitize-recover=undefined -Wall -Wextra -Wpedantic $(NATIVE_QUIRK) -pthread \
+	    -o $@ $(SRC)
+
 # The benchmark data generator. Writes the same bytes as the five other
 # generators; it is here because it is the only one fast enough to keep up with
 # the disk. See tools/gen_data.cpp.
@@ -80,4 +93,4 @@ build/pq-dump$(EXE): tools/pq_dump.cpp src/parquet.cpp src/parquet.hpp
 clean:
 	rm -rf build
 
-.PHONY: all gen-data scanners pq-dump clean
+.PHONY: all asan gen-data scanners pq-dump clean
