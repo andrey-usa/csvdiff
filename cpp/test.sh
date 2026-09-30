@@ -88,6 +88,20 @@ proof "a difference confined to an ignored column" \
   '{"k":"1","v":"5","w":"one"}' '{"k":"1","v":"5","w":"two"}' "changed 0"
 proof "the key written after the last compared value" \
   '{"v":"5","w":"x","k":"1"}' '{"v":"6","w":"x","k":"1"}' "changed 1"
+# Past an ignored value in the middle: the rows first differ inside the value
+# of `w`, which nobody tracks, so that value is skipped in each row on its own
+# and the comparison carries on -- whatever its length, escapes, type or nested
+# names. A repeat of the compared name after it still wins.
+proof "an ignored middle value that differs" \
+  '{"k":"1","w":"x","v":"5"}' '{"k":"1","w":"x and longer","v":"5"}' "changed 0"
+proof "and a real change after it" \
+  '{"k":"1","w":"x","v":"5"}' '{"k":"1","w":"x and longer","v":"6"}' "changed 1"
+proof "an escaped ignored value against null" \
+  '{"k":"1","w":"a\"b,c}","v":"5"}' '{"k":"1","w":null,"v":"5"}' "changed 0"
+proof "nested ignored values, tracked names inside" \
+  '{"k":"1","w":{"v":"Z"},"v":"5"}' '{"k":"1","w":[1,{"v":"Y"}],"v":"5"}' "changed 0"
+proof "a repeat of the compared name after the gap" \
+  '{"k":"1","w":"x","v":"5"}' '{"k":"1","w":"y","v":"5","v":"LATER"}' "changed 1"
 
 # The CSV byte proof with gaps: an ignored column among compared ones is
 # skipped by field count in each row on its own, so a value there that differs
