@@ -132,6 +132,127 @@ pub fn jsonTailIsClean(p: RowParser, d: []const u8, from: usize, end: usize) boo
     return true;
 }
 
+/// The JSON proof, past ignored values that differ.
+///
+/// `a` is A's row from its start through the last value either side wants; the
+/// plain proof holds when the mate opens with exactly those bytes and its tail
+/// names nothing tracked. One ignored member in between whose value differs --
+/// an `updated_at`, say, which differs on every row -- fails that on every row.
+/// So where the two rows first differ, this finds the member of A's object that
+/// byte is in. If it is the value of a name nobody tracks, the value is skipped
+/// in each row on its own -- in B from the same offset, since everything before
+/// it agreed, name included -- and the comparison carries on from there. A
+/// difference anywhere else, in a tracked value, or in a shape the walk does not
+/// follow fails the proof, and the row is parsed as before. The names before
+/// each skipped value are equal bytes in both rows and the skipped values belong
+/// to untracked names, so every tracked name sits at the same place with the
+/// same bytes; the tail check covers what follows. The C, C++ and Rust ports
+/// have the same proof (#234, #235, #236).
+pub fn jsonRowsMatch(p: RowParser, a: []const u8, b: []const u8, b_lo: usize, b_hi: usize) bool {
+    const j = switch (p) {
+        .json => |x| x,
+        .csv => return false,
+    };
+    var ai: usize = 0;
+    var bi = b_lo;
+    var after_value = false;
+    var hops: usize = 0;
+    while (hops < 64) : (hops += 1) {
+        const left = a.len - ai;
+        const m = @min(left, b_hi - bi);
+        // The whole run first: equal slices are one compare, and they are the
+        // common case -- every row whose ignored values do not differ.
+        if (m == left and std.mem.eql(u8, a[ai..], b[bi .. bi + left])) {
+            return jsonTailIsClean(p, b, bi + left, b_hi);
+        }
+        const same = commonPrefix(a[ai .. ai + m], b[bi .. bi + m]);
+        if (same == left) return jsonTailIsClean(p, b, bi + left, b_hi);
+        if (same == m) return false; // B ends first
+        const gap = jsonMemberAt(j, a, ai, ai + same, after_value) orelse return false;
+        const b_vs = bi + (gap[0] - ai);
+        const b_ve = jsonValueEnd(b, b_vs, b_hi);
+        if (b_ve >= b_hi or b_ve <= b_vs) return false;
+        ai = gap[1];
+        bi = b_ve;
+        after_value = true;
+    }
+    return false;
+}
+
+/// How many leading bytes `x` and `y` share, eight at a time.
+fn commonPrefix(x: []const u8, y: []const u8) usize {
+    const n = @min(x.len, y.len);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const u = std.mem.readInt(u64, x[i..][0..8], .little);
+        const v = std.mem.readInt(u64, y[i..][0..8], .little);
+        if (u != v) return i + @ctz(u ^ v) / 8;
+    }
+    while (i < n and x[i] == y[i]) i += 1;
+    return i;
+}
+
+fn jsonGap(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r';
+}
+
+/// Past one JSON value from `at`: a string, a scalar, or a nested object or
+/// array. `end` where it does not close before `end`.
+fn jsonValueEnd(d: []const u8, from: usize, end: usize) usize {
+    if (from >= end) return end;
+    switch (d[from]) {
+        '"' => return skipJsonString(d, from, end)[0],
+        '{', '[' => return skipJsonNested(d, from, end),
+        else => {
+            var at = from;
+            while (at < end) : (at += 1) {
+                switch (d[at]) {
+                    ',', '}', ']', '\n', ' ', '\t', '\r' => break,
+                    else => {},
+                }
+            }
+            return at;
+        },
+    }
+}
+
+/// The member of `d`'s object whose value holds byte `diff`, walking from `from`
+/// (the row start, or just past a value already skipped): its value's bounds.
+/// Null where `diff` falls in a name or the punctuation between members, in a
+/// tracked member, or anywhere the walk cannot follow -- an escaped name
+/// included, as the tail check treats one. `d` ends at the last wanted value, so
+/// a value that runs to its end is not a gap.
+fn jsonMemberAt(j: RowParser.Json, d: []const u8, from: usize, diff: usize, after: bool) ?[2]usize {
+    const end = d.len;
+    var at = from;
+    var after_value = after;
+    while (true) {
+        while (at < end and jsonGap(d[at])) at += 1;
+        if (at >= end or at > diff) return null;
+        if (d[at] != @as(u8, if (after_value) ',' else '{')) return null;
+        at += 1;
+        while (at < end and jsonGap(d[at])) at += 1;
+        if (at >= end or d[at] != '"' or at >= diff) return null;
+        const kq = at;
+        const kend, const escaped = skipJsonString(d, at, end);
+        if (escaped or kend >= end or kend >= diff) return null;
+        at = kend;
+        while (at < end and jsonGap(d[at])) at += 1;
+        if (at >= end or d[at] != ':') return null;
+        at += 1;
+        while (at < end and jsonGap(d[at])) at += 1;
+        if (at > diff) return null;
+        const v_end = jsonValueEnd(d, at, end);
+        if (v_end >= end or v_end <= at) return null;
+        if (diff < v_end) {
+            if (j.slotFor(d[kq + 1 .. kend - 1]) != null) return null;
+            return .{ at, v_end };
+        }
+        at = v_end;
+        after_value = true;
+    }
+}
+
 /// Skips a nested object or array, which is not a cell value.
 fn skipJsonNested(d: []const u8, from: usize, end: usize) usize {
     var pos = from;
