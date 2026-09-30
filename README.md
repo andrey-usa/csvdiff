@@ -85,14 +85,14 @@ values (`gen-data --columns 100`), sized so the CSV pair is about the bytes of
 the ten-million-row one — 3,449 MB against 3,509. Same key and `--ignore`, so
 the per-cell diff now covers 97 columns, and the ignored `updated_at` sits at
 column 20 of 100 rather than last. Same runner model, same workflow, 2026-09-30
-([run 36731199773](https://github.com/andrey-usa/csvdiff/actions/runs/36731199773),
-on `834bef1`). Each cell is **wall · CPU · memory above the mapped input**.
+([run 36741246747](https://github.com/andrey-usa/csvdiff/actions/runs/36741246747),
+on `b8efd42`). Each cell is **wall · CPU · memory above the mapped input**.
 
 | Format | Input | C | C++ | Rust | Zig |
 |---|---:|---|---|---|---|
-| CSV | 3,449 MB | **0.66s** · 2.4s · **126 MB** | 0.76s · 2.8s · 133 MB | 0.74s · 2.7s · 128 MB | 0.73s · **2.3s** · 135 MB |
-| ndjson | 7,191 MB | 3.26s · 12.8s · **126 MB** | 3.58s · 13.8s · 135 MB | 3.90s · 14.9s · 128 MB | **3.09s** · **11.1s** · 134 MB |
-| Parquet | 4,077 MB | **1.14s** · **4.3s** · 319 MB | 1.65s · 6.3s · 385 MB | 1.46s · 5.5s · 392 MB | 1.89s · 7.2s · **314 MB** |
+| CSV | 3,449 MB | **0.65s** · 2.4s · **126 MB** | 0.76s · 2.8s · 134 MB | 0.68s · 2.4s · 128 MB | 0.74s · **2.3s** · 136 MB |
+| ndjson | 7,191 MB | 2.00s · 7.7s · **126 MB** | **1.91s** · 7.3s · 133 MB | 2.28s · 8.6s · 128 MB | 1.93s · **6.7s** · 134 MB |
+| Parquet | 4,077 MB | **1.16s** · **4.4s** · 344 MB | 1.55s · 5.9s · 384 MB | 1.46s · 5.6s · 392 MB | 1.88s · 7.2s · **309 MB** |
 
 All four returned identical counts on all three formats — matched 1,998,000,
 changed 180,084, added 2,000, removed 2,000, duplicate keys 200 in A and 100 in
@@ -103,8 +103,8 @@ This is a separate run, so the caveat below the main table applies to setting
 the two side by side: only differences well past run-to-run noise (up to 20% on
 ndjson) mean anything.
 
-**CSV is now 1.43–1.62x faster wide than long at the same bytes.** C takes
-0.66s against 1.02s, Rust 0.74s against 1.20s, on 2.3–2.8 CPU-seconds against
+**CSV is now 1.43–1.76x faster wide than long at the same bytes.** C takes
+0.65s against 1.02s, Rust 0.68s against 1.20s, on 2.3–2.8 CPU-seconds against
 3.0–4.0. A fifth of the rows is a fifth of the keys to index and look up, and
 the row proof now settles the unchanged 91% without parsing them. The first run
 of this table
@@ -115,24 +115,30 @@ ignored `updated_at`, which differs on every row — so it failed on every row
 and each one was parsed and compared column by column. #229–#232 compare the
 wanted columns in runs and skip the ignored ones between them; the same data
 went 1.81s → 0.66s on C, 2.12s → 0.76s on C++, 2.10s → 0.74s on Rust and
-1.95s → 0.73s on Zig.
+1.95s → 0.73s on Zig
+([36731199773](https://github.com/andrey-usa/csvdiff/actions/runs/36731199773)).
 
-**ndjson did not move, and is still 1.19–1.42x slower than long** (C 2.72 →
-3.26s, Zig 2.59 → 3.09s). Its proof takes one span over every wanted value,
-which crosses the ignored value just as the CSV one did; that has not been
-changed. Zig is fastest and spends the least CPU, 11.1 seconds. The wide ndjson
-is 15% smaller than the long one because every value carries its key: `c021` is
-four characters, the standard names average eight.
+**ndjson is now 1.22–1.36x faster wide than long too** (C 2.72 → 2.00s, C++
+2.53 → 1.91s, Rust 2.79 → 2.28s, Zig 2.59 → 1.93s), on 6.7–8.6 CPU-seconds
+against 8.3–10.4. Until #234–#237 it was the other way round, 1.19–1.42x
+*slower* (C 3.26s, C++ 3.58s, Rust 3.90s, Zig 3.09s, on 11.1–14.9 CPU-seconds):
+its proof took one span over every wanted value, which crossed the ignored
+`updated_at` just as the CSV one did, and failed on every row. Now, at the first
+differing byte, the proof finds the member holding it; if that member is not
+compared, it skips the value in both rows and carries on. C++ is fastest and Zig
+spends the least CPU, 6.7 seconds. The wide ndjson is 15% smaller than the long
+one because every value carries its key: `c021` is four characters, the
+standard names average eight.
 
 **On the text formats, memory above the input follows rows, not bytes.**
-126–135 MB here against 591–735 MB at ten million rows: a fifth of the rows,
+126–136 MB here against 591–735 MB at ten million rows: a fifth of the rows,
 18–23% of the memory, on every port. Parquet's readers hold a quarter to a
-third of what they did (314–392 MB against 1,081–1,342), with twice the input.
+third of what they did (309–392 MB against 1,081–1,342), with twice the input.
 
-**Parquet is untouched by the change.** Random eight-digit values do not
+**Parquet is untouched by either change.** Random eight-digit values do not
 dictionary-encode, so the wide Parquet is twice the long one's bytes (4,077 MB
-against 2,074) — yet C is faster than on the long file (1.14s against 1.28s),
-and Rust about level. C leads by 1.28x over Rust and 1.66x over Zig, the widest
+against 2,074) — yet C is faster than on the long file (1.16s against 1.28s),
+and Rust about level. C leads by 1.26x over Rust and 1.62x over Zig, the widest
 spread in either table.
 
 ---
