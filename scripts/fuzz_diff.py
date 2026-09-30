@@ -178,8 +178,8 @@ def gen_ndjson(r: random.Random, d: Path) -> tuple[Path, Path, list[str]]:
 # seed's data. Values are unquoted and hold no delimiter, quote or newline, which
 # is what lets `must_refuse` below read the rows back without a CSV parser.
 
-NORMALISING_PORTS = ("rust", "cpp", "zig")  # the reference first: Rust folds Unicode
-ASCII_FOLDERS = frozenset({"cpp", "zig"})
+NORMALISING_PORTS = ("rust", "c", "cpp", "zig")  # the reference first: Rust folds Unicode
+ASCII_FOLDERS = frozenset({"c", "cpp", "zig"})
 WORDS = ("alpha", "Beta", "GAMMA", "delta", "x")
 OUTSIDE_ASCII = ("é", "É", "ß", "İ", "\u212a")  # the last is the Kelvin sign, which folds to "k"
 FLAG_CHOICES = (["--trim"], ["--ignore-case"], ["--empty-is-null"], ["--tolerance", "0.5"])

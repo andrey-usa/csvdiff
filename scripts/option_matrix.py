@@ -75,8 +75,12 @@ CASES: list[tuple[str, list[str], str | None]] = [
 
 # The ports that carry the normalisation flags, the reference first: Rust folds
 # Unicode, so its answer is the one the ASCII-only ports are held to.
-NORMALISING_PORTS = ["rust", "cpp", "zig"]
-ASCII_FOLDERS = {"cpp", "zig"}
+NORMALISING_PORTS = ["rust", "c", "cpp", "zig"]
+ASCII_FOLDERS = {"c", "cpp", "zig"}
+# The ports whose Parquet path does not carry the flags yet. They must refuse by
+# name, naming the first flag given, rather than compare the raw bytes.
+PARQUET_REFUSERS = {"c"}
+NORM_FLAGS = ("--trim", "--ignore-case", "--empty-is-null", "--tolerance")
 ALL_FOUR = ["--trim", "--ignore-case", "--empty-is-null", "--tolerance", "0.5"]
 NORMALISING = [["--trim"], ["--ignore-case"], ["--empty-is-null"], ["--tolerance", "0.5"], ALL_FOUR]
 FOLD = ROOT / "tests" / "fixtures" / "fold"
@@ -129,11 +133,12 @@ def run(port: str, a: Path, b: Path, flags: list[str], work: Path):
 
 
 def judge(results: dict, flags: list[str], must_name: str | None = None,
-          refusers: frozenset[str] = frozenset()) -> list[str]:
+          refusers: dict[str, str] | None = None) -> list[str]:
     """What is wrong with one invocation's results, against the first port's.
 
-    A port in `refusers` must refuse and name --ignore-case instead of agreeing."""
-    ref_port = next(iter(results))
+    A port in `refusers` must refuse, naming the option it maps to, instead of agreeing."""
+    refusers = refusers or {}
+    ref_port = next((p for p in results if p not in refusers), next(iter(results)))
     ref = results[ref_port]
     problems = []
     for p, (code, got, err, contract_problems) in results.items():
@@ -142,8 +147,8 @@ def judge(results: dict, flags: list[str], must_name: str | None = None,
         if p in refusers:
             if code != 2:
                 problems.append(f"{p} exits {code} on {' '.join(flags)}; it must refuse")
-            elif "--ignore-case" not in err:
-                problems.append(f"{p} refuses without naming --ignore-case: {first}")
+            elif refusers[p] not in err:
+                problems.append(f"{p} refuses without naming {refusers[p]}: {first}")
             continue
         if code != ref[0]:
             problems.append(f"{p} exits {code}, {ref_port} exits {ref[0]}" + (f" ({first})" if code > 1 else ""))
@@ -187,15 +192,22 @@ def main() -> int:
                             "--format", fmt], check=True, capture_output=True)
             pairs[fmt] = (work / f"m_a.{ext}", work / f"m_b.{ext}")
 
+        def norm_refusers(fmt: str, flags: list[str], fold_decides: bool) -> dict[str, str]:
+            """Who must refuse this normalising case, and the option each must name."""
+            out = {p: "--ignore-case" for p in ASCII_FOLDERS} if fold_decides else {}
+            if "parquet" in fmt:
+                first = next(f for f in flags if f in NORM_FLAGS)
+                out |= {p: first for p in PARQUET_REFUSERS}
+            return out
+
         # (format, label, a, b, flags, the ports in reference-first order, must_name, refusers)
-        plan = [(fmt, label, a, b, flags, ports, must_name, frozenset())
+        plan = [(fmt, label, a, b, flags, ports, must_name, {})
                 for fmt, (a, b) in pairs.items() for label, flags, must_name in CASES]
         norm_ports = [p for p in NORMALISING_PORTS if p in ports]
         if len(norm_ports) >= 2:
-            plan += [(fmt, " ".join(f), a, b, ["-k", KEY, *f], norm_ports, None, frozenset())
+            plan += [(fmt, " ".join(f), a, b, ["-k", KEY, *f], norm_ports, None, norm_refusers(fmt, f, False))
                      for fmt, (a, b) in pairs.items() for f in NORMALISING]
-            plan += [(f"fold, {fmt}", label, a, b, flags, norm_ports, None,
-                      frozenset(ASCII_FOLDERS) if refuse else frozenset())
+            plan += [(f"fold, {fmt}", label, a, b, flags, norm_ports, None, norm_refusers(fmt, flags, refuse))
                      for fmt, (a, b) in FOLD_PAIRS.items() for label, flags, refuse in FOLD_CASES]
 
         for fmt, label, a, b, flags, order, must_name, refusers in plan:

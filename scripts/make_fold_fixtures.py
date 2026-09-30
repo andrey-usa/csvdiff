@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Writes the pair `scripts/option_matrix.py` holds --ignore-case to outside ASCII.
 
-C++ and Zig fold case in ASCII only. They refuse a value outside it by name, but
+C, C++ and Zig fold case in ASCII only. They refuse a value outside it by name, but
 only where the fold decides the answer: in a key, or in a compared value that
 differs byte for byte between two matched rows. Rust folds Unicode and answers
 everything. So on one pair the ports must refuse or answer according to which
-columns take part, and where C++ and Zig answer they must give Rust's counts.
+columns take part, and where those three answer they must give Rust's counts.
 Generated data is pure ASCII and never reaches this, which is how the ports came
 to disagree on it unnoticed.
 
