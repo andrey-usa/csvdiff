@@ -167,6 +167,57 @@ if agree "$thr_dir/g1.json" "$thr_dir/g4.json" &&
 else
   echo "  FAIL  a split guessed inside a quoted field changed the answer"; fail=1
 fi
+# Past page cache the join runs inside A's sweep, joining every row as though it
+# were its key's first and taking back, afterwards, the rows that repeat a key.
+# CSVDIFF_FUSED_JOIN=1 takes that path at any size. The repeats here differ from
+# their key's first row -- in a compared value, or in being absent from B -- so a
+# repeat that was not taken back, or one taken back twice, changes the counts.
+python3 - "$thr_dir" <<'PY'
+import json, sys
+d = sys.argv[1]
+def rows(side):
+    out = []
+    for i in range(60000):
+        if side == "b" and i % 4001 == 0:
+            continue                                   # removed from B
+        v = i * 3 + (1 if side == "b" and i % 17 == 0 else 0)
+        out.append((f"K{i:06d}", str(v), "t"))
+        if i % 97 == 0:                                # a repeat that differs
+            out.append((f"K{i:06d}", str(v + 5), "u" if side == "a" else "t"))
+        if side == "b" and i % 131 == 0:               # repeats in B too
+            out.append((f"K{i:06d}", "0", "x"))
+    for i in range(30):
+        out.append((f"{side.upper()}ONLY{i:03d}", "1", "t"))
+    return out
+for side in ("a", "b"):
+    rs = rows(side)
+    with open(f"{d}/f_{side}.csv", "w") as f:
+        f.write("k,v,w\n")
+        f.writelines(f"{k},{v},{w}\n" for k, v, w in rs)
+    with open(f"{d}/f_{side}.ndjson", "w") as f:
+        f.writelines(json.dumps({"k": k, "v": v, "w": w}) + "\n" for k, v, w in rs)
+PY
+for ext in csv ndjson; do
+  for t in 1 4; do
+    ./csvdiff compare "$thr_dir/f_a.$ext" "$thr_dir/f_b.$ext" -k k --threads $t \
+        --json "$thr_dir/f_after.json" >/dev/null 2>&1 || true
+    CSVDIFF_FUSED_JOIN=1 ./csvdiff compare "$thr_dir/f_a.$ext" "$thr_dir/f_b.$ext" -k k \
+        --threads $t --json "$thr_dir/f_inside.json" >/dev/null 2>&1 || true
+    if agree "$thr_dir/f_after.json" "$thr_dir/f_inside.json"; then
+      printf '  ok    %s, %s thread(s): the join inside the sweep finds what the join after it finds\n' "$ext" "$t"
+    else
+      printf '  FAIL  %s, %s thread(s): the join inside the sweep disagrees\n' "$ext" "$t"; fail=1
+    fi
+  done
+  code=0
+  out=$(CSVDIFF_FUSED_JOIN=1 CSVDIFF_VERIFY_ADDED=1 ./csvdiff compare "$thr_dir/f_a.$ext" \
+      "$thr_dir/f_b.$ext" -k k 2>&1 >/dev/null) || code=$?
+  if [ "$code" -le 1 ] && [ -z "$out" ]; then
+    printf '  ok    %s: added derived inside the sweep matches the pass that counts it\n' "$ext"
+  else
+    printf '  FAIL  %s: added inside the sweep: %s\n' "$ext" "${out:-exit $code}"; fail=1
+  fi
+done
 rm -rf "$thr_dir"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 if [ "$with_ports" = 1 ]; then

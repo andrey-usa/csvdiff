@@ -1216,6 +1216,11 @@ typedef struct {
     Field *probe;      /* re-used by every lookup, so a probe is not an allocation */
     Field *probe2;     /* the other side of a lazy equality check, same reason */
     int64_t dup_keys, dup_rows;
+    /* Rows that repeat a key already seen, in file order -- only when the
+     * build was given a sink, which joined them as if each were its key's
+     * first and needs them to take that back. */
+    int32_t *later;
+    size_t n_later, later_cap;
     bool failed;       /* a field too long for the packed length */
     const Norm *norm;  /* text normalisation for key comparison; NULL for none */
 } RowIndex;
@@ -1365,6 +1370,18 @@ static bool chunk_push(Chunk *c, size_t start, uint64_t hash) {
     return true;
 }
 
+/*
+ * What the sweep hands each row to, when the join runs inside it: the row's
+ * bytes, from its start to the next row's, and its key hash. `k` is the row's
+ * position in its chunk, for the proof's backoff. `reset` clears a part's
+ * counts when a wrong split guess makes the sweep start over.
+ */
+typedef struct {
+    void (*row)(void *ctx, unsigned part, size_t lo, size_t hi, uint64_t hash, size_t k);
+    void (*reset)(void *ctx, unsigned part);
+    void *ctx;
+} RowSink;
+
 typedef struct {
     const Slab      *slab;
     const RowParser *parser;
@@ -1372,6 +1389,7 @@ typedef struct {
     const size_t    *bounds;
     Chunk           *chunk;
     const Norm      *norm;
+    const RowSink   *sink;
     /* Per-thread timing, nanoseconds. Aggregated after the join. */
     uint64_t        *parse_ns;
     uint64_t        *hash_ns;
@@ -1434,10 +1452,26 @@ static void sweep_part(void *vctx, unsigned p) {
         if (!chunk_push(out, pos, hash)) { out->oom = true; break; }
         if (timed) t_push += now_ns() - t0;
         n_rows++;
+        /* The row before this one ends where this one starts, which is what
+         * the index will say its end is; its pages are still in memory. */
+        if (c->sink && out->n >= 2)
+            c->sink->row(c->sink->ctx, p, out->start[out->n - 2], pos, out->hash[out->n - 2],
+                         out->n - 2);
         if (next <= pos) break; /* no progress: a malformed tail, not an endless loop */
         pos = next;
     }
     out->stopped = pos;
+    /* The chunk's last row ends where the next row in the file starts: past
+     * the blank lines the next chunk will skip, or at the end of the file. */
+    if (c->sink && out->n >= 1 && !out->failed && !out->oom) {
+        size_t e = pos;
+        while (e < end) {
+            if (d[e] == '\n') e++;
+            else if (d[e] == '\r' && e + 1 < end && d[e + 1] == '\n') e += 2;
+            else break;
+        }
+        c->sink->row(c->sink->ctx, p, out->start[out->n - 1], e, out->hash[out->n - 1], out->n - 1);
+    }
     free(fields);
     if (timed) {
         c->parse_ns[p] = t_parse;
@@ -1464,7 +1498,8 @@ static void sweep_part(void *vctx, unsigned p) {
  * thousand parses rather than ten million.
  */
 static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser, size_t from,
-                        size_t key_size, unsigned threads, const Norm *norm) {
+                        size_t key_size, unsigned threads, const Norm *norm,
+                        const RowSink *sink) {
     memset(ix, 0, sizeof *ix);
     ix->slab = slab;
     ix->parser = parser;
@@ -1487,7 +1522,7 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     uint64_t *t_hash = timed ? calloc(threads, sizeof *t_hash) : NULL;
     uint64_t *t_push = timed ? calloc(threads, sizeof *t_push) : NULL;
     uint64_t *t_rows = timed ? calloc(threads, sizeof *t_rows) : NULL;
-    SweepCtx sc = { slab, parser, key_size, bounds, chunks, norm,
+    SweepCtx sc = { slab, parser, key_size, bounds, chunks, norm, sink,
                     t_parse, t_hash, t_push, t_rows };
 
     /*
@@ -1519,6 +1554,9 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     if (!held) {
         for (unsigned p = 0; p < ways; p++) { free(chunks[p].start); free(chunks[p].hash); }
         memset(chunks, 0, threads * sizeof *chunks);
+        /* Whatever the sink was handed came from rows that were not rows. */
+        if (sink)
+            for (unsigned p = 0; p < threads; p++) sink->reset(sink->ctx, p);
         ways = chunk_bounds(slab, from, threads, bounds, true);
         run_parts(sweep_part, &sc, ways);
     }
@@ -1634,6 +1672,18 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
                         ix->dup_rows++;  /* the first occurrence counts once the key repeats */
                     }
                     ix->dup_rows++;
+                    if (sink) {
+                        if (ix->n_later == ix->later_cap) {
+                            const size_t next = ix->later_cap ? ix->later_cap * 2 : 1024;
+                            if (budget_take((next - ix->later_cap) * sizeof *ix->later) != 0)
+                                return false;
+                            int32_t *grown = realloc(ix->later, next * sizeof *grown);
+                            if (!grown) return false;
+                            ix->later = grown;
+                            ix->later_cap = next;
+                        }
+                        ix->later[ix->n_later++] = (int32_t)r;
+                    }
                     break;
                 }
             }
@@ -1659,7 +1709,7 @@ typedef struct {
 static void build_part(void *vctx, unsigned p) {
     BuildCtx *c = vctx;
     c->ok[p] = index_build(c->ix[p], c->slab[p], c->parser[p], c->from[p], c->key_size,
-                           c->threads, c->norm);
+                           c->threads, c->norm, NULL);
 }
 
 /*
@@ -1940,6 +1990,7 @@ typedef struct {
     int64_t *col_changed, *col_blanked, *col_filled;
     Field   *fa, *fb, *probe;
     size_t  *seg_lo, *seg_len;   /* this row's runs of wanted columns, for the gapped proof */
+    unsigned refused;            /* the proof's backoff, when rows arrive from the sweep */
     bool     oom;
     char     pad[64];
 } CmpPart;
@@ -2161,9 +2212,7 @@ static int32_t lookup_by_segments(const CmpCtx *c, const CmpPart *out, uint64_t 
  * this row cannot be proven that way. Through the byte that closes the last
  * value either file wants, for the reason the CSV proof below gives.
  */
-static size_t proof_span(const CmpCtx *c, int32_t row, const Field *fa) {
-    const size_t a_lo = (size_t)c->ai->row_start[row];
-    const size_t a_end = row_end(c->ai, row);
+static size_t proof_span(const CmpCtx *c, size_t a_lo, size_t a_end, const Field *fa) {
     size_t t = a_lo;
     if (c->json) {
         for (size_t i = 0; i < c->width; i++) {
@@ -2181,11 +2230,9 @@ static size_t proof_span(const CmpCtx *c, int32_t row, const Field *fa) {
     return t < a_end ? t + 1 - a_lo : 0;
 }
 
-static void compare_part(void *vctx, unsigned p) {
-    CmpCtx *c = vctx;
-    CmpPart *out = &c->parts[p];
-    const size_t key_size = c->key_size, nc = c->nc;
-
+/* A part's scratch. False, and the part marked, when there is no memory. */
+static bool part_init(const CmpCtx *c, CmpPart *out) {
+    const size_t nc = c->nc;
     out->fa = malloc(c->width * sizeof *out->fa);
     out->fb = malloc(c->width * sizeof *out->fb);
     out->probe = malloc(c->width * sizeof *out->probe);
@@ -2199,8 +2246,146 @@ static void compare_part(void *vctx, unsigned p) {
     if (!out->fa || !out->fb || !out->probe || !out->col_changed || !out->col_blanked ||
         !out->col_filled || (c->nseg > 1 && (!out->seg_lo || !out->seg_len))) {
         out->oom = true;
+        return false;
+    }
+    return true;
+}
+
+/*
+ * One row of A against its mate in B, counted into `out`: matched or removed,
+ * and if matched, changed or not and in which columns. The row is the bytes
+ * from `row_lo` to `row_hi`, the next row's start, as `row_end` gives it.
+ * `k` and `refused` are the proof's backoff; they decide only how the answer
+ * is reached, never what it is.
+ */
+static void join_row(const CmpCtx *c, CmpPart *out, size_t row_lo, size_t row_hi, uint64_t hash,
+                     size_t k, unsigned *refused) {
+    const size_t key_size = c->key_size, nc = c->nc;
+    const bool attempt = *refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0;
+    /*
+     * The proof's span without the parse: the guard's delimiter sits a
+     * fixed count past the keys, countable with the delimiter cursor
+     * alone. Most rows prove out here and never pay for fields; a row
+     * the bytes do not settle is parsed below.
+     */
+    if (attempt && c->guard_commas > 0) {
+        const size_t a_lo = row_lo;
+        const size_t a_hi = row_hi;
+        bool proven = false, tried = false;
+        int32_t mate = -1;
+        if (c->nseg > 1) {
+            tried = segments_of(c, out, a_lo, a_hi);
+            if (tried) mate = lookup_by_segments(c, out, hash, &proven);
+        } else {
+            const size_t need =
+                guard_span(c->a->data, a_lo, a_hi, c->delim, c->guard_commas);
+            tried = need != 0;
+            if (tried)
+                mate = index_lookup_proof(c->bi, c->a, NULL, hash, out->probe,
+                                          c->a->data + a_lo, need, a_hi, false, &proven);
+        }
+        if (tried) {
+            if (mate < 0) { out->removed++; return; }
+            if (proven) { out->matched++; *refused = 0; return; }
+            /*
+             * A candidate the bytes did not settle: parse and let the
+             * key check confirm it, which also covers the hash
+             * collision the deferred check skipped past.
+             */
+            parse_row(c->ai->parser, c->a->data, row_lo, c->a->size, out->fa);
+            const int32_t mate2 =
+                index_lookup(c->bi, c->a, out->fa, hash, out->probe);
+            if (mate2 < 0) { out->removed++; return; }
+            out->matched++;
+            if (*refused < PROOF_BACKOFF) (*refused)++;
+            compare_mate(c, out, mate2);
+            return;
+        }
+    }
+    parse_row(c->ai->parser, c->a->data, row_lo, c->a->size, out->fa);
+    const size_t need = attempt && c->keys_in_proof ? proof_span(c, row_lo, row_hi, out->fa) : 0;
+    if (need) {
+        bool proven = false;
+        const int32_t mate = index_lookup_proof(
+            c->bi, c->a, out->fa, hash, out->probe,
+            c->a->data + row_lo, need, row_hi,
+            c->json, &proven);
+        if (mate < 0) { out->removed++; return; }
+        out->matched++;
+        if (proven) { *refused = 0; return; }
+        if (*refused < PROOF_BACKOFF) (*refused)++;
+        compare_mate(c, out, mate);
         return;
     }
+    const int32_t mate = index_lookup(c->bi, c->a, out->fa, hash, out->probe);
+    if (mate < 0) { out->removed++; return; }
+    out->matched++;
+    if (c->json &&
+        (*refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0)) {
+        const size_t a_lo = row_lo;
+        const size_t b_lo = (size_t)c->bi->row_start[mate];
+        const size_t a_end = row_hi;
+        const size_t b_n = row_end(c->bi, mate) - b_lo;
+        /* Through the byte that closes the last compared value --
+         * whichever it turns out to be, since objects need not list
+         * their names in the same order twice. */
+        size_t t = a_lo;
+        for (size_t i = 0; i < nc; i++) {
+            const Field x = out->fa[key_size + i];
+            if (!field_real(x)) continue;
+            const size_t e = field_off(x) + field_len(x);
+            if (e > t) t = e;
+        }
+        const size_t need = t + 1 - a_lo;
+        if (t < a_end && json_rows_match(c->bi->parser, c->a->data, a_lo, a_end, need,
+                                         c->b->data, b_lo, b_lo + b_n)) {
+            *refused = 0;
+            return;
+        }
+        if (*refused < PROOF_BACKOFF) (*refused)++;
+    }
+    /*
+     * A proof that keeps failing is a scan for nothing -- two files
+     * where every row really has changed pay for it on every row. So
+     * after PROOF_BACKOFF failures in a row it is only attempted every
+     * PROOF_BACKOFF rows, until one succeeds and it is on again.
+     */
+    const Field g = c->aligned ? out->fa[c->guard] : ABSENT;
+    if (c->aligned && field_real(g) &&
+        (*refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0)) {
+        const size_t a_lo = row_lo;
+        const size_t b_lo = (size_t)c->bi->row_start[mate];
+        /*
+         * How far the two rows have to agree: through the byte that
+         * closes the last compared column, and no further -- whatever
+         * trails it is ignored, and reading it is work for nothing.
+         *
+         * Through the closing byte, not up to it. Agreeing as far as
+         * the field's last byte says only that the mate's field starts
+         * the same way: `cc` is a prefix of `cccccccc`, and a quoted
+         * field the mate carries on with a doubled quote reads the same
+         * that far too. It is the delimiter or the line ending after it
+         * that says the mate's field stopped where this one did.
+         */
+        const char *d = c->a->data;
+        const size_t a_end = row_hi;
+        size_t t = field_off(g) + field_len(g);
+        while (t < a_end && d[t] != c->delim && d[t] != '\n' && d[t] != '\r') t++;
+        const size_t need = t + 1 - a_lo;
+        if (t < a_end && need <= row_end(c->bi, mate) - b_lo &&
+            common_prefix(d + a_lo, c->b->data + b_lo, need) == need) {
+            *refused = 0;
+            return;
+        }
+        if (*refused < PROOF_BACKOFF) (*refused)++;
+    }
+    compare_mate(c, out, mate);
+}
+
+static void compare_part(void *vctx, unsigned p) {
+    CmpCtx *c = vctx;
+    CmpPart *out = &c->parts[p];
+    if (!part_init(c, out)) return;
 
     if (p < c->ways) {
         const size_t lo = c->ai->keys * p / c->ways, hi = c->ai->keys * (p + 1) / c->ways;
@@ -2215,125 +2400,8 @@ static void compare_part(void *vctx, unsigned p) {
                     &c->bi->table[slot_of(c->bi,
                                           c->ai->row_hash[c->ai->first_row[k + PREFETCH_AHEAD]])],
                     0, 0);
-            const bool attempt = refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0;
-            /*
-             * The proof's span without the parse: the guard's delimiter sits a
-             * fixed count past the keys, countable with the delimiter cursor
-             * alone. Most rows prove out here and never pay for fields; a row
-             * the bytes do not settle is parsed below.
-             */
-            if (attempt && c->guard_commas > 0) {
-                const size_t a_lo = (size_t)c->ai->row_start[row];
-                const size_t a_hi = row_end(c->ai, row);
-                bool proven = false, tried = false;
-                int32_t mate = -1;
-                if (c->nseg > 1) {
-                    tried = segments_of(c, out, a_lo, a_hi);
-                    if (tried) mate = lookup_by_segments(c, out, hash, &proven);
-                } else {
-                    const size_t need =
-                        guard_span(c->a->data, a_lo, a_hi, c->delim, c->guard_commas);
-                    tried = need != 0;
-                    if (tried)
-                        mate = index_lookup_proof(c->bi, c->a, NULL, hash, out->probe,
-                                                  c->a->data + a_lo, need, a_hi, false, &proven);
-                }
-                if (tried) {
-                    if (mate < 0) { out->removed++; continue; }
-                    if (proven) { out->matched++; refused = 0; continue; }
-                    /*
-                     * A candidate the bytes did not settle: parse and let the
-                     * key check confirm it, which also covers the hash
-                     * collision the deferred check skipped past.
-                     */
-                    index_fields(c->ai, row, out->fa);
-                    const int32_t mate2 =
-                        index_lookup(c->bi, c->a, out->fa, hash, out->probe);
-                    if (mate2 < 0) { out->removed++; continue; }
-                    out->matched++;
-                    if (refused < PROOF_BACKOFF) refused++;
-                    compare_mate(c, out, mate2);
-                    continue;
-                }
-            }
-            index_fields(c->ai, row, out->fa);
-            const size_t need = attempt && c->keys_in_proof ? proof_span(c, row, out->fa) : 0;
-            if (need) {
-                bool proven = false;
-                const int32_t mate = index_lookup_proof(
-                    c->bi, c->a, out->fa, hash, out->probe,
-                    c->a->data + (size_t)c->ai->row_start[row], need, row_end(c->ai, row),
-                    c->json, &proven);
-                if (mate < 0) { out->removed++; continue; }
-                out->matched++;
-                if (proven) { refused = 0; continue; }
-                if (refused < PROOF_BACKOFF) refused++;
-                compare_mate(c, out, mate);
-                continue;
-            }
-            const int32_t mate = index_lookup(c->bi, c->a, out->fa, hash, out->probe);
-            if (mate < 0) { out->removed++; continue; }
-            out->matched++;
-            if (c->json &&
-                (refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0)) {
-                const size_t a_lo = (size_t)c->ai->row_start[row];
-                const size_t b_lo = (size_t)c->bi->row_start[mate];
-                const size_t a_end = row_end(c->ai, row);
-                const size_t b_n = row_end(c->bi, mate) - b_lo;
-                /* Through the byte that closes the last compared value --
-                 * whichever it turns out to be, since objects need not list
-                 * their names in the same order twice. */
-                size_t t = a_lo;
-                for (size_t i = 0; i < nc; i++) {
-                    const Field x = out->fa[key_size + i];
-                    if (!field_real(x)) continue;
-                    const size_t e = field_off(x) + field_len(x);
-                    if (e > t) t = e;
-                }
-                const size_t need = t + 1 - a_lo;
-                if (t < a_end && json_rows_match(c->bi->parser, c->a->data, a_lo, a_end, need,
-                                                 c->b->data, b_lo, b_lo + b_n)) {
-                    refused = 0;
-                    continue;
-                }
-                if (refused < PROOF_BACKOFF) refused++;
-            }
-            /*
-             * A proof that keeps failing is a scan for nothing -- two files
-             * where every row really has changed pay for it on every row. So
-             * after PROOF_BACKOFF failures in a row it is only attempted every
-             * PROOF_BACKOFF rows, until one succeeds and it is on again.
-             */
-            const Field g = c->aligned ? out->fa[c->guard] : ABSENT;
-            if (c->aligned && field_real(g) &&
-                (refused < PROOF_BACKOFF || (k & (PROOF_BACKOFF - 1)) == 0)) {
-                const size_t a_lo = (size_t)c->ai->row_start[row];
-                const size_t b_lo = (size_t)c->bi->row_start[mate];
-                /*
-                 * How far the two rows have to agree: through the byte that
-                 * closes the last compared column, and no further -- whatever
-                 * trails it is ignored, and reading it is work for nothing.
-                 *
-                 * Through the closing byte, not up to it. Agreeing as far as
-                 * the field's last byte says only that the mate's field starts
-                 * the same way: `cc` is a prefix of `cccccccc`, and a quoted
-                 * field the mate carries on with a doubled quote reads the same
-                 * that far too. It is the delimiter or the line ending after it
-                 * that says the mate's field stopped where this one did.
-                 */
-                const char *d = c->a->data;
-                const size_t a_end = row_end(c->ai, row);
-                size_t t = field_off(g) + field_len(g);
-                while (t < a_end && d[t] != c->delim && d[t] != '\n' && d[t] != '\r') t++;
-                const size_t need = t + 1 - a_lo;
-                if (t < a_end && need <= row_end(c->bi, mate) - b_lo &&
-                    common_prefix(d + a_lo, c->b->data + b_lo, need) == need) {
-                    refused = 0;
-                    continue;
-                }
-                if (refused < PROOF_BACKOFF) refused++;
-            }
-            compare_mate(c, out, mate);
+            join_row(c, out, (size_t)c->ai->row_start[row], row_end(c->ai, row), hash, k,
+                     &refused);
         }
         return;
     }
@@ -2353,12 +2421,67 @@ static void compare_part(void *vctx, unsigned p) {
     }
 }
 
+/*
+ * The join inside A's sweep. See `fused` in main. Each row is joined as the
+ * sweep finds it, as though it were the first row of its key; `fix_part` then
+ * takes back the rows the insertion found repeating one.
+ */
+static void fused_row(void *ctx, unsigned p, size_t lo, size_t hi, uint64_t hash, size_t k) {
+    const CmpCtx *c = ctx;
+    CmpPart *out = &c->parts[p];
+    if (!out->oom) join_row(c, out, lo, hi, hash, k, &out->refused);
+}
+
+static void fused_reset(void *ctx, unsigned p) {
+    const CmpCtx *c = ctx;
+    CmpPart *out = &c->parts[p];
+    const size_t n = c->nc ? c->nc : 1;
+    out->matched = out->changed = out->removed = 0;
+    out->refused = 0;
+    if (out->col_changed) memset(out->col_changed, 0, n * sizeof *out->col_changed);
+    if (out->col_blanked) memset(out->col_blanked, 0, n * sizeof *out->col_blanked);
+    if (out->col_filled) memset(out->col_filled, 0, n * sizeof *out->col_filled);
+}
+
+/* The rows that repeat a key, joined again into parts of their own, to be
+ * subtracted: the same bytes against the same index give the same counts. */
+typedef struct {
+    const CmpCtx *cc;
+    CmpPart      *parts;
+    unsigned      ways;
+} FixCtx;
+
+static void fix_part(void *vctx, unsigned p) {
+    const FixCtx *f = vctx;
+    const CmpCtx *c = f->cc;
+    CmpPart *out = &f->parts[p];
+    const RowIndex *ai = c->ai;
+    const size_t lo = ai->n_later * p / f->ways, hi = ai->n_later * (p + 1) / f->ways;
+    for (size_t i = lo; i < hi && !out->oom; i++) {
+        const int32_t row = ai->later[i];
+        join_row(c, out, (size_t)ai->row_start[row], row_end(ai, row), ai->row_hash[row], i,
+                 &out->refused);
+    }
+}
+
+/* B's half, when CSVDIFF_VERIFY_ADDED asks for it, after a fused join. */
+static void b_pass(void *vctx, unsigned p) {
+    CmpCtx *c = vctx;
+    compare_part(vctx, c->ways + p);
+}
+
+static int fused_forced(void) {
+    const char *v = getenv("CSVDIFF_FUSED_JOIN");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
 static void index_free(RowIndex *ix) {
     free(ix->row_start);
     free(ix->row_hash);
     free(ix->table);
     free(ix->first_row);
     free(ix->occurrences);
+    free(ix->later);
     free(ix->probe);
     free(ix->probe2);
 }
@@ -2859,6 +2982,33 @@ int main(int argc, char **argv) {
         goto done;
     }
 
+    /*
+     * Past page cache the join runs inside A's sweep instead of after it.
+     *
+     * Past memory every pass is a read from disk, and the join used to be the
+     * fourth: A's sweep, B's sweep, then both files again, front to back, for
+     * the rows to compare -- on the 150M pair 131s of a 274s run, the time a
+     * cold read of both files takes. Built first, B's index is all the join
+     * needs from B, so A's rows can be joined as A's sweep finds them, while
+     * their pages are still in memory, and A is read once instead of twice.
+     *
+     * The catch is repeated keys. The join compares a key's first row, and
+     * which row is first is only known once the insertion has seen them all.
+     * So every row is joined as though it were first, and the rows that turn
+     * out to repeat a key -- `later`, recorded by the insertion -- are joined
+     * again afterwards and subtracted. Counts are sums, so that is exact.
+     *
+     * Not with the normalisation flags: --ignore-case can refuse the whole run
+     * from inside a comparison, and a row that is later found to repeat a key
+     * would have refused for a row the join never compares.
+     *
+     * CSVDIFF_FUSED_JOIN=1 takes this path at any size, which is how the tests
+     * reach it.
+     */
+    const unsigned all_threads = threads ? threads : cpu_count();
+    const bool fused =
+        !norm && ((a.size + b.size > (size_t)8 << 30 && all_threads > 1) || fused_forced());
+
     {
         /*
          * Both files at once, each on half the budget -- except when the input
@@ -2889,13 +3039,16 @@ int main(int argc, char **argv) {
              * the threads.
              */
             bc.threads = budget ? budget : 1;
-            build_part(&bc, 0);
+            if (!fused) build_part(&bc, 0);
+            build_part(&bc, 1);
+        } else if (fused) {
+            bc.threads = budget ? budget : 1;
             build_part(&bc, 1);
         } else {
             run_parts(build_part, &bc, 2);
         }
-        phase_mark(&whole, "both indexes");
-        if (!bc.ok[0] || !bc.ok[1]) {
+        phase_mark(&whole, fused ? "B index" : "both indexes");
+        if ((!fused && !bc.ok[0]) || !bc.ok[1]) {
             if (budget_exceeded()) fail_budget();
             else fail(ai.failed || bi.failed ? "a field is larger than this engine packs"
                                              : "out of memory");
@@ -2906,11 +3059,15 @@ int main(int argc, char **argv) {
     int64_t matched = 0, changed = 0, added = 0, removed = 0;
     {
         unsigned budget = threads ? threads : cpu_count();
-        unsigned ways = ai.keys < (1u << 14) ? 1u : budget;
+        /* Fused, A's keys are not counted yet: one part a sweep thread. */
+        unsigned ways = fused ? (all_threads ? all_threads : 1)
+                              : (ai.keys < (1u << 14) ? 1u : budget);
         /* The B pass only runs when it is being used to check the derivation. */
         const int verify = verify_added();
         unsigned b_ways = !verify ? 0u : (bi.keys < (1u << 14) ? 1u : budget);
-        CmpPart *parts = calloc(ways + b_ways, sizeof *parts);
+        /* Fused, another `ways` parts at the end hold what is taken back. */
+        const unsigned n_parts = ways + b_ways + (fused ? ways : 0);
+        CmpPart *parts = calloc(n_parts, sizeof *parts);
         if (!parts) { fail("out of memory"); goto done; }
         /*
          * Can a prefix prove a row equal? Only where both files are CSV read
@@ -2965,30 +3122,53 @@ int main(int argc, char **argv) {
                           ? (int)(a_src[width - 1] + 1)
                           : 0,
                       norm, nseg, runs, runs ? runs + a_src[width - 1] + 2 : NULL };
-        run_parts(compare_part, &cc, ways + b_ways);
+        bool built = true;
+        if (fused) {
+            bool ok = true;
+            for (unsigned p = 0; p < ways; p++) ok = part_init(&cc, &parts[p]) && ok;
+            const RowSink sink = { fused_row, fused_reset, &cc };
+            built = ok && index_build(&ai, &a, &ap, a_start, key_size, ways, norm, &sink);
+            phase_mark(&whole, "A index, joined as it was read");
+            if (built) {
+                FixCtx fx = { &cc, parts + ways + b_ways, ways };
+                for (unsigned p = 0; p < ways; p++) part_init(&cc, &fx.parts[p]);
+                run_parts(fix_part, &fx, ways);
+                if (b_ways) run_parts(b_pass, &cc, b_ways);
+                phase_mark(&whole, "repeated keys taken back");
+            }
+        } else {
+            run_parts(compare_part, &cc, ways + b_ways);
+            phase_mark(&whole, "join and compare");
+        }
         free(runs);
-        phase_mark(&whole, "join and compare");
 
         bool oom = false;
-        for (unsigned p = 0; p < ways + b_ways; p++) {
+        for (unsigned p = 0; p < n_parts; p++) {
             const CmpPart *q = &parts[p];
+            /* The parts past `ways + b_ways` are the taken-back rows. */
+            const int64_t sign = p < ways + b_ways ? 1 : -1;
             oom = oom || q->oom;
-            matched += q->matched;
-            changed += q->changed;
-            removed += q->removed;
-            added += q->added;
+            matched += sign * q->matched;
+            changed += sign * q->changed;
+            removed += sign * q->removed;
+            added += sign * q->added;
             for (size_t i = 0; i < nc && q->col_changed; i++) {
-                col_changed[i] += q->col_changed[i];
-                col_blanked[i] += q->col_blanked[i];
-                col_filled[i] += q->col_filled[i];
+                col_changed[i] += sign * q->col_changed[i];
+                col_blanked[i] += sign * q->col_blanked[i];
+                col_filled[i] += sign * q->col_filled[i];
             }
         }
-        for (unsigned p = 0; p < ways + b_ways; p++) {
+        for (unsigned p = 0; p < n_parts; p++) {
             free(parts[p].fa); free(parts[p].fb); free(parts[p].probe);
             free(parts[p].seg_lo); free(parts[p].seg_len);
             free(parts[p].col_changed); free(parts[p].col_blanked); free(parts[p].col_filled);
         }
         free(parts);
+        if (!built) {
+            if (budget_exceeded()) fail_budget();
+            else fail(ai.failed ? "a field is larger than this engine packs" : "out of memory");
+            goto done;
+        }
         if (oom) { fail("out of memory"); goto done; }
         if (atomic_load(&fold_refused)) {
             fail("--ignore-case on a field outside ASCII needs Unicode case folding, which "
