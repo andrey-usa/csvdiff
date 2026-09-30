@@ -2673,6 +2673,14 @@ int main(int argc, char **argv) {
         BuildCtx bc = { { &ai, &bi }, { &a, &b }, { &ap, &bp }, { a_start, b_start },
                         key_size, budget > 1 ? budget / 2 : 1, norm, { false, false } };
         if (a.size + b.size > (size_t)8 << 30) {
+            /*
+             * Alone on the machine: the sweep inside each build gets the whole
+             * budget, not the half the parallel overlap divides. Halving here
+             * would leave half the cores idle through both sweeps for no
+             * reason -- the point of going sequential was the page cache, not
+             * the threads.
+             */
+            bc.threads = budget ? budget : 1;
             build_part(&bc, 0);
             build_part(&bc, 1);
         } else {
