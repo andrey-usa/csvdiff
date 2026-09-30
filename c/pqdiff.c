@@ -65,10 +65,11 @@ static void map_close(Map *m) {
 /* ------------------------------------------------------------------------- */
 /* Values                                                                      */
 /*                                                                             */
-/* This port carries no --trim, --ignore-case or --tolerance, for the reason    */
-/* README.md gives, so a value is its bytes and nothing has to be normalised    */
-/* before it is compared. Absent is null or empty, the same rule the CSV path   */
-/* uses, so the two paths agree on which cells count as blanked and filled.     */
+/* This path carries no --trim, --ignore-case, --empty-is-null or --tolerance  */
+/* yet -- the caller refuses them by name before it gets here -- so a value is  */
+/* its bytes and nothing is normalised before it is compared. Absent is null    */
+/* or empty, the same rule the CSV path uses without the options, so the two    */
+/* paths agree on which cells count as blanked and filled.                      */
 /* ------------------------------------------------------------------------- */
 
 typedef struct {

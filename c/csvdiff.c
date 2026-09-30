@@ -22,6 +22,8 @@
 #define _GNU_SOURCE
 #include <ctype.h>
 #include <fcntl.h>
+#include <math.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #if defined(__SSE2__) || defined(__AVX2__)
@@ -43,19 +45,35 @@
 #include "pqdiff.h"
 
 /*
- * Text normalisation options: --trim, --ignore-case, --empty-is-null (which is
- * C's default: is_absent already treats empty as absent), --tolerance.
+ * Text normalisation options: --trim, --ignore-case, --empty-is-null and
+ * --tolerance, with the answers the other three ports give.
  *
- * The normalisation is applied where the bytes are read: the key hash folds
- * over the normalised bytes, and cell comparison uses the normalised form.
- * --tolerance is different: it applies at comparison time, where both sides
- * parse as numbers.
+ * An empty value is absent whatever the options. --empty-is-null adds one case:
+ * under --trim, a value that trims to nothing is absent too; without it, that
+ * value is "", which is present. --tolerance compares two values that both read
+ * as numbers -- after trimming whitespace, and by the same strict rule as the
+ * other ports, so "inf" and "0x1p3" are text -- and --ignore-case folds ASCII.
+ *
+ * A byte outside ASCII under --ignore-case is refused by name where the fold
+ * would decide the answer: in a key, or in a compared value that differs from
+ * its mate byte for byte. That is the rule C++ and Zig follow; folding such a
+ * value partially would make CAFE with an acute differ from its lower case here
+ * and not in Rust, with nothing in the output to say why. The refusal is raised
+ * from inside the parallel parts, so it is a flag they set and the run checks
+ * before it reports.
+ *
+ * A run that uses none of the four passes no Norm at all: a null pointer is
+ * one test per cell the compiler keeps in a register, where the fields of a
+ * struct are loads it repeats past every counter the loop writes.
  */
 typedef struct {
     bool   trim;
     bool   ignore_case;
+    bool   empty_is_null;
     double tolerance;
 } Norm;
+
+static atomic_bool fold_refused;
 
 /* ------------------------------------------------------------------------- */
 /* A field packed into one word: offset, length, and whether it needs           */
@@ -576,36 +594,82 @@ static bool same_bytes(const Slab *a, Field x, const Slab *b, Field y) {
  * before comparing; --tolerance applies where both sides parse as numbers.
  */
 static size_t norm_copy(const Slab *s, Field f, const Norm *n, char *out, size_t cap);
-static bool same_norm(const Slab *a, Field x, const Slab *b, Field y, const Norm *n) {
-    if (!n->trim && !n->ignore_case && n->tolerance <= 0.0)
-        return same_bytes(a, x, b, y);
-    /* --tolerance: if both sides parse as doubles, compare within tolerance. */
-    if (n->tolerance > 0.0 && field_real(x) && field_real(y)) {
-        char sx[4096], sy[4096];
-        size_t lx = norm_copy(a, x, n, sx, sizeof sx - 1);
-        size_t ly = norm_copy(b, y, n, sy, sizeof sy - 1);
-        if (lx != (size_t)-1 && ly != (size_t)-1) {
-            sx[lx] = '\0'; sy[ly] = '\0';
-            char *ex, *ey;
-            double dx = strtod(sx, &ex), dy = strtod(sy, &ey);
-            if (*ex == '\0' && *ey == '\0') {
-                double d = dx - dy;
-                if (d < 0) d = -d;
-                return d <= n->tolerance;
-            }
-        }
+
+/*
+ * A value as a number, for --tolerance, by the rule every port uses: whitespace
+ * around it is ignored, and what is left is an optional sign, then a digit or a
+ * point, then only digits, points, exponents and signs -- which is stricter than
+ * strtod, so "inf", "nan" and "0x10" stay text -- and it must read to a finite
+ * double in full.
+ */
+static bool as_number(const Slab *s, Field f, double *out) {
+    char buf[4096];
+    const size_t len = logical_len(s, f);
+    if (len >= sizeof buf) return false;
+    logical_copy(s, f, buf, sizeof buf);
+    size_t lo = 0, hi = len;
+    while (lo < hi && (unsigned char)buf[lo] <= ' ') lo++;
+    while (hi > lo && (unsigned char)buf[hi - 1] <= ' ') hi--;
+    if (lo == hi) return false;
+    size_t body = lo;
+    if (buf[body] == '+' || buf[body] == '-') body++;
+    if (body == hi || !(isdigit((unsigned char)buf[body]) || buf[body] == '.')) return false;
+    for (size_t i = body; i < hi; i++) {
+        const char c = buf[i];
+        if (!(isdigit((unsigned char)c) || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-'))
+            return false;
     }
-    /* --trim / --ignore-case: normalise both sides, then compare bytes. */
+    buf[hi] = '\0';
+    char *end;
+    const double v = strtod(buf + lo, &end);
+    if (end != buf + hi || !isfinite(v)) return false;
+    *out = v;
+    return true;
+}
+
+/* Field equality under the options, for two values the caller knows are both
+ * present. Out of line: the path that uses no option never gets here. */
+static bool same_norm_slow(const Slab *a, Field x, const Slab *b, Field y, const Norm *n) {
+    if (n->tolerance > 0.0) {
+        double dx, dy;
+        if (as_number(a, x, &dx) && as_number(b, y, &dy)) return fabs(dx - dy) <= n->tolerance;
+    }
+    /* Identical bytes are equal under any option, and deciding so before the
+     * fold is what keeps an unchanged value outside ASCII from being refused. */
+    if (same_bytes(a, x, b, y)) return true;
+    if (!n->trim && !n->ignore_case) return false;
     char nx[4096], ny[4096];
-    size_t lx = norm_copy(a, x, n, nx, sizeof nx);
-    size_t ly = norm_copy(b, y, n, ny, sizeof ny);
-    if (lx == (size_t)-1 || ly == (size_t)-1) return false; /* non-ASCII: refused */
+    const size_t lx = norm_copy(a, x, n, nx, sizeof nx);
+    const size_t ly = norm_copy(b, y, n, ny, sizeof ny);
+    if (lx == (size_t)-1 || ly == (size_t)-1) {
+        /* The fold would decide this, and this port does not fold outside ASCII. */
+        atomic_store_explicit(&fold_refused, true, memory_order_relaxed);
+        return false;
+    }
     return lx == ly && memcmp(nx, ny, lx) == 0;
 }
 
-static bool is_absent(const Slab *s, Field f) {
-    (void)s;
-    return !field_real(f) || field_len(f) == 0;
+static inline bool same_norm(const Slab *a, Field x, const Slab *b, Field y, const Norm *n) {
+    if (!n) return same_bytes(a, x, b, y);
+    return same_norm_slow(a, x, b, y, n);
+}
+
+/* Under --trim and --empty-is-null, a value that is only whitespace is absent
+ * as well; under anything else it is a value. Out of line for the same reason
+ * as same_norm_slow. */
+static bool blank_is_absent(const Slab *s, Field f) {
+    char buf[4096];
+    const size_t len = logical_len(s, f);
+    if (len >= sizeof buf) return false;
+    logical_copy(s, f, buf, sizeof buf);
+    for (size_t i = 0; i < len; i++)
+        if ((unsigned char)buf[i] > ' ') return false;
+    return true;
+}
+
+static inline bool absent_norm(const Slab *s, Field f, const Norm *n) {
+    if (!field_real(f) || field_len(f) == 0) return true;
+    return n && n->trim && n->empty_is_null && blank_is_absent(s, f);
 }
 
 /*
@@ -634,21 +698,10 @@ static inline uint64_t tail_word(const char *p, size_t len, size_t rem) {
 }
 
 /*
- * The key hash, over exactly the bytes equality compares: a field's logical
- * value, whatever escaping it arrived in, so that two spellings of one value
- * hash alike.
- *
- * It took a byte at a time, one dependent multiply per byte, which on this
- * workload's two keys of twelve and fifteen bytes was 1.04B instructions of the
- * 8.5B a 2M CSV pair costs. Eight bytes a step is what the Rust and Zig ports
- * have done all along; an escaped value is decoded first -- the rare case, a
- * doubled quote or a backslash -- and folded by the same loop.
- */
-/*
  * Normalises a field's bytes into `out`: unescapes if needed, then applies
  * --trim (strip bytes <= ' ') and --ignore-case (ASCII fold A-Z to a-z).
- * Returns the normalised length, or (size_t)-1 if --ignore-case meets a
- * non-ASCII byte (which this port refuses by name, like C++ and Zig).
+ * Returns the normalised length, or (size_t)-1 if --ignore-case meets a byte
+ * outside ASCII; the caller raises the refusal.
  */
 static size_t norm_copy(const Slab *s, Field f, const Norm *n, char *out, size_t cap) {
     char tmp[4096];
@@ -662,12 +715,12 @@ static size_t norm_copy(const Slab *s, Field f, const Norm *n, char *out, size_t
         len = field_len(f);
     }
     /* --trim: strip leading/trailing whitespace (bytes <= ' '). */
-    if (n->trim) {
+    if (n && n->trim) {
         while (len > 0 && (unsigned char)p[0] <= ' ') { p++; len--; }
         while (len > 0 && (unsigned char)p[len - 1] <= ' ') len--;
     }
     if (len > cap) len = cap; /* refused upstream by the length cap */
-    if (n->ignore_case) {
+    if (n && n->ignore_case) {
         for (size_t i = 0; i < len; i++) {
             unsigned char c = (unsigned char)p[i];
             if (c >= 0x80) return (size_t)-1; /* non-ASCII: refused */
@@ -679,12 +732,23 @@ static size_t norm_copy(const Slab *s, Field f, const Norm *n, char *out, size_t
     return len;
 }
 
+/*
+ * The key hash, over exactly the bytes equality compares: a field's logical
+ * value, whatever escaping it arrived in, so that two spellings of one value
+ * hash alike.
+ *
+ * It took a byte at a time, one dependent multiply per byte, which on this
+ * workload's two keys of twelve and fifteen bytes was 1.04B instructions of the
+ * 8.5B a 2M CSV pair costs. Eight bytes a step is what the Rust and Zig ports
+ * have done all along; an escaped value is decoded first -- the rare case, a
+ * doubled quote or a backslash -- and folded by the same loop.
+ */
 static uint64_t hash_field_norm(const Slab *s, Field f, uint64_t seed, const Norm *n) {
     const uint64_t PRIME = UINT64_C(0x100000001b3);
     uint64_t h = seed;
-    if (is_absent(s, f)) return (h ^ UINT64_C(0x9e3779b97f4a7c15)) * PRIME;
+    if (absent_norm(s, f, n)) return (h ^ UINT64_C(0x9e3779b97f4a7c15)) * PRIME;
     /* Fast path: no normalisation, no escaping -- hash the bytes in place. */
-    if (!n->trim && !n->ignore_case && !field_escaped(f)) {
+    if ((!n || (!n->trim && !n->ignore_case)) && !field_escaped(f)) {
         const char *p = s->data + field_off(f);
         size_t len = field_len(f);
         size_t i = 0;
@@ -703,7 +767,11 @@ static uint64_t hash_field_norm(const Slab *s, Field f, uint64_t seed, const Nor
     /* Slow path: normalise into a buffer, then hash it. */
     char buf[4096];
     size_t len = norm_copy(s, f, n, buf, sizeof buf);
-    if (len == (size_t)-1) return 0; /* non-ASCII under --ignore-case: caller refuses */
+    if (len == (size_t)-1) {
+        /* A key outside ASCII under --ignore-case: its fold is its identity. */
+        atomic_store_explicit(&fold_refused, true, memory_order_relaxed);
+        return 0;
+    }
     size_t i = 0;
     for (; i + 8 <= len; i += 8) {
         uint64_t w;
@@ -1149,7 +1217,7 @@ typedef struct {
     Field *probe2;     /* the other side of a lazy equality check, same reason */
     int64_t dup_keys, dup_rows;
     bool failed;       /* a field too long for the packed length */
-    const Norm *norm;  /* text normalisation for key comparison */
+    const Norm *norm;  /* text normalisation for key comparison; NULL for none */
 } RowIndex;
 
 #define TABLE_EMPTY 0u
@@ -1354,7 +1422,8 @@ static void sweep_part(void *vctx, unsigned p) {
         if (out->failed) break;
         if (timed) t0 = now_ns();
         uint64_t hash = UINT64_C(0xcbf29ce484222325);
-        for (size_t i = 0; i < c->key_size; i++) hash = hash_field_norm(c->slab, fields[i], hash, c->norm);
+        const Norm *n = c->norm;
+        for (size_t i = 0; i < c->key_size; i++) hash = hash_field_norm(c->slab, fields[i], hash, n);
         if (timed) { t_hash += now_ns() - t0; t0 = now_ns(); }
         if (!chunk_push(out, pos, hash)) { out->oom = true; break; }
         if (timed) t_push += now_ns() - t0;
@@ -1513,12 +1582,13 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
             if (ix->row_hash[candidate] == hash) {
                 index_keys(ix, candidate, ix->probe);
                 index_keys(ix, (int32_t)r, ix->probe2);
+                const Norm *n = ix->norm;
                 bool same = true;
                 for (size_t i = 0; i < key_size && same; i++) {
-                    const bool xa = is_absent(slab, ix->probe[i]);
-                    const bool ya = is_absent(slab, ix->probe2[i]);
+                    const bool xa = absent_norm(slab, ix->probe[i], n);
+                    const bool ya = absent_norm(slab, ix->probe2[i], n);
                     same = (xa || ya) ? (xa && ya)
-                                      : same_norm(slab, ix->probe[i], slab, ix->probe2[i], ix->norm);
+                                      : same_norm(slab, ix->probe[i], slab, ix->probe2[i], n);
                 }
                 if (same) {
                     if (++ix->occurrences[at] == 2) {
@@ -1570,10 +1640,11 @@ static int32_t index_lookup(const RowIndex *ix, const Slab *other, const Field *
         int32_t candidate = ix->first_row[at];
         if (ix->row_hash[candidate] == hash) {
             index_keys(ix, candidate, probe);
+            const Norm *n = ix->norm;
             bool ok = true;
             for (size_t i = 0; i < ix->key_size && ok; i++) {
-                bool xa = is_absent(ix->slab, probe[i]), ya = is_absent(other, fields[i]);
-                ok = (xa || ya) ? (xa && ya) : same_norm(ix->slab, probe[i], other, fields[i], ix->norm);
+                bool xa = absent_norm(ix->slab, probe[i], n), ya = absent_norm(other, fields[i], n);
+                ok = (xa || ya) ? (xa && ya) : same_norm(ix->slab, probe[i], other, fields[i], n);
             }
             if (ok) return candidate;
         }
@@ -1694,10 +1765,11 @@ static int32_t index_lookup_proof(const RowIndex *ix, const Slab *other, const F
             }
             if (!fields) { *proven = false; return candidate; }
             index_keys(ix, candidate, probe);
+            const Norm *n = ix->norm;
             bool ok = true;
             for (size_t i = 0; i < ix->key_size && ok; i++) {
-                bool xa = is_absent(ix->slab, probe[i]), ya = is_absent(other, fields[i]);
-                ok = (xa || ya) ? (xa && ya) : same_norm(ix->slab, probe[i], other, fields[i], ix->norm);
+                bool xa = absent_norm(ix->slab, probe[i], n), ya = absent_norm(other, fields[i], n);
+                ok = (xa || ya) ? (xa && ya) : same_norm(ix->slab, probe[i], other, fields[i], n);
             }
             if (ok) return candidate;
         }
@@ -1782,15 +1854,19 @@ typedef struct {
  */
 static int verify_added(void) { return getenv("CSVDIFF_VERIFY_ADDED") != NULL; }
 
-/* Parses the mate in full and counts the compared columns that differ. */
-static void compare_mate(const CmpCtx *c, CmpPart *out, int32_t mate) {
+/* One mate's compared columns under `n`. Always inlined, so compare_mate's
+ * call with a literal NULL is the byte compare the run without options was
+ * before they existed: left to the compiler, the test for `n` stayed in the
+ * loop, and that was 1.5% of a default run. */
+static inline __attribute__((always_inline))
+bool compare_cells(const CmpCtx *c, CmpPart *out, const Norm *n) {
     const size_t key_size = c->key_size, nc = c->nc;
-    index_fields(c->bi, mate, out->fb);
+    const Slab *a = c->a, *b = c->b;
     bool any = false;
     for (size_t i = 0; i < nc; i++) {
         const Field x = out->fa[key_size + i], y = out->fb[key_size + i];
-        const bool xa = is_absent(c->a, x), ya = is_absent(c->b, y);
-        const bool differs = (xa || ya) ? (xa != ya) : !same_norm(c->a, x, c->b, y, c->norm);
+        const bool xa = absent_norm(a, x, n), ya = absent_norm(b, y, n);
+        const bool differs = (xa || ya) ? (xa != ya) : !same_norm(a, x, b, y, n);
         if (differs) {
             any = true;
             out->col_changed[i]++;
@@ -1798,6 +1874,13 @@ static void compare_mate(const CmpCtx *c, CmpPart *out, int32_t mate) {
             if (xa) out->col_filled[i]++;
         }
     }
+    return any;
+}
+
+/* Parses the mate in full and counts the compared columns that differ. */
+static void compare_mate(const CmpCtx *c, CmpPart *out, int32_t mate) {
+    index_fields(c->bi, mate, out->fb);
+    const bool any = c->norm ? compare_cells(c, out, c->norm) : compare_cells(c, out, NULL);
     if (any) out->changed++;
 }
 
@@ -2288,7 +2371,8 @@ static int compare_parquet(const char *a_path, const char *b_path, const Names *
 int main(int argc, char **argv) {
     if (argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
         printf("csvdiff - composite-key comparison, byte-level, in C\n\n"
-               "usage:\n  csvdiff compare A B -k COLS [-i COLS] [--json PATH] [--threads N]\n\n"
+               "usage:\n  csvdiff compare A B -k COLS [-i COLS] [--json PATH] [--threads N]\n"
+               "                  [--trim] [--ignore-case] [--empty-is-null] [--tolerance X]\n\n"
                "CSV, newline-delimited JSON, and uncompressed Parquet when both files\n"
                "are Parquet. The dialect is detected from the bytes.\n"
                "exit codes: 0 identical, 1 differences found, 2 error\n");
@@ -2300,8 +2384,9 @@ int main(int argc, char **argv) {
     const char *a_path = NULL, *b_path = NULL, *json_path = NULL;
     unsigned threads = 0;   /* 0 means one per core, on the Parquet path */
     size_t   max_memory_mb = 0;   /* 0 means no ceiling */
-    bool trim = false, ignore_case = false;
+    bool trim = false, ignore_case = false, empty_is_null = false;
     double tolerance = 0.0;
+    const char *first_norm = NULL;   /* the first normalisation flag given, to name it */
     /* Three lists to release now, and a fourth would be a fourth place to
      * forget one: every exit from the scan goes through here. */
 #define ARGS_FAIL(msg) \
@@ -2338,10 +2423,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(f, "-t") || !strcmp(f, "--threads"))
             threads = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(f, "--max-memory")) max_memory_mb = strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(f, "--trim")) trim = true;
-        else if (!strcmp(f, "--ignore-case")) ignore_case = true;
-        else if (!strcmp(f, "--empty-is-null")) { /* C's default: is_absent treats empty as absent */ }
-        else if (!strcmp(f, "--tolerance")) tolerance = strtod(argv[++i], NULL);
+        else if (!strcmp(f, "--trim")) { trim = true; if (!first_norm) first_norm = f; }
+        else if (!strcmp(f, "--ignore-case")) { ignore_case = true; if (!first_norm) first_norm = f; }
+        else if (!strcmp(f, "--empty-is-null")) { empty_is_null = true; if (!first_norm) first_norm = f; }
+        else if (!strcmp(f, "--tolerance")) {
+            if (!first_norm) first_norm = f;
+            char *end;
+            tolerance = strtod(argv[++i], &end);
+            if (*end != '\0' || !(tolerance >= 0.0) || !isfinite(tolerance))
+                ARGS_FAIL("--tolerance needs a non-negative number");
+        }
         else if (!strcmp(f, "-o") || !strcmp(f, "--out") || !strcmp(f, "--engine")) i++;
         else if (f[0] == '-') ARGS_FAIL("unknown option");
         else if (!a_path) a_path = f;
@@ -2371,6 +2462,16 @@ int main(int argc, char **argv) {
             names_free(&ignore);
             names_free(&compare);
             return fail("one file is parquet and the other is not; convert one of them first");
+        }
+        /* The columnar path does not carry the normalisation options yet. It
+         * accepted them and compared the raw bytes, which is a wrong answer with
+         * nothing to say so; refusing names the option instead. */
+        if (ap && first_norm) {
+            names_free(&key);
+            names_free(&ignore);
+            names_free(&compare);
+            return fail_named("this port does not support this option on parquet input yet",
+                              first_norm);
         }
         if (ap) {
             const int st = compare_parquet(a_path, b_path, &key, &ignore, &compare,
@@ -2482,7 +2583,8 @@ int main(int argc, char **argv) {
     ap.delimiter = a_delim; ap.source = a_src; ap.width = width; ap.dialect = a.dialect;
     bp.delimiter = b_delim; bp.source = b_src; bp.width = width; bp.dialect = b.dialect;
     ap.key_size = bp.key_size = key_size;
-    Norm norm = { trim, ignore_case, tolerance };
+    const Norm norm_opts = { trim, ignore_case, empty_is_null, tolerance };
+    const Norm *norm = trim || ignore_case || empty_is_null || tolerance > 0.0 ? &norm_opts : NULL;
     ap.last_needed = bp.last_needed = ap.key_last = bp.key_last = -1;
     for (size_t i = 0; i < width; i++) {
         if (a_src[i] > ap.last_needed) ap.last_needed = a_src[i];
@@ -2531,7 +2633,7 @@ int main(int argc, char **argv) {
          */
         unsigned budget = threads ? threads : cpu_count();
         BuildCtx bc = { { &ai, &bi }, { &a, &b }, { &ap, &bp }, { a_start, b_start },
-                        key_size, budget > 1 ? budget / 2 : 1, &norm, { false, false } };
+                        key_size, budget > 1 ? budget / 2 : 1, norm, { false, false } };
         if (a.size + b.size > (size_t)8 << 30) {
             build_part(&bc, 0);
             build_part(&bc, 1);
@@ -2585,7 +2687,7 @@ int main(int argc, char **argv) {
                       (aligned && keys_in_proof && !json_proof)
                           ? (int)(a_src[width - 1] + 1)
                           : 0,
-                      &norm };
+                      norm };
         run_parts(compare_part, &cc, ways + b_ways);
         phase_mark(&whole, "join and compare");
 
@@ -2609,6 +2711,11 @@ int main(int argc, char **argv) {
         }
         free(parts);
         if (oom) { fail("out of memory"); goto done; }
+        if (atomic_load(&fold_refused)) {
+            fail("--ignore-case on a field outside ASCII needs Unicode case folding, which "
+                 "this port does not carry; use another implementation for that data");
+            goto done;
+        }
 
         const int64_t derived = (int64_t)bi.keys - matched;
         if (verify && added != derived) {
