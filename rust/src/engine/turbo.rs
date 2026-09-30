@@ -52,7 +52,7 @@ use text::{
 };
 
 use crate::alloc;
-use crate::columns::{compare_keys, differs, empty_to_null, normalise, resolve};
+use crate::columns::{Resolved, compare_keys, differs, empty_to_null, normalise, resolve};
 use crate::contract::{Cell, CellDiff, ColumnStat, Counts, EngineResult, Section, Val};
 use crate::error::{Error, Result};
 use crate::options::Options;
@@ -490,6 +490,11 @@ struct RowIndex {
     rows: i64,
     dup_keys: i64,
     dup_rows: i64,
+    /// Rows that repeated an already-seen key, in file order. Only kept when
+    /// the fused join asked for them: the sweep joins every row as though it
+    /// were first, and these are joined again afterwards and subtracted.
+    later: Vec<i32>,
+    track_later: bool,
 }
 
 impl RowIndex {
@@ -534,9 +539,10 @@ impl RowIndex {
         opt: &Options,
         threads: usize,
         tag: &'static str,
-    ) -> Result<Self> {
+        sink: Option<&RowSink<'_>>,
+    ) -> Result<(Self, Vec<Part>)> {
         let mut phases = Phases::new(tag);
-        let mut chunks = sweep(side, key_size, opt, threads)?;
+        let (mut chunks, fparts) = sweep(side, key_size, opt, threads, sink)?;
         phases.mark("sweep (parallel)");
 
         let total: usize = chunks.iter().map(|c| c.at.len()).sum();
@@ -606,6 +612,8 @@ impl RowIndex {
             rows: 0,
             dup_keys: 0,
             dup_rows: 0,
+            later: Vec::new(),
+            track_later: sink.is_some(),
         };
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
@@ -616,7 +624,7 @@ impl RowIndex {
             idx.insert(side, row as i32, key_size, opt, &mut probe, &mut mine)?;
         }
         phases.mark("index insert (serial)");
-        Ok(idx)
+        Ok((idx, fparts))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -671,6 +679,11 @@ impl RowIndex {
                             self.dup_rows += 1; // the first occurrence counts once the key repeats
                         }
                         self.dup_rows += 1;
+                        // The fused join joined this row as though it were
+                        // first; it is joined again afterwards and subtracted.
+                        if self.track_later {
+                            alloc::push(&mut self.later, row, "a repeated key's row")?;
+                        }
                         return Ok(());
                     }
                 }
@@ -842,12 +855,76 @@ impl RowIndex {
 // The sweep: finding and hashing every row, in parallel
 // ---------------------------------------------------------------------------
 
-fn sweep(side: &Side, key_size: usize, opt: &Options, threads: usize) -> Result<Vec<Chunk>> {
+fn sweep(
+    side: &Side,
+    key_size: usize,
+    opt: &Options,
+    threads: usize,
+    sink: Option<&RowSink<'_>>,
+) -> Result<(Vec<Chunk>, Vec<Part>)> {
     match &side.rows {
         Rows::Text { parser, keys, from } => {
-            sweep_text(side, keys, parser, *from, key_size, opt, threads)
+            sweep_text(side, keys, parser, *from, key_size, opt, threads, sink)
         }
-        Rows::Columnar { rows, .. } => sweep_columnar(side, *rows, key_size, opt, threads),
+        Rows::Columnar { rows, .. } => {
+            debug_assert!(sink.is_none(), "the fused join is text only");
+            sweep_columnar(side, *rows, key_size, opt, threads).map(|c| (c, Vec::new()))
+        }
+    }
+}
+
+/// What the sweep hands each row to, when the join runs inside it.
+///
+/// Each sweep worker owns its part's `Part` and `RowScratch`; the sink only
+/// carries the shared join state, so `&RowSink` is `Sync` and no row takes a
+/// lock. The worker returns its `Part` with its chunk, and the parts are
+/// folded after the sweep.
+struct RowSink<'a> {
+    ctx: &'a JoinCtx<'a>,
+    /// B's seen bitmap: rows the sweep matched set their bit here, with a
+    /// plain atomic OR — the one shared write, and it is idempotent.
+    seen: &'a [AtomicU64],
+    nc: usize,
+}
+
+impl RowSink<'_> {
+    /// A worker's own join state: its part's counts and its row scratch.
+    fn worker(&self) -> (Part, RowScratch) {
+        let runs_len = self.ctx.runs.as_ref().map_or(0, Runs::len);
+        (
+            Part::blank(self.nc),
+            RowScratch::new(self.ctx.width, runs_len),
+        )
+    }
+
+    /// Joins one row into the worker's own part: its byte range, key hash,
+    /// index in its part (for the proof backoff), and the next row's hash for
+    /// the lookup prefetch (`None` at a chunk's end).
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        &self,
+        part: &mut Part,
+        scratch: &mut RowScratch,
+        from: u64,
+        end: u64,
+        hash: u64,
+        k: usize,
+        next_hash: Option<u64>,
+    ) {
+        if let Some(next) = next_hash {
+            self.ctx.bi.prefetch(next);
+        }
+        join_row(
+            self.ctx,
+            part,
+            scratch,
+            -1,
+            from as usize,
+            end as usize,
+            hash,
+            k,
+            self.seen,
+        );
     }
 }
 
@@ -956,6 +1033,7 @@ where
 /// run again on counted bounds, which is exactly what it did before. A chunk
 /// that started on a wrong guess parsed garbage, so its rows *and its errors*
 /// are discarded unread.
+#[allow(clippy::too_many_arguments)]
 fn sweep_text(
     side: &Side,
     keys: &RowParser,
@@ -964,41 +1042,55 @@ fn sweep_text(
     key_size: usize,
     opt: &Options,
     threads: usize,
-) -> Result<Vec<Chunk>> {
+    sink: Option<&RowSink<'_>>,
+) -> Result<(Vec<Chunk>, Vec<Part>)> {
     let data = side.slab.data();
     if from >= data.len() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let dialect = side.slab.dialect();
     if dialect == Dialect::Csv {
         let bounds = chunk_bounds(data, from, threads, dialect, false);
-        let mut swept = sweep_chunks(side, keys, whole, &bounds, key_size, opt).into_iter();
-        let mut chunks = Vec::with_capacity(bounds.len() - 1);
+        let parts = bounds.len() - 1;
+        let mut swept = sweep_chunks(side, keys, whole, &bounds, key_size, opt, sink).into_iter();
+        let mut chunks = Vec::with_capacity(parts);
+        let mut fparts = Vec::with_capacity(parts);
         let mut held = true;
-        for i in 0..bounds.len() - 1 {
+        for i in 0..parts {
             // Chunk i started at a real row: chunk 0 by construction, and every
             // later one because the loop only gets here past the check below.
-            let (chunk, end) = swept.next().expect("one result per chunk")?;
+            let (chunk, end, fpart) = swept.next().expect("one result per chunk")?;
             chunks.push(chunk);
+            if let Some(p) = fpart {
+                fparts.push(p);
+            }
             if i + 2 < bounds.len() && end != bounds[i + 1] {
                 held = false;
                 break;
             }
         }
         if held {
-            return Ok(chunks);
+            return Ok((chunks, fparts));
         }
+        // A wrong guess joined garbage rows; the garbage parts are dropped and
+        // the counted sweep re-joins the real rows into fresh ones.
     }
     let bounds = chunk_bounds(data, from, threads, dialect, true);
-    sweep_chunks(side, keys, whole, &bounds, key_size, opt)
-        .into_iter()
-        .map(|r| r.map(|(chunk, _)| chunk))
-        .collect()
+    let mut chunks = Vec::new();
+    let mut fparts = Vec::new();
+    for r in sweep_chunks(side, keys, whole, &bounds, key_size, opt, sink) {
+        let (chunk, _, fpart) = r?;
+        chunks.push(chunk);
+        if let Some(p) = fpart {
+            fparts.push(p);
+        }
+    }
+    Ok((chunks, fparts))
 }
 
 /// One chunk per pair of `bounds`, each returned with the offset its sweep
-/// stopped at: the start of the first row past its boundary, or the end of the
-/// file.
+/// stopped at (the start of the first row past its boundary, or the end of the
+/// file) and, when the fused join is running, the worker's own joined part.
 #[allow(clippy::type_complexity)]
 fn sweep_chunks(
     side: &Side,
@@ -1007,7 +1099,8 @@ fn sweep_chunks(
     bounds: &[usize],
     key_size: usize,
     opt: &Options,
-) -> Vec<Result<(Chunk, usize)>> {
+    sink: Option<&RowSink<'_>>,
+) -> Vec<Result<(Chunk, usize, Option<Part>)>> {
     let data = side.slab.data();
     let parts = bounds.len() - 1;
     in_parallel(parts, |i| {
@@ -1016,6 +1109,9 @@ fn sweep_chunks(
             at: Vec::new(),
             hash: Vec::new(),
         };
+        // The fused join's counts live in the worker that joined them: no
+        // lock, no sharing, just returned with the chunk.
+        let mut fused = sink.map(|s| s.worker());
         let mut fields = vec![ABSENT; key_size.max(1)];
         let mut whole_fields = vec![ABSENT; side.width];
         let mut pos = begin;
@@ -1053,12 +1149,36 @@ fn sweep_chunks(
                 )));
             }
             chunk.push(pos as u64, key_hash(&side.slab, &fields, key_size, opt))?;
+            // The row before this one ends where this one starts, and its
+            // pages are still hot: the fused join takes it now, rather than
+            // re-reading it after the sweep.
+            if let (Some(s), Some((part, scratch))) = (sink, fused.as_mut())
+                && chunk.at.len() >= 2
+            {
+                let j = chunk.at.len() - 2;
+                s.row(
+                    part,
+                    scratch,
+                    chunk.at[j],
+                    pos as u64,
+                    chunk.hash[j],
+                    j,
+                    Some(chunk.hash[j + 1]),
+                );
+            }
             if next <= pos {
                 break; // no progress: a malformed tail rather than an endless loop
             }
             pos = next;
         }
-        Ok((chunk, pos))
+        // The chunk's last row ends where the sweep stopped.
+        if let (Some(s), Some((part, scratch))) = (sink, fused.as_mut())
+            && let Some(&lo) = chunk.at.last()
+        {
+            let j = chunk.at.len() - 1;
+            s.row(part, scratch, lo, pos as u64, chunk.hash[j], j, None);
+        }
+        Ok((chunk, pos, fused.map(|(part, _)| part)))
     })
 }
 
@@ -1309,18 +1429,341 @@ fn to_cells(values: &[Val]) -> Result<Vec<Cell>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn join(
-    a: &Side,
-    ai: &RowIndex,
-    b: &Side,
-    bi: &RowIndex,
-    opt: &Options,
-    compared: &[String],
+/// Everything one row's join needs beyond the row itself and the part its
+/// counts land in. Built once per join and shared by every part; the fused join
+/// builds one too, so both paths join a row with the same code.
+struct JoinCtx<'a> {
+    a: &'a Side,
+    b: &'a Side,
+    bi: &'a RowIndex,
+    opt: &'a Options,
+    key_size: usize,
+    nc: usize,
+    width: usize,
+    cap: usize,
+    keep_picks: bool,
     exporting: bool,
-    threads: usize,
-) -> Result<Joined> {
+    plain: bool,
+    span_tail: Option<(usize, u8, usize)>,
+    guard: Option<(u8, usize)>,
+    runs: Option<Runs>,
+    json_proof: bool,
+}
+
+/// One row-join's scratch: the two rows' fields, the runs' spans, and the proof
+/// backoff. The normal join builds one per part; the fused join carries one per
+/// part across the sweep.
+struct RowScratch {
+    fa: Vec<Field>,
+    fb: Vec<Field>,
+    spans: Vec<(usize, usize)>,
+    refused: usize,
+}
+
+impl RowScratch {
+    fn new(width: usize, runs_len: usize) -> RowScratch {
+        RowScratch {
+            fa: vec![ABSENT; width],
+            fb: vec![ABSENT; width],
+            spans: vec![(0usize, 0usize); runs_len],
+            refused: 0,
+        }
+    }
+}
+
+impl Part {
+    fn blank(nc: usize) -> Part {
+        Part {
+            matched: 0,
+            changed_per: vec![0; nc],
+            blanked_per: vec![0; nc],
+            filled_per: vec![0; nc],
+            changed: Vec::new(),
+            removed: Vec::new(),
+            changed_total: 0,
+            removed_total: 0,
+        }
+    }
+
+    /// Folds another part's counts into this one. The fused path keeps no
+    /// picks, so only the totals move; the ordinary fold in `join_tail`
+    /// keeps its own pick merging.
+    fn add(&mut self, other: &Part) {
+        debug_assert!(other.changed.is_empty() && other.removed.is_empty());
+        self.matched += other.matched;
+        for i in 0..self.changed_per.len() {
+            self.changed_per[i] += other.changed_per[i];
+            self.blanked_per[i] += other.blanked_per[i];
+            self.filled_per[i] += other.filled_per[i];
+        }
+        self.changed_total += other.changed_total;
+        self.removed_total += other.removed_total;
+    }
+
+    /// Takes another part's counts back out: the later-duplicate correction.
+    /// A repeated key's first row stays matched, so the caller marks nothing.
+    fn sub(&mut self, other: &Part) {
+        debug_assert!(other.changed.is_empty() && other.removed.is_empty());
+        self.matched -= other.matched;
+        for i in 0..self.changed_per.len() {
+            self.changed_per[i] -= other.changed_per[i];
+            self.blanked_per[i] -= other.blanked_per[i];
+            self.filled_per[i] -= other.filled_per[i];
+        }
+        self.changed_total -= other.changed_total;
+        self.removed_total -= other.removed_total;
+    }
+}
+
+/// Records a matched B row in the seen bitmap. Idempotent: the fused sweep may
+/// mark the same row from a duplicate key, and a wrong split guess may mark
+/// rows the counted sweep marks again.
+fn mark_seen(seen: &[AtomicU64], row: i32) {
+    let bit = row as usize;
+    seen[bit >> 6].fetch_or(1 << (bit & 63), Ordering::Relaxed);
+}
+
+/// Joins one row of A's against B's index: the join's inner loop as a function,
+/// shared by the normal join (over each key's first row) and the fused join
+/// (over every row as the sweep finds it, then again over the repeated keys,
+/// whose results are subtracted).
+///
+/// `row` is the row's id for the pick lists, `from`/`end` its byte range in
+/// A's slab, `hash` its sweep-computed key hash, and `k` its index in the part,
+/// for the proof backoff. `seen` records the mate in B's seen bitmap.
+#[allow(clippy::too_many_arguments)]
+fn join_row(
+    ctx: &JoinCtx,
+    out: &mut Part,
+    scratch: &mut RowScratch,
+    row: i32,
+    from: usize,
+    end: usize,
+    hash: u64,
+    k: usize,
+    seen: &[AtomicU64],
+) {
+    enum Fast {
+        Proved(i32),
+        Unproven,
+        Missed,
+        Skipped,
+    }
+    let fast = if let (Some(runs), Some((delimiter, _))) = (&ctx.runs, ctx.guard) {
+        let data = ctx.a.slab.data();
+        if runs.of_row(data, from, end, delimiter, &mut scratch.spans) {
+            // No fields and no span: the first candidate whose whole
+            // hash matches, unproven, which the runs then settle.
+            match ctx.bi.lookup(
+                ctx.b,
+                &ctx.a.slab,
+                None,
+                hash,
+                ctx.key_size,
+                ctx.opt,
+                None,
+                &mut scratch.fb,
+            ) {
+                Some((mate, _)) => {
+                    let bd = ctx.b.slab.data();
+                    let b_lo = ctx.bi.row_at[mate as usize] as usize;
+                    let b_hi = row_end(ctx.bi, mate, bd.len());
+                    if runs.matches(data, &scratch.spans, bd, b_lo, b_hi, delimiter) {
+                        Fast::Proved(mate)
+                    } else {
+                        Fast::Unproven
+                    }
+                }
+                None => Fast::Missed,
+            }
+        } else {
+            Fast::Skipped
+        }
+    } else if let Some((delimiter, commas)) = ctx.guard {
+        let data = ctx.a.slab.data();
+        match guard_span(data, from, end, delimiter, commas) {
+            Some(len) => {
+                let span = Some(Proof::Csv {
+                    bytes: &data[from..from + len],
+                    delimiter,
+                });
+                match ctx.bi.lookup(
+                    ctx.b,
+                    &ctx.a.slab,
+                    None,
+                    hash,
+                    ctx.key_size,
+                    ctx.opt,
+                    span,
+                    &mut scratch.fb,
+                ) {
+                    Some((mate, true)) => Fast::Proved(mate),
+                    Some(_) => Fast::Unproven,
+                    None => Fast::Missed,
+                }
+            }
+            None => Fast::Skipped,
+        }
+    } else {
+        Fast::Skipped
+    };
+    match fast {
+        Fast::Proved(mate) => {
+            out.matched += 1;
+            mark_seen(seen, mate);
+            return;
+        }
+        Fast::Missed => {
+            out.removed_total += 1;
+            if ctx.keep_picks && (ctx.exporting || out.removed.len() <= ctx.cap) {
+                out.removed.push(Pick { row, mate: -1 });
+            }
+            return;
+        }
+        Fast::Unproven | Fast::Skipped => {}
+    }
+
+    ctx.a.fields_at(from as u64, &mut scratch.fa);
+    // `scratch.fb` is the lookup's scratch, and on a hit it already holds the
+    // mate's fields: that is what the key columns were matched against.
+    // A's row up to the end of the last column either file wants. The
+    // end has to be a boundary in A as well: a quoted field ends on its
+    // closing quote, and what follows is not part of the run.
+    let csv_span = ctx.span_tail.and_then(|(slot, delimiter, _)| {
+        let f = scratch.fa[slot];
+        if !field::is_real(f) {
+            return None;
+        }
+        let data = ctx.a.slab.data();
+        let to = field::offset_of(f) + field::len_of(f);
+        if to < from || to > data.len() {
+            return None;
+        }
+        if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
+            return None;
+        }
+        Some(Proof::Csv {
+            bytes: &data[from..to],
+            delimiter,
+        })
+    });
+    // Through the byte that closes the last value either file wants --
+    // whichever it turns out to be, since two objects need not list their
+    // names in the same order. `ctx.width` and not `ctx.nc`: the keys have to be
+    // inside the run for it to stand in for the key comparison.
+    let span = csv_span.or_else(|| {
+        if !ctx.json_proof {
+            return None;
+        }
+        if scratch.refused >= PROOF_BACKOFF && k & (PROOF_BACKOFF - 1) != 0 {
+            return None;
+        }
+        let data = ctx.a.slab.data();
+        let mut t = from;
+        for &f in scratch.fa.iter().take(ctx.width) {
+            if !field::is_real(f) {
+                continue;
+            }
+            let e = field::offset_of(f) + field::len_of(f);
+            if e > t {
+                t = e;
+            }
+        }
+        if t >= end || t < from {
+            return None;
+        }
+        Some(Proof::Json {
+            bytes: &data[from..t + 1],
+        })
+    });
+    let Some((mate, same_bytes)) = ctx.bi.lookup(
+        ctx.b,
+        &ctx.a.slab,
+        Some(&scratch.fa),
+        hash,
+        ctx.key_size,
+        ctx.opt,
+        span,
+        &mut scratch.fb,
+    ) else {
+        out.removed_total += 1;
+        if ctx.keep_picks && (ctx.exporting || out.removed.len() <= ctx.cap) {
+            out.removed.push(Pick { row, mate: -1 });
+        }
+        return;
+    };
+    out.matched += 1;
+    mark_seen(seen, mate);
+    // `same_bytes` is the proof's own verdict, so it is what the backoff
+    // counts. A run of failures means two files where the rows really do
+    // differ, and scanning them is work for nothing.
+    if ctx.json_proof && span.is_some() {
+        if same_bytes {
+            scratch.refused = 0;
+        } else if scratch.refused < PROOF_BACKOFF {
+            scratch.refused += 1;
+        }
+    }
+    // The two rows carry the same bytes across every column either file
+    // wants, so no column differs and the mate was never read.
+    if same_bytes {
+        return;
+    }
+
+    let mut any = false;
+    // Two loops rather than one with a flag inside it: `ctx.plain` cannot
+    // change between columns or between rows, and this is the innermost
+    // loop of the whole comparison.
+    if ctx.plain {
+        for i in 0..ctx.nc {
+            let (x, y) = (scratch.fa[ctx.key_size + i], scratch.fb[ctx.key_size + i]);
+            let (xa, yb) = (plain_absent(x), plain_absent(y));
+            if plain_differs(&ctx.a.slab, x, xa, &ctx.b.slab, y, yb) {
+                any = true;
+                out.changed_per[i] += 1;
+                // Absence is already known rather than asked for again.
+                if yb {
+                    out.blanked_per[i] += 1;
+                }
+                if xa {
+                    out.filled_per[i] += 1;
+                }
+            }
+        }
+    } else {
+        for i in 0..ctx.nc {
+            let (x, y) = (scratch.fa[ctx.key_size + i], scratch.fb[ctx.key_size + i]);
+            if cell_differs(&ctx.a.slab, x, &ctx.b.slab, y, ctx.opt) {
+                any = true;
+                out.changed_per[i] += 1;
+                if is_absent(&ctx.b.slab, y, ctx.opt) {
+                    out.blanked_per[i] += 1;
+                }
+                if is_absent(&ctx.a.slab, x, ctx.opt) {
+                    out.filled_per[i] += 1;
+                }
+            }
+        }
+    }
+    if any {
+        out.changed_total += 1;
+        if ctx.keep_picks && (ctx.exporting || out.changed.len() <= ctx.cap) {
+            out.changed.push(Pick { row, mate });
+        }
+    }
+}
+
+/// Everything both join paths build once: the row-join context and B's
+/// seen bitmap.
+fn join_setup<'a>(
+    a: &'a Side,
+    b: &'a Side,
+    bi: &'a RowIndex,
+    opt: &'a Options,
+    nc: usize,
+    exporting: bool,
+) -> (JoinCtx<'a>, Vec<AtomicU64>) {
     let key_size = opt.key.len();
-    let nc = compared.len();
     let width = key_size + nc;
     let cap = opt.max_rows;
     // The pick lists are only read for the report (`row_lists`) or a full
@@ -1371,38 +1814,50 @@ fn join(
     let seen: Vec<AtomicU64> = std::iter::repeat_with(|| AtomicU64::new(0))
         .take(bi.row_at.len().div_ceil(64))
         .collect();
-    let mark = |row: i32| {
-        let bit = row as usize;
-        seen[bit >> 6].fetch_or(1 << (bit & 63), Ordering::Relaxed);
+
+    let ctx = JoinCtx {
+        a,
+        b,
+        bi,
+        opt,
+        key_size,
+        nc,
+        width,
+        cap,
+        keep_picks,
+        exporting,
+        plain,
+        span_tail,
+        guard,
+        runs,
+        json_proof,
     };
-    let matched_already = |row: i32| {
-        let bit = row as usize;
-        seen[bit >> 6].load(Ordering::Relaxed) & (1 << (bit & 63)) != 0
-    };
+    (ctx, seen)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn join(
+    a: &Side,
+    ai: &RowIndex,
+    b: &Side,
+    bi: &RowIndex,
+    opt: &Options,
+    compared: &[String],
+    exporting: bool,
+    threads: usize,
+) -> Result<Joined> {
+    let (ctx, seen) = join_setup(a, b, bi, opt, compared.len(), exporting);
 
     let a_keys = ai.first_row.len();
-    let b_keys = bi.first_row.len();
     let a_ways = ways_for(a_keys);
-    let b_ways = ways_for(b_keys);
+
+    let nc = ctx.nc;
+    let width = ctx.width;
+    let data_len = a.slab.data().len();
 
     let a_range = |p: usize| -> Part {
-        let mut out = Part {
-            matched: 0,
-            changed_per: vec![0; nc],
-            blanked_per: vec![0; nc],
-            filled_per: vec![0; nc],
-            changed: Vec::new(),
-            removed: Vec::new(),
-            changed_total: 0,
-            removed_total: 0,
-        };
-        let (mut fa, mut fb) = (vec![ABSENT; width], vec![ABSENT; width]);
-        let mut spans = vec![(0usize, 0usize); runs.as_ref().map_or(0, Runs::len)];
-        // A proof that keeps failing is a scan for nothing: two files where every
-        // row really has changed would pay for it on every row. After
-        // `PROOF_BACKOFF` failures in a row it is tried every `PROOF_BACKOFF`
-        // rows instead, until one succeeds and it is on again.
-        let mut refused = 0usize;
+        let mut out = Part::blank(nc);
+        let mut scratch = RowScratch::new(width, ctx.runs.as_ref().map_or(0, Runs::len));
         let lo = a_keys * p / a_ways;
         let hi = a_keys * (p + 1) / a_ways;
         let keys = &ai.first_row[lo..hi];
@@ -1414,204 +1869,67 @@ fn join(
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
             let hash = ai.row_hash[row as usize];
-
-            // The proof's span without the parse: the guard's delimiter sits a
-            // fixed count from the row start, countable with the delimiter
-            // cursor alone. Most rows prove out here and never pay for fields;
-            // a row the bytes do not settle falls through to the parse below.
-            enum Fast {
-                Proved(i32),
-                Unproven,
-                Missed,
-                Skipped,
-            }
-            let fast = if let (Some(runs), Some((delimiter, _))) = (&runs, guard) {
-                let data = a.slab.data();
-                let from = ai.row_at[row as usize] as usize;
-                let end = row_end(ai, row, data.len());
-                if runs.of_row(data, from, end, delimiter, &mut spans) {
-                    // No fields and no span: the first candidate whose whole
-                    // hash matches, unproven, which the runs then settle.
-                    match bi.lookup(b, &a.slab, None, hash, key_size, opt, None, &mut fb) {
-                        Some((mate, _)) => {
-                            let bd = b.slab.data();
-                            let b_lo = bi.row_at[mate as usize] as usize;
-                            let b_hi = row_end(bi, mate, bd.len());
-                            if runs.matches(data, &spans, bd, b_lo, b_hi, delimiter) {
-                                Fast::Proved(mate)
-                            } else {
-                                Fast::Unproven
-                            }
-                        }
-                        None => Fast::Missed,
-                    }
-                } else {
-                    Fast::Skipped
-                }
-            } else if let Some((delimiter, commas)) = guard {
-                let data = a.slab.data();
-                let from = ai.row_at[row as usize] as usize;
-                let end = row_end(ai, row, data.len());
-                match guard_span(data, from, end, delimiter, commas) {
-                    Some(len) => {
-                        let span = Some(Proof::Csv {
-                            bytes: &data[from..from + len],
-                            delimiter,
-                        });
-                        match bi.lookup(b, &a.slab, None, hash, key_size, opt, span, &mut fb) {
-                            Some((mate, true)) => Fast::Proved(mate),
-                            Some(_) => Fast::Unproven,
-                            None => Fast::Missed,
-                        }
-                    }
-                    None => Fast::Skipped,
-                }
-            } else {
-                Fast::Skipped
-            };
-            match fast {
-                Fast::Proved(mate) => {
-                    out.matched += 1;
-                    mark(mate);
-                    continue;
-                }
-                Fast::Missed => {
-                    out.removed_total += 1;
-                    if keep_picks && (exporting || out.removed.len() <= cap) {
-                        out.removed.push(Pick { row, mate: -1 });
-                    }
-                    continue;
-                }
-                Fast::Unproven | Fast::Skipped => {}
-            }
-
-            ai.fields_of(a, row, &mut fa);
-            // `fb` is the lookup's scratch, and on a hit it already holds the
-            // mate's fields: that is what the key columns were matched against.
-            // A's row up to the end of the last column either file wants. The
-            // end has to be a boundary in A as well: a quoted field ends on its
-            // closing quote, and what follows is not part of the run.
-            let csv_span = span_tail.and_then(|(slot, delimiter, _)| {
-                let f = fa[slot];
-                if !field::is_real(f) {
-                    return None;
-                }
-                let data = a.slab.data();
-                let from = ai.row_at[row as usize] as usize;
-                let to = field::offset_of(f) + field::len_of(f);
-                if to < from || to > data.len() {
-                    return None;
-                }
-                if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
-                    return None;
-                }
-                Some(Proof::Csv {
-                    bytes: &data[from..to],
-                    delimiter,
-                })
-            });
-            // Through the byte that closes the last value either file wants --
-            // whichever it turns out to be, since two objects need not list their
-            // names in the same order. `width` and not `nc`: the keys have to be
-            // inside the run for it to stand in for the key comparison.
-            let span = csv_span.or_else(|| {
-                if !json_proof {
-                    return None;
-                }
-                if refused >= PROOF_BACKOFF && i & (PROOF_BACKOFF - 1) != 0 {
-                    return None;
-                }
-                let data = a.slab.data();
-                let lo = ai.row_at[row as usize] as usize;
-                let end = row_end(ai, row, data.len());
-                let mut t = lo;
-                for &f in fa.iter().take(width) {
-                    if !field::is_real(f) {
-                        continue;
-                    }
-                    let e = field::offset_of(f) + field::len_of(f);
-                    if e > t {
-                        t = e;
-                    }
-                }
-                if t >= end || t < lo {
-                    return None;
-                }
-                Some(Proof::Json {
-                    bytes: &data[lo..t + 1],
-                })
-            });
-            let Some((mate, same_bytes)) =
-                bi.lookup(b, &a.slab, Some(&fa), hash, key_size, opt, span, &mut fb)
-            else {
-                out.removed_total += 1;
-                if keep_picks && (exporting || out.removed.len() <= cap) {
-                    out.removed.push(Pick { row, mate: -1 });
-                }
-                continue;
-            };
-            out.matched += 1;
-            mark(mate);
-            // `same_bytes` is the proof's own verdict, so it is what the backoff
-            // counts. A run of failures means two files where the rows really do
-            // differ, and scanning them is work for nothing.
-            if json_proof && span.is_some() {
-                if same_bytes {
-                    refused = 0;
-                } else if refused < PROOF_BACKOFF {
-                    refused += 1;
-                }
-            }
-            // The two rows carry the same bytes across every column either file
-            // wants, so no column differs and the mate was never read.
-            if same_bytes {
-                continue;
-            }
-
-            let mut any = false;
-            // Two loops rather than one with a flag inside it: `plain` cannot
-            // change between columns or between rows, and this is the innermost
-            // loop of the whole comparison.
-            if plain {
-                for i in 0..nc {
-                    let (x, y) = (fa[key_size + i], fb[key_size + i]);
-                    let (xa, yb) = (plain_absent(x), plain_absent(y));
-                    if plain_differs(&a.slab, x, xa, &b.slab, y, yb) {
-                        any = true;
-                        out.changed_per[i] += 1;
-                        // Absence is already known rather than asked for again.
-                        if yb {
-                            out.blanked_per[i] += 1;
-                        }
-                        if xa {
-                            out.filled_per[i] += 1;
-                        }
-                    }
-                }
-            } else {
-                for i in 0..nc {
-                    let (x, y) = (fa[key_size + i], fb[key_size + i]);
-                    if cell_differs(&a.slab, x, &b.slab, y, opt) {
-                        any = true;
-                        out.changed_per[i] += 1;
-                        if is_absent(&b.slab, y, opt) {
-                            out.blanked_per[i] += 1;
-                        }
-                        if is_absent(&a.slab, x, opt) {
-                            out.filled_per[i] += 1;
-                        }
-                    }
-                }
-            }
-            if any {
-                out.changed_total += 1;
-                if keep_picks && (exporting || out.changed.len() <= cap) {
-                    out.changed.push(Pick { row, mate });
-                }
-            }
+            join_row(
+                &ctx,
+                &mut out,
+                &mut scratch,
+                row,
+                ai.row_at[row as usize] as usize,
+                row_end(ai, row, data_len),
+                hash,
+                i,
+                &seen,
+            );
         }
         out
     };
+
+    let next = AtomicUsize::new(0);
+    let mut parts = on_threads(threads, || -> Vec<(usize, Part)> {
+        let mut mine = Vec::new();
+        loop {
+            let t = next.fetch_add(1, Ordering::Relaxed);
+            if t >= a_ways {
+                return mine;
+            }
+            mine.push((t, a_range(t)));
+        }
+    });
+    parts.sort_by_key(|(t, _)| *t);
+    let parts: Vec<Part> = parts.into_iter().map(|(_, part)| part).collect();
+    join_tail(
+        a, ai, b, bi, opt, compared, exporting, threads, &ctx, &seen, parts,
+    )
+}
+
+/// Everything after A's parts are joined: B's walk over the seen bitmap,
+/// the fold into counts and columns, and the report/export rows. Shared by the
+/// normal join and the fused join, so both produce the same `Joined`.
+#[allow(clippy::too_many_arguments)]
+fn join_tail(
+    a: &Side,
+    ai: &RowIndex,
+    b: &Side,
+    bi: &RowIndex,
+    opt: &Options,
+    compared: &[String],
+    exporting: bool,
+    threads: usize,
+    ctx: &JoinCtx,
+    seen: &[AtomicU64],
+    parts: Vec<Part>,
+) -> Result<Joined> {
+    let key_size = ctx.key_size;
+    let nc = ctx.nc;
+    let cap = ctx.cap;
+    let keep_picks = ctx.keep_picks;
+    let matched_already = |row: i32| {
+        let bit = row as usize;
+        seen[bit >> 6].load(Ordering::Relaxed) & (1 << (bit & 63)) != 0
+    };
+
+    let b_keys = bi.first_row.len();
+    let b_ways = ways_for(b_keys);
 
     let b_range = |p: usize| -> Capped {
         let mut added = Capped::new(cap, exporting, keep_picks);
@@ -1627,23 +1945,9 @@ fn join(
         added
     };
 
-    // Two rounds, both over a queue the workers pull from. A's chunks have to be
-    // finished before B's begin because B's read the bitmap A's write; within a
-    // round the order chunks are taken in does not matter, since each carries
-    // its own index and the merge sorts them back.
+    // B's round; A's parts arrived joined. B only reads the bitmap A's
+    // writes finished before this call, so the two rounds stay ordered.
     let mut phases = Phases::new("");
-    let next = AtomicUsize::new(0);
-    let mut parts = on_threads(threads, || -> Vec<(usize, Part)> {
-        let mut mine = Vec::new();
-        loop {
-            let t = next.fetch_add(1, Ordering::Relaxed);
-            if t >= a_ways {
-                return mine;
-            }
-            mine.push((t, a_range(t)));
-        }
-    });
-    parts.sort_by_key(|(t, _)| *t);
 
     let next = AtomicUsize::new(0);
     let mut chunks = on_threads(threads, || -> Vec<(usize, Capped)> {
@@ -1658,7 +1962,6 @@ fn join(
     });
     chunks.sort_by_key(|(t, _)| *t);
 
-    let parts: Vec<Part> = parts.into_iter().map(|(_, part)| part).collect();
     let mut added = Capped::new(cap, exporting, keep_picks);
     for (_, chunk) in chunks {
         for pick in &chunk.held {
@@ -1801,6 +2104,212 @@ fn join(
         changed_a,
         changed_b,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The fused join
+// ---------------------------------------------------------------------------
+
+/// Past page cache the join runs inside A's sweep instead of after it.
+///
+/// Past memory every pass is a read from disk, and the join used to be the
+/// fourth: both sweeps, then both files again for the rows to compare -- at
+/// 150M rows as long as a cold read of both files. Built first, B's index is
+/// all the join needs from B, so A's rows can be joined as A's sweep finds
+/// them, while their pages are still hot, and A is read once.
+///
+/// The join compares a key's first row, and which row is first is only known
+/// once the insertion has seen them all. So every row is joined as though it
+/// were first, and the rows that turn out to repeat a key -- `later`, kept by
+/// the insertion -- are joined again afterwards and subtracted. Counts are
+/// sums, so that is exact. The C, C++, and Zig ports do the same (#241-#243).
+///
+/// Not with the normalisation flags: they refuse from inside a comparison, and
+/// a repeat's refusal could not be taken back. Not with row lists or exports
+/// either: a repeat taken back could have held a place in a capped list, so
+/// the fused path keeps no picks and production fusion is summary-only.
+///
+/// `CSVDIFF_FUSED_JOIN=1` takes this path at any size, which is how the tests
+/// reach it. With row lists as well the ordinary join runs too, for the lists,
+/// and the two sets of counts must agree or the run fails.
+fn fused_active(a_bytes: Option<u64>, b_bytes: Option<u64>, opt: &Options, threads: usize) -> bool {
+    if needs_normalising(opt) {
+        return false;
+    }
+    let forced = std::env::var("CSVDIFF_FUSED_JOIN")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if forced {
+        return true;
+    }
+    if opt.row_lists || opt.export_dir.is_some() {
+        return false;
+    }
+    match (a_bytes, b_bytes) {
+        (Some(a), Some(b)) => threads > 1 && a.saturating_add(b) > (8u64 << 30),
+        _ => false,
+    }
+}
+
+/// What the fused sweep hands on: the folded totals (later duplicates already
+/// subtracted), A's index, the row-join context the sweep ran under, and B's
+/// seen bitmap, which the tail's B round reads.
+struct FusedJoin<'x> {
+    totals: Part,
+    ai: RowIndex,
+    ctx: JoinCtx<'x>,
+    seen: Vec<AtomicU64>,
+}
+
+/// Sweeps A and joins each row as the sweep finds it, while its pages are hot.
+///
+/// The row id handed to `join_row` is -1: ids only feed the pick lists, which
+/// the fused path never builds. Each sweep worker owns its part's counts, so
+/// no row takes a lock; the parts come back with the chunks and are folded.
+fn fused_join<'x>(
+    a: &'x Side,
+    b: &'x Side,
+    bi: &'x RowIndex,
+    opt: &'x Options,
+    nc: usize,
+    threads: usize,
+) -> Result<FusedJoin<'x>> {
+    let key_size = opt.key.len();
+    let (base, seen) = join_setup(a, b, bi, opt, nc, false);
+    // The fused path keeps no picks: row ids are not known during the sweep,
+    // and a later duplicate taken back could have held a capped place.
+    let ctx = JoinCtx {
+        keep_picks: false,
+        ..base
+    };
+    let width = ctx.width;
+    let runs_len = ctx.runs.as_ref().map_or(0, Runs::len);
+
+    let sink = RowSink {
+        ctx: &ctx,
+        seen: &seen,
+        nc,
+    };
+    let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink))?;
+
+    // The rows that turned out to repeat a key were joined as though first;
+    // join them again and subtract. Re-marking the same seen bits changes
+    // nothing: the first row with this key is still matched.
+    let mut neg = Part::blank(nc);
+    {
+        let mut scratch = RowScratch::new(width, runs_len);
+        let data_len = a.slab.data().len();
+        for (k, &row) in ai.later.iter().enumerate() {
+            join_row(
+                &ctx,
+                &mut neg,
+                &mut scratch,
+                -1,
+                ai.row_at[row as usize] as usize,
+                row_end(&ai, row, data_len),
+                ai.row_hash[row as usize],
+                k,
+                &seen,
+            );
+        }
+    }
+    let mut totals = Part::blank(nc);
+    for part in &parts {
+        totals.add(part);
+    }
+    totals.sub(&neg);
+    Ok(FusedJoin {
+        totals,
+        ai,
+        ctx,
+        seen,
+    })
+}
+
+/// The fused compare: B's index is built first on the full thread budget, then
+/// A's sweep joins each row as it finds it.
+#[allow(clippy::too_many_arguments)]
+fn compare_fused(
+    a_input: Input,
+    b_input: Input,
+    opt: &Options,
+    resolved: &Resolved,
+    key_size: usize,
+    a_cols: usize,
+    b_cols: usize,
+    wanted: &[&String],
+    total: usize,
+) -> Result<EngineResult> {
+    let nc = resolved.compared.len();
+    let exporting = opt.export_dir.is_some();
+    let keep_picks = opt.row_lists || exporting;
+
+    // B first, on the full budget: its index is all the join needs from B.
+    let b = b_input.project(wanted, key_size, total)?;
+    let (bi, _) = RowIndex::build(&b, key_size, opt, total, "B ", None)?;
+    // A projected on the full budget too; its sweep joins as it goes.
+    let a = a_input.project(wanted, key_size, total)?;
+    let fused = fused_join(&a, &b, &bi, opt, nc, total)?;
+
+    let mut phases = Phases::new("");
+    let joined = if keep_picks {
+        // Forced by CSVDIFF_FUSED_JOIN with lists or exports: the ordinary
+        // join supplies the report, and the fused totals must agree with it.
+        let check = join(
+            &a,
+            &fused.ai,
+            &b,
+            &bi,
+            opt,
+            &resolved.compared,
+            exporting,
+            total,
+        )?;
+        let same = fused.totals.matched == check.counts.matched
+            && fused.totals.changed_total == check.counts.changed
+            && fused.totals.removed_total == check.counts.removed
+            && (0..nc).all(|i| {
+                fused.totals.changed_per[i] == check.columns[i].changed
+                    && fused.totals.blanked_per[i] == check.columns[i].blanked
+                    && fused.totals.filled_per[i] == check.columns[i].filled
+            });
+        if !same {
+            return Err(Error::new(
+                "CSVDIFF_FUSED_JOIN: the join inside the sweep disagrees with the join after it",
+            ));
+        }
+        check
+    } else {
+        // Summary only: the fused totals are the join's A round.
+        join_tail(
+            &a,
+            &fused.ai,
+            &b,
+            &bi,
+            opt,
+            &resolved.compared,
+            exporting,
+            total,
+            &fused.ctx,
+            &fused.seen,
+            vec![fused.totals],
+        )?
+    };
+    phases.mark("fused join");
+
+    let (dup_a, dup_b) = if opt.row_lists {
+        (
+            duplicate_section(&a, &fused.ai, opt)?,
+            duplicate_section(&b, &bi, opt)?,
+        )
+    } else {
+        (empty_section(opt), empty_section(opt))
+    };
+    phases.mark("duplicate sections");
+    let meta = resolved.meta(&opt.key, a_cols, b_cols);
+    let out = assemble(meta, joined, dup_a, dup_b, opt, &resolved.compared);
+    phases.mark("assemble");
+    out
 }
 
 fn sort_rows(rows: &mut [Vec<Val>], key_size: usize) {
@@ -1949,6 +2458,15 @@ impl Input {
         }
     }
 
+    /// The mapped size, for the fused join's size gate. `None` for Parquet:
+    /// the fused join is text only.
+    fn text_bytes(&self) -> Option<u64> {
+        match self {
+            Input::Text { slab, .. } => Some(slab.data().len() as u64),
+            Input::Parquet { .. } => None,
+        }
+    }
+
     /// Reads the file into the join's representation, keeping only `wanted`.
     fn project(self, wanted: &[&String], key_size: usize, threads: usize) -> Result<Side> {
         let width = wanted.len();
@@ -2020,13 +2538,19 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let b_cols = b_input.header().len();
     let wanted: Vec<&String> = opt.key.iter().chain(&resolved.compared).collect();
 
+    if fused_active(a_input.text_bytes(), b_input.text_bytes(), opt, total) {
+        return compare_fused(
+            a_input, b_input, opt, &resolved, key_size, a_cols, b_cols, &wanted, total,
+        );
+    }
+
     // The two files share nothing until the join, so they are read at the same
     // time, and each is split further: two files across four cores is two chunks
     // each, so the whole machine is busy rather than half of it.
     let per_file = (total / 2).max(1);
     let prepare = |input: Input, tag: &'static str| -> Result<(Side, RowIndex)> {
         let side = input.project(&wanted, key_size, per_file)?;
-        let index = RowIndex::build(&side, key_size, opt, per_file, tag)?;
+        let (index, _) = RowIndex::build(&side, key_size, opt, per_file, tag, None)?;
         Ok((side, index))
     };
     let b_held = parallel::Once::new(b_input);
