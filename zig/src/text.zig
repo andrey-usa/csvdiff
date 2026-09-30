@@ -282,20 +282,136 @@ pub fn sharedTail(a: RowParser, b: RowParser) ?Tail {
 /// The span is the field bytes, not including the delimiter that ends them —
 /// the same `data[from..to]` the field-offset path builds — so the proof's
 /// boundary check in `rowMatches` applies unchanged.
+///
+/// A guard that is the row's last column ends at the line ending instead of a
+/// delimiter, and that is accepted for the last count only; a line ending
+/// before it is a short row. Refusing it, as this did until the 2M x 100 run,
+/// turned the fast path off for any file whose last column is compared.
 pub fn guardSpan(data: []const u8, lo: usize, hi: usize, delimiter: u8, commas: usize) ?usize {
-    var at = lo;
+    if (commas == 0) return null;
     var delims = scan.Delims.init(data, lo, hi, delimiter, '\n');
-    for (0..commas) |i| {
+    const at = pastFields(&delims, data, lo, hi, delimiter, commas, true) orelse return null;
+    return at - 1 - lo;
+}
+
+/// Past the byte that closes the `n`th field from `at`, or null where the row
+/// ends first. With `may_end` the last of them may close on the line ending.
+inline fn pastFields(
+    delims: *scan.Delims,
+    data: []const u8,
+    from: usize,
+    hi: usize,
+    delimiter: u8,
+    n: usize,
+    may_end: bool,
+) ?usize {
+    var at = from;
+    for (0..n) |i| {
         const cur = if (at < hi and data[at] == '"') blk: {
             const close = scan.skipQuoted(data, at + 1, hi);
             break :blk delims.next(close);
         } else delims.next(at);
-        if (cur >= hi or data[cur] != delimiter) return null;
+        if (cur >= hi) return null;
+        if (data[cur] != delimiter and !(may_end and i + 1 == n and data[cur] == '\n')) return null;
         at = cur + 1;
-        if (i + 1 == commas) return cur - lo;
     }
-    return null;
+    return at;
 }
+
+/// The gapped proof's plan, where a column nobody wants sits among the wanted
+/// ones -- an ignored `updated_at` in the middle of the row, say.
+///
+/// `guardSpan` covers one run: A's row from its start through the last column
+/// either file wants, compared as bytes. An unwanted column inside that run
+/// that differs -- and an ignored timestamp differs on every row -- fails the
+/// proof every time, and every row is parsed. So the wanted columns are
+/// compared as runs instead, and the unwanted ones between them skipped by
+/// field count in each row on its own: an ignored value that differs cannot
+/// stop a row proving equal, and one that differs in length cannot misalign
+/// what follows. `seg[j]` wanted fields are followed by `gap[j]` unwanted ones;
+/// the last run has no gap. The C, C++ and Rust ports have the same proof
+/// (#229, #230, #231).
+pub const Runs = struct {
+    seg: []usize,
+    gap: []usize,
+
+    /// Null where there is no gap, and the one-run proof applies unchanged.
+    /// Only called once `sharedTail` has agreed the two sides' shapes, so A's
+    /// map of wanted columns is B's too.
+    pub fn plan(gpa: std.mem.Allocator, a: RowParser) !?Runs {
+        const c = switch (a) {
+            .csv => |c| c,
+            .json => return null,
+        };
+        var seg: std.ArrayList(usize) = .empty;
+        errdefer seg.deinit(gpa);
+        var gap: std.ArrayList(usize) = .empty;
+        errdefer gap.deinit(gpa);
+        try seg.append(gpa, 0);
+        try gap.append(gpa, 0);
+        for (0..c.last_needed + 1) |col| {
+            const wanted = c.starts[col + 1] > c.starts[col];
+            if (!wanted) {
+                gap.items[gap.items.len - 1] += 1;
+                continue;
+            }
+            if (gap.items[gap.items.len - 1] > 0) {
+                try seg.append(gpa, 0);
+                try gap.append(gpa, 0);
+            }
+            seg.items[seg.items.len - 1] += 1;
+        }
+        if (seg.items.len < 2) {
+            seg.deinit(gpa);
+            gap.deinit(gpa);
+            return null;
+        }
+        const s = try seg.toOwnedSlice(gpa);
+        errdefer gpa.free(s);
+        return .{ .seg = s, .gap = try gap.toOwnedSlice(gpa) };
+    }
+
+    pub fn deinit(self: Runs, gpa: std.mem.Allocator) void {
+        gpa.free(self.seg);
+        gpa.free(self.gap);
+    }
+
+    /// Where each run starts in this row and how many bytes it takes, through
+    /// the byte that closes it, into `out` -- two words a run. False where the
+    /// row ends first, which falls back to the parse.
+    pub fn ofRow(self: Runs, data: []const u8, lo: usize, hi: usize, delimiter: u8, out: []usize) bool {
+        var delims = scan.Delims.init(data, lo, hi, delimiter, '\n');
+        var at = lo;
+        const n = self.seg.len;
+        for (self.seg, 0..) |fields, j| {
+            const last = j + 1 == n;
+            const end = pastFields(&delims, data, at, hi, delimiter, fields, last) orelse return false;
+            out[2 * j] = at;
+            out[2 * j + 1] = end - at;
+            if (last) break;
+            at = pastFields(&delims, data, end, hi, delimiter, self.gap[j], false) orelse return false;
+        }
+        return true;
+    }
+
+    /// Whether B's row `b[lo..hi]` holds each of A's runs where its own gaps
+    /// put it. A run's bytes include the byte that closes it, so equal bytes
+    /// leave B at the start of its next field, as they leave A.
+    pub fn matches(self: Runs, a: []const u8, spans: []const usize, b: []const u8, lo: usize, hi: usize, delimiter: u8) bool {
+        var delims = scan.Delims.init(b, lo, hi, delimiter, '\n');
+        var at = lo;
+        const n = self.seg.len;
+        for (0..n) |j| {
+            const from = spans[2 * j];
+            const len = spans[2 * j + 1];
+            if (len > hi - at or !std.mem.eql(u8, a[from .. from + len], b[at .. at + len])) return false;
+            at += len;
+            if (j + 1 == n) break;
+            at = pastFields(&delims, b, at, hi, delimiter, self.gap[j], false) orelse return false;
+        }
+        return true;
+    }
+};
 
 pub const RowParser = union(enum) {
     csv: Csv,
