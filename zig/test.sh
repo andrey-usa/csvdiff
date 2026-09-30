@@ -359,4 +359,52 @@ if [ "$got" = "matched 2" ]; then echo "  ok    and a CSV doubled quote finds th
 else echo "  FAIL  a CSV key with a doubled quote missed its JSON spelling: $got"; fail=1; fi
 rm -rf "$kesc"
 
+# Past page cache the join runs inside A's sweep, joining every row as though it
+# were its key's first and taking back, afterwards, the rows that repeat a key.
+# CSVDIFF_FUSED_JOIN=1 takes that path at any size. The repeats here differ from
+# their key's first row -- in a compared value, or in being absent from B -- and
+# the file is past the split threshold, so a repeat that was not taken back, or a
+# chunk's last row cut short, changes the counts or the column counts.
+echo "the join inside the sweep:"
+fz=$(mktemp -d)
+python3 - "$fz" <<'PY'
+import json, sys
+d = sys.argv[1]
+def rows(side):
+    out = []
+    for i in range(250000):
+        if side == "b" and i % 4001 == 0:
+            continue                                   # removed from B
+        v = i * 3 + (1 if side == "b" and i % 17 == 0 else 0)
+        out.append((f"K{i:06d}", str(v), "t"))
+        if i % 97 == 0:                                # a repeat that differs
+            out.append((f"K{i:06d}", str(v + 5), "u" if side == "a" else "t"))
+        if side == "b" and i % 131 == 0:               # repeats in B too
+            out.append((f"K{i:06d}", "0", "x"))
+    for i in range(30):
+        out.append((f"{side.upper()}ONLY{i:03d}", "1", "t"))
+    return out
+for side in ("a", "b"):
+    rs = rows(side)
+    with open(f"{d}/f_{side}.csv", "w") as f:
+        f.write("k,v,w\n")
+        f.writelines(f"{k},{v},{w}\n" for k, v, w in rs)
+    with open(f"{d}/f_{side}.ndjson", "w") as f:
+        f.writelines(json.dumps({"k": k, "v": v, "w": w}) + "\n" for k, v, w in rs)
+PY
+for ext in csv ndjson; do
+  for t in 1 4; do
+    $BIN compare "$fz/f_a.$ext" "$fz/f_b.$ext" -k k --threads $t --json "$fz/after.json" >/dev/null 2>&1 || true
+    CSVDIFF_FUSED_JOIN=1 $BIN compare "$fz/f_a.$ext" "$fz/f_b.$ext" -k k --threads $t \
+        --json "$fz/inside.json" >/dev/null 2>&1 || true
+    if python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:3]); sys.exit(0 if (a["counts"],a["columns"])==(b["counts"],b["columns"]) and a["counts"]["matched"]>0 else 1)' \
+        "$fz/after.json" "$fz/inside.json"; then
+      printf '  ok    %s, %s thread(s): the join inside the sweep finds what the join after it finds\n' "$ext" "$t"
+    else
+      printf '  FAIL  %s, %s thread(s): the join inside the sweep disagrees\n' "$ext" "$t"; fail=1
+    fi
+  done
+done
+rm -rf "$fz"
+
 exit $fail

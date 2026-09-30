@@ -76,6 +76,11 @@ const JOIN_THRESHOLD: usize = 1 << 14;
 /// does the reading.
 pub var phases_on: bool = false;
 
+/// Set from `CSVDIFF_FUSED_JOIN` by `main.zig`, like `phases_on`: takes the join
+/// inside A's sweep at any size, which is how the tests reach it. See `fused` in
+/// `compare`.
+pub var fused_forced: bool = false;
+
 pub const Phases = struct {
     on: bool,
     tag: []const u8,
@@ -822,6 +827,10 @@ const RowIndex = struct {
     mask: usize,
     first_row: std.ArrayList(i32),
     occurrences: std.ArrayList(u32),
+    /// Rows that repeat a key already seen, in file order -- kept only when the
+    /// build was given a sink, which joined them as though each were first.
+    later: std.ArrayList(i32) = .empty,
+    track_later: bool = false,
     probe: []Field,
     mine: []Field,
     rows: i64 = 0,
@@ -867,9 +876,10 @@ const RowIndex = struct {
         opt: Options,
         threads: usize,
         tag: []const u8,
+        sink: ?*FusedSink,
     ) !RowIndex {
         var phases = Phases.start(tag);
-        const chunks = try sweep(gpa, side, key_size, opt, threads);
+        const chunks = try sweep(gpa, side, key_size, opt, threads, sink);
         phases.mark("sweep (parallel)");
         defer {
             for (chunks) |*c| c.deinit(gpa);
@@ -916,6 +926,7 @@ const RowIndex = struct {
             .occurrences = .empty,
             .probe = try gpa.alloc(Field, side.width),
             .mine = try gpa.alloc(Field, side.width),
+            .track_later = sink != null,
         };
         errdefer self.deinit();
 
@@ -984,6 +995,7 @@ const RowIndex = struct {
         self.row_hash.deinit(self.gpa);
         self.first_row.deinit(self.gpa);
         self.occurrences.deinit(self.gpa);
+        self.later.deinit(self.gpa);
         self.gpa.free(self.table);
         self.gpa.free(self.probe);
         self.gpa.free(self.mine);
@@ -1032,6 +1044,7 @@ const RowIndex = struct {
                             self.dup_rows += 1; // the first occurrence counts once the key repeats
                         }
                         self.dup_rows += 1;
+                        if (self.track_later) try self.later.append(self.gpa, row);
                         return;
                     }
                 }
@@ -1283,6 +1296,9 @@ const Sweep = struct {
     columnar_rows: usize,
     chunks: []Chunk,
     next: std.atomic.Value(usize),
+    /// When the join runs inside the sweep, where each row goes once the next
+    /// row's start says where it ends.
+    sink: ?*FusedSink = null,
 
     fn run(self: *Sweep) void {
         while (true) {
@@ -1353,6 +1369,12 @@ const Sweep = struct {
                     }
                     try push(u64, &chunk.at, gpa, pos);
                     try push(u64, &chunk.hash, gpa, try keyHash(self.side.slab, keys, self.key_size, self.opt, &s.a));
+                    // The row before this one ends where this one starts, which
+                    // is what `rowEnd` will say; its pages are still in memory.
+                    if (self.sink) |sink| {
+                        const n = chunk.at.items.len;
+                        if (n >= 2) try sink.row(i, @intCast(chunk.at.items[n - 2]), pos, chunk.hash.items[n - 2]);
+                    }
                     if (next <= pos) break; // no progress: a malformed tail, not a loop
                     pos = next;
                 }
@@ -1375,6 +1397,7 @@ fn sweep(
     key_size: usize,
     opt: Options,
     threads: usize,
+    sink: ?*FusedSink,
 ) ![]Chunk {
     var bounds: []usize = &.{};
     var parts: usize = 1;
@@ -1410,10 +1433,26 @@ fn sweep(
         },
         .chunks = chunks,
         .next = std.atomic.Value(usize).init(0),
+        .sink = sink,
     };
     try runOnThreads(&work, Sweep.run, parts);
     for (chunks) |c| {
         if (c.failure) |e| return e;
+    }
+    // Each chunk's last row ends where the next chunk's first row starts, which
+    // only the next chunk knows, so those rows are handed over now.
+    if (sink) |k| {
+        for (chunks, 0..) |c, i| {
+            if (c.at.items.len == 0) continue;
+            var hi: usize = side.slab.data.len;
+            for (chunks[i + 1 ..]) |later| {
+                if (later.at.items.len > 0) {
+                    hi = @intCast(later.at.items[0]);
+                    break;
+                }
+            }
+            try k.row(i, @intCast(c.at.items[c.at.items.len - 1]), hi, c.hash.items[c.hash.items.len - 1]);
+        }
     }
     return chunks;
 }
@@ -1537,25 +1576,13 @@ const Join = struct {
     }
 
     fn range(self: *Join, p: usize) !void {
-        const gpa = self.a.gpa;
-        const fa = try gpa.alloc(Field, self.width);
-        defer gpa.free(fa);
-        // The lookup's scratch, and on a hit it already holds the mate's fields:
-        // that is what the key columns were matched against.
-        const fb = try gpa.alloc(Field, self.width);
-        defer gpa.free(fb);
-        // Two words a run, for the gapped proof.
-        const spans = try gpa.alloc(usize, if (self.runs) |r| 2 * r.seg.len else 0);
-        defer gpa.free(spans);
-        var s = Scratch{};
-        var out = &self.parts[p];
+        var rs = try RowScratch.init(self);
+        defer rs.deinit(self.a.gpa);
+        const out = &self.parts[p];
 
         const keys = self.ai.first_row.items;
         const lo = keys.len * p / self.parts.len;
         const hi = keys.len * (p + 1) / self.parts.len;
-        // Nothing to normalise and no tolerance: the cell comparison cannot
-        // fail, so it need not be asked through an error union.
-        const plain = !needsNormalising(self.opt);
         const mine = keys[lo..hi];
         // A proof that keeps failing is a scan for nothing: two files where every
         // row really has changed would pay for it on every row. After
@@ -1569,143 +1596,266 @@ const Join = struct {
             // The hash is the one the sweep computed for this row: the same
             // bytes through the same function, so computing it again here would
             // be a second pass over every key in the file for the same number.
-            const hash = self.ai.row_hash.items[@intCast(row)];
-            // The proof's span without the parse: the guard's delimiter sits a
-            // fixed count from the row start, countable with the delimiter
-            // cursor alone. Most rows prove out here and never pay for fields;
-            // a row the bytes do not settle falls through to the parse below.
-            const guard = self.span_tail;
-            const attempt = guard != null and (refused < PROOF_BACKOFF or at & (PROOF_BACKOFF - 1) == 0);
-            if (attempt) {
-                const t = guard.?;
-                const data = self.a.slab.data;
-                const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
-                const end = self.ai.rowEnd(row);
-                if (self.runs) |runs| gapped: {
-                    if (!runs.ofRow(data, from, end, t.delimiter, spans)) break :gapped;
-                    // No fields and no span: the first candidate whose whole
-                    // hash matches, unproven, which the runs then settle.
-                    if (try self.bi.lookup(self.a.slab, null, hash, .whole, null, &s, fb)) |hit| {
-                        const bd = self.b.slab.data;
-                        const b_lo: usize = @intCast(self.bi.row_at.items[@intCast(hit.row)]);
-                        if (runs.matches(data, spans, bd, b_lo, self.bi.rowEnd(hit.row), t.delimiter)) {
-                            out.matched += 1;
-                            refused = 0;
-                            continue;
-                        }
-                        if (refused < PROOF_BACKOFF) refused += 1;
-                    } else {
-                        out.removed += 1;
-                        continue;
+            const row_lo: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
+            try self.joinRow(out, &rs, row_lo, self.ai.rowEnd(row), self.ai.row_hash.items[@intCast(row)], at, &refused);
+        }
+    }
+
+    /// One row of A against its mate in B, counted into `out`: the row's bytes
+    /// from `row_lo` to `row_hi`, the next row's start, which is what `rowEnd`
+    /// gives -- by offsets rather than by row number, so the join can run while
+    /// A's index is still being built (see `fused` in `compare`). `at` and
+    /// `refused` are the proof's backoff; they decide how the answer is
+    /// reached, never what it is.
+    fn joinRow(
+        self: *const Join,
+        out: *Part,
+        rs: *RowScratch,
+        row_lo: usize,
+        row_hi: usize,
+        hash: u64,
+        at: usize,
+        refused: *usize,
+    ) !void {
+        // Nothing to normalise and no tolerance: the cell comparison cannot
+        // fail, so it need not be asked through an error union.
+        const plain = !needsNormalising(self.opt);
+        // The proof's span without the parse: the guard's delimiter sits a
+        // fixed count from the row start, countable with the delimiter
+        // cursor alone. Most rows prove out here and never pay for fields;
+        // a row the bytes do not settle falls through to the parse below.
+        const guard = self.span_tail;
+        const attempt = guard != null and (refused.* < PROOF_BACKOFF or at & (PROOF_BACKOFF - 1) == 0);
+        if (attempt) {
+            const t = guard.?;
+            const data = self.a.slab.data;
+            const from = row_lo;
+            const end = row_hi;
+            if (self.runs) |runs| gapped: {
+                if (!runs.ofRow(data, from, end, t.delimiter, rs.spans)) break :gapped;
+                // No fields and no span: the first candidate whose whole
+                // hash matches, unproven, which the runs then settle.
+                if (try self.bi.lookup(self.a.slab, null, hash, .whole, null, &rs.s, rs.fb)) |hit| {
+                    const bd = self.b.slab.data;
+                    const b_lo: usize = @intCast(self.bi.row_at.items[@intCast(hit.row)]);
+                    if (runs.matches(data, rs.spans, bd, b_lo, self.bi.rowEnd(hit.row), t.delimiter)) {
+                        out.matched += 1;
+                        refused.* = 0;
+                        return;
                     }
-                } else if (text.guardSpan(data, from, end, t.delimiter, t.src + 1)) |need| {
-                    const span: Span = .{ .csv = .{ .bytes = data[from .. from + need], .delimiter = t.delimiter } };
-                    if (try self.bi.lookup(self.a.slab, null, hash, .whole, span, &s, fb)) |hit| {
-                        if (hit.same_bytes) {
-                            out.matched += 1;
-                            refused = 0;
-                            continue;
-                        }
-                        // A candidate the bytes did not settle: fall through to
-                        // the parse and the key-checking lookup below, which also
-                        // covers the hash collision this skipped past.
-                        if (refused < PROOF_BACKOFF) refused += 1;
-                    } else {
-                        out.removed += 1;
-                        continue;
+                    if (refused.* < PROOF_BACKOFF) refused.* += 1;
+                } else {
+                    out.removed += 1;
+                    return;
+                }
+            } else if (text.guardSpan(data, from, end, t.delimiter, t.src + 1)) |need| {
+                const span: Span = .{ .csv = .{ .bytes = data[from .. from + need], .delimiter = t.delimiter } };
+                if (try self.bi.lookup(self.a.slab, null, hash, .whole, span, &rs.s, rs.fb)) |hit| {
+                    if (hit.same_bytes) {
+                        out.matched += 1;
+                        refused.* = 0;
+                        return;
                     }
+                    // A candidate the bytes did not settle: fall through to
+                    // the parse and the key-checking lookup below, which also
+                    // covers the hash collision this skipped past.
+                    if (refused.* < PROOF_BACKOFF) refused.* += 1;
+                } else {
+                    out.removed += 1;
+                    return;
                 }
             }
-            self.ai.fieldsOf(row, fa);
-            // A's row up to the end of the last column either file wants. The
-            // end has to be a boundary in A as well: a quoted field ends on its
-            // closing quote, and what follows is not part of the run.
-            const span: ?Span = blk: {
-                const tail = self.span_tail orelse break :blk null;
-                const f = fa[tail.slot];
-                if (!fld.isReal(f)) break :blk null;
-                const data = self.a.slab.data;
-                const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
-                const to = fld.offsetOf(f) + fld.lenOf(f);
-                if (to < from or to > data.len) break :blk null;
-                if (to < data.len and data[to] != tail.delimiter and data[to] != '\n') {
-                    break :blk null;
-                }
-                break :blk .{ .csv = .{ .bytes = data[from..to], .delimiter = tail.delimiter } };
-            };
-            // What JSON gets instead, since `sharedTail` cannot promise it an
-            // offset. Through the byte that closes the last value either file
-            // wants -- whichever it turns out to be, since two objects need not
-            // list their names in the same order. Every wanted field and not only
-            // the compared ones: the keys have to be inside the run for it to
-            // stand in for the key comparison, which is what lets it run before
-            // the mate is parsed.
-            const proof: ?Span = span orelse blk: {
-                if (!self.json_proof) break :blk null;
-                if (refused >= PROOF_BACKOFF and at & (PROOF_BACKOFF - 1) != 0) break :blk null;
-                const data = self.a.slab.data;
-                const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
-                const end = self.ai.rowEnd(row);
-                var t = from;
-                for (fa[0..self.width]) |f| {
-                    if (!fld.isReal(f)) continue;
-                    const e = fld.offsetOf(f) + fld.lenOf(f);
-                    if (e > t) t = e;
-                }
-                if (t >= end or t < from) break :blk null;
-                break :blk .{ .json = .{ .bytes = data[from .. t + 1] } };
-            };
-            const hit = (try self.bi.lookup(self.a.slab, fa, hash, .whole, proof, &s, fb)) orelse {
-                out.removed += 1;
-                continue;
-            };
-            out.matched += 1;
-            // `same_bytes` is the proof's own verdict, so it is what the backoff
-            // counts. A run of failures means two files whose rows really do
-            // differ, and scanning them is work for nothing.
-            if (self.json_proof and proof != null) {
-                if (hit.same_bytes) {
-                    refused = 0;
-                } else if (refused < PROOF_BACKOFF) {
-                    refused += 1;
+        }
+        self.a.fieldsAt(row_lo, rs.fa);
+        // A's row up to the end of the last column either file wants. The
+        // end has to be a boundary in A as well: a quoted field ends on its
+        // closing quote, and what follows is not part of the run.
+        const span: ?Span = blk: {
+            const tail = self.span_tail orelse break :blk null;
+            const f = rs.fa[tail.slot];
+            if (!fld.isReal(f)) break :blk null;
+            const data = self.a.slab.data;
+            const from = row_lo;
+            const to = fld.offsetOf(f) + fld.lenOf(f);
+            if (to < from or to > data.len) break :blk null;
+            if (to < data.len and data[to] != tail.delimiter and data[to] != '\n') {
+                break :blk null;
+            }
+            break :blk .{ .csv = .{ .bytes = data[from..to], .delimiter = tail.delimiter } };
+        };
+        // What JSON gets instead, since `sharedTail` cannot promise it an
+        // offset. Through the byte that closes the last value either file
+        // wants -- whichever it turns out to be, since two objects need not
+        // list their names in the same order. Every wanted field and not only
+        // the compared ones: the keys have to be inside the run for it to
+        // stand in for the key comparison, which is what lets it run before
+        // the mate is parsed.
+        const proof: ?Span = span orelse blk: {
+            if (!self.json_proof) break :blk null;
+            if (refused.* >= PROOF_BACKOFF and at & (PROOF_BACKOFF - 1) != 0) break :blk null;
+            const data = self.a.slab.data;
+            const from = row_lo;
+            const end = row_hi;
+            var t = from;
+            for (rs.fa[0..self.width]) |f| {
+                if (!fld.isReal(f)) continue;
+                const e = fld.offsetOf(f) + fld.lenOf(f);
+                if (e > t) t = e;
+            }
+            if (t >= end or t < from) break :blk null;
+            break :blk .{ .json = .{ .bytes = data[from .. t + 1] } };
+        };
+        const hit = (try self.bi.lookup(self.a.slab, rs.fa, hash, .whole, proof, &rs.s, rs.fb)) orelse {
+            out.removed += 1;
+            return;
+        };
+        out.matched += 1;
+        // `same_bytes` is the proof's own verdict, so it is what the backoff
+        // counts. A run of failures means two files whose rows really do
+        // differ, and scanning them is work for nothing.
+        if (self.json_proof and proof != null) {
+            if (hit.same_bytes) {
+                refused.* = 0;
+            } else if (refused.* < PROOF_BACKOFF) {
+                refused.* += 1;
+            }
+        }
+        // The two rows carry the same bytes across every column either file
+        // wants, so no column differs and the mate was never read.
+        if (hit.same_bytes) return;
+        var any = false;
+        // Two loops rather than one with a flag inside it: `plain` cannot
+        // change between columns or between rows, and this is the innermost
+        // loop of the whole comparison -- seventeen columns of ten million
+        // matched rows.
+        if (plain) {
+            for (0..self.nc) |i| {
+                const x = rs.fa[self.key_size + i];
+                const y = rs.fb[self.key_size + i];
+                const xa = plainAbsent(x);
+                const yb = plainAbsent(y);
+                if (plainDiffers(self.a.slab, x, xa, self.b.slab, y, yb)) {
+                    any = true;
+                    out.columns[i].changed += 1;
+                    // Absence is already known: the general path asks for it
+                    // twice more, having thrown away the answer.
+                    if (yb) out.columns[i].blanked += 1;
+                    if (xa) out.columns[i].filled += 1;
                 }
             }
-            // The two rows carry the same bytes across every column either file
-            // wants, so no column differs and the mate was never read.
-            if (hit.same_bytes) continue;
-            var any = false;
-            // Two loops rather than one with a flag inside it: `plain` cannot
-            // change between columns or between rows, and this is the innermost
-            // loop of the whole comparison -- seventeen columns of ten million
-            // matched rows.
-            if (plain) {
-                for (0..self.nc) |i| {
-                    const x = fa[self.key_size + i];
-                    const y = fb[self.key_size + i];
-                    const xa = plainAbsent(x);
-                    const yb = plainAbsent(y);
-                    if (plainDiffers(self.a.slab, x, xa, self.b.slab, y, yb)) {
-                        any = true;
-                        out.columns[i].changed += 1;
-                        // Absence is already known: the general path asks for it
-                        // twice more, having thrown away the answer.
-                        if (yb) out.columns[i].blanked += 1;
-                        if (xa) out.columns[i].filled += 1;
-                    }
-                }
-            } else {
-                for (0..self.nc) |i| {
-                    const x = fa[self.key_size + i];
-                    const y = fb[self.key_size + i];
-                    if (try cellDiffers(self.a.slab, x, self.b.slab, y, self.opt, &s)) {
-                        any = true;
-                        out.columns[i].changed += 1;
-                        if (try isAbsent(self.b.slab, y, self.opt, &s.b)) out.columns[i].blanked += 1;
-                        if (try isAbsent(self.a.slab, x, self.opt, &s.a)) out.columns[i].filled += 1;
-                    }
+        } else {
+            for (0..self.nc) |i| {
+                const x = rs.fa[self.key_size + i];
+                const y = rs.fb[self.key_size + i];
+                if (try cellDiffers(self.a.slab, x, self.b.slab, y, self.opt, &rs.s)) {
+                    any = true;
+                    out.columns[i].changed += 1;
+                    if (try isAbsent(self.b.slab, y, self.opt, &rs.s.b)) out.columns[i].blanked += 1;
+                    if (try isAbsent(self.a.slab, x, self.opt, &rs.s.a)) out.columns[i].filled += 1;
                 }
             }
-            if (any) out.changed += 1;
+        }
+        if (any) out.changed += 1;
+    }
+};
+
+/// One join worker's buffers: A's fields; the lookup's scratch, which on a hit
+/// already holds the mate's fields; two words a run for the gapped proof; and
+/// the normalising scratch.
+const RowScratch = struct {
+    fa: []Field,
+    fb: []Field,
+    spans: []usize,
+    s: Scratch = .{},
+
+    fn init(join: *const Join) !RowScratch {
+        const gpa = join.a.gpa;
+        const fa = try gpa.alloc(Field, join.width);
+        errdefer gpa.free(fa);
+        const fb = try gpa.alloc(Field, join.width);
+        errdefer gpa.free(fb);
+        const spans = try gpa.alloc(usize, if (join.runs) |r| 2 * r.seg.len else 0);
+        return .{ .fa = fa, .fb = fb, .spans = spans };
+    }
+
+    fn deinit(self: *RowScratch, gpa: std.mem.Allocator) void {
+        gpa.free(self.fa);
+        gpa.free(self.fb);
+        gpa.free(self.spans);
+    }
+};
+
+/// The join inside A's sweep: each sweep chunk joins its rows into its own part
+/// as it finds them. See `fused` in `compare`.
+const FusedSink = struct {
+    join: *const Join,
+    parts: []Part,
+    scratch: []RowScratch,
+    seen: []usize,
+    refused: []usize,
+
+    fn init(gpa: std.mem.Allocator, join: *const Join, parts: []Part) !FusedSink {
+        const scratch = try gpa.alloc(RowScratch, parts.len);
+        var made: usize = 0;
+        errdefer {
+            for (scratch[0..made]) |*x| x.deinit(gpa);
+            gpa.free(scratch);
+        }
+        for (scratch) |*x| {
+            x.* = try RowScratch.init(join);
+            made += 1;
+        }
+        const seen = try gpa.alloc(usize, parts.len);
+        errdefer gpa.free(seen);
+        @memset(seen, 0);
+        const refused = try gpa.alloc(usize, parts.len);
+        @memset(refused, 0);
+        return .{ .join = join, .parts = parts, .scratch = scratch, .seen = seen, .refused = refused };
+    }
+
+    fn deinit(self: *FusedSink, gpa: std.mem.Allocator) void {
+        for (self.scratch) |*x| x.deinit(gpa);
+        gpa.free(self.scratch);
+        gpa.free(self.seen);
+        gpa.free(self.refused);
+    }
+
+    fn row(self: *FusedSink, i: usize, lo: usize, hi: usize, hash: u64) !void {
+        try self.join.joinRow(&self.parts[i], &self.scratch[i], lo, hi, hash, self.seen[i], &self.refused[i]);
+        self.seen[i] += 1;
+    }
+};
+
+/// The rows that repeat a key, joined again into parts of their own after a
+/// join inside the sweep, to be subtracted: the same bytes against the same
+/// index give the same counts.
+const TakeBack = struct {
+    join: *const Join,
+    rows: []const i32,
+    parts: []Part,
+    next: std.atomic.Value(usize),
+
+    fn run(self: *TakeBack) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.parts.len) return;
+            self.one(i) catch |e| {
+                self.parts[i].failure = e;
+                return;
+            };
+        }
+    }
+
+    fn one(self: *TakeBack, p: usize) !void {
+        var rs = try RowScratch.init(self.join);
+        defer rs.deinit(self.join.a.gpa);
+        const ai = self.join.ai;
+        const lo = self.rows.len * p / self.parts.len;
+        const hi = self.rows.len * (p + 1) / self.parts.len;
+        var refused: usize = 0;
+        for (self.rows[lo..hi], lo..) |row, at| {
+            const row_lo: usize = @intCast(ai.row_at.items[@intCast(row)]);
+            try self.join.joinRow(&self.parts[p], &rs, row_lo, ai.rowEnd(row), ai.row_hash.items[@intCast(row)], at, &refused);
         }
     }
 };
@@ -1745,6 +1895,7 @@ const Prepare = struct {
             self.opt,
             self.threads,
             self.tag,
+            null,
         );
     }
 
@@ -1852,13 +2003,36 @@ pub fn compare(
     // which would hand two threads the same bytes -- so main.zig passes its
     // lock-taking variant. The budget it enforces is unchanged.
     const per_file: usize = 1;
+
+    // Past page cache the join runs inside A's sweep instead of after it.
+    //
+    // Past memory every pass is a read from disk, and the join used to be the
+    // fourth: both sweeps, then both files again for the rows to compare -- at
+    // 150M rows as long as a cold read of both files. Built first, B's index is
+    // all the join needs from B, so A's rows can be joined as A's sweep finds
+    // them, while their pages are in memory, and A is read once.
+    //
+    // The join compares a key's first row, and which row is first is only known
+    // once the insertion has seen them all. So every row is joined as though it
+    // were first, and the rows that turn out to repeat a key -- `later`, kept by
+    // the insertion -- are joined again afterwards and subtracted. Counts are
+    // sums, so that is exact. The C and C++ ports do the same.
+    //
+    // Text on both sides only, and not with the normalisation flags:
+    // --ignore-case refuses from inside a comparison, and a repeat's refusal
+    // could not be taken back. CSVDIFF_FUSED_JOIN=1 takes this path at any size,
+    // which is how the tests reach it.
+    const fused = !needsNormalising(opt) and a_input == .text and b_input == .text and
+        (fused_forced or (total > 1 and
+            a_input.text.slab.data.len + b_input.text.slab.data.len > (@as(usize, 8) << 30)));
+
     var prepare_a = Prepare{
         .gpa = gpa,
         .input = a_input,
         .wanted = wanted.items,
         .key_size = key_size,
         .opt = opt,
-        .threads = per_file,
+        .threads = if (fused) total else per_file,
         .tag = "A ",
     };
     var prepare_b = Prepare{
@@ -1867,21 +2041,28 @@ pub fn compare(
         .wanted = wanted.items,
         .key_size = key_size,
         .opt = opt,
-        .threads = per_file,
+        .threads = if (fused) total else per_file,
         .tag = "B ",
     };
-    const reader: ?std.Thread = std.Thread.spawn(.{}, Prepare.run, .{&prepare_b}) catch null;
-    if (reader == null) prepare_b.run();
-    prepare_a.run();
-    if (reader) |w| w.join();
     defer prepare_a.deinit();
     defer prepare_b.deinit();
-    if (prepare_a.failure) |e| return e;
-    if (prepare_b.failure) |e| return e;
+    if (fused) {
+        // B whole, on the whole budget; A only read, since its index is built
+        // with the join inside it below.
+        prepare_b.run();
+        if (prepare_b.failure) |e| return e;
+        prepare_a.side = try prepare_a.input.project(gpa, wanted.items, key_size, total);
+    } else {
+        const reader: ?std.Thread = std.Thread.spawn(.{}, Prepare.run, .{&prepare_b}) catch null;
+        if (reader == null) prepare_b.run();
+        prepare_a.run();
+        if (reader) |w| w.join();
+        if (prepare_a.failure) |e| return e;
+        if (prepare_b.failure) |e| return e;
+    }
 
     const a = &prepare_a.side.?;
     const b = &prepare_b.side.?;
-    const ai = &prepare_a.index.?;
     const bi = &prepare_b.index.?;
 
     // Owned copies: the names point into the header, which is released when this
@@ -1899,7 +2080,8 @@ pub fn compare(
 
     // A's keys, chunked into one queue every thread pulls from. B has no pass of
     // its own any more: see `counts.added` below.
-    const a_ways = waysFor(ai.first_row.items.len);
+    // Fused, A's keys are not counted yet: one part a sweep chunk.
+    const a_ways = if (fused) total else waysFor(prepare_a.index.?.first_row.items.len);
     const parts = try gpa.alloc(Part, a_ways);
     // One release, of the parts that were built, on every path. This was a
     // `defer` over all of them beside an `errdefer` over the built ones, so any
@@ -1923,7 +2105,7 @@ pub fn compare(
     var join = Join{
         .a = a,
         .b = b,
-        .ai = ai,
+        .ai = undefined, // set once A's index exists: see below
         .bi = bi,
         .opt = opt,
         .key_size = key_size,
@@ -1937,9 +2119,39 @@ pub fn compare(
     if (join.span_tail != null) join.runs = try text.Runs.plan(gpa, a.parser().?);
     defer if (join.runs) |r| r.deinit(gpa);
     var phases = Phases.start("");
-    try runOnThreads(&join, Join.run, total);
-    phases.mark("join chunks (par)");
+    // Fused, the rows that repeat a key, joined again to be subtracted.
+    var back: []Part = &.{};
+    var back_built: usize = 0;
+    defer {
+        for (back[0..back_built]) |p| gpa.free(p.columns);
+        if (back.len > 0) gpa.free(back);
+    }
+    if (fused) {
+        var sink = try FusedSink.init(gpa, &join, parts);
+        defer sink.deinit(gpa);
+        prepare_a.index = try RowIndex.build(gpa, a, key_size, opt, total, "A ", &sink);
+        join.ai = &prepare_a.index.?;
+        const later = join.ai.later.items;
+        back = try gpa.alloc(Part, if (later.len < (1 << 14)) 1 else total);
+        for (back) |*p| {
+            const stats = try gpa.alloc(ColumnStat, nc);
+            for (stats, compared.items) |*stat, name| stat.* = .{ .name = name };
+            p.* = .{ .columns = stats };
+            back_built += 1;
+        }
+        var take = TakeBack{ .join = &join, .rows = later, .parts = back, .next = std.atomic.Value(usize).init(0) };
+        try runOnThreads(&take, TakeBack.run, back.len);
+        phases.mark("repeated keys taken back");
+    } else {
+        join.ai = &prepare_a.index.?;
+        try runOnThreads(&join, Join.run, total);
+        phases.mark("join chunks (par)");
+    }
+    const ai = join.ai;
     for (parts) |part| {
+        if (part.failure) |e| return e;
+    }
+    for (back) |part| {
         if (part.failure) |e| return e;
     }
 
@@ -1952,6 +2164,16 @@ pub fn compare(
             into.changed += from.changed;
             into.blanked += from.blanked;
             into.filled += from.filled;
+        }
+    }
+    for (back) |part| {
+        counts.matched -= part.matched;
+        counts.changed -= part.changed;
+        counts.removed -= part.removed;
+        for (columns, part.columns) |*into, from| {
+            into.changed -= from.changed;
+            into.blanked -= from.blanked;
+            into.filled -= from.filled;
         }
     }
 
