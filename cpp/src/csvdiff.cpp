@@ -1362,30 +1362,64 @@ class RowIndex {
         const std::size_t end = d.size();
         if (from >= end) return;
 
-        const std::vector<std::size_t> bounds = chunk_bounds(d, from, threads, slab.dialect() == Dialect::Json);
+        // The CSV splits are guessed, then checked.
+        //
+        // Counted bounds cost a pass over the front of the file before any
+        // chunk starts -- (threads-1)/threads of it, and at the two chunks a
+        // file this port uses, half the file on one thread. In memory that is a
+        // quick scan for one byte. On an input larger than memory it is a disk
+        // read that the sweep then repeats, because by the time the sweep gets
+        // there those pages are gone: "chunk bounds" was 61s and 65s on the
+        // 150M CI pair, 26 GB a side, before either sweep began.
+        //
+        // So each split is taken at the next newline, as JSON's are, and
+        // checked the way the Rust and C ports check it. Chunk 0 starts at a
+        // real row, so the last row it parses ends at the first real row start
+        // past its boundary; if that is where chunk 1 began, chunk 1 started at
+        // a real row too, and so on down the line. Only a guess that landed on
+        // a newline inside a quoted field breaks that, and then the sweep runs
+        // again on counted bounds, which is what it always did before. A chunk
+        // that started on a wrong guess parsed garbage, so its rows and its
+        // failure are thrown away unread; a failure in a chunk whose start is
+        // proven is real, and is thrown as it always was.
+        const bool json = slab.dialect() == Dialect::Json;
+        std::vector<std::size_t> bounds = chunk_bounds(d, from, threads, json, /*count_quotes=*/false);
         phase.mark("chunk bounds");
-        const std::size_t n = bounds.size() - 1;
-        std::vector<Chunk> chunks(n);
-        std::vector<std::exception_ptr> failures(n);
-
-        auto scan = [&](std::size_t i) {
-            try {
-                sweep(d, parser, bounds[i], bounds[i + 1], end, chunks[i]);
-            } catch (...) {
-                failures[i] = std::current_exception();
+        std::vector<Chunk> chunks;
+        std::vector<std::exception_ptr> failures;
+        auto sweep_all = [&] {
+            const std::size_t n = bounds.size() - 1;
+            chunks.assign(n, Chunk{});
+            failures.assign(n, nullptr);
+            auto scan = [&](std::size_t i) {
+                try {
+                    chunks[i].stopped = sweep(d, parser, bounds[i], bounds[i + 1], end, chunks[i]);
+                } catch (...) {
+                    failures[i] = std::current_exception();
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(n - 1);
+            for (std::size_t i = 1; i < n; ++i) {
+                try {
+                    workers.emplace_back(scan, i);
+                } catch (const std::system_error&) {
+                    scan(i);  // no thread to be had: the same work, here
+                }
             }
+            scan(0);
+            for (auto& w : workers) w.join();
         };
-        std::vector<std::thread> workers;
-        workers.reserve(n - 1);
-        for (std::size_t i = 1; i < n; ++i) {
-            try {
-                workers.emplace_back(scan, i);
-            } catch (const std::system_error&) {
-                scan(i);  // no thread to be had: the same work, here
-            }
+        sweep_all();
+        bool held = true;
+        for (std::size_t i = 0; i + 1 < chunks.size() && held; ++i) {
+            if (failures[i]) std::rethrow_exception(failures[i]);  // its start is proven
+            held = json || chunks[i].stopped == bounds[i + 1];
         }
-        scan(0);
-        for (auto& w : workers) w.join();
+        if (!held) {
+            bounds = chunk_bounds(d, from, threads, json, /*count_quotes=*/true);
+            sweep_all();
+        }
         for (const auto& f : failures)
             if (f) std::rethrow_exception(f);
         phase.mark("sweep (parallel)");
@@ -1623,6 +1657,7 @@ class RowIndex {
     struct alignas(64) Chunk {
         std::vector<std::size_t> starts;
         std::vector<std::uint64_t> hashes;
+        std::size_t stopped = 0;  // where the sweep left off: the first row start past the chunk
         char pad[64]{};
     };
 
@@ -1644,8 +1679,13 @@ class RowIndex {
     // splits -- it is also wrong: an escaped `\"` toggles the parity, and a
     // split whose count comes out odd can walk to the end of the file looking for
     // a newline outside quotes, and the chunk is dropped.
+    //
+    // With `count_quotes` false, CSV takes the next newline as well, which is a
+    // guess; the constructor checks it after the sweep and counts only when a
+    // guess was wrong.
     static std::vector<std::size_t> chunk_bounds(std::string_view d, std::size_t from,
-                                                 unsigned threads, bool json) {
+                                                 unsigned threads, bool json, bool count_quotes) {
+        if (!count_quotes) json = true;  // the newline rule, without the count
         const std::size_t end = d.size();
         // Below this there is nothing to divide: the boundary work would cost
         // more than the parsing it splits.
@@ -1717,8 +1757,10 @@ class RowIndex {
     // `stop` to finish the last one. `end` is the end of the file. This is the
     // work worth splitting: it reads the members but writes only `out`, so any
     // number of threads may be inside it at once.
-    void sweep(std::string_view d, const RowParser& parser, std::size_t begin, std::size_t stop,
-               std::size_t end, Chunk& out) const {
+    // Returns where it left off: the first row start at or past `stop`, or
+    // short of it if a malformed tail stopped it.
+    std::size_t sweep(std::string_view d, const RowParser& parser, std::size_t begin,
+                      std::size_t stop, std::size_t end, Chunk& out) const {
         std::vector<Field> fields(parser.width());
         std::size_t pos = begin;
         while (pos < stop) {
@@ -1744,6 +1786,7 @@ class RowIndex {
             if (next <= pos) break;  // no progress: a malformed tail, not an endless loop
             pos = next;
         }
+        return pos;
     }
 
     // `row` indexes `row_start_` and `row_hash_`, which the transfer above has
@@ -2373,6 +2416,11 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // threading is supposed to trade, and `budget / 2` buys it for less than
     // `budget` does. That is also the rule the C port has always used, and both
     // files are swept at once, so half the machine each is the whole of it.
+    //
+    // (The quote-counting pass described above is no longer paid up front: the
+    // splits are now guessed and checked after the sweep, and counted only when
+    // a guess lands inside a quoted field -- see the constructor. These
+    // measurements predate that and were not re-taken.)
     const unsigned per_file = budget > 1 ? budget / 2 : 1;
 
     std::optional<RowIndex> ai_slot, bi_slot;

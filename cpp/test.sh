@@ -171,6 +171,32 @@ else
   [ "$one" = "$r" ] && echo "  ok    and what the rust port finds" \
     || { echo "  FAIL  the threaded sweep disagrees with the rust port"; echo "    rust: $r"; fail=1; }
 fi
+# The splits are guessed at the next newline and checked after the sweep; only
+# a wrong guess pays for counting quotes. This pair makes the guess wrong on
+# purpose: one quoted field of 20,000 lines sits across the middle of each file,
+# so the halfway split lands on a newline inside it, and the rows on either side
+# of it carry the changes that a chunk started there would misread.
+python3 - "$thr" <<'PY'
+import sys
+d = sys.argv[1]
+for side in ("a", "b"):
+    rows = ["k,v,note\n"]
+    rows += [f"R{i:06d},{i},plain\n" for i in range(110000)]
+    rows.append(f"MID,{'x' if side == 'a' else 'y'},\"" + "inside\n" * 20000 + "\"\n")
+    rows += [f"S{i:06d},{i + (side == 'b' and i == 7)},plain\n" for i in range(110000)]
+    open(f"{d}/g_{side}.csv", "w").write("".join(rows))
+PY
+one=$(build/csvdiff compare "$thr/g_a.csv" "$thr/g_b.csv" -k k --threads 1 2>&1 | summary) || true
+many=$(build/csvdiff compare "$thr/g_a.csv" "$thr/g_b.csv" -k k --threads 4 2>&1 | summary) || true
+case "$one" in
+  *"(changed 2) | added 0 | removed 0"*)
+    if [ "$one" = "$many" ]; then
+      echo "  ok    a split guessed inside a quoted field is caught and counted instead"
+    else
+      printf '  FAIL  a split guessed inside a quoted field changed the answer\n    1 : %s\n    4 : %s\n' "$one" "$many"; fail=1
+    fi ;;
+  *) echo "  FAIL  the guessed-split fixture: $one"; fail=1 ;;
+esac
 rm -rf "$thr"
 
 echo "quoting, ragged rows and keys near the end of the file:"
