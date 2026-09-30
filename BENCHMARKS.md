@@ -122,6 +122,43 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-30 (c++ guessed splits) — "chunk bounds" was a disk read the sweep repeated
+
+C's change above, ported to C++ (#221). C++ counted quotes over the front of
+each file before either sweep began: at its two chunks a file, half the file on
+one thread. At 150M, 26 GB a side against ~16 GB of RAM, that was a serial disk
+read which the sweep then repeated once the pages were evicted. The splits are
+now guessed at the next newline and checked after the sweep.
+
+Locally, cold, 5M pair, memory cgroup capped at 600 MB (400 MB kills the old
+build, which holds both indexes at once): storage reads 2.52x input -> 2.02x on
+every run; both indexes 1.53x [1.37–1.63], wall 1.20x [1.14–1.29], against an
+A/A of 1.01x [0.97–1.06] and 1.01x [0.98–1.03]. Warm, `bench_ab.sh` does not
+tell the builds apart on the 5M or the 200k pair.
+
+**On CI, 150M.** `sizes=150m`, `mem_cap_mb=13941`: 36656925225 before, and
+36667822301 with #221. One run each, each port on its own runner.
+
+| C++, phase run | before | after |
+|---|---|---|
+| chunk bounds, A / B | 61.2s / 65.0s | 0.001s / 0.000s |
+| sweep, A / B | 131.7s / 129.0s | 130.0s / 130.0s |
+| join and compare | 131.3s | 131.4s |
+| phase-run total | 334.1s | 271.9s |
+| **wall, timed run** | **354.4s** | **297.9s (1.19x)** |
+
+The sweeps did not get slower for starting cold: the counted region was being
+read twice, and now it is read once. The join, untouched, is the same to a
+tenth of a second, so the runners look alike. For scale, C's timed wall was
+272.8s in the earlier run and 287.5s in this one on the same code, which is
+the runner-to-runner spread; 354 to 298 is well outside it.
+
+The same run, all four ports: Rust 269.0s and C++ 271.9s (phase-run totals),
+C 287.5s and Zig 335.1s (timed runs). Zig still counts quotes inside its sweep
+timer; the same change applies there.
+
+---
+
 ## 2026-09-30 (c guessed splits) — the C sweep read half of every file twice once it outgrew memory
 
 The one live lead left on C at 150M was its sweep on cold reads. The CI phase
