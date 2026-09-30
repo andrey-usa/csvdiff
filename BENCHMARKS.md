@@ -122,6 +122,28 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-30 (reverted: zig key-list reservation) — #213 cost memory for a gap that was not there
+
+#213 reserved `first_row` and `occurrences` to `total` in `RowIndex.build`,
+to close a ~24s insert gap to Rust in the 150M CI run. That gap was two
+machines compared: on one machine Zig inserts about 1.15x faster than Rust.
+Measured against its parent (b432409) on a 5M CSV pair, one machine:
+
+| | parent | #213 |
+|---|---|---|
+| peak `VmData`, every run of six | 402 MB | 430 MB (+7%) |
+| peak RSS (the mapped inputs dominate it) | 2049 MB | 2049 MB |
+
+`bench_ab.sh`, 11 interleaved rounds: by default "5% less work", with a middle
+half reaching only 1.02x, against a `--self-test` of 1.00x [0.95–1.10] on the
+same machine; with `-i updated_at`, no result. The CPU side was not told apart,
+and the memory side is what #73 measured for the same configuration in
+September (key lists reserved: 790–815 MB against 735–761 MB with none, on 6M),
+and the number that decides how many rows this port can do. Reverted; the
+comment in `RowIndex.build` records it so it is not tried a third time.
+
+---
+
 ## 2026-09-28 (zig guard span) — the Zig join stopped parsing rows the proof settles
 
 The C change from 09-27, ported to Zig. `Join.range` called `fieldsOf` on every
