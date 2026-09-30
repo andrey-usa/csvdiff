@@ -846,4 +846,56 @@ case "$out" in
 esac
 rm -rf "$sdir"
 
+# The four normalisation options, held to the answers the other ports give.
+# Each case is two rows, A then B, under one flag set; the expected result is
+# "changed added removed", or "refuse" for a run that must exit 2 naming the
+# reason -- with and without --json, since only one of them builds samples.
+echo "normalisation options:"
+ndir=$(mktemp -d)
+ncase() { # label, a-row, b-row (printf %b escapes), expected, then flags
+  local label=$1 want=$4
+  printf 'id,v\nk0,same\n%b\n' "$2" > "$ndir/a.csv"
+  printf 'id,v\nk0,same\n%b\n' "$3" > "$ndir/b.csv"
+  shift 4
+  for json in "" "--json $ndir/o.json"; do
+    rm -f "$ndir/o.json"
+    local code=0 got
+    # shellcheck disable=SC2086  # $json is zero words or two
+    ./csvdiff compare "$ndir/a.csv" "$ndir/b.csv" -k id "$@" $json >"$ndir/out" 2>&1 || code=$?
+    if [ "$code" = 2 ]; then
+      if grep -q -- '--ignore-case on a field outside ASCII' "$ndir/out"; then got=refuse
+      else got="exit 2: $(cat "$ndir/out")"; fi
+    else got=$(summary < "$ndir/out" | sed -E 's/.*changed ([0-9]+)\) \| added ([0-9]+) \| removed ([0-9]+).*/\1 \2 \3/')
+    fi
+    if [ "$got" = "$want" ]; then printf '  ok    %s%s\n' "$label" "${json:+, --json}"
+    else printf '  FAIL  %s%s\n    want: %s\n    got : %s\n' "$label" "${json:+, --json}" "$want" "$got"; fail=1; fi
+  done
+}
+ncase "--tolerance reads a padded number"          'k1,100'          'k1,  100  '      "0 0 0" --tolerance 0.5
+ncase "--tolerance: inf is text, not a number"     'k1,inf'          'k1,Inf'          "1 0 0" --tolerance 0.5
+ncase "--tolerance outside it is a change"         'k1,7.25'         'k1,8'            "1 0 0" --tolerance 0.5
+ncase "--trim: blank against empty is a change"    'k1,   '          'k1,'             "1 0 0" --trim
+ncase "--trim --empty-is-null: and then it is not" 'k1,   '          'k1,'             "0 0 0" --trim --empty-is-null
+ncase "--ignore-case folds ASCII"                  'k1,Alpha'        'k1,ALPHA'        "0 0 0" --ignore-case
+ncase "--ignore-case, unchanged outside ASCII"     'k1,CAF\xc3\x89'  'k1,CAF\xc3\x89'  "0 0 0" --ignore-case
+ncase "--ignore-case, one side empty"              'k1,'             'k1,\xc3\x89'     "1 0 0" --ignore-case
+ncase "--ignore-case, differs outside ASCII"       'k1,CAF\xc3\x89'  'k1,caf\xc3\xa9'  refuse  --ignore-case
+ncase "--ignore-case, a key outside ASCII"         'k\xc3\x89,x'     'k\xc3\xa9,x'     refuse  --ignore-case
+# The columnar path does not carry the options yet, so it says so.
+if [ -x "$GEN" ]; then
+  "$GEN" --rows 1k --out-dir "$ndir" --prefix q --format parquet >/dev/null
+  for opt in --trim --ignore-case --empty-is-null "--tolerance 0.5"; do
+    code=0
+    # shellcheck disable=SC2086  # $opt is one flag or a flag and its value
+    out=$(./csvdiff compare "$ndir/q_a.unc.parquet" "$ndir/q_b.unc.parquet" -k account_id,txn_id $opt 2>&1) || code=$?
+    case "$code:$out" in
+      "2:"*"${opt%% *}"*) echo "  ok    parquet refuses $opt by name" ;;
+      *) echo "  FAIL  parquet with $opt: exit $code: $out"; fail=1 ;;
+    esac
+  done
+else
+  echo "skip: $GEN is not built, so the parquet refusals did not run"
+fi
+rm -rf "$ndir"
+
 exit $fail

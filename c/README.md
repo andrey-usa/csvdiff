@@ -94,11 +94,14 @@ A **floor measurement and a parity port**, not a fifth product. It carries the
 comparison and the JSON counts, not the HTML report and not the full option
 set:
 
-- **No `--trim`, `--ignore-case` or `--tolerance`.** Each of these needs either
-  a Unicode table or a number parser on the hot path, and each would change the
-  thing being measured. The C++ port draws this line differently — it
-  implements `--ignore-case` and refuses non-ASCII input — which is also
-  defensible; this port simply does not offer the flag.
+- **`--trim`, `--ignore-case`, `--empty-is-null` and `--tolerance` on CSV and
+  ndjson only.** They give the answers the other ports give, and a run that
+  uses none of them pays one register test per cell for their existence.
+  `--ignore-case` folds ASCII, as in C++ and Zig: a byte outside ASCII is
+  refused by name where the fold would decide the answer -- in a key, or in a
+  compared value that differs byte for byte -- and answered everywhere else.
+  The Parquet path does not carry them yet, and refuses each by name rather
+  than ignoring it.
 - **No `--export-dir`, no `--profile`, no HTML.** `--export-dir` and `--profile` are
   Rust-port features; the Rust port is the only one that renders HTML.
 - **Uncompressed Parquet only, and BYTE_ARRAY columns only.** Snappy, zstd,

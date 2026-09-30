@@ -38,7 +38,7 @@ What makes that affordable is that the contract is executable, not remembered:
 **Differences between ports are written down, not discovered.** The ones that exist by design are
 the HTML report, `--fail-on-dups` and its exit code 3 (Rust); row samples in `--json` (C++); an
 *enforced* `--max-memory` (Zig) against one that *bounds* (C); ASCII-only `--ignore-case` (C, C++,
-Zig); no Windows build (Zig). A new one needs an entry here and in the README's per-port table, and
+Zig); the normalisation flags refused on Parquet (C); no Windows build (Zig). A new one needs an entry here and in the README's per-port table, and
 it must not change `counts` or `columns`.
 
 **When you fix or optimise something, do it in all four, or say in the PR why the others are
@@ -122,7 +122,7 @@ rust/target/release/csvdiff head data/p_a.parquet -n 10
 - **The packed field is the representation.** A field is an offset and a length in a 64-bit word;
   nothing becomes a heap string until the report. Memory is this project's argument.
 - **`--ignore-case` is ASCII-only in C, C++ and Zig.** A non-ASCII byte in a folded field is
-  refused by name: folding it partially would be worse than not folding. C++ and Zig refuse only
+  refused by name: folding it partially would be worse than not folding. All three refuse only
   where the fold decides the answer -- a key, or a compared value that differs byte for byte in a
   matched row -- and answer everywhere else, the same whether or not `--json` is asked for.
   `scripts/option_matrix.py` holds them to it on `tests/fixtures/fold`.
