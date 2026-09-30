@@ -142,6 +142,31 @@ else
     fi
   fi
 fi
+# The splits are guessed at the next newline and checked after the sweep; only
+# a wrong guess pays for counting quotes. This pair makes the guess wrong on
+# purpose: one quoted field of 20,000 lines sits across the middle of each file,
+# so the halfway split lands on a newline inside it, and the rows on either side
+# of it carry the changes that a chunk started there would misread.
+python3 - "$thr_dir" <<'PY'
+import sys
+d = sys.argv[1]
+for side in ("a", "b"):
+    rows = ["k,v,note\n"]
+    rows += [f"R{i:06d},{i},plain\n" for i in range(110000)]
+    rows.append(f"MID,{'x' if side == 'a' else 'y'},\"" + "inside\n" * 20000 + "\"\n")
+    rows += [f"S{i:06d},{i + (side == 'b' and i == 7)},plain\n" for i in range(110000)]
+    open(f"{d}/g_{side}.csv", "w").write("".join(rows))
+PY
+./csvdiff compare "$thr_dir/g_a.csv" "$thr_dir/g_b.csv" -k k --threads 1 \
+    --json "$thr_dir/g1.json" >/dev/null 2>&1 || true
+./csvdiff compare "$thr_dir/g_a.csv" "$thr_dir/g_b.csv" -k k --threads 4 \
+    --json "$thr_dir/g4.json" >/dev/null 2>&1 || true
+if agree "$thr_dir/g1.json" "$thr_dir/g4.json" &&
+   python3 -c 'import json,sys; c=json.load(open(sys.argv[1]))["counts"]; sys.exit(0 if (c["changed"], c["added"], c["removed"]) == (2, 0, 0) else 1)' "$thr_dir/g4.json"; then
+  echo "  ok    a split guessed inside a quoted field is caught and counted instead"
+else
+  echo "  FAIL  a split guessed inside a quoted field changed the answer"; fail=1
+fi
 rm -rf "$thr_dir"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 if [ "$with_ports" = 1 ]; then
