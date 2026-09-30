@@ -126,14 +126,25 @@ fn mapHandle(handle: std.Io.File.Handle, size: u64) !Mapping {
             const bytes: [*]align(std.heap.page_size_min) const u8 = @ptrCast(@alignCast(view));
             return bytes[0..len];
         },
-        else => return std.posix.mmap(
-            null,
-            len,
-            .{ .READ = true },
-            .{ .TYPE = .PRIVATE },
-            handle,
-            0,
-        ) catch Error.CannotReadFile,
+        else => {
+            const m = std.posix.mmap(
+                null,
+                len,
+                .{ .READ = true },
+                .{ .TYPE = .PRIVATE },
+                handle,
+                0,
+            ) catch return Error.CannotReadFile;
+            // Every pass reads the file front to back: the sweep, and the join
+            // after it, whose chunks are A's rows in order. Saying so doubles the
+            // kernel's readahead and lets it drop pages behind the reader, which
+            // is what matters once the pair is larger than memory -- without it
+            // the join evicted pages it was about to need and ran at half the
+            // disk's rate. The other three ports have always asked. A hint the
+            // kernel may ignore, so a refusal costs nothing.
+            std.posix.madvise(@constCast(m.ptr), m.len, std.posix.MADV.SEQUENTIAL) catch {};
+            return m;
+        },
     }
 }
 
