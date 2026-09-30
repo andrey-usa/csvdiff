@@ -1189,10 +1189,7 @@ const RowIndex = struct {
         const data = self.side.slab.data;
         const from: usize = @intCast(self.row_at.items[@intCast(candidate)]);
         const end = self.rowEnd(candidate);
-        if (bytes.len > end -| from) return false;
-        const to = from + bytes.len;
-        if (!std.mem.eql(u8, data[from..to], bytes)) return false;
-        return text.jsonTailIsClean(parser, data, to, end);
+        return text.jsonRowsMatch(parser, bytes, data, from, end);
     }
 
     fn uniqueKeys(self: RowIndex) i64 {

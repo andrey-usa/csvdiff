@@ -100,6 +100,25 @@ check "a gap, and CRLF against LF" "$tmp/gc_a.csv" "$tmp/gc_b.csv" -k id -i skip
 { echo 'a,k,c'; echo 'x,K1,c1'; echo 'y,K2,cccccccc'; } > "$tmp/pre_b.csv"
 check "a mate whose last column carries on" "$tmp/pre_a.csv" "$tmp/pre_b.csv" -k k
 
+# The ndjson proof past an ignored value in the middle: where the rows first
+# differ inside the value of `ts`, which nobody tracks, that value is skipped in
+# each row on its own and the comparison carries on -- whatever its length,
+# escapes, type or nested names. A repeat of the compared name after it wins.
+echo "the ndjson byte proof, past an ignored value:"
+printf '{"id":"k1","ts":"T1","a":"p"}\n'                  > "$tmp/jg_a.ndjson"
+printf '{"id":"k1","ts":"T2 and longer","a":"p"}\n'       > "$tmp/jg_b.ndjson"
+check "an ignored middle value that differs" "$tmp/jg_a.ndjson" "$tmp/jg_b.ndjson" -k id -i ts
+printf '{"id":"k1","ts":"T2 and longer","a":"X"}\n'       > "$tmp/jgc_b.ndjson"
+check "and a real change after it" "$tmp/jg_a.ndjson" "$tmp/jgc_b.ndjson" -k id -i ts
+printf '{"id":"k1","ts":"a\\"b,c}","a":"p"}\n'            > "$tmp/jge_a.ndjson"
+printf '{"id":"k1","ts":null,"a":"p"}\n'                  > "$tmp/jge_b.ndjson"
+check "an escaped ignored value against null" "$tmp/jge_a.ndjson" "$tmp/jge_b.ndjson" -k id -i ts
+printf '{"id":"k1","ts":{"a":"Z"},"a":"p"}\n'             > "$tmp/jgn_a.ndjson"
+printf '{"id":"k1","ts":[1,{"a":"Y"}],"a":"p"}\n'         > "$tmp/jgn_b.ndjson"
+check "nested ignored values, tracked names inside" "$tmp/jgn_a.ndjson" "$tmp/jgn_b.ndjson" -k id -i ts
+printf '{"id":"k1","ts":"T2","a":"p","a":"LATER"}\n'      > "$tmp/jgd_b.ndjson"
+check "a repeat of the compared name after the gap" "$tmp/jg_a.ndjson" "$tmp/jgd_b.ndjson" -k id -i ts
+
 # --ignore-case refuses a value outside ASCII only where folding it decides the
 # answer: a key, or a compared value that differs byte for byte. A value that is
 # unchanged, or in a row only one side has, or whose mate is empty, is answered.
