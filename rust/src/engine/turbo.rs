@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
-    RowParser, csv_header, detect_delimiter, guard_span, json_header, json_tail_is_clean,
+    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_tail_is_clean,
     shared_tail, sniff_dialect,
 };
 
@@ -1353,6 +1353,9 @@ fn join(
     // The proof's delimiter and delimiter count, for the fast path in the join
     // below. `None` takes the old parse-first path.
     let guard = span_tail.map(|(_, delimiter, last_needed)| (delimiter, last_needed + 1));
+    // The same fast path in runs, where an unwanted column sits among the
+    // wanted ones; see `Runs`. `None` where there is no gap.
+    let runs = span_tail.and_then(|_| a.parser().and_then(Runs::plan));
     // What JSON gets instead, since `shared_tail` cannot promise it an offset.
     // See `json_values_agree`.
     let json_proof =
@@ -1398,6 +1401,7 @@ fn join(
             removed_total: 0,
         };
         let (mut fa, mut fb) = (vec![ABSENT; width], vec![ABSENT; width]);
+        let mut spans = vec![(0usize, 0usize); runs.as_ref().map_or(0, Runs::len)];
         // A proof that keeps failing is a scan for nothing: two files where every
         // row really has changed would pay for it on every row. After
         // `PROOF_BACKOFF` failures in a row it is tried every `PROOF_BACKOFF`
@@ -1425,7 +1429,30 @@ fn join(
                 Missed,
                 Skipped,
             }
-            let fast = if let Some((delimiter, commas)) = guard {
+            let fast = if let (Some(runs), Some((delimiter, _))) = (&runs, guard) {
+                let data = a.slab.data();
+                let from = ai.row_at[row as usize] as usize;
+                let end = row_end(ai, row, data.len());
+                if runs.of_row(data, from, end, delimiter, &mut spans) {
+                    // No fields and no span: the first candidate whose whole
+                    // hash matches, unproven, which the runs then settle.
+                    match bi.lookup(b, &a.slab, None, hash, key_size, opt, None, &mut fb) {
+                        Some((mate, _)) => {
+                            let bd = b.slab.data();
+                            let b_lo = bi.row_at[mate as usize] as usize;
+                            let b_hi = row_end(bi, mate, bd.len());
+                            if runs.matches(data, &spans, bd, b_lo, b_hi, delimiter) {
+                                Fast::Proved(mate)
+                            } else {
+                                Fast::Unproven
+                            }
+                        }
+                        None => Fast::Missed,
+                    }
+                } else {
+                    Fast::Skipped
+                }
+            } else if let Some((delimiter, commas)) = guard {
                 let data = a.slab.data();
                 let from = ai.row_at[row as usize] as usize;
                 let end = row_end(ai, row, data.len());

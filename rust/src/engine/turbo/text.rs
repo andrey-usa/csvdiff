@@ -410,6 +410,147 @@ pub(super) fn guard_span(
     None
 }
 
+/// The gapped proof's plan, where a column nobody wants sits among the wanted
+/// ones -- an ignored `updated_at` in the middle of the row, say.
+///
+/// `guard_span` covers one run: A's row from its start through the last column
+/// either file wants, compared as bytes. An unwanted column inside that run that
+/// differs -- and an ignored timestamp differs on every row -- fails the proof
+/// every time, and every row is parsed. So the wanted columns are compared as
+/// runs instead, and the unwanted ones between them skipped by field count in
+/// each row on its own: an ignored value that differs cannot stop a row proving
+/// equal, and one that differs in length cannot misalign what follows. `seg[j]`
+/// wanted fields are followed by `gap[j]` unwanted ones; the last run has no
+/// gap. The C and C++ ports have the same proof (#229, #230).
+pub(super) struct Runs {
+    seg: Vec<usize>,
+    gap: Vec<usize>,
+}
+
+impl Runs {
+    /// `None` where there is no gap, and the one-run proof applies unchanged.
+    /// Only called once `shared_tail` has agreed the two sides' shapes, so A's
+    /// map of wanted columns is B's too.
+    pub(super) fn plan(a: &RowParser) -> Option<Runs> {
+        let RowParser::Csv {
+            last_needed,
+            slots_for,
+            ..
+        } = a
+        else {
+            return None;
+        };
+        let (mut seg, mut gap) = (vec![0usize], vec![0usize]);
+        for slots in &slots_for[..=*last_needed] {
+            if slots.is_empty() {
+                *gap.last_mut()? += 1;
+                continue;
+            }
+            if *gap.last()? > 0 {
+                seg.push(0);
+                gap.push(0);
+            }
+            *seg.last_mut()? += 1;
+        }
+        (seg.len() > 1).then_some(Runs { seg, gap })
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.seg.len()
+    }
+
+    /// Where each run starts in this row and how many bytes it takes, through
+    /// the byte that closes it, into `out`. `false` where the row ends first,
+    /// which falls back to the parse.
+    pub(super) fn of_row(
+        &self,
+        data: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+        out: &mut [(usize, usize)],
+    ) -> bool {
+        let mut delims = Delims::new(data, lo, hi, delimiter, b'\n');
+        let mut at = lo;
+        let n = self.seg.len();
+        for (j, (slot, &fields)) in out.iter_mut().zip(&self.seg).enumerate() {
+            let last = j + 1 == n;
+            let Some(end) = past_fields(&mut delims, data, at, hi, delimiter, fields, last) else {
+                return false;
+            };
+            *slot = (at, end - at);
+            if last {
+                break;
+            }
+            match past_fields(&mut delims, data, end, hi, delimiter, self.gap[j], false) {
+                Some(next) => at = next,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether B's row `b[lo..hi]` holds each of A's runs where its own gaps
+    /// put it. A run's bytes include the byte that closes it, so equal bytes
+    /// leave B at the start of its next field, as they leave A.
+    pub(super) fn matches(
+        &self,
+        a: &[u8],
+        spans: &[(usize, usize)],
+        b: &[u8],
+        lo: usize,
+        hi: usize,
+        delimiter: u8,
+    ) -> bool {
+        let mut delims = Delims::new(b, lo, hi, delimiter, b'\n');
+        let mut at = lo;
+        let n = self.seg.len();
+        for (j, &(from, len)) in spans.iter().enumerate().take(n) {
+            if len > hi - at || a[from..from + len] != b[at..at + len] {
+                return false;
+            }
+            at += len;
+            if j + 1 == n {
+                break;
+            }
+            match past_fields(&mut delims, b, at, hi, delimiter, self.gap[j], false) {
+                Some(next) => at = next,
+                None => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Past the byte that closes the `n`th field from `at`, or `None` where the row
+/// ends first. With `may_end` the last of them may close on the line ending: a
+/// run that ends in the row's last column has nothing else to close it.
+fn past_fields(
+    delims: &mut Delims<'_>,
+    data: &[u8],
+    mut at: usize,
+    hi: usize,
+    delimiter: u8,
+    n: usize,
+    may_end: bool,
+) -> Option<usize> {
+    for i in 0..n {
+        let cur = if at < hi && data[at] == b'"' {
+            delims.next(skip_quoted(data, at + 1, hi))
+        } else {
+            delims.next(at)
+        };
+        if cur >= hi {
+            return None;
+        }
+        if data[cur] != delimiter && !(may_end && i + 1 == n && data[cur] == b'\n') {
+            return None;
+        }
+        at = cur + 1;
+    }
+    Some(at)
+}
+
 impl RowParser {
     pub(super) fn csv(delimiter: u8, source: Vec<Option<usize>>) -> Self {
         let last_needed = source.iter().flatten().copied().max().unwrap_or(0);
