@@ -359,4 +359,77 @@ if [ "$got" = "matched 2" ]; then echo "  ok    and a CSV doubled quote finds th
 else echo "  FAIL  a CSV key with a doubled quote missed its JSON spelling: $got"; fail=1; fi
 rm -rf "$kesc"
 
+# Past page cache the join runs inside A's sweep, joining every row as though it
+# were its key's first and taking back, afterwards, the rows that repeat a key.
+# CSVDIFF_FUSED_JOIN=1 takes that path at any size. The repeats here differ from
+# their key's first row -- in a compared value, or in being absent from B -- and
+# the file is past the split threshold, so a repeat that was not taken back, or a
+# chunk's last row cut short, changes the counts or the column counts.
+echo "the join inside the sweep:"
+fz=$(mktemp -d)
+python3 - "$fz" <<'PY'
+import json, sys
+d = sys.argv[1]
+def rows(side):
+    out = []
+    for i in range(250000):
+        if side == "b" and i % 4001 == 0:
+            continue                                   # removed from B
+        v = i * 3 + (1 if side == "b" and i % 17 == 0 else 0)
+        out.append((f"K{i:06d}", str(v), "t"))
+        if i % 97 == 0:                                # a repeat that differs
+            out.append((f"K{i:06d}", str(v + 5), "u" if side == "a" else "t"))
+        if side == "b" and i % 131 == 0:               # repeats in B too
+            out.append((f"K{i:06d}", "0", "x"))
+    for i in range(30):
+        out.append((f"{side.upper()}ONLY{i:03d}", "1", "t"))
+    return out
+for side in ("a", "b"):
+    rs = rows(side)
+    with open(f"{d}/f_{side}.csv", "w") as f:
+        f.write("k,v,w\n")
+        f.writelines(f"{k},{v},{w}\n" for k, v, w in rs)
+    with open(f"{d}/f_{side}.ndjson", "w") as f:
+        f.writelines(json.dumps({"k": k, "v": v, "w": w}) + "\n" for k, v, w in rs)
+PY
+for ext in csv ndjson; do
+  for t in 1 4; do
+    $BIN compare "$fz/f_a.$ext" "$fz/f_b.$ext" -k k --threads $t --json "$fz/after.json" >/dev/null 2>&1 || true
+    CSVDIFF_FUSED_JOIN=1 $BIN compare "$fz/f_a.$ext" "$fz/f_b.$ext" -k k --threads $t \
+        --json "$fz/inside.json" >/dev/null 2>&1 || true
+    if python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:3]); sys.exit(0 if (a["counts"],a["columns"])==(b["counts"],b["columns"]) and a["counts"]["matched"]>0 else 1)' \
+        "$fz/after.json" "$fz/inside.json"; then
+      printf '  ok    %s, %s thread(s): the join inside the sweep finds what the join after it finds\n' "$ext" "$t"
+    else
+      printf '  FAIL  %s, %s thread(s): the join inside the sweep disagrees\n' "$ext" "$t"; fail=1
+    fi
+  done
+done
+# A guessed split inside a quoted field: one field of 20,000 lines sits across
+# the middle of each file, so the halfway guess lands on a newline inside it and
+# the sweep has to start over on counted splits -- and throw away what it had
+# already joined, not only what it had indexed.
+python3 - "$fz" <<'PY'
+import sys
+d = sys.argv[1]
+for side in ("a", "b"):
+    rows = ["k,v,note\n"]
+    rows += [f"R{i:06d},{i},plain\n" for i in range(110000)]
+    rows.append(f"MID,{'x' if side == 'a' else 'y'},\"" + "inside\n" * 20000 + "\"\n")
+    rows += [f"S{i:06d},{i + (side == 'b' and i == 7)},plain\n" for i in range(110000)]
+    open(f"{d}/g_{side}.csv", "w").write("".join(rows))
+PY
+one=$($BIN compare "$fz/g_a.csv" "$fz/g_b.csv" -k k --threads 1 2>&1 | head -1 | answer) || true
+inside=$(CSVDIFF_FUSED_JOIN=1 $BIN compare "$fz/g_a.csv" "$fz/g_b.csv" -k k --threads 4 2>&1 | head -1 | answer) || true
+case "$one" in
+  *"(changed 2) | added 0 | removed 0"*)
+    if [ "$inside" = "$one" ]; then
+      echo "  ok    a split guessed inside a quoted field is caught, and the join inside the sweep starts over"
+    else
+      printf '  FAIL  the join inside the sweep kept rows from a wrong guess\n    1     : %s\n    inside: %s\n' "$one" "$inside"; fail=1
+    fi ;;
+  *) echo "  FAIL  the guessed-split fixture: $one"; fail=1 ;;
+esac
+rm -rf "$fz"
+
 exit $fail

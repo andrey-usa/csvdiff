@@ -59,6 +59,11 @@ pub fn main(init: std.process.Init) !u8 {
     // and reading it on Windows does not compile. Only the presence of the
     // variable matters here, which is exactly what `contains` reports.
     csvdiff.phases_on = init.minimal.environ.contains(arena, "CSVDIFF_PHASES") catch false;
+    // Set and not "0", as the C and C++ ports read it.
+    csvdiff.fused_forced = if (init.minimal.environ.getAlloc(arena, "CSVDIFF_FUSED_JOIN")) |v|
+        v.len > 0 and !std.mem.eql(u8, v, "0")
+    else |_|
+        false;
 
     const io = init.io;
     var stdout_buf: [4096]u8 = undefined;
