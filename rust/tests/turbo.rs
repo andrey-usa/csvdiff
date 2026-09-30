@@ -672,3 +672,76 @@ fn the_backoff_never_skips_a_difference() {
         "the backoff skipped rows instead of parsing them"
     );
 }
+
+/// `agrees`, with columns ignored, and the number of rows turbo calls changed.
+fn changed_ignoring(a_body: &str, b_body: &str, key: &[&str], ignore: &[&str]) -> i64 {
+    let f = Fixture::new(a_body, b_body);
+    let mut results = Vec::new();
+    let mut changed = 0;
+    for engine in [Engine::Native, Engine::Turbo] {
+        let mut opt = Options::with_key(key.iter().copied());
+        opt.engine = engine.label().to_string();
+        opt.ignore = ignore.iter().map(|s| s.to_string()).collect();
+        let r = compare(&f.a, &f.b, &mut opt).expect("compare");
+        changed = r.counts.changed;
+        results.push(
+            serde_json::json!({
+                "counts": r.counts, "columns": r.columns, "changed": r.changed,
+                "added": r.added, "removed": r.removed, "dup_a": r.dup_a, "dup_b": r.dup_b,
+            })
+            .to_string(),
+        );
+    }
+    assert_eq!(results[1], results[0], "turbo diverges from native");
+    changed
+}
+
+/// The CSV byte proof with gaps: an ignored column among compared ones is
+/// skipped by field count in each row on its own, so a value there that
+/// differs -- in length, in quoting, with a delimiter inside the quotes -- does
+/// not stop a row proving equal, and does not shift what the proof compares
+/// after it. The last column is compared, so the proof also has to close on the
+/// line ending.
+#[test]
+fn the_csv_byte_proof_skips_an_ignored_middle_column() {
+    assert_eq!(
+        changed_ignoring(
+            "id,skip,a,b\nk1,S1,p,q\nk2,S1,p,q\nk3,S1,p,q\n",
+            "id,skip,a,b\nk1,\"S, \"\"two\"\" and more\",p,q\nk2,,p,X\nk3,S2,p,qq\n",
+            &["id"],
+            &["skip"],
+        ),
+        2,
+        "a middle ignored column that differs"
+    );
+    assert_eq!(
+        changed_ignoring(
+            "id,skip,a,b\nk1,S1,p,q\nk2,S1,p,q\n",
+            "id,skip,a,b\nk1\nk2,S2\n",
+            &["id"],
+            &["skip"],
+        ),
+        2,
+        "a mate that stops inside the gap"
+    );
+    assert_eq!(
+        changed_ignoring(
+            "skip,id,a,t,b\nS1,k1,p,T1,q\nS1,k2,p,T1,q\n",
+            "skip,id,a,t,b\nS22,k1,p,T2,q\nS,k2,p,T222,Y\n",
+            &["id"],
+            &["skip", "t"],
+        ),
+        1,
+        "a leading gap and a second one"
+    );
+    assert_eq!(
+        changed_ignoring(
+            "id,skip,a\nk1,S1,p\n",
+            "id,skip,a\r\nk1,S22,p\r\n",
+            &["id"],
+            &["skip"],
+        ),
+        0,
+        "a gap, and CRLF against LF"
+    );
+}
