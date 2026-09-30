@@ -1836,6 +1836,7 @@ typedef struct {
     int64_t  matched, changed, removed, added;
     int64_t *col_changed, *col_blanked, *col_filled;
     Field   *fa, *fb, *probe;
+    size_t  *seg_lo, *seg_len;   /* this row's runs of wanted columns, for the gapped proof */
     bool     oom;
     char     pad[64];
 } CmpPart;
@@ -1874,6 +1875,18 @@ typedef struct {
      * the aligned CSV proof; 0 disables it. */
     int             guard_commas;
     const Norm     *norm;
+    /*
+     * The same fields in runs, where a column nobody wants sits among them --
+     * an ignored `updated_at` in the middle of the row, say. One run is the
+     * plain prefix above. More, and the proof compares each run of wanted
+     * columns as bytes and skips the unwanted ones between them in each row on
+     * its own: an ignored value that differs cannot stop a row proving equal,
+     * and one that differs in length cannot misalign what follows, because the
+     * skip counts fields rather than bytes. `seg_fields[j]` wanted fields are
+     * followed by `gap_fields[j]` unwanted ones; the last run has no gap.
+     */
+    int             nseg;
+    const int      *seg_fields, *gap_fields;
 } CmpCtx;
 
 /*
@@ -1940,24 +1953,104 @@ static void compare_mate(const CmpCtx *c, CmpPart *out, int32_t mate) {
  * else is data, exactly as the row parse treats it. Where the bytes are not
  * well-formed the span can only come out short of the row end, and a short
  * span fails the proof's length check and falls back -- it never proves.
+ *
+ * The byte that closes the guard may be the line ending as well as a
+ * delimiter: where the last compared column is the row's last column, it is
+ * the only byte that can. Refusing it -- as this did until the 2M x 100 run --
+ * turned the whole fast path off for any file whose last column is compared,
+ * and every row paid for a parse. A line ending before the last count is a
+ * short row, and still returns 0.
  */
-static size_t guard_span(const char *d, size_t lo, size_t hi, char delim, int commas) {
-    size_t at = lo;
-    Delims c;
-    delims_init(&c, d, lo, hi, delim, '\n');
-    for (int i = 0; i < commas; i++) {
+static size_t past_fields(Delims *c, const char *d, size_t at, size_t hi, char delim, int n,
+                          bool may_end) {
+    for (int i = 0; i < n; i++) {
         size_t cur;
         if (at < hi && d[at] == '"') {
             const size_t close = skip_quoted(d, at + 1, hi);
-            cur = delims_next(&c, close);
+            cur = delims_next(c, close);
         } else {
-            cur = delims_next(&c, at);
+            cur = delims_next(c, at);
         }
-        if (cur >= hi || d[cur] != delim) return 0;
+        if (cur >= hi) return SIZE_MAX;
+        if (d[cur] != delim && !(may_end && i == n - 1)) return SIZE_MAX;
         at = cur + 1;
-        if (i == commas - 1) return cur + 1 - lo;
     }
-    return 0;
+    return at;
+}
+
+static size_t guard_span(const char *d, size_t lo, size_t hi, char delim, int commas) {
+    Delims c;
+    delims_init(&c, d, lo, hi, delim, '\n');
+    const size_t at = past_fields(&c, d, lo, hi, delim, commas, true);
+    return at == SIZE_MAX || commas == 0 ? 0 : at - lo;
+}
+
+/*
+ * The gapped proof's A side: where each run of wanted columns starts in this
+ * row and how many bytes it takes, through the byte that closes it. False
+ * where the row ends first, which falls back to the parse.
+ */
+static bool segments_of(const CmpCtx *c, CmpPart *out, size_t lo, size_t hi) {
+    const char *d = c->a->data;
+    Delims cur;
+    delims_init(&cur, d, lo, hi, c->delim, '\n');
+    size_t at = lo;
+    for (int j = 0; j < c->nseg; j++) {
+        const bool last = j == c->nseg - 1;
+        const size_t end = past_fields(&cur, d, at, hi, c->delim, c->seg_fields[j], last);
+        if (end == SIZE_MAX) return false;
+        out->seg_lo[j] = at;
+        out->seg_len[j] = end - at;
+        if (last) break;
+        at = past_fields(&cur, d, end, hi, c->delim, c->gap_fields[j], false);
+        if (at == SIZE_MAX) return false;
+    }
+    return true;
+}
+
+/*
+ * The B side: each run's bytes equal A's where B's own gaps put it. A run's
+ * bytes include the byte that closes it, so equal bytes leave B at the start
+ * of its next field, as they leave A.
+ */
+static bool segments_match(const CmpCtx *c, const CmpPart *out, size_t b_lo, size_t b_hi) {
+    const char *a = c->a->data, *b = c->b->data;
+    Delims cur;
+    delims_init(&cur, b, b_lo, b_hi, c->delim, '\n');
+    size_t at = b_lo;
+    for (int j = 0; j < c->nseg; j++) {
+        const size_t n = out->seg_len[j];
+        if (n > b_hi - at || common_prefix(a + out->seg_lo[j], b + at, n) != n) return false;
+        at += n;
+        if (j == c->nseg - 1) break;
+        at = past_fields(&cur, b, at, b_hi, c->delim, c->gap_fields[j], false);
+        if (at == SIZE_MAX) return false;
+    }
+    return true;
+}
+
+/*
+ * `index_lookup_proof` with no fields, for the gapped proof: the first
+ * candidate whose whole hash matches, proven when its runs match A's.
+ * Unproven, the caller parses and looks up again with the key check.
+ */
+static int32_t lookup_by_segments(const CmpCtx *c, const CmpPart *out, uint64_t hash,
+                                  bool *proven) {
+    const RowIndex *ix = c->bi;
+    size_t slot = slot_of(ix, hash);
+    for (;;) {
+        const uint32_t v = ix->table[slot];
+        if (v == TABLE_EMPTY) return -1;
+        if (slot_tag_is(ix, v, hash)) {
+            const int32_t candidate = ix->first_row[slot_pos(ix, v)];
+            if (ix->row_hash[candidate] == hash) {
+                *proven = segments_match(c, out, (size_t)ix->row_start[candidate],
+                                         row_end(ix, candidate));
+                return candidate;
+            }
+        }
+        slot = (slot + 1) & ix->mask;
+    }
 }
 
 /*
@@ -1996,8 +2089,12 @@ static void compare_part(void *vctx, unsigned p) {
     out->col_changed = calloc(nc ? nc : 1, sizeof *out->col_changed);
     out->col_blanked = calloc(nc ? nc : 1, sizeof *out->col_blanked);
     out->col_filled = calloc(nc ? nc : 1, sizeof *out->col_filled);
+    if (c->nseg > 1) {
+        out->seg_lo = malloc((size_t)c->nseg * sizeof *out->seg_lo);
+        out->seg_len = malloc((size_t)c->nseg * sizeof *out->seg_len);
+    }
     if (!out->fa || !out->fb || !out->probe || !out->col_changed || !out->col_blanked ||
-        !out->col_filled) {
+        !out->col_filled || (c->nseg > 1 && (!out->seg_lo || !out->seg_len))) {
         out->oom = true;
         return;
     }
@@ -2024,13 +2121,21 @@ static void compare_part(void *vctx, unsigned p) {
              */
             if (attempt && c->guard_commas > 0) {
                 const size_t a_lo = (size_t)c->ai->row_start[row];
-                const size_t need = guard_span(c->a->data, a_lo, row_end(c->ai, row),
-                                               c->delim, c->guard_commas);
-                if (need) {
-                    bool proven = false;
-                    const int32_t mate = index_lookup_proof(
-                        c->bi, c->a, NULL, hash, out->probe,
-                        c->a->data + a_lo, need, false, &proven);
+                const size_t a_hi = row_end(c->ai, row);
+                bool proven = false, tried = false;
+                int32_t mate = -1;
+                if (c->nseg > 1) {
+                    tried = segments_of(c, out, a_lo, a_hi);
+                    if (tried) mate = lookup_by_segments(c, out, hash, &proven);
+                } else {
+                    const size_t need =
+                        guard_span(c->a->data, a_lo, a_hi, c->delim, c->guard_commas);
+                    tried = need != 0;
+                    if (tried)
+                        mate = index_lookup_proof(c->bi, c->a, NULL, hash, out->probe,
+                                                  c->a->data + a_lo, need, false, &proven);
+                }
+                if (tried) {
                     if (mate < 0) { out->removed++; continue; }
                     if (proven) { out->matched++; refused = 0; continue; }
                     /*
@@ -2724,6 +2829,29 @@ int main(int argc, char **argv) {
                 keys_in_proof = a_src[i] >= 0 && a_src[i] == b_src[i] &&
                                 a_src[i] < a_src[width - 1];
         }
+        /* The runs of wanted columns through the guard, and the unwanted ones
+         * between them -- see `nseg`. */
+        int nseg = 1, *runs = NULL;
+        if (aligned && keys_in_proof && !json_proof) {
+            const size_t g = (size_t)a_src[width - 1];
+            unsigned char *wanted = calloc(g + 1, 1);
+            runs = calloc(2 * (g + 2), sizeof *runs);
+            if (!wanted || !runs) {
+                free(wanted); free(runs); free(parts);
+                fail("out of memory");
+                goto done;
+            }
+            for (size_t i = 0; i < width; i++) wanted[a_src[i]] = 1;
+            int *seg = runs, *gap = runs + g + 2;
+            int j = 0;
+            for (size_t col = 0; col <= g; col++) {
+                if (!wanted[col]) { gap[j]++; continue; }
+                if (gap[j]) j++;
+                seg[j]++;
+            }
+            nseg = j + 1;
+            free(wanted);
+        }
         CmpCtx cc = { &ai, &bi, &a, &b, key_size, nc, width, ways, b_ways, parts,
                       aligned, width - 1, a_delim, json_proof, keys_in_proof,
                       /* Delimiters from the row start to the one that ends the
@@ -2733,8 +2861,9 @@ int main(int argc, char **argv) {
                       (aligned && keys_in_proof && !json_proof)
                           ? (int)(a_src[width - 1] + 1)
                           : 0,
-                      norm };
+                      norm, nseg, runs, runs ? runs + a_src[width - 1] + 2 : NULL };
         run_parts(compare_part, &cc, ways + b_ways);
+        free(runs);
         phase_mark(&whole, "join and compare");
 
         bool oom = false;
@@ -2753,6 +2882,7 @@ int main(int argc, char **argv) {
         }
         for (unsigned p = 0; p < ways + b_ways; p++) {
             free(parts[p].fa); free(parts[p].fb); free(parts[p].probe);
+            free(parts[p].seg_lo); free(parts[p].seg_len);
             free(parts[p].col_changed); free(parts[p].col_blanked); free(parts[p].col_filled);
         }
         free(parts);

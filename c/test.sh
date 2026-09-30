@@ -585,6 +585,28 @@ pcase "a change in the first compared column" "1 0 0" head_a.csv head_b.csv -k i
 { echo 'id,skip,a,ts'; echo 'k1,S2,X,T2'; } > "$pdir/mid_b.csv"
 pcase "a change behind an ignored middle column" "1 0 0" mid_a.csv mid_b.csv -k id -i skip,ts
 
+# The gapped proof: an ignored column among compared ones is skipped by field
+# count in each row on its own, so a value there that differs -- in length, in
+# quoting, with a delimiter inside the quotes -- does not stop a row proving
+# equal, and does not shift what the proof compares after it. The last column
+# here is compared, so the proof also has to close on the line ending.
+{ echo 'id,skip,a,b'; echo 'k1,S1,p,q'; echo 'k2,S1,p,q'; echo 'k3,S1,p,q'; } > "$pdir/gap_a.csv"
+{ echo 'id,skip,a,b'; echo 'k1,"S, ""two"" and more",p,q'; echo 'k2,,p,X'; echo 'k3,S2,p,qq'; } > "$pdir/gap_b.csv"
+pcase "a middle ignored column that differs" "2 0 0" gap_a.csv gap_b.csv -k id -i skip
+# A mate that ends inside the gap, and one that ends in the gap's last field.
+{ echo 'id,skip,a,b'; echo 'k1,S1,p,q'; echo 'k2,S1,p,q'; } > "$pdir/gs_a.csv"
+{ echo 'id,skip,a,b'; echo 'k1'; echo 'k2,S2'; } > "$pdir/gs_b.csv"
+pcase "a mate that stops inside the gap" "2 0 0" gs_a.csv gs_b.csv -k id -i skip
+# The gap first, before the key, and two gaps.
+{ echo 'skip,id,a,t,b'; echo 'S1,k1,p,T1,q'; echo 'S1,k2,p,T1,q'; } > "$pdir/g2_a.csv"
+{ echo 'skip,id,a,t,b'; echo 'S22,k1,p,T2,q'; echo 'S,k2,p,T222,Y'; } > "$pdir/g2_b.csv"
+pcase "a leading gap and a second one" "1 0 0" g2_a.csv g2_b.csv -k id -i skip,t
+# CRLF against LF, with the last column compared: the bytes differ at the line
+# ending, so the proof refuses and the values -- equal -- are compared.
+printf 'id,skip,a\nk1,S1,p\n' > "$pdir/gc_a.csv"
+printf 'id,skip,a\r\nk1,S22,p\r\n' > "$pdir/gc_b.csv"
+pcase "a gap, and CRLF against LF" "0 0 0" gc_a.csv gc_b.csv -k id -i skip
+
 # Identical bytes, different columns. The proof reads bytes, so this is the
 # shape that breaks it if it is applied where the two headers disagree.
 { echo 'id,p,q'; echo 'k1,X,Y'; } > "$pdir/ord_a.csv"
