@@ -58,6 +58,12 @@ on:
       rows:
         description: "Row count (2m, 10m, 20m ...)"
         default: "2m"
+      columns:
+        description: >-
+          Columns per row, 20 to 256. Past the standard twenty they are sized
+          like a standard cell, so 2m rows at 100 is close to the bytes of 10m
+          at 20.
+        default: "20"
       formats:
         description: "Comma-separated: csv, json, parquet"
         default: "csv,json,parquet"
@@ -88,7 +94,7 @@ concurrency:
 
 jobs:
   bench:
-    name: ${{ github.event.inputs.rows || '2m' }} rows, every format
+    name: ${{ github.event.inputs.rows || '2m' }} rows x ${{ github.event.inputs.columns || '20' }} columns, every format
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -237,10 +243,11 @@ jobs:
         run: |
           set -u
           rows="${{ github.event.inputs.rows || '2m' }}"
+          cols="${{ github.event.inputs.columns || '20' }}"
           reps="${{ github.event.inputs.repeats || '5' }}"
           formats="${{ github.event.inputs.formats || 'csv,json,parquet' }}"
           data=$(mktemp -d)
-          echo "## $rows rows" >> "$GITHUB_STEP_SUMMARY"
+          echo "## $rows rows x $cols columns" >> "$GITHUB_STEP_SUMMARY"
           for fmt in ${formats//,/ }; do
             case "$fmt" in
               csv)     ext=.csv;          gen="";; 
@@ -249,7 +256,7 @@ jobs:
               *) echo "::error::unknown format $fmt"; exit 1;;
             esac
             rm -f "$data"/p_*
-            c/gen-data --rows "$rows" --out-dir "$data" --prefix p $gen
+            c/gen-data --rows "$rows" --columns "$cols" --out-dir "$data" --prefix p $gen
             {
               echo
               echo "### $fmt"

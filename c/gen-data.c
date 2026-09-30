@@ -30,7 +30,10 @@
 #include <sys/stat.h>
 #include "win32.h"   /* make_dir, and O_BINARY off Windows */
 
-#define COLUMNS 20
+#define COLUMNS 20        /* the standard recipe */
+#define MAX_COLUMNS 256   /* --columns: the standard twenty and up to 236 more */
+/* The most one row can take in any format, at MAX_COLUMNS. */
+#define ROW_BYTES_MAX 16384
 
 static char *const kNames[COLUMNS] = {
     "account_id", "txn_id", "posting_date", "value_date", "currency", "amount", "fee",
@@ -46,6 +49,9 @@ static const char *const kCategory[] = { "retail", "corporate", "treasury", "car
 
 /* Drift buckets, against a 0..9999 hash bucket per row. */
 enum { CHG_STATUS = 300, CHG_AMOUNT = 150, CHG_BALANCE = 150, CHG_VALUE_DATE = 30 };
+/* With --columns, one extra column changes in another 3% of rows -- buckets no
+ * standard column uses, so the wide columns carry differences of their own. */
+enum { CHG_EXTRA_LO = 600, CHG_EXTRA_HI = 900 };
 #define REMOVED_MOD 1000
 #define ADDED_RATIO 1000
 #define DUP_MOD     10000
@@ -54,13 +60,32 @@ enum { CHG_STATUS = 300, CHG_AMOUNT = 150, CHG_BALANCE = 150, CHG_VALUE_DATE = 3
  * library; this one only needs the same strings out. */
 static char g_days[240][11];
 
+/*
+ * The columns this run writes: the standard twenty, then `--columns` minus
+ * twenty more, named c021, c022 and so on. The extra ones exist to measure a
+ * wide table at about the bytes of a long one -- 2M rows by 100 columns against
+ * 10M by 20 -- so their values are sized for that rather than for realism:
+ * eight digits, where a standard cell averages 8.2 characters. At the default
+ * of twenty nothing here changes a byte of the output.
+ */
+static int g_columns = COLUMNS;
+static char *g_names[MAX_COLUMNS];
+static char g_extra_names[MAX_COLUMNS][8];
+
 /* Column-name lengths, computed once. Writing a JSON row calls for all twenty
  * of them, so taking strlen each time is forty million calls on a two-million
  * row file. */
-static size_t g_name_len[COLUMNS];
+static size_t g_name_len[MAX_COLUMNS];
 
 static void build_days(void) {
-    for (int i = 0; i < COLUMNS; i++) g_name_len[i] = strlen(kNames[i]);
+    for (int i = 0; i < g_columns; i++) {
+        if (i < COLUMNS) g_names[i] = kNames[i];
+        else {
+            snprintf(g_extra_names[i], sizeof g_extra_names[i], "c%03d", i + 1);
+            g_names[i] = g_extra_names[i];
+        }
+        g_name_len[i] = strlen(g_names[i]);
+    }
     static const int len[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
     int month = 0, day = 1;
     for (int i = 0; i < 240; i++) {
@@ -137,9 +162,9 @@ static char *put_money(char *p, int64_t cents) {
  * is what every reader here treats an empty CSV field as anyway.
  */
 typedef struct {
-    char        buf[512];
-    const char *f[COLUMNS];
-    size_t      n[COLUMNS];
+    char        buf[ROW_BYTES_MAX / 2];
+    const char *f[MAX_COLUMNS];
+    size_t      n[MAX_COLUMNS];
 } Row;
 
 static void fields(Row *out, int64_t i, bool b, int64_t seed) {
@@ -190,6 +215,15 @@ static void fields(Row *out, int64_t i, bool b, int64_t seed) {
         DONE(put_int(q, i % 53 + 1));
     }
     DONE(put(p, b ? "2026-09-01 02:15:00" : "2026-08-01 02:15:00"));
+    if (g_columns > COLUMNS) {
+        const int changed = b && bucket >= CHG_EXTRA_LO && bucket < CHG_EXTRA_HI
+            ? COLUMNS + mod_of(i, 171, seed, g_columns - COLUMNS) : -1;
+        for (int x = COLUMNS; x < g_columns; x++) {
+            int64_t v = mod_of(i, 200 + x, seed, 100000000);
+            if (x == changed) v = (v + 1) % 100000000;
+            DONE(put_pad(p, v, 8));
+        }
+    }
 #undef DONE
 }
 
@@ -260,15 +294,16 @@ static char *put_json(char *p, const char *v, size_t n) {
  * the lock, the branch on the stream's state, the memcpy into libc's own buffer
  * -- was being paid two million times for work that is a memcpy either way.
  */
-#define CSV_HEADER                                                                    \
-    "account_id,txn_id,posting_date,value_date,currency,amount,fee,balance,status," \
-    "channel,region,branch_code,product_code,counterparty,quantity,rate,category,"  \
-    "risk_flag,note,updated_at\n"
+static int put_csv_header(FILE *fh) {
+    for (int c = 0; c < g_columns; c++)
+        if ((c && fputc(',', fh) == EOF) || fputs(g_names[c], fh) < 0) return -1;
+    return fputc('\n', fh) == EOF ? -1 : 0;
+}
 
-/* One row's bytes. A row is bounded well under 4 KB, so a caller only has to
+/* One row's bytes. A row is bounded by ROW_BYTES_MAX, so a caller only has to
  * guarantee that much room. */
 static char *render_csv(char *p, const Row *r) {
-    for (int c = 0; c < COLUMNS; c++) {
+    for (int c = 0; c < g_columns; c++) {
         if (c) *p++ = ',';
         memcpy(p, r->f[c], r->n[c]);
         p += r->n[c];
@@ -279,10 +314,10 @@ static char *render_csv(char *p, const Row *r) {
 
 static char *render_json(char *p, const Row *r) {
     *p++ = '{';
-    for (int c = 0; c < COLUMNS; c++) {
+    for (int c = 0; c < g_columns; c++) {
         if (c) *p++ = ',';
         *p++ = '"';
-        memcpy(p, kNames[c], g_name_len[c]);
+        memcpy(p, g_names[c], g_name_len[c]);
         p += g_name_len[c];
         *p++ = '"';
         *p++ = ':';
@@ -337,7 +372,7 @@ typedef struct {
  */
 #define EMIT_ONE(out, b, seed, RENDER, i)                                      \
     do {                                                                       \
-        if (blob_room((out), 4096) != 0) { oom = true; break; }                 \
+        if (blob_room((out), ROW_BYTES_MAX) != 0) { oom = true; break; }       \
         Row r_;                                                                \
         fields(&r_, (i), (b), (seed));                                         \
         (out)->n = (size_t)(RENDER((out)->p + (out)->n, &r_) - (out)->p);       \
@@ -378,7 +413,7 @@ static int write_text(const char *path, bool b, int64_t rows, int64_t seed, bool
      * it. */
     FILE *fh = fopen(path, "wb");
     if (!fh) return -errno;
-    if (!json && fputs(CSV_HEADER, fh) < 0) { const int e = errno; fclose(fh); return -e; }
+    if (!json && put_csv_header(fh) != 0) { const int e = errno; fclose(fh); return -e; }
 
     Blob *blob = calloc(ways, sizeof *blob);
     if (!blob) { fclose(fh); return -ENOMEM; }
@@ -415,16 +450,16 @@ static int write_text(const char *path, bool b, int64_t rows, int64_t seed, bool
 
 static int write_parquet(const char *path, bool b, int64_t rows, int64_t seed,
                          size_t group_rows, size_t dict_limit) {
-    PqWriter *w = pqw_open(path, kNames, COLUMNS, group_rows, dict_limit);
+    PqWriter *w = pqw_open(path, g_names, (size_t)g_columns, group_rows, dict_limit);
     if (!w) return -1;
     Row r;
-    PqValue cells[COLUMNS];
+    PqValue cells[MAX_COLUMNS];
     int bad = 0;
 #define EMIT_PQ(i)                                                         \
     do {                                                                   \
         if (bad) break;                                                    \
         fields(&r, (i), b, seed);                                          \
-        for (int c = 0; c < COLUMNS; c++) {                                \
+        for (int c = 0; c < g_columns; c++) {                              \
             cells[c].p = r.f[c];                                           \
             cells[c].n = r.n[c];                                           \
             cells[c].null = r.n[c] == 0;                                   \
@@ -472,12 +507,15 @@ static int usage(void) {
     fprintf(stderr,
             "usage: gen-data --rows 10m --out-dir DIR [--prefix P]\n"
             "                [--format csv|json|ndjson|parquet] [--seed N]\n"
-            "                [--row-group-size N] [--dict-limit N]\n\n"
+            "                [--row-group-size N] [--dict-limit N] [--columns N]\n\n"
             "Writes DIR/P_a.EXT and DIR/P_b.EXT. Parquet is uncompressed: this port\n"
             "carries no codec, by the same choice its reader makes.\n\n"
             "--dict-limit is how many distinct values a column may have in one row\n"
             "group before it gives up on the dictionary; lowering it produces the\n"
-            "mixed-encoding columns a real writer emits at scale.\n");
+            "mixed-encoding columns a real writer emits at scale.\n\n"
+            "--columns widens the standard twenty columns to N (up to 256) with\n"
+            "extra columns c021, c022 ... of 8-digit values, about the bytes of a\n"
+            "standard cell, so 2m x 100 is close to the size of 10m x 20.\n");
     return 2;
 }
 
@@ -497,6 +535,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(f, "--row-group-size") && i + 1 < argc) group_rows = (size_t)parse_rows(argv[++i]);
         else if (!strcmp(f, "--dict-limit") && i + 1 < argc) dict_limit = (size_t)parse_rows(argv[++i]);
         else if (!strcmp(f, "--threads") && i + 1 < argc) threads = (unsigned)parse_rows(argv[++i]);
+        else if (!strcmp(f, "--columns") && i + 1 < argc) {
+            g_columns = (int)parse_rows(argv[++i]);
+            if (g_columns < COLUMNS || g_columns > MAX_COLUMNS) {
+                fprintf(stderr, "error: --columns takes %d to %d\n", COLUMNS, MAX_COLUMNS);
+                return 2;
+            }
+        }
         else if (!strcmp(f, "--compression") && i + 1 < argc) {
             const char *c = argv[++i];
             if (strcmp(c, "none") != 0) {
