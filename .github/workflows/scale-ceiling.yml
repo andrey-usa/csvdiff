@@ -195,6 +195,21 @@ jobs:
               "$RUNNER_TEMP/scale/${{ matrix.size }}_a.csv" "$RUNNER_TEMP/scale/${{ matrix.size }}_b.csv" \
               -k account_id,txn_id --threads "$(nproc)" $PHASE_FLAGS \
               2>&1 | tee -a "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt" || true
+          # The floor under the join. At 150M three ports spent 131s in "join and
+          # compare" to the second, which is the shape of a disk limit rather
+          # than of three codebases: the join reads both files again, and they
+          # no longer fit in memory. So the same bytes are read once more with
+          # nothing done to them, from a dropped page cache. A join near this
+          # number is waiting on the disk and no parser work will move it; one
+          # well above it has work of its own to find.
+          sync
+          echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+          start=$(date +%s.%N)
+          cat "$RUNNER_TEMP/scale/${{ matrix.size }}_a.csv" "$RUNNER_TEMP/scale/${{ matrix.size }}_b.csv" > /dev/null
+          end=$(date +%s.%N)
+          python3 -c "import os,sys; s=float(sys.argv[2])-float(sys.argv[1]); b=sum(os.path.getsize(f) for f in sys.argv[3:]); print(f'plain read of both files, cold: {s:.1f}s ({b/1e6:,.0f} MB, {b/1e6/s:,.0f} MB/s)')" \
+              "$start" "$end" "$RUNNER_TEMP/scale/${{ matrix.size }}_a.csv" "$RUNNER_TEMP/scale/${{ matrix.size }}_b.csv" \
+              | tee -a "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt"
           # The harness kept the pair for the phase run; remove it now so the
           # disk is clean for whatever runs next.
           rm -f "$RUNNER_TEMP/scale/${{ matrix.size }}_a.csv" "$RUNNER_TEMP/scale/${{ matrix.size }}_b.csv"

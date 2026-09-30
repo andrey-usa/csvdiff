@@ -74,6 +74,14 @@ on:
         description: "Add Rust and Zig"
         type: boolean
         default: true
+      cpu:
+        description: >-
+          Text the runner's CPU model must contain, or "any". A run on another
+          model stops in its first step, before anything is built, so asking
+          again costs seconds rather than a table that cannot sit beside the
+          others. Every table in README.md is on an EPYC 7763; one run on an
+          EPYC 9V45 came out 1.6x faster on unchanged code.
+        default: "EPYC 7763"
       alt_ref:
         description: >-
           Also build Rust and Zig from this ref and measure them as separate
@@ -98,6 +106,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
+      # First, before a minute goes on toolchains: hosted runners are not one
+      # machine, and a table from the wrong one does not compare with the
+      # tables it would sit beside.
+      - name: The runner asked for
+        env:
+          WANT: ${{ github.event.inputs.cpu || 'any' }}
+        run: |
+          model=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')
+          echo "runner CPU: $model"
+          if [ "$WANT" != "any" ] && [[ "$model" != *"$WANT"* ]]; then
+            echo "::error::this runner is $model, not $WANT -- dispatch again, or pass cpu=any to measure it anyway"
+            exit 1
+          fi
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
