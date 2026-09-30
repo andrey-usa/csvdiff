@@ -289,46 +289,83 @@ std::size_t skip_quoted(std::string_view d, std::size_t from, std::size_t end) {
 // formed the span can only come out short of where the parse would put it, and
 // a short span fails the proof or falls back; it never proves a row the parse
 // would not. The C port has the same function (#178).
-std::size_t guard_span(std::string_view d, std::size_t lo, std::size_t hi, char delim,
-                       std::size_t commas) {
+//
+// The walk itself is `FieldWalker`, which the gapped proof also uses to skip
+// the unwanted columns between runs of wanted ones, in both rows.
+class FieldWalker {
+  public:
+    FieldWalker(std::string_view d, std::size_t lo, std::size_t hi, char delim)
+        : d_(d), hi_(hi), delim_(delim)
 #if defined(__AVX2__)
-    // The cursor `parse_csv` keeps, and for the same reason in locals.
-    std::size_t held = lo, scanned = lo;
-    std::uint32_t bits = 0;
-    const __m256i va = _mm256_set1_epi8(delim), vb = _mm256_set1_epi8('\n');
-    const auto next_delim = [&](std::size_t from) __attribute__((always_inline)) {
-        while (bits) {
-            const std::size_t at = held + static_cast<std::size_t>(std::countr_zero(bits));
-            bits &= bits - 1;
+          , held_(lo), scanned_(lo), va_(_mm256_set1_epi8(delim)), vb_(_mm256_set1_epi8('\n'))
+#endif
+    {
+        (void)lo;
+    }
+
+    static constexpr std::size_t kShort = static_cast<std::size_t>(-1);
+
+    // Past the byte that closes the `n`th field from `at` -- or kShort where the
+    // row ends first. With `may_end` the last of them may close on the line
+    // ending: where the last compared column is the row's last column, that is
+    // the only byte that can close it. A line ending before the last is a short
+    // row either way.
+    std::size_t past(std::size_t at, std::size_t n, bool may_end) {
+        const std::string_view d = d_;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t cur =
+                at < hi_ && d[at] == '"' ? next_delim(skip_quoted(d, at + 1, hi_)) : next_delim(at);
+            if (cur >= hi_) return kShort;
+            if (d[cur] != delim_ && !(may_end && i + 1 == n)) return kShort;
+            at = cur + 1;
+        }
+        return at;
+    }
+
+  private:
+#if defined(__AVX2__)
+    // The cursor `parse_csv` keeps.
+    std::size_t next_delim(std::size_t from) {
+        while (bits_) {
+            const std::size_t at = held_ + static_cast<std::size_t>(std::countr_zero(bits_));
+            bits_ &= bits_ - 1;
             if (at >= from) return at;
         }
-        std::size_t at = std::max(from, scanned);
-        for (; at + 32 <= hi; at += 32) {
-            const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d.data() + at));
+        std::size_t at = std::max(from, scanned_);
+        for (; at + 32 <= hi_; at += 32) {
+            const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(d_.data() + at));
             const auto hits = static_cast<std::uint32_t>(_mm256_movemask_epi8(
-                _mm256_or_si256(_mm256_cmpeq_epi8(w, va), _mm256_cmpeq_epi8(w, vb))));
-            scanned = at + 32;
+                _mm256_or_si256(_mm256_cmpeq_epi8(w, va_), _mm256_cmpeq_epi8(w, vb_))));
+            scanned_ = at + 32;
             if (hits) {
-                held = at;
-                bits = hits & (hits - 1);
+                held_ = at;
+                bits_ = hits & (hits - 1);
                 return at + static_cast<std::size_t>(std::countr_zero(hits));
             }
         }
-        const std::size_t next = next_of2(d, at, hi, delim, '\n');
-        scanned = next < hi ? next + 1 : hi;
+        const std::size_t next = next_of2(d_, at, hi_, delim_, '\n');
+        scanned_ = next < hi_ ? next + 1 : hi_;
         return next;
-    };
-#else
-    const auto next_delim = [&](std::size_t from) { return next_of2(d, from, hi, delim, '\n'); };
-#endif
-    std::size_t at = lo;
-    for (std::size_t i = 0; i < commas; ++i) {
-        const std::size_t cur =
-            at < hi && d[at] == '"' ? next_delim(skip_quoted(d, at + 1, hi)) : next_delim(at);
-        if (cur >= hi || d[cur] != delim) return 0;
-        at = cur + 1;
     }
-    return at - lo;
+#else
+    std::size_t next_delim(std::size_t from) const { return next_of2(d_, from, hi_, delim_, '\n'); }
+#endif
+
+    std::string_view d_;
+    std::size_t hi_;
+    char delim_;
+#if defined(__AVX2__)
+    std::size_t held_, scanned_;
+    std::uint32_t bits_ = 0;
+    __m256i va_, vb_;
+#endif
+};
+
+std::size_t guard_span(std::string_view d, std::size_t lo, std::size_t hi, char delim,
+                       std::size_t commas) {
+    FieldWalker w(d, lo, hi, delim);
+    const std::size_t at = w.past(lo, commas, true);
+    return at == FieldWalker::kShort ? 0 : at - lo;
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,6 +1597,22 @@ class RowIndex {
         }
     }
 
+    /// The first row whose whole hash is `hash`, or -1: the candidate
+    /// `lookup_proof` settles on when it is given no fields. The gapped proof
+    /// checks it itself.
+    int first_match(std::uint64_t hash) const {
+        std::size_t slot = slot_of(hash);
+        for (;;) {
+            const std::uint32_t v = table_[slot];
+            if (v == kEmpty) return -1;
+            if (slot_tag_is(v, hash)) {
+                const int candidate = first_row_[slot_pos(v)];
+                if (row_hash_[candidate] == hash) return candidate;
+            }
+            slot = (slot + 1) & mask_;
+        }
+    }
+
     /// `lookup`, with the proof tried first.
     ///
     /// `need` bytes from `a_row` cover every column either file wants, keys
@@ -2131,11 +2184,21 @@ struct ProofPlan {
     bool keys_in_proof = false;
     // How many delimiters from a CSV row's start close its guard column: where
     // `guard_span` can find the proof's span without the parse. 0 where it
-    // cannot -- JSON, keys the proof does not cover, or a guard that is the last
-    // column of A, which no delimiter closes: `guard_span` would scan every row
-    // to its end and return 0, and the proof that follows the lookup resets the
-    // backoff, so nothing would ever stop the scan.
+    // cannot -- JSON, or keys the proof does not cover. A guard that is the last
+    // column of A closes on the line ending, which `guard_span` accepts there;
+    // until it did, such a file never took this path at all.
     std::size_t guard_commas = 0;
+    // The same fields in runs, where a column nobody wants sits among them --
+    // an ignored `updated_at` in the middle of the row, say. One run is the
+    // plain prefix. More, and the proof compares each run of wanted columns as
+    // bytes and skips the unwanted ones between them in each row on its own: an
+    // ignored value that differs cannot stop a row proving equal, and one that
+    // differs in length cannot misalign what follows, because the skip counts
+    // fields rather than bytes. `seg_fields[j]` wanted fields are followed by
+    // `gap_fields[j]` unwanted ones; the last run has no gap. The C port has the
+    // same proof (#229).
+    std::vector<std::size_t> seg_fields, gap_fields;
+    std::size_t runs() const { return seg_fields.empty() ? 1 : seg_fields.size(); }
 };
 
 // `a_src[i]` is the CSV column slot `i` is read from in A, -1 where A lacks it;
@@ -2157,9 +2220,29 @@ ProofPlan plan_proof(const Slab& a, const Slab& b, char a_delim, char b_delim, s
             plan.keys_in_proof =
                 a_src[i] >= 0 && a_src[i] == b_src[i] && a_src[i] < a_src[width - 1];
     }
-    if (plan.keys_in_proof && !plan.json &&
-        static_cast<std::size_t>(a_src[width - 1]) + 1 < a_columns)
-        plan.guard_commas = static_cast<std::size_t>(a_src[width - 1]) + 1;
+    (void)a_columns;
+    if (plan.keys_in_proof && !plan.json) {
+        const auto g = static_cast<std::size_t>(a_src[width - 1]);
+        plan.guard_commas = g + 1;
+        std::vector<char> wanted(g + 1, 0);
+        for (std::size_t i = 0; i < width; ++i) wanted[static_cast<std::size_t>(a_src[i])] = 1;
+        std::vector<std::size_t> seg{0}, gap{0};
+        for (std::size_t col = 0; col <= g; ++col) {
+            if (!wanted[col]) {
+                ++gap.back();
+                continue;
+            }
+            if (gap.back()) {
+                seg.push_back(0);
+                gap.push_back(0);
+            }
+            ++seg.back();
+        }
+        if (seg.size() > 1) {
+            plan.seg_fields = std::move(seg);
+            plan.gap_fields = std::move(gap);
+        }
+    }
     return plan;
 }
 
@@ -2207,7 +2290,7 @@ struct ProofRows {
     const Slab& b;
     const RowIndex& ai;
     const RowIndex& bi;
-    const ProofPlan plan;  // a copy: four words, and the loop reads them from here
+    const ProofPlan plan;  // a copy, one per worker, and the loop reads it from here
     char a_delim;
     std::size_t width, key_size, nc;
 
@@ -2219,8 +2302,10 @@ struct ProofRows {
     };
 
     // The proof's span found by counting delimiters, without parsing the row.
-    Guard guard(int row, Field* probe) const {
+    // `seg` is the worker's scratch for the gapped proof, two words a run.
+    Guard guard(int row, Field* probe, std::size_t* seg) const {
         if (!plan.guard_commas) return Guard::Untried;
+        if (plan.runs() > 1) return gapped(row, seg);
         const std::size_t a_lo = ai.row_begin(row);
         const std::size_t span =
             guard_span(a.bytes(), a_lo, ai.row_end(row), a_delim, plan.guard_commas);
@@ -2230,6 +2315,45 @@ struct ProofRows {
                                          a.bytes().data() + a_lo, span, false, proven);
         if (mate < 0) return Guard::Removed;
         return proven ? Guard::Proven : Guard::Unsettled;
+    }
+
+    // The gapped form: where each run of wanted columns starts in A's row and
+    // how many bytes it takes, through the byte that closes it; then B's first
+    // hash match, and each run's bytes where B's own gaps put it. A run's bytes
+    // include its closing byte, so equal bytes leave B at the start of its next
+    // field, as they leave A.
+    Guard gapped(int row, std::size_t* seg) const {
+        const std::size_t runs = plan.runs();
+        const std::size_t a_lo = ai.row_begin(row), a_hi = ai.row_end(row);
+        FieldWalker wa(a.bytes(), a_lo, a_hi, a_delim);
+        std::size_t at = a_lo;
+        for (std::size_t j = 0; j < runs; ++j) {
+            const bool last = j + 1 == runs;
+            const std::size_t end = wa.past(at, plan.seg_fields[j], last);
+            if (end == FieldWalker::kShort) return Guard::Untried;
+            seg[2 * j] = at;
+            seg[2 * j + 1] = end - at;
+            if (last) break;
+            at = wa.past(end, plan.gap_fields[j], false);
+            if (at == FieldWalker::kShort) return Guard::Untried;
+        }
+        const int mate = bi.first_match(ai.hash_of(row));
+        if (mate < 0) return Guard::Removed;
+        const char* da = a.bytes().data();
+        const char* db = b.bytes().data();
+        const std::size_t b_hi = bi.row_end(mate);
+        FieldWalker wb(b.bytes(), bi.row_begin(mate), b_hi, a_delim);
+        at = bi.row_begin(mate);
+        for (std::size_t j = 0; j < runs; ++j) {
+            const std::size_t n = seg[2 * j + 1];
+            if (n > b_hi - at || common_prefix(da + seg[2 * j], db + at, n) != n)
+                return Guard::Unsettled;
+            at += n;
+            if (j + 1 == runs) break;
+            at = wb.past(at, plan.gap_fields[j], false);
+            if (at == FieldWalker::kShort) return Guard::Unsettled;
+        }
+        return Guard::Proven;
     }
 
     // How many bytes of A's row prove the whole row, keys included -- through the
@@ -2516,6 +2640,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         const std::size_t lo = a_keys.size() * p / join_ways;
         const std::size_t hi = a_keys.size() * (p + 1) / join_ways;
         std::vector<Field> fa(width), fb(width), probe(width);
+        std::vector<std::size_t> seg(2 * proof.plan.runs());
         ProofBackoff backoff;
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
@@ -2529,7 +2654,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             // collision `lookup_proof` passed over -- and compared.
             bool spanned = false;
             if (attempt) {
-                switch (proof.guard(row, probe.data())) {
+                switch (proof.guard(row, probe.data(), seg.data())) {
                     case ProofRows::Guard::Untried:
                         break;
                     case ProofRows::Guard::Removed:

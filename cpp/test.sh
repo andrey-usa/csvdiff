@@ -89,6 +89,37 @@ proof "a difference confined to an ignored column" \
 proof "the key written after the last compared value" \
   '{"v":"5","w":"x","k":"1"}' '{"v":"6","w":"x","k":"1"}' "changed 1"
 
+# The CSV byte proof with gaps: an ignored column among compared ones is
+# skipped by field count in each row on its own, so a value there that differs
+# -- in length, in quoting, with a delimiter inside the quotes -- does not stop
+# a row proving equal, and does not shift what the proof compares after it.
+# The last column is compared, so the proof also closes on the line ending.
+# Each pair is held to the Rust port's answer.
+echo "the csv byte proof, past an ignored column:"
+gapcheck() { # label, a-file, b-file, then flags
+  local label=$1 a=$2 b=$3; shift 3
+  local r c
+  r=$("$RUST" compare "$a" "$b" "$@" --engine turbo -o /dev/null 2>&1 | summary) || true
+  c=$(build/csvdiff compare "$a" "$b" "$@" 2>&1 | summary) || true
+  if [ "$r" = "$c" ]; then printf '  ok    %s\n' "$label"
+  else printf '  FAIL  %s\n    rust: %s\n    c++ : %s\n' "$label" "$r" "$c"; fail=1; fi
+}
+{ echo 'id,skip,a,b'; echo 'k1,S1,p,q'; echo 'k2,S1,p,q'; echo 'k3,S1,p,q'; } > "$tmpj/gap_a.csv"
+{ echo 'id,skip,a,b'; echo 'k1,"S, ""two"" and more",p,q'; echo 'k2,,p,X'; echo 'k3,S2,p,qq'; } > "$tmpj/gap_b.csv"
+gapcheck "a middle ignored column that differs" "$tmpj/gap_a.csv" "$tmpj/gap_b.csv" -k id -i skip
+{ echo 'id,skip,a,b'; echo 'k1,S1,p,q'; echo 'k2,S1,p,q'; } > "$tmpj/gs_a.csv"
+{ echo 'id,skip,a,b'; echo 'k1'; echo 'k2,S2'; } > "$tmpj/gs_b.csv"
+gapcheck "a mate that stops inside the gap" "$tmpj/gs_a.csv" "$tmpj/gs_b.csv" -k id -i skip
+{ echo 'skip,id,a,t,b'; echo 'S1,k1,p,T1,q'; echo 'S1,k2,p,T1,q'; } > "$tmpj/g2_a.csv"
+{ echo 'skip,id,a,t,b'; echo 'S22,k1,p,T2,q'; echo 'S,k2,p,T222,Y'; } > "$tmpj/g2_b.csv"
+gapcheck "a leading gap and a second one" "$tmpj/g2_a.csv" "$tmpj/g2_b.csv" -k id -i skip,t
+printf 'id,skip,a\nk1,S1,p\n' > "$tmpj/gc_a.csv"
+printf 'id,skip,a\r\nk1,S22,p\r\n' > "$tmpj/gc_b.csv"
+gapcheck "a gap, and CRLF against LF" "$tmpj/gc_a.csv" "$tmpj/gc_b.csv" -k id -i skip
+{ echo 'a,k,c'; echo 'x,K1,c1'; echo 'y,K2,cc'; } > "$tmpj/pre_a.csv"
+{ echo 'a,k,c'; echo 'x,K1,c1'; echo 'y,K2,cccccccc'; } > "$tmpj/pre_b.csv"
+gapcheck "a mate whose last column carries on" "$tmpj/pre_a.csv" "$tmpj/pre_b.csv" -k k
+
 # --ignore-case refuses a value outside ASCII only where folding it decides the
 # answer: a key, or a compared value that differs byte for byte. A value that is
 # unchanged, or in a row only one side has, is answered -- with or without
