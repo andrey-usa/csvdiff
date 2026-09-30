@@ -19,6 +19,16 @@ use std::process::Command;
 
 use csvdiff::gendata::{Compression, Format, generate_as};
 
+/// A number no other fixture in this process has. The tests run as parallel
+/// threads of one process, and the clock this used to take cannot tell them
+/// apart: macOS reports microseconds, and two fixtures made in the same one
+/// shared a directory, which the first to finish deleted under the other.
+fn fixture_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 const BIN: &str = env!("CARGO_BIN_EXE_csvdiff");
 
 struct Fixture(PathBuf);
@@ -28,10 +38,7 @@ impl Fixture {
         let dir = std::env::temp_dir().join(format!(
             "csvdiff-summary-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            fixture_id()
         ));
         fs::create_dir_all(&dir).expect("a temp directory");
         // Enough rows that every section has something in it -- changed, added,

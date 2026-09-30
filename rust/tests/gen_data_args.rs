@@ -9,6 +9,16 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+/// A number no other fixture in this process has. The tests run as parallel
+/// threads of one process, and the clock this used to take cannot tell them
+/// apart: macOS reports microseconds, and two fixtures made in the same one
+/// shared a directory, which the first to finish deleted under the other.
+fn fixture_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 const GEN: &str = env!("CARGO_BIN_EXE_gen-data");
 
 struct Dir(PathBuf);
@@ -18,10 +28,7 @@ impl Dir {
         let p = std::env::temp_dir().join(format!(
             "csvdiff-args-{tag}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            fixture_id()
         ));
         Dir(p)
     }

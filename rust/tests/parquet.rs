@@ -19,6 +19,16 @@ use csvdiff::contract::CompareResult;
 use csvdiff::engine::compare;
 use csvdiff::options::{Engine, Options};
 
+/// A number no other fixture in this process has. The tests run as parallel
+/// threads of one process, and the clock this used to take cannot tell them
+/// apart: macOS reports microseconds, and two fixtures made in the same one
+/// shared a directory, which the first to finish deleted under the other.
+fn fixture_id() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 fn generator() -> Option<PathBuf> {
     // The tests run from `rust/`, so the C++ build is one level up.
     let p = Path::new("../cpp/build/gen-data");
@@ -44,10 +54,7 @@ impl Fixture {
         let dir = std::env::temp_dir().join(format!(
             "csvdiff-pq-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            fixture_id()
         ));
         std::fs::create_dir_all(&dir).ok()?;
         for flags in [&[][..], extra] {
@@ -437,10 +444,7 @@ fn a_zstd_pair_falls_through_to_the_reader_that_handles_it() {
     let dir = std::env::temp_dir().join(format!(
         "csvdiff-zstd-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        fixture_id()
     ));
     std::fs::create_dir_all(&dir).expect("a temp directory");
 
