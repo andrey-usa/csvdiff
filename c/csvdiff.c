@@ -1765,6 +1765,108 @@ static bool json_tail_is_clean(const RowParser *p, const char *d, size_t at, siz
     return true;
 }
 
+static inline bool json_ws(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+
+/* Past one JSON value from `at`: a string, a scalar, or a nested object or
+ * array. `end` where it does not close before `end`. */
+static size_t json_value_end(const char *d, size_t at, size_t end) {
+    if (at >= end) return end;
+    if (d[at] == '"') {
+        bool escaped = false;
+        return skip_json_string(d, at, end, &escaped);
+    }
+    if (d[at] == '{' || d[at] == '[') return skip_json_nested(d, at, end);
+    while (at < end && d[at] != ',' && d[at] != '}' && d[at] != ']' && d[at] != '\n' &&
+           !json_ws(d[at]))
+        at++;
+    return at;
+}
+
+/*
+ * The member of A's object whose value holds byte `diff`, walking from `at`
+ * (the row start, or just past a value already skipped): its value's bounds in
+ * `*vs`, `*ve`. False where `diff` falls in a name or the punctuation between
+ * members, in a tracked member, or anywhere the walk cannot follow -- an
+ * escaped name included, as the tail check treats one.
+ */
+static bool json_member_at(const RowParser *p, const char *d, size_t at, size_t end,
+                           size_t diff, bool after_value, size_t *vs, size_t *ve) {
+    for (;;) {
+        while (at < end && json_ws(d[at])) at++;
+        if (at >= end || at > diff) return false;
+        if (!after_value) {
+            if (d[at] != '{') return false;
+        } else if (d[at] != ',') {
+            return false;                        /* the object closed first */
+        }
+        at++;
+        while (at < end && json_ws(d[at])) at++;
+        if (at >= end || d[at] != '"' || at >= diff) return false;
+        bool escaped = false;
+        const size_t kq = at, kend = skip_json_string(d, at, end, &escaped);
+        if (escaped || kend >= end || kend >= diff) return false;
+        at = kend;
+        while (at < end && json_ws(d[at])) at++;
+        if (at >= end || d[at] != ':') return false;
+        at++;
+        while (at < end && json_ws(d[at])) at++;
+        if (at > diff) return false;
+        const size_t v_end = json_value_end(d, at, end);
+        if (v_end >= end || v_end <= at) return false;
+        if (diff < v_end) {
+            if (parser_slot_for(p, d + kq + 1, kend - kq - 2) >= 0) return false;
+            *vs = at;
+            *ve = v_end;
+            return true;
+        }
+        at = v_end;
+        after_value = true;
+    }
+}
+
+/*
+ * The JSON proof, past ignored values that differ.
+ *
+ * The plain proof holds when A's row and its mate agree byte for byte through
+ * the last value either side wants and the mate's tail names nothing tracked.
+ * One ignored member in between whose value differs -- an `updated_at`, say,
+ * which differs on every row -- fails that on every row. So where the two rows
+ * first differ, this finds the member of A's object that byte is in. If it is
+ * the value of a name nobody tracks, the value is skipped in each row on its
+ * own -- in B from the same offset, since everything before it agreed, which
+ * includes the name -- and the comparison carries on from there. A difference
+ * anywhere else, or in a tracked value, or in a shape the walk does not follow,
+ * fails the proof, and the row is parsed as it was before.
+ *
+ * The names before each skipped value are equal bytes in both rows and the
+ * skipped values belong to untracked names, so every tracked name appears in
+ * both at the same place with the same bytes; the tail check covers what
+ * follows, as it did.
+ */
+static bool json_rows_match(const RowParser *p, const char *a, size_t a_lo, size_t a_hi,
+                            size_t need, const char *b, size_t b_lo, size_t b_hi) {
+    size_t ai = a_lo, bi = b_lo, left = need;
+    bool after_value = false;
+    for (int hops = 0; hops < 64; hops++) {
+        const size_t room = b_hi - bi;
+        const size_t m = left < room ? left : room;
+        const size_t same = common_prefix(a + ai, b + bi, m);
+        if (same == left) return json_tail_is_clean(p, b, bi + left, b_hi);
+        if (same == m) return false;             /* B ends first */
+        size_t vs, ve;
+        if (!json_member_at(p, a, ai, a_hi, ai + same, after_value, &vs, &ve)) return false;
+        if (ve - a_lo > need) return false;      /* the gap runs past the last wanted value */
+        const size_t b_vs = bi + (vs - ai);
+        const size_t b_ve = json_value_end(b, b_vs, b_hi);
+        if (b_ve >= b_hi || b_ve <= b_vs) return false;
+        left -= ve - ai;
+        ai = ve;
+        bi = b_ve;
+        after_value = true;
+    }
+    return false;
+}
+
 /*
  * `index_lookup`, with the proof tried first.
  *
@@ -1784,7 +1886,7 @@ static bool json_tail_is_clean(const RowParser *p, const char *d, size_t at, siz
  */
 static int32_t index_lookup_proof(const RowIndex *ix, const Slab *other, const Field *fields,
                                   uint64_t hash, Field *probe, const char *a_row, size_t need,
-                                  bool json, bool *proven) {
+                                  size_t a_hi, bool json, bool *proven) {
     size_t slot = slot_of(ix, hash);
     for (;;) {
         const uint32_t v = ix->table[slot];
@@ -1796,8 +1898,9 @@ static int32_t index_lookup_proof(const RowIndex *ix, const Slab *other, const F
             const size_t b_lo = (size_t)ix->row_start[candidate];
             const size_t b_n = row_end(ix, candidate) - b_lo;
             const char *b = ix->slab->data;
-            if (need <= b_n && common_prefix(a_row, b + b_lo, need) == need &&
-                (!json || json_tail_is_clean(ix->parser, b, b_lo + need, b_lo + b_n))) {
+            if (json ? json_rows_match(ix->parser, other->data, (size_t)(a_row - other->data),
+                                       a_hi, need, b, b_lo, b_lo + b_n)
+                     : need <= b_n && common_prefix(a_row, b + b_lo, need) == need) {
                 *proven = true;
                 return candidate;
             }
@@ -2133,7 +2236,7 @@ static void compare_part(void *vctx, unsigned p) {
                     tried = need != 0;
                     if (tried)
                         mate = index_lookup_proof(c->bi, c->a, NULL, hash, out->probe,
-                                                  c->a->data + a_lo, need, false, &proven);
+                                                  c->a->data + a_lo, need, a_hi, false, &proven);
                 }
                 if (tried) {
                     if (mate < 0) { out->removed++; continue; }
@@ -2159,7 +2262,8 @@ static void compare_part(void *vctx, unsigned p) {
                 bool proven = false;
                 const int32_t mate = index_lookup_proof(
                     c->bi, c->a, out->fa, hash, out->probe,
-                    c->a->data + (size_t)c->ai->row_start[row], need, c->json, &proven);
+                    c->a->data + (size_t)c->ai->row_start[row], need, row_end(c->ai, row),
+                    c->json, &proven);
                 if (mate < 0) { out->removed++; continue; }
                 out->matched++;
                 if (proven) { refused = 0; continue; }
@@ -2187,9 +2291,8 @@ static void compare_part(void *vctx, unsigned p) {
                     if (e > t) t = e;
                 }
                 const size_t need = t + 1 - a_lo;
-                if (t < a_end && need <= b_n &&
-                    common_prefix(c->a->data + a_lo, c->b->data + b_lo, need) == need &&
-                    json_tail_is_clean(c->bi->parser, c->b->data, b_lo + need, b_lo + b_n)) {
+                if (t < a_end && json_rows_match(c->bi->parser, c->a->data, a_lo, a_end, need,
+                                                 c->b->data, b_lo, b_lo + b_n)) {
                     refused = 0;
                     continue;
                 }

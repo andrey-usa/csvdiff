@@ -677,6 +677,29 @@ pcase "a change in the compared value"          "1 0 0" jc_a.ndjson jc_b.ndjson 
 printf '{"id":"k1","a":"p"}\n'              > "$pdir/jk_a.ndjson"
 printf '{"id":"k1","id":"OTHER","a":"p"}\n' > "$pdir/jk_b.ndjson"
 pcase "a repeated key name keeps the first"     "0 0 0" jk_a.ndjson jk_b.ndjson -k id
+
+# Past an ignored value in the middle: where the rows first differ inside the
+# value of a name nobody tracks, that value is skipped in each row on its own
+# and the comparison carries on. It may differ in length, in escapes, in type,
+# or be a nested object whose inner names do not count.
+printf '{"id":"k1","ts":"T1","a":"p"}\n'                      > "$pdir/jg_a.ndjson"
+printf '{"id":"k1","ts":"T2 and longer","a":"p"}\n'           > "$pdir/jg_b.ndjson"
+pcase "an ignored middle value that differs"      "0 0 0" jg_a.ndjson jg_b.ndjson -k id -i ts
+printf '{"id":"k1","ts":"T2 and longer","a":"X"}\n'           > "$pdir/jgc_b.ndjson"
+pcase "and a real change after it"                "1 0 0" jg_a.ndjson jgc_b.ndjson -k id -i ts
+printf '{"id":"k1","ts":"a\\"b,c}","a":"p"}\n'                 > "$pdir/jge_a.ndjson"
+printf '{"id":"k1","ts":null,"a":"p"}\n'                      > "$pdir/jge_b.ndjson"
+pcase "an escaped ignored value against null"     "0 0 0" jge_a.ndjson jge_b.ndjson -k id -i ts
+printf '{"id":"k1","ts":{"a":"Z"},"a":"p"}\n'                 > "$pdir/jgn_a.ndjson"
+printf '{"id":"k1","ts":[1,{"a":"Y"}],"a":"p"}\n'             > "$pdir/jgn_b.ndjson"
+pcase "nested ignored values, names inside"       "0 0 0" jgn_a.ndjson jgn_b.ndjson -k id -i ts
+# The mate repeats the compared name after the gap, and last wins.
+printf '{"id":"k1","ts":"T2","a":"p","a":"LATER"}\n'          > "$pdir/jgd_b.ndjson"
+pcase "a repeat of the column after the gap"      "1 0 0" jg_a.ndjson jgd_b.ndjson -k id -i ts
+# Two gaps, the first before the key.
+printf '{"t1":"x","id":"k1","t2":"y","a":"p"}\n'              > "$pdir/jg2_a.ndjson"
+printf '{"t1":"xx","id":"k1","t2":"","a":"p"}\n'              > "$pdir/jg2_b.ndjson"
+pcase "two ignored values, one before the key"    "0 0 0" jg2_a.ndjson jg2_b.ndjson -k id -i t1,t2
 rm -rf "$pdir"
 
 # --- the generator's own front door -----------------------------------------
