@@ -405,6 +405,31 @@ for ext in csv ndjson; do
     fi
   done
 done
+# A guessed split inside a quoted field: one field of 20,000 lines sits across
+# the middle of each file, so the halfway guess lands on a newline inside it and
+# the sweep has to start over on counted splits -- and throw away what it had
+# already joined, not only what it had indexed.
+python3 - "$fz" <<'PY'
+import sys
+d = sys.argv[1]
+for side in ("a", "b"):
+    rows = ["k,v,note\n"]
+    rows += [f"R{i:06d},{i},plain\n" for i in range(110000)]
+    rows.append(f"MID,{'x' if side == 'a' else 'y'},\"" + "inside\n" * 20000 + "\"\n")
+    rows += [f"S{i:06d},{i + (side == 'b' and i == 7)},plain\n" for i in range(110000)]
+    open(f"{d}/g_{side}.csv", "w").write("".join(rows))
+PY
+one=$($BIN compare "$fz/g_a.csv" "$fz/g_b.csv" -k k --threads 1 2>&1 | head -1 | answer) || true
+inside=$(CSVDIFF_FUSED_JOIN=1 $BIN compare "$fz/g_a.csv" "$fz/g_b.csv" -k k --threads 4 2>&1 | head -1 | answer) || true
+case "$one" in
+  *"(changed 2) | added 0 | removed 0"*)
+    if [ "$inside" = "$one" ]; then
+      echo "  ok    a split guessed inside a quoted field is caught, and the join inside the sweep starts over"
+    else
+      printf '  FAIL  the join inside the sweep kept rows from a wrong guess\n    1     : %s\n    inside: %s\n' "$one" "$inside"; fail=1
+    fi ;;
+  *) echo "  FAIL  the guessed-split fixture: $one"; fail=1 ;;
+esac
 rm -rf "$fz"
 
 exit $fail

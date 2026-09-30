@@ -801,6 +801,9 @@ const Chunk = struct {
     /// Written only by the thread that owns this chunk, read only once every
     /// thread has been joined -- which is why no lock is needed for it.
     failure: ?anyerror = null,
+    /// Where a text chunk's sweep left off: the first row start at or past its
+    /// end. The next chunk's guessed start is checked against it.
+    stopped: usize = 0,
 
     fn deinit(self: *Chunk, gpa: std.mem.Allocator) void {
         self.at.deinit(gpa);
@@ -1232,7 +1235,11 @@ fn chunkBounds(
     from: usize,
     threads: usize,
     dialect: Dialect,
+    count_quotes: bool,
 ) ![]usize {
+    // Without the count a CSV split is taken at the next newline, as JSON's is:
+    // a guess, which `sweep` checks.
+    const quoted = dialect == .csv and count_quotes;
     var bounds: std.ArrayList(usize) = .empty;
     errdefer bounds.deinit(gpa);
     const end = data.len;
@@ -1253,7 +1260,7 @@ fn chunkBounds(
     // numbers for one pass.
     var before = try gpa.alloc(usize, threads);
     defer gpa.free(before);
-    if (dialect == .csv) {
+    if (quoted) {
         var running: usize = 0;
         var prev = from;
         for (1..threads) |i| {
@@ -1267,11 +1274,11 @@ fn chunkBounds(
     }
     for (1..threads) |i| {
         const nominal = from + (end - from) * i / threads;
-        var in_quotes = dialect == .csv and before[i] % 2 == 1;
+        var in_quotes = quoted and before[i] % 2 == 1;
         var at = nominal;
         while (at < end) : (at += 1) {
             const c = data[at];
-            if (c == '"' and dialect == .csv) {
+            if (c == '"' and quoted) {
                 in_quotes = !in_quotes;
             } else if (c == '\n' and !in_quotes) {
                 at += 1;
@@ -1378,6 +1385,7 @@ const Sweep = struct {
                     if (next <= pos) break; // no progress: a malformed tail, not a loop
                     pos = next;
                 }
+                chunk.stopped = pos;
             },
         }
     }
@@ -1399,20 +1407,88 @@ fn sweep(
     threads: usize,
     sink: ?*FusedSink,
 ) ![]Chunk {
-    var bounds: []usize = &.{};
-    var parts: usize = 1;
-    switch (side.rows) {
-        .text => |t| {
-            const data = side.slab.data;
-            if (t.from >= data.len) return gpa.alloc(Chunk, 0);
-            bounds = try chunkBounds(gpa, data, t.from, threads, side.slab.dialect);
-            parts = bounds.len - 1;
-        },
-        .columnar => |c| {
-            parts = @max(1, @min(threads, (c.rows + (1 << 14) - 1) / (1 << 14)));
-        },
+    const t = switch (side.rows) {
+        .text => |t| t,
+        .columnar => return sweepOnce(gpa, side, key_size, opt, threads, &.{}, sink),
+    };
+    const data = side.slab.data;
+    if (t.from >= data.len) return gpa.alloc(Chunk, 0);
+
+    // The CSV splits are guessed, then checked, as the C and C++ ports do.
+    //
+    // Counted splits cost a pass over most of the file on one thread before any
+    // chunk starts. With one chunk a file that was never paid; the join inside
+    // the sweep takes the whole budget, and on the 150M pair the count read
+    // most of each 26 GB file from disk a second time. A guess lands on the
+    // next newline; chunk i's sweep stops at the first row start past its end,
+    // and if that is where chunk i + 1 began, chunk i + 1 started on a real
+    // row. Only a guess inside a quoted field breaks that, and then the sweep
+    // runs again on counted splits. A chunk that started on a wrong guess
+    // parsed garbage, so its rows, its failure and what it handed the sink are
+    // all thrown away.
+    var bounds = try chunkBounds(gpa, data, t.from, threads, side.slab.dialect, false);
+    defer gpa.free(bounds);
+    var chunks = try sweepOnce(gpa, side, key_size, opt, threads, bounds, sink);
+    errdefer freeChunks(gpa, chunks);
+    var held = true;
+    for (chunks[0..chunks.len -| 1], 0..) |c, i| {
+        if (c.failure) |e| return e; // its start is proven
+        if (c.stopped != bounds[i + 1]) {
+            held = false;
+            break;
+        }
     }
-    defer if (bounds.len > 0) gpa.free(bounds);
+    if (!held) {
+        freeChunks(gpa, chunks);
+        chunks = &.{};
+        if (sink) |k| k.reset();
+        gpa.free(bounds);
+        bounds = &.{};
+        bounds = try chunkBounds(gpa, data, t.from, threads, side.slab.dialect, true);
+        chunks = try sweepOnce(gpa, side, key_size, opt, threads, bounds, sink);
+    }
+    for (chunks) |c| {
+        if (c.failure) |e| return e;
+    }
+    // Each chunk's last row ends where the next chunk's first row starts, which
+    // only the next chunk knows, so those rows are handed over now.
+    if (sink) |k| {
+        for (chunks, 0..) |c, i| {
+            if (c.at.items.len == 0) continue;
+            var hi: usize = data.len;
+            for (chunks[i + 1 ..]) |later| {
+                if (later.at.items.len > 0) {
+                    hi = @intCast(later.at.items[0]);
+                    break;
+                }
+            }
+            try k.row(i, @intCast(c.at.items[c.at.items.len - 1]), hi, c.hash.items[c.hash.items.len - 1]);
+        }
+    }
+    return chunks;
+}
+
+fn freeChunks(gpa: std.mem.Allocator, chunks: []Chunk) void {
+    for (chunks) |*c| c.deinit(gpa);
+    gpa.free(chunks);
+}
+
+/// One sweep over `bounds` (text) or over the rows split `threads` ways
+/// (columnar). A text chunk's failure is left in the chunk for the caller,
+/// which knows whether the chunk's start was a real row.
+fn sweepOnce(
+    gpa: std.mem.Allocator,
+    side: *const Side,
+    key_size: usize,
+    opt: Options,
+    threads: usize,
+    bounds: []const usize,
+    sink: ?*FusedSink,
+) ![]Chunk {
+    const parts: usize = switch (side.rows) {
+        .text => bounds.len - 1,
+        .columnar => |c| @max(1, @min(threads, (c.rows + (1 << 14) - 1) / (1 << 14))),
+    };
 
     const chunks = try gpa.alloc(Chunk, parts);
     errdefer {
@@ -1436,22 +1512,9 @@ fn sweep(
         .sink = sink,
     };
     try runOnThreads(&work, Sweep.run, parts);
-    for (chunks) |c| {
-        if (c.failure) |e| return e;
-    }
-    // Each chunk's last row ends where the next chunk's first row starts, which
-    // only the next chunk knows, so those rows are handed over now.
-    if (sink) |k| {
-        for (chunks, 0..) |c, i| {
-            if (c.at.items.len == 0) continue;
-            var hi: usize = side.slab.data.len;
-            for (chunks[i + 1 ..]) |later| {
-                if (later.at.items.len > 0) {
-                    hi = @intCast(later.at.items[0]);
-                    break;
-                }
-            }
-            try k.row(i, @intCast(c.at.items[c.at.items.len - 1]), hi, c.hash.items[c.hash.items.len - 1]);
+    if (side.rows == .columnar) {
+        for (chunks) |c| {
+            if (c.failure) |e| return e;
         }
     }
     return chunks;
@@ -1820,6 +1883,22 @@ const FusedSink = struct {
         gpa.free(self.refused);
     }
 
+    /// Everything the sink was handed came from a sweep that started over.
+    fn reset(self: *FusedSink) void {
+        for (self.parts) |*p| {
+            p.matched = 0;
+            p.changed = 0;
+            p.removed = 0;
+            for (p.columns) |*c| {
+                c.changed = 0;
+                c.blanked = 0;
+                c.filled = 0;
+            }
+        }
+        @memset(self.seen, 0);
+        @memset(self.refused, 0);
+    }
+
     fn row(self: *FusedSink, i: usize, lo: usize, hi: usize, hash: u64) !void {
         try self.join.joinRow(&self.parts[i], &self.scratch[i], lo, hi, hash, self.seen[i], &self.refused[i]);
         self.seen[i] += 1;
@@ -2131,6 +2210,7 @@ pub fn compare(
         defer sink.deinit(gpa);
         prepare_a.index = try RowIndex.build(gpa, a, key_size, opt, total, "A ", &sink);
         join.ai = &prepare_a.index.?;
+        phases.mark("A index, joined as it was read");
         const later = join.ai.later.items;
         back = try gpa.alloc(Part, if (later.len < (1 << 14)) 1 else total);
         for (back) |*p| {
