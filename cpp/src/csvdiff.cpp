@@ -1241,7 +1241,100 @@ class RowParser {
         return true;
     }
 
+    /// The JSON proof, past ignored values that differ.
+    ///
+    /// The plain proof holds when A's row and its mate agree byte for byte
+    /// through the last value either side wants and the mate's tail names
+    /// nothing tracked. One ignored member in between whose value differs -- an
+    /// `updated_at`, say, which differs on every row -- fails that on every row.
+    /// So where the two rows first differ, this finds the member of A's object
+    /// that byte is in. If it is the value of a name nobody tracks, the value is
+    /// skipped in each row on its own -- in B from the same offset, since
+    /// everything before it agreed, name included -- and the comparison carries
+    /// on from there. A difference anywhere else, in a tracked value, or in a
+    /// shape the walk does not follow fails the proof, and the row is parsed as
+    /// before. The names before each skipped value are equal bytes in both rows
+    /// and the skipped values belong to untracked names, so every tracked name
+    /// sits at the same place with the same bytes; the tail check covers what
+    /// follows. The C port has the same proof (#234).
+    bool json_rows_match(std::string_view a, std::size_t a_lo, std::size_t a_hi,
+                         std::size_t need, std::string_view b, std::size_t b_lo,
+                         std::size_t b_hi) const {
+        std::size_t ai = a_lo, bi = b_lo, left = need;
+        bool after_value = false;
+        for (int hops = 0; hops < 64; ++hops) {
+            const std::size_t m = std::min(left, b_hi - bi);
+            const std::size_t same = common_prefix(a.data() + ai, b.data() + bi, m);
+            if (same == left) return json_tail_is_clean(b, bi + left, b_hi);
+            if (same == m) return false;  // B ends first
+            std::size_t vs = 0, ve = 0;
+            if (!json_member_at(a, ai, a_hi, ai + same, after_value, vs, ve)) return false;
+            if (ve - a_lo > need) return false;  // the gap runs past the last wanted value
+            const std::size_t b_vs = bi + (vs - ai);
+            const std::size_t b_ve = json_value_end(b, b_vs, b_hi);
+            if (b_ve >= b_hi || b_ve <= b_vs) return false;
+            left -= ve - ai;
+            ai = ve;
+            bi = b_ve;
+            after_value = true;
+        }
+        return false;
+    }
+
   private:
+    static bool json_gap(char c) { return c == ' ' || c == '\t' || c == '\r'; }
+
+    // Past one JSON value from `at`: a string, a scalar, or a nested object or
+    // array. `end` where it does not close before `end`.
+    static std::size_t json_value_end(std::string_view d, std::size_t at, std::size_t end) {
+        if (at >= end) return end;
+        if (d[at] == '"') {
+            bool escaped = false;
+            return skip_json_string(d, at, end, &escaped);
+        }
+        if (d[at] == '{' || d[at] == '[') return skip_json_nested(d, at, end);
+        while (at < end && d[at] != ',' && d[at] != '}' && d[at] != ']' && d[at] != '\n' &&
+               !json_gap(d[at]))
+            ++at;
+        return at;
+    }
+
+    // The member of A's object whose value holds byte `diff`, walking from `at`
+    // (the row start, or just past a value already skipped): its value's bounds.
+    // False where `diff` falls in a name or the punctuation between members, in
+    // a tracked member, or anywhere the walk cannot follow -- an escaped name
+    // included, as the tail check treats one.
+    bool json_member_at(std::string_view d, std::size_t at, std::size_t end, std::size_t diff,
+                        bool after_value, std::size_t& vs, std::size_t& ve) const {
+        for (;;) {
+            while (at < end && json_gap(d[at])) ++at;
+            if (at >= end || at > diff) return false;
+            if (d[at] != (after_value ? ',' : '{')) return false;
+            ++at;
+            while (at < end && json_gap(d[at])) ++at;
+            if (at >= end || d[at] != '"' || at >= diff) return false;
+            bool escaped = false;
+            const std::size_t kq = at, kend = skip_json_string(d, at, end, &escaped);
+            if (escaped || kend >= end || kend >= diff) return false;
+            at = kend;
+            while (at < end && json_gap(d[at])) ++at;
+            if (at >= end || d[at] != ':') return false;
+            ++at;
+            while (at < end && json_gap(d[at])) ++at;
+            if (at > diff) return false;
+            const std::size_t v_end = json_value_end(d, at, end);
+            if (v_end >= end || v_end <= at) return false;
+            if (diff < v_end) {
+                if (slot_for(d.substr(kq + 1, kend - kq - 2)) >= 0) return false;
+                vs = at;
+                ve = v_end;
+                return true;
+            }
+            at = v_end;
+            after_value = true;
+        }
+    }
+
     static std::size_t skip_json_nested(std::string_view d, std::size_t pos, std::size_t end) {
         int depth = 0;
         while (pos < end) {
@@ -1623,7 +1716,8 @@ class RowIndex {
     /// a proven mate needs no comparing either -- the C and Zig ports do the
     /// same.
     int lookup_proof(const Slab& other, const Field* fields, std::uint64_t hash, Field* probe,
-                     const char* a_row, std::size_t need, bool json, bool& proven) const {
+                     const char* a_row, std::size_t need, std::size_t a_hi, bool json,
+                     bool& proven) const {
         std::size_t slot = slot_of(hash);
         for (;;) {
             const std::uint32_t v = table_[slot];
@@ -1636,8 +1730,11 @@ class RowIndex {
             if (row_hash_[candidate] == hash) {
                 const std::size_t b_lo = row_begin(candidate);
                 const std::size_t b_n = row_end(candidate) - b_lo;
-                if (need <= b_n && common_prefix(a_row, slab_.bytes().data() + b_lo, need) == need &&
-                    (!json || parser_.json_tail_is_clean(slab_.bytes(), b_lo + need, b_lo + b_n))) {
+                if (json ? parser_.json_rows_match(other.bytes(),
+                                                   static_cast<std::size_t>(a_row - other.bytes().data()),
+                                                   a_hi, need, slab_.bytes(), b_lo, b_lo + b_n)
+                         : need <= b_n &&
+                               common_prefix(a_row, slab_.bytes().data() + b_lo, need) == need) {
                     proven = true;
                     return candidate;
                 }
@@ -2312,7 +2409,7 @@ struct ProofRows {
         if (!span) return Guard::Untried;
         bool proven = false;
         const int mate = bi.lookup_proof(a, nullptr, ai.hash_of(row), probe,
-                                         a.bytes().data() + a_lo, span, false, proven);
+                                         a.bytes().data() + a_lo, span, 0, false, proven);
         if (mate < 0) return Guard::Removed;
         return proven ? Guard::Proven : Guard::Unsettled;
     }
@@ -2381,15 +2478,13 @@ struct ProofRows {
     // objects need not list their names in the same order. The keys are not in the
     // run and do not need to be.
     Proof json_after_lookup(int row, int mate, const Field* fa) const {
-        const char* d = a.bytes().data();
         const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
         const std::size_t b_lo = bi.row_begin(mate);
         const std::size_t b_n = bi.row_end(mate) - b_lo;
         const std::size_t t = run_end(fa + key_size, nc, a_lo);
         const std::size_t need = t + 1 - a_lo;
-        const bool same = t < a_end && need <= b_n &&
-                          common_prefix(d + a_lo, b.bytes().data() + b_lo, need) == need &&
-                          bi.parser().json_tail_is_clean(b.bytes(), b_lo + need, b_lo + b_n);
+        const bool same = t < a_end && bi.parser().json_rows_match(a.bytes(), a_lo, a_end, need,
+                                                                   b.bytes(), b_lo, b_lo + b_n);
         return same ? Proof::Proven : Proof::Failed;
     }
 
@@ -2682,8 +2777,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             bool proven = false;
             const int mate =
                 need ? bi.lookup_proof(a, fa.data(), ai.hash_of(row), probe.data(),
-                                       a.bytes().data() + ai.row_begin(row), need, proof.plan.json,
-                                       proven)
+                                       a.bytes().data() + ai.row_begin(row), need, ai.row_end(row),
+                                       proof.plan.json, proven)
                      : bi.lookup(a, fa.data(), ai.hash_of(row), probe.data());
             if (mate < 0) {
                 ++out.removed_total;
