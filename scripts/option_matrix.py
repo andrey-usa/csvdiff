@@ -23,8 +23,9 @@ passes scripts/contract.py. A refusal (exit 2) must also say which column or
 file it is about, the one thing a user needs from it.
 
 The normalisation flags -- --trim, --ignore-case, --empty-is-null, --tolerance
--- run on the ports that carry them (C refuses each as an unknown option; see
-c/README.md), with Rust as the reference. They run on the generated pairs and on
+-- run on the ports that carry them (C carries all four on CSV/ndjson and
+refuses each by name on Parquet, by design; see c/README.md), with Rust as the
+reference. They run on the generated pairs and on
 tests/fixtures/fold, a pair written to sit on the one place the ports are
 allowed to differ: C++ and Zig fold case in ASCII only, and refuse a value
 outside it where the fold decides the answer -- a key, or a compared value that
