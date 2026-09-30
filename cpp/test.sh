@@ -242,6 +242,68 @@ case "$one" in
     fi ;;
   *) echo "  FAIL  the guessed-split fixture: $one"; fail=1 ;;
 esac
+# The same pair with the join inside the sweep: the wrong guess has to throw
+# away what the sweep already joined, not only what it indexed.
+inside=$(CSVDIFF_FUSED_JOIN=1 build/csvdiff compare "$thr/g_a.csv" "$thr/g_b.csv" -k k --threads 4 2>&1 | summary) || true
+if [ "$inside" = "$one" ]; then
+  echo "  ok    and the join inside the sweep starts over with it"
+else
+  printf '  FAIL  the join inside the sweep kept rows from a wrong guess\n    after : %s\n    inside: %s\n' "$one" "$inside"; fail=1
+fi
+
+# Past page cache the join runs inside A's sweep, joining every row as though it
+# were its key's first and taking back, afterwards, the rows that repeat a key.
+# CSVDIFF_FUSED_JOIN=1 takes that path at any size; with --json it also runs the
+# join after the sweep and fails unless the two agree, column counts included.
+# The repeats here differ from their key's first row -- in a compared value, or
+# in being absent from B -- and the file is past the 4 MB split, so a repeat that
+# was not taken back, or a chunk's last row cut short, changes the counts.
+python3 - "$thr" <<'PY'
+import json, sys
+d = sys.argv[1]
+def rows(side):
+    out = []
+    for i in range(250000):
+        if side == "b" and i % 4001 == 0:
+            continue                                   # removed from B
+        v = i * 3 + (1 if side == "b" and i % 17 == 0 else 0)
+        out.append((f"K{i:06d}", str(v), "t"))
+        if i % 97 == 0:                                # a repeat that differs
+            out.append((f"K{i:06d}", str(v + 5), "u" if side == "a" else "t"))
+        if side == "b" and i % 131 == 0:               # repeats in B too
+            out.append((f"K{i:06d}", "0", "x"))
+    for i in range(30):
+        out.append((f"{side.upper()}ONLY{i:03d}", "1", "t"))
+    return out
+for side in ("a", "b"):
+    rs = rows(side)
+    with open(f"{d}/f_{side}.csv", "w") as f:
+        f.write("k,v,w\n")
+        f.writelines(f"{k},{v},{w}\n" for k, v, w in rs)
+    with open(f"{d}/f_{side}.ndjson", "w") as f:
+        f.writelines(json.dumps({"k": k, "v": v, "w": w}) + "\n" for k, v, w in rs)
+PY
+for ext in csv ndjson; do
+  for t in 1 4; do
+    after=$(build/csvdiff compare "$thr/f_a.$ext" "$thr/f_b.$ext" -k k --threads $t 2>&1 | summary) || true
+    inside=$(CSVDIFF_FUSED_JOIN=1 build/csvdiff compare "$thr/f_a.$ext" "$thr/f_b.$ext" -k k \
+        --threads $t 2>&1 | summary) || true
+    if [ "$after" = "$inside" ]; then
+      printf '  ok    %s, %s thread(s): the join inside the sweep finds what the join after it finds\n' "$ext" "$t"
+    else
+      printf '  FAIL  %s, %s thread(s): the join inside the sweep disagrees\n    after : %s\n    inside: %s\n' \
+          "$ext" "$t" "$after" "$inside"; fail=1
+    fi
+  done
+  code=0
+  out=$(CSVDIFF_FUSED_JOIN=1 build/csvdiff compare "$thr/f_a.$ext" "$thr/f_b.$ext" -k k \
+      --json "$thr/f.json" 2>&1 >/dev/null) || code=$?
+  if [ "$code" -le 1 ] && [ -z "$out" ]; then
+    printf '  ok    %s: and its column counts, checked against the join after it\n' "$ext"
+  else
+    printf '  FAIL  %s: the join inside the sweep, with --json: %s\n' "$ext" "${out:-exit $code}"; fail=1
+  fi
+done
 rm -rf "$thr"
 
 echo "quoting, ragged rows and keys near the end of the file:"

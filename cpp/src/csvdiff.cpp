@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 
 namespace csvdiff {
@@ -1432,6 +1433,30 @@ class RowParser {
 // The index
 // ---------------------------------------------------------------------------
 
+// What a sweep hands each row to when the join runs inside it: the row's bytes,
+// from its start to the next row's start -- what `RowIndex::row_end` will say --
+// and its key hash. `part` is the sweep chunk, so each can count into its own
+// totals. `reset` clears a chunk's totals when a wrong split guess makes the
+// sweep start over.
+class RowSink {
+  public:
+    virtual void row(std::size_t part, std::size_t lo, std::size_t hi, std::uint64_t hash) = 0;
+    virtual void reset(std::size_t part) = 0;
+
+  protected:
+    ~RowSink() = default;
+};
+
+class FnSink final : public RowSink {
+  public:
+    std::function<void(std::size_t, std::size_t, std::size_t, std::uint64_t)> on_row;
+    std::function<void(std::size_t)> on_reset;
+    void row(std::size_t part, std::size_t lo, std::size_t hi, std::uint64_t hash) override {
+        on_row(part, lo, hi, hash);
+    }
+    void reset(std::size_t part) override { on_reset(part); }
+};
+
 // Open addressing over one file's rows. Everything is a primitive array: row
 // starts, key hashes, and a table of key numbers masked into a power-of-two slot
 // count. The index stores where a row starts rather than its fields, because an
@@ -1478,8 +1503,9 @@ class RowIndex {
     static constexpr std::size_t kInsertPrefetch = 24;
 
     RowIndex(const Slab& slab, const RowParser& parser, std::size_t from, std::size_t key_size,
-             const Options& opt, unsigned threads = 1, const char* tag = "")
-        : slab_(slab), parser_(parser), key_size_(key_size), opt_(opt) {
+             const Options& opt, unsigned threads = 1, const char* tag = "",
+             RowSink* sink = nullptr)
+        : slab_(slab), parser_(parser), key_size_(key_size), opt_(opt), track_later_(sink != nullptr) {
         Phases phase(tag);
         // A placeholder until the sweep says how many rows there are; an empty
         // file returns before that and needs a valid mask.
@@ -1523,7 +1549,8 @@ class RowIndex {
             failures.assign(n, nullptr);
             auto scan = [&](std::size_t i) {
                 try {
-                    chunks[i].stopped = sweep(d, parser, bounds[i], bounds[i + 1], end, chunks[i]);
+                    chunks[i].stopped =
+                        sweep(d, parser, bounds[i], bounds[i + 1], end, chunks[i], i, sink);
                 } catch (...) {
                     failures[i] = std::current_exception();
                 }
@@ -1547,11 +1574,29 @@ class RowIndex {
             held = json || chunks[i].stopped == bounds[i + 1];
         }
         if (!held) {
+            // Whatever the sink was handed came from rows that were not rows.
+            if (sink)
+                for (std::size_t p = 0; p < chunks.size(); ++p) sink->reset(p);
             bounds = chunk_bounds(d, from, threads, json, /*count_quotes=*/true);
             sweep_all();
         }
         for (const auto& f : failures)
             if (f) std::rethrow_exception(f);
+        // Each chunk's last row ends where the next chunk's first row starts,
+        // which only the next chunk knows, so those rows are handed over now.
+        if (sink) {
+            for (std::size_t i = 0; i < chunks.size(); ++i) {
+                if (chunks[i].starts.empty()) continue;
+                std::size_t hi = end;
+                for (std::size_t j = i + 1; j < chunks.size(); ++j) {
+                    if (!chunks[j].starts.empty()) {
+                        hi = chunks[j].starts.front();
+                        break;
+                    }
+                }
+                sink->row(i, chunks[i].starts.back(), hi, chunks[i].hashes.back());
+            }
+        }
         phase.mark("sweep (parallel)");
 
         std::size_t total = 0;
@@ -1770,6 +1815,9 @@ class RowIndex {
     std::int64_t unique_keys() const { return static_cast<std::int64_t>(first_row_.size()); }
     std::int64_t dup_keys() const { return dup_keys_; }
     std::int64_t dup_rows() const { return dup_rows_; }
+    /// Rows that repeat a key already seen, in file order -- kept only when the
+    /// build was given a sink, which joined them as though each were first.
+    const std::vector<int>& later() const { return later_; }
 
   private:
     static constexpr std::uint32_t kEmpty = 0;
@@ -1910,7 +1958,8 @@ class RowIndex {
     // Returns where it left off: the first row start at or past `stop`, or
     // short of it if a malformed tail stopped it.
     std::size_t sweep(std::string_view d, const RowParser& parser, std::size_t begin,
-                      std::size_t stop, std::size_t end, Chunk& out) const {
+                      std::size_t stop, std::size_t end, Chunk& out, std::size_t part,
+                      RowSink* sink) const {
         std::vector<Field> fields(parser.width());
         std::size_t pos = begin;
         while (pos < stop) {
@@ -1933,6 +1982,12 @@ class RowIndex {
                                 " bytes is more than this engine packs");
             out.starts.push_back(pos);
             out.hashes.push_back(key_hash(slab_, fields.data(), key_size_, opt_));
+            // The row before this one ends where this one starts, which is what
+            // `row_end` will say; its pages are still in memory.
+            if (sink && out.starts.size() >= 2) {
+                const std::size_t n = out.starts.size();
+                sink->row(part, out.starts[n - 2], pos, out.hashes[n - 2]);
+            }
             if (next <= pos) break;  // no progress: a malformed tail, not an endless loop
             pos = next;
         }
@@ -1988,6 +2043,7 @@ class RowIndex {
                         ++dup_rows_;  // the first occurrence counts once the key repeats
                     }
                     ++dup_rows_;
+                    if (track_later_) later_.push_back(row);
                     return;
                 }
             }
@@ -2039,6 +2095,8 @@ class RowIndex {
     std::uint32_t pos_mask_ = 0xFFFFFFFFu;
     std::size_t mask_ = 0;
     std::vector<int> first_row_;
+    bool track_later_ = false;
+    std::vector<int> later_;
     std::vector<std::uint32_t> occurrences_;
     // Re-used by every probe. A lookup happens once per distinct key, so a
     // vector constructed here would be one heap allocation per row of the file.
@@ -2382,10 +2440,17 @@ inline std::size_t field_close(const char* d, std::size_t t, std::size_t end, ch
 // The ways one row of A can be proven equal to its mate in B without comparing
 // its columns. Each takes the row and answers; the caller keeps the counts and
 // the backoff, so this holds no state of its own.
+// One row of A as the join sees it: its bytes, from its start to the next
+// row's, and its key hash. By offsets rather than by row number, so the join
+// can run while A's index is still being built.
+struct ARow {
+    std::size_t lo, hi;
+    std::uint64_t hash;
+};
+
 struct ProofRows {
     const Slab& a;
     const Slab& b;
-    const RowIndex& ai;
     const RowIndex& bi;
     const ProofPlan plan;  // a copy, one per worker, and the loop reads it from here
     char a_delim;
@@ -2400,15 +2465,15 @@ struct ProofRows {
 
     // The proof's span found by counting delimiters, without parsing the row.
     // `seg` is the worker's scratch for the gapped proof, two words a run.
-    Guard guard(int row, Field* probe, std::size_t* seg) const {
+    Guard guard(const ARow& row, Field* probe, std::size_t* seg) const {
         if (!plan.guard_commas) return Guard::Untried;
         if (plan.runs() > 1) return gapped(row, seg);
-        const std::size_t a_lo = ai.row_begin(row);
+        const std::size_t a_lo = row.lo;
         const std::size_t span =
-            guard_span(a.bytes(), a_lo, ai.row_end(row), a_delim, plan.guard_commas);
+            guard_span(a.bytes(), a_lo, row.hi, a_delim, plan.guard_commas);
         if (!span) return Guard::Untried;
         bool proven = false;
-        const int mate = bi.lookup_proof(a, nullptr, ai.hash_of(row), probe,
+        const int mate = bi.lookup_proof(a, nullptr, row.hash, probe,
                                          a.bytes().data() + a_lo, span, 0, false, proven);
         if (mate < 0) return Guard::Removed;
         return proven ? Guard::Proven : Guard::Unsettled;
@@ -2419,9 +2484,9 @@ struct ProofRows {
     // hash match, and each run's bytes where B's own gaps put it. A run's bytes
     // include its closing byte, so equal bytes leave B at the start of its next
     // field, as they leave A.
-    Guard gapped(int row, std::size_t* seg) const {
+    Guard gapped(const ARow& row, std::size_t* seg) const {
         const std::size_t runs = plan.runs();
-        const std::size_t a_lo = ai.row_begin(row), a_hi = ai.row_end(row);
+        const std::size_t a_lo = row.lo, a_hi = row.hi;
         FieldWalker wa(a.bytes(), a_lo, a_hi, a_delim);
         std::size_t at = a_lo;
         for (std::size_t j = 0; j < runs; ++j) {
@@ -2434,7 +2499,7 @@ struct ProofRows {
             at = wa.past(end, plan.gap_fields[j], false);
             if (at == FieldWalker::kShort) return Guard::Untried;
         }
-        const int mate = bi.first_match(ai.hash_of(row));
+        const int mate = bi.first_match(row.hash);
         if (mate < 0) return Guard::Removed;
         const char* da = a.bytes().data();
         const char* db = b.bytes().data();
@@ -2456,10 +2521,10 @@ struct ProofRows {
     // How many bytes of A's row prove the whole row, keys included -- through the
     // byte that closes the last value either file wants -- or 0 where this row
     // cannot be proven that way. Needs the row's fields.
-    std::size_t run_before_lookup(int row, const Field* fa) const {
+    std::size_t run_before_lookup(const ARow& row, const Field* fa) const {
         if (!plan.keys_in_proof) return 0;
         const char* d = a.bytes().data();
-        const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+        const std::size_t a_lo = row.lo, a_end = row.hi;
         std::size_t t = a_lo;
         if (plan.json) {
             t = run_end(fa, width, a_lo);
@@ -2477,8 +2542,8 @@ struct ProofRows {
     // closes the last compared value -- whichever it turns out to be, since two
     // objects need not list their names in the same order. The keys are not in the
     // run and do not need to be.
-    Proof json_after_lookup(int row, int mate, const Field* fa) const {
-        const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+    Proof json_after_lookup(const ARow& row, int mate, const Field* fa) const {
+        const std::size_t a_lo = row.lo, a_end = row.hi;
         const std::size_t b_lo = bi.row_begin(mate);
         const std::size_t b_n = bi.row_end(mate) - b_lo;
         const std::size_t t = run_end(fa + key_size, nc, a_lo);
@@ -2494,11 +2559,11 @@ struct ProofRows {
     // `cccccccc`, and a quoted field the mate carries on with a doubled quote reads
     // the same that far too. It is the delimiter or the line ending after it that
     // says the mate's field stopped where this one did.
-    Proof csv_after_lookup(int row, int mate, const Field* fa) const {
+    Proof csv_after_lookup(const ARow& row, int mate, const Field* fa) const {
         const Field g = fa[width - 1];
         if (!is_real(g)) return Proof::NotTried;
         const char* d = a.bytes().data();
-        const std::size_t a_lo = ai.row_begin(row), a_end = ai.row_end(row);
+        const std::size_t a_lo = row.lo, a_end = row.hi;
         const std::size_t b_lo = bi.row_begin(mate);
         const std::size_t b_n = bi.row_end(mate) - b_lo;
         const std::size_t t = field_close(d, offset_of(g) + len_of(g), a_end, a_delim);
@@ -2642,9 +2707,171 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // measurements predate that and were not re-taken.)
     const unsigned per_file = budget > 1 ? budget / 2 : 1;
 
+    // What one part of the join counts into.
+    struct Part {
+        std::int64_t matched = 0;
+        std::vector<ColumnStat> columns;
+        std::vector<std::pair<int, int>> changed, removed;
+        std::int64_t changed_total = 0, removed_total = 0;
+    };
+    // One worker's buffers, and its proof backoff.
+    struct Scratch {
+        std::vector<Field> fa, fb, probe;
+        std::vector<std::size_t> seg;
+        ProofBackoff backoff;
+        Scratch(std::size_t width, std::size_t runs)
+            : fa(width), fb(width), probe(width), seg(2 * runs) {}
+    };
+    // One row of A against its mate in B, counted into `out`. `row` is A's row
+    // number for the report's row lists, and -1 when the join runs inside A's
+    // sweep, which only happens without them (see `fused`). `at` is the row's
+    // place in the worker's run, for the backoff; it decides how the answer is
+    // reached, never what it is.
+    auto join_row = [&](const ProofRows& proof, Part& out, Scratch& s, const ARow& ar, int row,
+                        std::size_t at) {
+        const bool attempt = s.backoff.attempt(at);
+        // The proof's span without the parse: the guard's delimiter sits a
+        // fixed count from the row start. Most rows prove out here and never
+        // pay for their fields; a row the bytes do not settle is parsed
+        // below, looked up again by its keys -- which also covers the hash
+        // collision `lookup_proof` passed over -- and compared.
+        bool spanned = false;
+        if (attempt) {
+            switch (proof.guard(ar, s.probe.data(), s.seg.data())) {
+                case ProofRows::Guard::Untried:
+                    break;
+                case ProofRows::Guard::Removed:
+                    ++out.removed_total;
+                    if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
+                    return;
+                case ProofRows::Guard::Proven:
+                    ++out.matched;
+                    s.backoff.proved();
+                    return;
+                case ProofRows::Guard::Unsettled:
+                    s.backoff.failed();
+                    spanned = true;
+                    break;
+            }
+        }
+        ap.parse(a.bytes(), ar.lo, a.bytes().size(), s.fa.data());
+        // How many bytes of A's row prove the whole row, keys included --
+        // through the byte that closes the last value either file wants --
+        // or 0 where this row cannot be proven that way.
+        const std::size_t need = !spanned && attempt ? proof.run_before_lookup(ar, s.fa.data()) : 0;
+        // The hash is the one the sweep computed for this row: the same
+        // bytes through the same function, so computing it again here would
+        // be a second pass over every key in the file for the same number.
+        bool proven = false;
+        const int mate =
+            need ? proof.bi.lookup_proof(a, s.fa.data(), ar.hash, s.probe.data(),
+                                   a.bytes().data() + ar.lo, need, ar.hi,
+                                   proof.plan.json, proven)
+                 : proof.bi.lookup(a, s.fa.data(), ar.hash, s.probe.data());
+        if (mate < 0) {
+            ++out.removed_total;
+            if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
+            return;
+        }
+        ++out.matched;
+        if (need) {
+            if (proven) {
+                s.backoff.proved();
+                return;
+            }
+            s.backoff.failed();
+        }
+        // The proofs that need the mate. They sit here rather than inside
+        // `lookup` because this port's `lookup` compares only the keys --
+        // `keys_of`, not `fields_of` -- so the mate's row is still unparsed
+        // at this point and a proof saves the whole of it. The Rust and Zig
+        // ports had to put theirs *inside* the lookup for that reason:
+        // theirs materialise the mate's whole row to compare its keys, and a
+        // proof after that saves only the column comparison. Same proof,
+        // different place, because the surrounding code differs.
+        if (!need && attempt) {
+            const ProofRows::Proof after = proof.plan.json ? proof.json_after_lookup(ar, mate, s.fa.data())
+                                           : !spanned && proof.plan.aligned
+                                               ? proof.csv_after_lookup(ar, mate, s.fa.data())
+                                               : ProofRows::Proof::NotTried;
+            if (after == ProofRows::Proof::Proven) {
+                s.backoff.proved();
+                return;
+            }
+            if (after == ProofRows::Proof::Failed) s.backoff.failed();
+        }
+        proof.bi.fields_of(mate, s.fb.data());
+        bool any = false;
+        for (std::size_t i = 0; i < nc; ++i) {
+            const Field x = s.fa[key_size + i], y = s.fb[key_size + i];
+            if (cell_differs(a, x, b, y, opt)) {
+                any = true;
+                ++out.columns[i].changed;
+                if (is_absent(b, y, opt)) ++out.columns[i].blanked;
+                if (is_absent(a, x, opt)) ++out.columns[i].filled;
+            }
+        }
+        if (any) {
+            ++out.changed_total;
+            if (out.changed.size() <= opt.max_rows) out.changed.emplace_back(row, mate);
+        }
+    };
+
+    // Past page cache the join runs inside A's sweep instead of after it.
+    //
+    // Past memory every pass is a read from disk, and the join used to be the
+    // fourth: both sweeps, then both files again for the rows to compare -- at
+    // 150M rows as long as a cold read of both files. Built first, B's index is
+    // all the join needs from B, so A's rows can be joined as A's sweep finds
+    // them, while their pages are in memory, and A is read once.
+    //
+    // The join compares a key's first row, and which row is first is only known
+    // once the insertion has seen them all. So every row is joined as though it
+    // were first, and the rows that turn out to repeat a key -- `later()`, kept
+    // by the insertion -- are joined again afterwards and subtracted. Counts are
+    // sums, so that is exact. The C port does the same (#241).
+    //
+    // Not with --json: its row lists keep the first rows of each section in key
+    // order, and a repeat taken back could have held a place in one. Not with the
+    // normalisation flags either: --ignore-case refuses from inside a comparison,
+    // and a repeat's refusal could not be taken back.
+    //
+    // CSVDIFF_FUSED_JOIN=1 takes this path at any size, which is how the tests
+    // reach it. With --json as well -- which is how the fuzzer runs -- the
+    // join after the sweep runs too, for the lists, and the two sets of counts
+    // must agree or the run fails.
+    const bool normalising = opt.trim || opt.ignore_case || opt.empty_is_null || opt.tolerance > 0.0;
+    const bool fused_forced = [] {
+        const char* v = std::getenv("CSVDIFF_FUSED_JOIN");
+        return v && *v && std::string_view(v) != "0";
+    }();
+    const bool fused = !normalising &&
+                       ((!opt.row_lists && a.bytes().size() + b.bytes().size() > (std::size_t{8} << 30) &&
+                         budget > 1) ||
+                        fused_forced);
+    std::vector<Part> fused_parts;
+
     std::optional<RowIndex> ai_slot, bi_slot;
     std::exception_ptr worker_failure;
-    {
+    if (fused) {
+        bi_slot.emplace(b, bp, b_start, key_size, opt, budget, "B ");
+        const ProofRows proof{a, b, *bi_slot, plan, a_delim, width, key_size, nc};
+        fused_parts.resize(budget);
+        for (auto& part : fused_parts) part.columns.resize(nc);
+        std::vector<Scratch> scratch(budget, Scratch(width, plan.runs()));
+        std::vector<std::size_t> seen(budget, 0);
+        FnSink sink;
+        sink.on_row = [&](std::size_t p, std::size_t lo, std::size_t hi, std::uint64_t hash) {
+            join_row(proof, fused_parts[p], scratch[p], ARow{lo, hi, hash}, -1, seen[p]++);
+        };
+        sink.on_reset = [&](std::size_t p) {
+            fused_parts[p] = Part{};
+            fused_parts[p].columns.resize(nc);
+            scratch[p].backoff = ProofBackoff{};
+            seen[p] = 0;
+        };
+        ai_slot.emplace(a, ap, a_start, key_size, opt, budget, "A ", &sink);
+    } else {
         std::thread worker([&] {
             try {
                 bi_slot.emplace(b, bp, b_start, key_size, opt, per_file, "B ");
@@ -2690,12 +2917,6 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // its own column stats and its own capped row lists; because the ranges are
     // contiguous and merged in order, the result is identical to one thread's,
     // including which rows survive the cap.
-    struct Part {
-        std::int64_t matched = 0;
-        std::vector<ColumnStat> columns;
-        std::vector<std::pair<int, int>> changed, removed;
-        std::int64_t changed_total = 0, removed_total = 0;
-    };
 
     const std::vector<int>& a_keys = ai.first_rows();
     // The whole budget, unless a B-side pass is going to run beside this one.
@@ -2730,103 +2951,17 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         // references are known to the loop, where a captured one is loaded again
         // after every call the compiler cannot see through (about 1% of the
         // instructions on a 200k pair).
-        const ProofRows proof{a, b, ai, bi, plan, a_delim, width, key_size, nc};
+        const ProofRows proof{a, b, bi, plan, a_delim, width, key_size, nc};
         Part& out = parts[p];
         const std::size_t lo = a_keys.size() * p / join_ways;
         const std::size_t hi = a_keys.size() * (p + 1) / join_ways;
-        std::vector<Field> fa(width), fb(width), probe(width);
-        std::vector<std::size_t> seg(2 * proof.plan.runs());
-        ProofBackoff backoff;
+        Scratch s(width, proof.plan.runs());
         for (std::size_t at = lo; at < hi; ++at) {
             const int row = a_keys[at];
             if (at + RowIndex::kLookupPrefetch < hi)
                 bi.prefetch(ai.hash_of(a_keys[at + RowIndex::kLookupPrefetch]));
-            const bool attempt = backoff.attempt(at);
-            // The proof's span without the parse: the guard's delimiter sits a
-            // fixed count from the row start. Most rows prove out here and never
-            // pay for their fields; a row the bytes do not settle is parsed
-            // below, looked up again by its keys -- which also covers the hash
-            // collision `lookup_proof` passed over -- and compared.
-            bool spanned = false;
-            if (attempt) {
-                switch (proof.guard(row, probe.data(), seg.data())) {
-                    case ProofRows::Guard::Untried:
-                        break;
-                    case ProofRows::Guard::Removed:
-                        ++out.removed_total;
-                        if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
-                        continue;
-                    case ProofRows::Guard::Proven:
-                        ++out.matched;
-                        backoff.proved();
-                        continue;
-                    case ProofRows::Guard::Unsettled:
-                        backoff.failed();
-                        spanned = true;
-                        break;
-                }
-            }
-            ai.fields_of(row, fa.data());
-            // How many bytes of A's row prove the whole row, keys included --
-            // through the byte that closes the last value either file wants --
-            // or 0 where this row cannot be proven that way.
-            const std::size_t need = !spanned && attempt ? proof.run_before_lookup(row, fa.data()) : 0;
-            // The hash is the one the sweep computed for this row: the same
-            // bytes through the same function, so computing it again here would
-            // be a second pass over every key in the file for the same number.
-            bool proven = false;
-            const int mate =
-                need ? bi.lookup_proof(a, fa.data(), ai.hash_of(row), probe.data(),
-                                       a.bytes().data() + ai.row_begin(row), need, ai.row_end(row),
-                                       proof.plan.json, proven)
-                     : bi.lookup(a, fa.data(), ai.hash_of(row), probe.data());
-            if (mate < 0) {
-                ++out.removed_total;
-                if (out.removed.size() <= opt.max_rows) out.removed.emplace_back(row, -1);
-                continue;
-            }
-            ++out.matched;
-            if (need) {
-                if (proven) {
-                    backoff.proved();
-                    continue;
-                }
-                backoff.failed();
-            }
-            // The proofs that need the mate. They sit here rather than inside
-            // `lookup` because this port's `lookup` compares only the keys --
-            // `keys_of`, not `fields_of` -- so the mate's row is still unparsed
-            // at this point and a proof saves the whole of it. The Rust and Zig
-            // ports had to put theirs *inside* the lookup for that reason:
-            // theirs materialise the mate's whole row to compare its keys, and a
-            // proof after that saves only the column comparison. Same proof,
-            // different place, because the surrounding code differs.
-            if (!need && attempt) {
-                const ProofRows::Proof after = proof.plan.json ? proof.json_after_lookup(row, mate, fa.data())
-                                               : !spanned && proof.plan.aligned
-                                                   ? proof.csv_after_lookup(row, mate, fa.data())
-                                                   : ProofRows::Proof::NotTried;
-                if (after == ProofRows::Proof::Proven) {
-                    backoff.proved();
-                    continue;
-                }
-                if (after == ProofRows::Proof::Failed) backoff.failed();
-            }
-            bi.fields_of(mate, fb.data());
-            bool any = false;
-            for (std::size_t i = 0; i < nc; ++i) {
-                const Field x = fa[key_size + i], y = fb[key_size + i];
-                if (cell_differs(a, x, b, y, opt)) {
-                    any = true;
-                    ++out.columns[i].changed;
-                    if (is_absent(b, y, opt)) ++out.columns[i].blanked;
-                    if (is_absent(a, x, opt)) ++out.columns[i].filled;
-                }
-            }
-            if (any) {
-                ++out.changed_total;
-                if (out.changed.size() <= opt.max_rows) out.changed.emplace_back(row, mate);
-            }
+            join_row(proof, out, s, ARow{ai.row_begin(row), ai.row_end(row), ai.hash_of(row)}, row,
+                     at);
         }
     };
 
@@ -2947,7 +3082,77 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // random-probed pass over a second table, and threading it changed nothing
     // because the machine was already busy with the A side. That is the whole
     // difference between work moved and work removed.
-    if (!opt.row_lists) {
+    struct Totals {
+        std::int64_t matched = 0, changed = 0, removed = 0;
+        std::vector<ColumnStat> columns;
+    } fused_totals;
+    fused_totals.columns.resize(nc);
+    if (fused) {
+        // A was joined as it was swept. What is left is to take back the rows
+        // that repeat a key, joined again into parts of their own.
+        const std::vector<int>& later = ai.later();
+        const unsigned back_ways = later.size() < (1u << 14) ? 1u : join_ways;
+        std::vector<Part> back(back_ways);
+        for (auto& part : back) part.columns.resize(nc);
+        std::vector<std::exception_ptr> failures(back_ways);
+        auto take_back = [&](unsigned p) {
+            try {
+                const ProofRows proof{a, b, bi, plan, a_delim, width, key_size, nc};
+                Scratch s(width, proof.plan.runs());
+                const std::size_t lo = later.size() * p / back_ways;
+                const std::size_t hi = later.size() * (p + 1) / back_ways;
+                for (std::size_t at = lo; at < hi; ++at) {
+                    const int row = later[at];
+                    join_row(proof, back[p], s, ARow{ai.row_begin(row), ai.row_end(row), ai.hash_of(row)},
+                             -1, at);
+                }
+            } catch (...) {
+                failures[p] = std::current_exception();
+            }
+        };
+        std::vector<std::thread> workers;
+        for (unsigned p = 1; p < back_ways; ++p) {
+            try {
+                workers.emplace_back(take_back, p);
+            } catch (const std::system_error&) {
+                take_back(p);
+            }
+        }
+        take_back(0);
+        for (auto& w : workers) w.join();
+        for (const auto& f : failures)
+            if (f) std::rethrow_exception(f);
+        whole.mark("repeated keys taken back");
+
+        const auto fold = [&](const std::vector<Part>& from, std::int64_t sign) {
+            for (const Part& part : from) {
+                fused_totals.matched += sign * part.matched;
+                fused_totals.changed += sign * part.changed_total;
+                fused_totals.removed += sign * part.removed_total;
+                for (std::size_t i = 0; i < nc; ++i) {
+                    fused_totals.columns[i].changed += sign * part.columns[i].changed;
+                    fused_totals.columns[i].blanked += sign * part.columns[i].blanked;
+                    fused_totals.columns[i].filled += sign * part.columns[i].filled;
+                }
+            }
+        };
+        fold(fused_parts, 1);
+        fold(back, -1);
+        if (!opt.row_lists) {
+            matched = fused_totals.matched;
+            changed.total = fused_totals.changed;
+            removed.total = fused_totals.removed;
+            for (std::size_t i = 0; i < nc; ++i) {
+                r.columns[i].changed = fused_totals.columns[i].changed;
+                r.columns[i].blanked = fused_totals.columns[i].blanked;
+                r.columns[i].filled = fused_totals.columns[i].filled;
+            }
+            added.total = bi.unique_keys() - matched;
+        }
+    }
+    if (fused && !opt.row_lists) {
+        // Counted above; nothing more to do.
+    } else if (!opt.row_lists) {
         a_side();
         std::int64_t seen = 0;
         for (const Part& part : parts) seen += part.matched;
@@ -2969,6 +3174,17 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         }
         worker.join();
         if (failure) std::rethrow_exception(failure);
+    }
+    // CSVDIFF_FUSED_JOIN=1 with --json: both joins ran, and they must agree.
+    if (fused && opt.row_lists) {
+        bool same = fused_totals.matched == matched && fused_totals.changed == changed.total &&
+                    fused_totals.removed == removed.total;
+        for (std::size_t i = 0; i < nc && same; ++i)
+            same = fused_totals.columns[i].changed == r.columns[i].changed &&
+                   fused_totals.columns[i].blanked == r.columns[i].blanked &&
+                   fused_totals.columns[i].filled == r.columns[i].filled;
+        if (!same)
+            throw Error("CSVDIFF_FUSED_JOIN: the join inside the sweep disagrees with the join after it");
     }
 
     // Only now does anything become a string, and only for the rows kept -- and
