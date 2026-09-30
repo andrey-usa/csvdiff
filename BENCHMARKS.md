@@ -148,8 +148,29 @@ the other as the >8 GB path does):
 
 The 0.5x of input removed is the counted half of each file (two sweep threads a
 file on that path). Warm, `bench_ab.sh` does not tell the builds apart on the
-5M or the 200k pair. At CI's scale the saving should be of the order of the
-~138s prelude; the next scale-ceiling run is what will say.
+5M or the 200k pair.
+
+**On CI, 150M.** Two scale-ceiling runs the same night, `sizes=150m`,
+`mem_cap_mb=13941`: 36655830861 on main just before this change, and
+36656925225 with it. One run each, each port on its own runner. The join, which
+this does not touch, took 131.1s and 131.2s, so the two C runners look alike.
+
+| C, phase run | before | after |
+|---|---|---|
+| before the sweep clock, A / B | 30s / 33s | 0s / 0s |
+| A: count + sweep | 30 + 35 = 65s | 65s |
+| B: count + sweep | 33 + 67 = 100s | 71s |
+| both indexes | 176.0s | 147.2s |
+| join and compare | 131.1s | 131.2s |
+| **wall, timed run** | **305.8s** | **272.8s (1.12x)** |
+
+All of the saving is on B. A's counted pages were still in memory when its
+sweep reached them, so A cost 65s either way. By the time B was built, A's index
+held that memory, B's counted half had been evicted, and the sweep read it
+again: the case this removes. The ~138s above was the older layout, both
+indexes at once; after #214 the prelude was ~63s, and it is now gone. The same
+run, all four ports: Rust 267.3s (its phase-run total), C 272.8s, Zig 339.0s,
+C++ 354.4s, which still spends 61s and 65s in "chunk bounds" before its sweeps.
 
 The remaining 1.0x of re-reading is the join, which walks B in A's order.
 C++ and Zig still count before their sweeps; the same change applies to both.
