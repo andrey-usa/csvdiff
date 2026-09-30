@@ -20,38 +20,43 @@ is what makes a number from one directly comparable with a number from another.
 
 Ten million rows × 20 columns, keyed on `(account_id, txn_id)`, `--ignore
 updated_at`, a per-cell diff over seventeen columns. One GitHub Actions runner
-(4 vCPU / 16 GB), every port built from this tree and compiled for that runner,
-all four interleaved in one sitting, five rounds each, 2026-09-09. Each cell is
-**wall · CPU · memory above the mapped input**.
+(AMD EPYC 7763, 4 vCPU / 16 GB), every port built from this tree and compiled
+for that runner, all four interleaved in one sitting, five rounds each, best
+kept, 2026-09-30
+([run 36672430118](https://github.com/andrey-usa/csvdiff/actions/runs/36672430118),
+`benchmark-native.yml` on `58eb980`). Each cell is **wall · CPU · memory above
+the mapped input**.
 
 | Format | Input | C | C++ | Rust | Zig |
 |---|---:|---|---|---|---|
-| CSV | 3,509 MB | **2.14s** · 7.7s · 716 MB | 5.19s · 16.2s · 878 MB | 2.46s · 8.2s · 899 MB | 2.71s · 9.7s · 887 MB |
-| ndjson | 8,487 MB | **7.40s** · 24.3s · 716 MB | 20.53s · 67.8s · 880 MB | 14.32s · 55.5s · 899 MB | 13.88s · 54.3s · 890 MB |
-| Parquet | 2,074 MB | **1.48s** · 4.8s · 1,297 MB | 3.43s · 11.3s · 1,480 MB | 2.80s · 9.1s · 1,474 MB | 2.96s · 10.5s · **1,276 MB** |
+| CSV | 3,509 MB | **1.02s** · 3.5s · 716 MB | 1.09s · 3.8s · 723 MB | 1.20s · 4.0s · **591 MB** | 1.09s · **3.0s** · 597 MB |
+| ndjson | 8,487 MB | 2.72s · **8.3s** · 716 MB | **2.53s** · 9.4s · 735 MB | 2.79s · 10.4s · **592 MB** | 2.59s · **8.3s** · 600 MB |
+| Parquet | 2,074 MB | **1.28s** · **4.1s** · **1,081 MB** | 1.41s · 4.5s · 1,180 MB | 1.41s · 4.7s · 1,342 MB | 1.61s · 5.4s · 1,230 MB |
 
-All four returned identical counts — matched 9,990,000, changed 599,320, added
-10,000, removed 10,000, duplicate keys 1,000 in A and 500 in B. That is the
-run's gate, not a footnote: builds that disagree about how many rows changed
-mean a bug in one of them, so the run fails and names it.
+All four returned identical counts on all three formats — matched 9,990,000,
+changed 599,320, added 10,000, removed 10,000, duplicate keys 1,000 in A and
+500 in B. That is the run's gate, not a footnote: builds that disagree about how
+many rows changed mean a bug in one of them, so the run fails and names it.
 
-Three things this table says.
+Four things this table says.
 
-**On CSV the four ports have almost converged.** C leads Rust by 1.15x and does
-7.7 CPU-seconds against its 8.2 — a gap you would not design around. That is
-what a text path looks like once every port stops parsing columns nobody reads
-and stops comparing rows it can prove equal from their bytes. The interesting
-column is no longer the fastest one.
+**On CSV the four ports are within 1.18x of each other.** C is fastest at
+1.02s, Rust last at 1.20s, and Zig does the least work of the four — 3.0
+CPU-seconds against C's 3.5. That is what a text path looks like once every
+port stops parsing columns nobody reads and stops comparing rows it can prove
+equal from their bytes.
 
-**ndjson is where the ports still differ**, and by 1.9x: C spends 24.3 CPU
-seconds where the next build spends 54.3. The proof that settles a CSV row from
-its raw bytes has to rule out a repeated name before it can settle a JSON one,
-and only one port does that so far.
+**ndjson has converged too.** The 09-09 edition of this table, on another
+runner, had C ahead by 1.9x; here the whole field is within 1.10x (2.53–2.79s)
+and C++ is fastest. C and Zig spend the least CPU,
+8.3 seconds each.
 
-**Memory is the flattest ranking and the widest margin.** 716 MB above the
-mapped input on both text formats against 878 and up — a field here is one
-64-bit word and never becomes a string. Parquet is the exception, and the one
-row C does not lead: Zig's reader peaks 21 MB lower.
+**Memory splits two and two.** Rust and Zig hold 591–600 MB above the mapped
+input on both text formats, against 716–735 MB for C and C++. On Parquet the
+order turns over: C's reader peaks lowest, at 1,081 MB, and Rust highest.
+
+**Parquet is the one format with a clear order.** C leads by 1.10x; C++ and
+Rust tie at 1.41s; Zig is last at 1.61s.
 
 > **Where the columns come from.** All four are built from this tree, on one
 > runner, in one sitting — the two branches that used to be measured against
@@ -63,19 +68,16 @@ row C does not lead: Zig's reader peaks 21 MB lower.
 > [the defect in BENCHMARKS.md](BENCHMARKS.md).
 >
 > Compare rows within this table. Not with the tables in
-> [BENCHMARKS.md](BENCHMARKS.md) above or below it: this runner's ndjson
-> numbers moved 20% between two runs one morning with no code change at all.
+> [BENCHMARKS.md](BENCHMARKS.md) or [RESULTS.md](RESULTS.md), and not with the
+> 2026-09-09 edition of this one, which ran on a different runner: this
+> project has seen one runner's ndjson numbers move 20% between two runs one
+> morning with no code change at all, and the same tree produce three different
+> ndjson winners on three machines inside an hour. A published ordering is only
+> meaningful with its CPU printed next to it.
 >
-> **This table is a 2026-09-09 reference point and is no longer the latest
-> measurement.** The current numbers, measured on CI on 2026-09-17 after the
-> C++ columnar work and the ndjson row-end fix, are in
-> [RESULTS.md](RESULTS.md).
->
-> That page also carries a result this one cannot: the same tree, measured at
-> 10M on three machines inside an hour, produces **three different ndjson
-> winners** — Rust first on one, last on another. A published ordering for
-> ndjson is only meaningful with its CPU printed next to it, which is why
-> benchmark results here are now grouped by processor.
+> [RESULTS.md](RESULTS.md) carries the rest of the ladder — 10M, 50M and 150M
+> rows, CSV and Parquet, each rung on its own runner.
+
 ---
 
 ## Building and running
