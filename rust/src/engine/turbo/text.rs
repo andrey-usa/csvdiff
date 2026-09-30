@@ -923,6 +923,157 @@ pub(super) fn json_tail_is_clean(p: &RowParser, d: &[u8], mut at: usize, end: us
     true
 }
 
+/// The JSON proof, past ignored values that differ.
+///
+/// `a` is A's row from its start through the last value either side wants; the
+/// plain proof holds when the mate opens with exactly those bytes and its tail
+/// names nothing tracked. One ignored member in between whose value differs --
+/// an `updated_at`, say, which differs on every row -- fails that on every row.
+/// So where the two rows first differ, this finds the member of A's object that
+/// byte is in. If it is the value of a name nobody tracks, the value is skipped
+/// in each row on its own -- in B from the same offset, since everything before
+/// it agreed, name included -- and the comparison carries on from there. A
+/// difference anywhere else, in a tracked value, or in a shape the walk does not
+/// follow fails the proof, and the row is parsed as before. The names before
+/// each skipped value are equal bytes in both rows and the skipped values belong
+/// to untracked names, so every tracked name sits at the same place with the
+/// same bytes; the tail check covers what follows. The C and C++ ports have the
+/// same proof (#234, #235).
+pub(super) fn json_rows_match(p: &RowParser, a: &[u8], b: &[u8], b_lo: usize, b_hi: usize) -> bool {
+    let (mut ai, mut bi) = (0usize, b_lo);
+    let mut after_value = false;
+    for _ in 0..64 {
+        let left = a.len() - ai;
+        let m = left.min(b_hi - bi);
+        // The whole run first: equal slices are one memcmp, and they are the
+        // common case -- every row whose ignored values do not differ.
+        if m == left && a[ai..] == b[bi..bi + left] {
+            return json_tail_is_clean(p, b, bi + left, b_hi);
+        }
+        let same = common_prefix(&a[ai..ai + m], &b[bi..bi + m]);
+        if same == left {
+            return json_tail_is_clean(p, b, bi + left, b_hi);
+        }
+        if same == m {
+            return false; // B ends first
+        }
+        let Some((vs, ve)) = json_member_at(p, a, ai, ai + same, after_value) else {
+            return false;
+        };
+        let b_vs = bi + (vs - ai);
+        let b_ve = json_value_end(b, b_vs, b_hi);
+        if b_ve >= b_hi || b_ve <= b_vs {
+            return false;
+        }
+        ai = ve;
+        bi = b_ve;
+        after_value = true;
+    }
+    false
+}
+
+/// How many leading bytes `x` and `y` share, eight at a time.
+fn common_prefix(x: &[u8], y: &[u8]) -> usize {
+    let n = x.len().min(y.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let a = u64::from_le_bytes(x[i..i + 8].try_into().unwrap_or([0; 8]));
+        let b = u64::from_le_bytes(y[i..i + 8].try_into().unwrap_or([0; 8]));
+        if a != b {
+            return i + ((a ^ b).trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    while i < n && x[i] == y[i] {
+        i += 1;
+    }
+    i
+}
+
+fn json_gap(c: u8) -> bool {
+    c == b' ' || c == b'\t' || c == b'\r'
+}
+
+/// Past one JSON value from `at`: a string, a scalar, or a nested object or
+/// array. `end` where it does not close before `end`.
+fn json_value_end(d: &[u8], mut at: usize, end: usize) -> usize {
+    if at >= end {
+        return end;
+    }
+    match d[at] {
+        b'"' => skip_json_string(d, at, end).0,
+        b'{' | b'[' => skip_json_nested(d, at, end),
+        _ => {
+            while at < end && !matches!(d[at], b',' | b'}' | b']' | b'\n') && !json_gap(d[at]) {
+                at += 1;
+            }
+            at
+        }
+    }
+}
+
+/// The member of `d`'s object whose value holds byte `diff`, walking from `at`
+/// (the row start, or just past a value already skipped): its value's bounds.
+/// `None` where `diff` falls in a name or the punctuation between members, in a
+/// tracked member, or anywhere the walk cannot follow -- an escaped name
+/// included, as the tail check treats one. `d` ends at the last wanted value, so
+/// a value that runs to its end is not a gap.
+fn json_member_at(
+    p: &RowParser,
+    d: &[u8],
+    mut at: usize,
+    diff: usize,
+    mut after_value: bool,
+) -> Option<(usize, usize)> {
+    let end = d.len();
+    loop {
+        while at < end && json_gap(d[at]) {
+            at += 1;
+        }
+        if at >= end || at > diff || d[at] != if after_value { b',' } else { b'{' } {
+            return None;
+        }
+        at += 1;
+        while at < end && json_gap(d[at]) {
+            at += 1;
+        }
+        if at >= end || d[at] != b'"' || at >= diff {
+            return None;
+        }
+        let kq = at;
+        let (kend, escaped) = skip_json_string(d, at, end);
+        if escaped || kend >= end || kend >= diff {
+            return None;
+        }
+        at = kend;
+        while at < end && json_gap(d[at]) {
+            at += 1;
+        }
+        if at >= end || d[at] != b':' {
+            return None;
+        }
+        at += 1;
+        while at < end && json_gap(d[at]) {
+            at += 1;
+        }
+        if at > diff {
+            return None;
+        }
+        let v_end = json_value_end(d, at, end);
+        if v_end >= end || v_end <= at {
+            return None;
+        }
+        if diff < v_end {
+            if p.slot_for(&d[kq + 1..kend - 1]).is_some() {
+                return None;
+            }
+            return Some((at, v_end));
+        }
+        at = v_end;
+        after_value = true;
+    }
+}
+
 /// The end of a row, which for newline-delimited JSON is the next newline byte
 /// and nothing subtler.
 ///

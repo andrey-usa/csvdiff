@@ -745,3 +745,62 @@ fn the_csv_byte_proof_skips_an_ignored_middle_column() {
         "a gap, and CRLF against LF"
     );
 }
+
+/// The JSON proof past an ignored value in the middle: where the rows first
+/// differ inside the value of `note`, which nobody tracks, that value is skipped
+/// in each row on its own and the comparison carries on -- whatever its length,
+/// escapes, type or nested names. A repeat of a compared name after it still
+/// wins, and a change after it is still found.
+#[test]
+fn the_json_byte_proof_skips_an_ignored_middle_value() {
+    let row = |note: &str, amount: &str| {
+        format!(
+            "{{\"account_id\":\"a\",\"txn_id\":\"t\",\"note\":{note},\"amount\":\"{amount}\"}}\n"
+        )
+    };
+    let cases: [(&str, &str, &str, &str, i64, &str); 5] = [
+        (
+            "\"x\"",
+            "5",
+            "\"x and longer\"",
+            "5",
+            0,
+            "a middle value that differs",
+        ),
+        (
+            "\"x\"",
+            "5",
+            "\"x and longer\"",
+            "6",
+            1,
+            "and a real change after it",
+        ),
+        (
+            "\"a\\\"b,c}\"",
+            "5",
+            "null",
+            "5",
+            0,
+            "an escaped value against null",
+        ),
+        (
+            "{\"amount\":\"Z\"}",
+            "5",
+            "[1,{\"amount\":\"Y\"}]",
+            "5",
+            0,
+            "nested values, tracked names inside",
+        ),
+        (
+            "\"x\"",
+            "5",
+            "\"y\"",
+            "5\",\"amount\":\"LATER",
+            1,
+            "a repeat of the compared name after it",
+        ),
+    ];
+    for (na, aa, nb, ab, want, what) in cases {
+        assert_eq!(changed_json(&row(na, aa), &row(nb, ab)), want, "{what}");
+    }
+}

@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
 use text::{
-    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_tail_is_clean,
+    RowParser, Runs, csv_header, detect_delimiter, guard_span, json_header, json_rows_match,
     shared_tail, sniff_dialect,
 };
 
@@ -810,11 +810,7 @@ impl RowIndex {
         let data = side.slab.data();
         let lo = self.row_at[candidate as usize] as usize;
         let end = row_end(self, candidate, data.len());
-        let need = bytes.len();
-        if need > end.saturating_sub(lo) {
-            return false;
-        }
-        data[lo..lo + need] == *bytes && json_tail_is_clean(parser, data, lo + need, end)
+        json_rows_match(parser, bytes, data, lo, end)
     }
 
     /// Whether `candidate`'s row opens with exactly `bytes` and ends that run on
