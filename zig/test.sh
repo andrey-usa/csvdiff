@@ -78,6 +78,28 @@ done
 [ $fail -eq 0 ] && echo "  ok    one answer at 1, 2, 3, 4 and 8 threads"
 check "and it is the answer rust gives" "$tmp/a.csv" "$tmp/b.csv" -k k
 
+# The CSV byte proof with gaps: an ignored column among compared ones is
+# skipped by field count in each row on its own, so a value there that differs
+# -- in length, in quoting, with a delimiter inside the quotes -- does not stop
+# a row proving equal, and does not shift what the proof compares after it.
+# The last column is compared, so the proof also closes on the line ending.
+echo "the csv byte proof, past an ignored column:"
+{ echo 'id,skip,a,b'; echo 'k1,S1,p,q'; echo 'k2,S1,p,q'; echo 'k3,S1,p,q'; } > "$tmp/gap_a.csv"
+{ echo 'id,skip,a,b'; echo 'k1,"S, ""two"" and more",p,q'; echo 'k2,,p,X'; echo 'k3,S2,p,qq'; } > "$tmp/gap_b.csv"
+check "a middle ignored column that differs" "$tmp/gap_a.csv" "$tmp/gap_b.csv" -k id -i skip
+{ echo 'id,skip,a,b'; echo 'k1,S1,p,q'; echo 'k2,S1,p,q'; } > "$tmp/gs_a.csv"
+{ echo 'id,skip,a,b'; echo 'k1'; echo 'k2,S2'; } > "$tmp/gs_b.csv"
+check "a mate that stops inside the gap" "$tmp/gs_a.csv" "$tmp/gs_b.csv" -k id -i skip
+{ echo 'skip,id,a,t,b'; echo 'S1,k1,p,T1,q'; echo 'S1,k2,p,T1,q'; } > "$tmp/g2_a.csv"
+{ echo 'skip,id,a,t,b'; echo 'S22,k1,p,T2,q'; echo 'S,k2,p,T222,Y'; } > "$tmp/g2_b.csv"
+check "a leading gap and a second one" "$tmp/g2_a.csv" "$tmp/g2_b.csv" -k id -i skip,t
+printf 'id,skip,a\nk1,S1,p\n' > "$tmp/gc_a.csv"
+printf 'id,skip,a\r\nk1,S22,p\r\n' > "$tmp/gc_b.csv"
+check "a gap, and CRLF against LF" "$tmp/gc_a.csv" "$tmp/gc_b.csv" -k id -i skip
+{ echo 'a,k,c'; echo 'x,K1,c1'; echo 'y,K2,cc'; } > "$tmp/pre_a.csv"
+{ echo 'a,k,c'; echo 'x,K1,c1'; echo 'y,K2,cccccccc'; } > "$tmp/pre_b.csv"
+check "a mate whose last column carries on" "$tmp/pre_a.csv" "$tmp/pre_b.csv" -k k
+
 # --ignore-case refuses a value outside ASCII only where folding it decides the
 # answer: a key, or a compared value that differs byte for byte. A value that is
 # unchanged, or in a row only one side has, or whose mate is empty, is answered.

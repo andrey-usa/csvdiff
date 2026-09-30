@@ -1519,6 +1519,9 @@ const Join = struct {
     /// the same shape; see `text.sharedTail`. Null compares every pair column by
     /// column, which is what a mixed pair, a columnar side or JSON gets.
     span_tail: ?text.Tail,
+    /// The same fast path in runs, where an unwanted column sits among the
+    /// wanted ones; see `text.Runs`. Null where there is no gap.
+    runs: ?text.Runs = null,
     /// What JSON gets instead: no fixed offset to promise, so the run is built
     /// per row and the mate's tail is scanned. See `RowIndex.jsonMatches`.
     json_proof: bool,
@@ -1544,6 +1547,9 @@ const Join = struct {
         // that is what the key columns were matched against.
         const fb = try gpa.alloc(Field, self.width);
         defer gpa.free(fb);
+        // Two words a run, for the gapped proof.
+        const spans = try gpa.alloc(usize, if (self.runs) |r| 2 * r.seg.len else 0);
+        defer gpa.free(spans);
         var s = Scratch{};
         var out = &self.parts[p];
 
@@ -1578,7 +1584,24 @@ const Join = struct {
                 const data = self.a.slab.data;
                 const from: usize = @intCast(self.ai.row_at.items[@intCast(row)]);
                 const end = self.ai.rowEnd(row);
-                if (text.guardSpan(data, from, end, t.delimiter, t.src + 1)) |need| {
+                if (self.runs) |runs| gapped: {
+                    if (!runs.ofRow(data, from, end, t.delimiter, spans)) break :gapped;
+                    // No fields and no span: the first candidate whose whole
+                    // hash matches, unproven, which the runs then settle.
+                    if (try self.bi.lookup(self.a.slab, null, hash, .whole, null, &s, fb)) |hit| {
+                        const bd = self.b.slab.data;
+                        const b_lo: usize = @intCast(self.bi.row_at.items[@intCast(hit.row)]);
+                        if (runs.matches(data, spans, bd, b_lo, self.bi.rowEnd(hit.row), t.delimiter)) {
+                            out.matched += 1;
+                            refused = 0;
+                            continue;
+                        }
+                        if (refused < PROOF_BACKOFF) refused += 1;
+                    } else {
+                        out.removed += 1;
+                        continue;
+                    }
+                } else if (text.guardSpan(data, from, end, t.delimiter, t.src + 1)) |need| {
                     const span: Span = .{ .csv = .{ .bytes = data[from .. from + need], .delimiter = t.delimiter } };
                     if (try self.bi.lookup(self.a.slab, null, hash, .whole, span, &s, fb)) |hit| {
                         if (hit.same_bytes) {
@@ -1914,6 +1937,8 @@ pub fn compare(
         .json_proof = nc > 0 and a.slab.dialect == .json and b.slab.dialect == .json,
         .next = std.atomic.Value(usize).init(0),
     };
+    if (join.span_tail != null) join.runs = try text.Runs.plan(gpa, a.parser().?);
+    defer if (join.runs) |r| r.deinit(gpa);
     var phases = Phases.start("");
     try runOnThreads(&join, Join.run, total);
     phases.mark("join chunks (par)");
