@@ -1274,6 +1274,7 @@ typedef struct {
     uint64_t *start;
     uint64_t *hash;
     size_t    n, cap;
+    size_t    stopped;  /* where the sweep left off: the first row start past the chunk */
     bool      failed;   /* a field too long for the packed length */
     bool      oom;
     char      pad[64];
@@ -1297,8 +1298,13 @@ typedef struct {
  * -- it is also wrong: an escaped `\"` toggles the parity, and a split whose
  * count comes out odd can walk to the end of the file looking for a newline
  * outside quotes, and the chunk is dropped.
+ *
+ * With `count_quotes` false, CSV takes the next newline as well, which is a
+ * guess; the caller checks it after the sweep (see `index_build`) and counts
+ * only when a guess was wrong.
  */
-static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_t *bounds) {
+static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_t *bounds,
+                             bool count_quotes) {
     const char *d = s->data;
     const size_t end = s->size;
     if (threads <= 1 || end - from < SPLIT_FROM) {
@@ -1318,7 +1324,7 @@ static unsigned chunk_bounds(const Slab *s, size_t from, unsigned threads, size_
      * new, so counting that and adding it keeps a running total of the quotes
      * before `nominal` for one pass in total.
      */
-    const bool json = s->dialect == DIALECT_JSON;
+    const bool json = s->dialect == DIALECT_JSON || !count_quotes;
     size_t quotes = 0;
     size_t counted = from;
     for (unsigned i = 1; i < threads; i++) {
@@ -1431,6 +1437,7 @@ static void sweep_part(void *vctx, unsigned p) {
         if (next <= pos) break; /* no progress: a malformed tail, not an endless loop */
         pos = next;
     }
+    out->stopped = pos;
     free(fields);
     if (timed) {
         c->parse_ns[p] = t_parse;
@@ -1471,19 +1478,50 @@ static bool index_build(RowIndex *ix, const Slab *slab, const RowParser *parser,
     size_t *bounds = malloc((threads + 1) * sizeof *bounds);
     Chunk *chunks = calloc(threads, sizeof *chunks);
     if (!bounds || !chunks) { free(bounds); free(chunks); return false; }
-    const unsigned ways = chunk_bounds(slab, from, threads, bounds);
 
     Phases ph;
     phases_init(&ph);
     /* Per-thread sweep timings, only when the phase breakdown is on. */
     const bool timed = ph.on;
-    uint64_t *t_parse = timed ? calloc(ways, sizeof *t_parse) : NULL;
-    uint64_t *t_hash = timed ? calloc(ways, sizeof *t_hash) : NULL;
-    uint64_t *t_push = timed ? calloc(ways, sizeof *t_push) : NULL;
-    uint64_t *t_rows = timed ? calloc(ways, sizeof *t_rows) : NULL;
+    uint64_t *t_parse = timed ? calloc(threads, sizeof *t_parse) : NULL;
+    uint64_t *t_hash = timed ? calloc(threads, sizeof *t_hash) : NULL;
+    uint64_t *t_push = timed ? calloc(threads, sizeof *t_push) : NULL;
+    uint64_t *t_rows = timed ? calloc(threads, sizeof *t_rows) : NULL;
     SweepCtx sc = { slab, parser, key_size, bounds, chunks, norm,
                     t_parse, t_hash, t_push, t_rows };
+
+    /*
+     * The CSV splits are guessed, then checked.
+     *
+     * Counted bounds cost a pass over the front of the file -- (threads-1)/threads
+     * of it -- on one thread, before any chunk starts. In memory that is a quick
+     * scan for one byte. On an input larger than memory it is a disk read of most
+     * of the file that the sweep then reads again, because by the time the sweep
+     * gets there those pages are gone: on the 150M CI pair, 26 GB a side, about
+     * 138 seconds before the sweep began, against a sweep of 230.
+     *
+     * So each split is taken at the next newline, as JSON's are, and checked the
+     * way the Rust port checks it. Chunk 0 starts at a real row, so the last row
+     * it parses ends at the first real row start past its boundary; if that is
+     * where chunk 1 began, chunk 1 started at a real row too, and so on down the
+     * line. Only a guess that landed on a newline inside a quoted field breaks
+     * that, and then the sweep runs again on counted bounds, which is exactly
+     * what it did before. A chunk that started on a wrong guess parsed garbage,
+     * so its rows and its failures are both thrown away unread; one that failed
+     * for real stops short of its boundary, looks like a wrong guess, and fails
+     * again on the counted run, where it is reported.
+     */
+    unsigned ways = chunk_bounds(slab, from, threads, bounds, false);
     run_parts(sweep_part, &sc, ways);
+    bool held = true;
+    if (slab->dialect != DIALECT_JSON)
+        for (unsigned p = 0; p + 1 < ways && held; p++) held = chunks[p].stopped == bounds[p + 1];
+    if (!held) {
+        for (unsigned p = 0; p < ways; p++) { free(chunks[p].start); free(chunks[p].hash); }
+        memset(chunks, 0, threads * sizeof *chunks);
+        ways = chunk_bounds(slab, from, threads, bounds, true);
+        run_parts(sweep_part, &sc, ways);
+    }
     free(bounds);
     phase_mark(&ph, "sweep rows");
     if (timed) {

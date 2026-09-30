@@ -122,6 +122,41 @@ other branch's agent that pointed this out.
 
 ---
 
+## 2026-09-30 (c guessed splits) — the C sweep read half of every file twice once it outgrew memory
+
+The one live lead left on C at 150M was its sweep on cold reads. The CI phase
+run (36634384428, 26 GB a side against ~16 GB of RAM) shows C spending about
+138s *before* its sweep clock started: `chunk_bounds` counts quotes on one
+thread from the start of the file to the last split, so the CSV split cannot
+land inside a quoted newline. In memory that is a quick byte scan. On an input
+larger than memory it is a serial disk read of the counted region, and by the
+time the sweep reaches those bytes they have been evicted, so the sweep reads
+them again. Rust does not count: it guesses each split at the next newline and
+checks after the sweep that each chunk ended where the next began, counting
+only when a guess was wrong. C now does the same.
+
+Reproduced here by capping the process's memory cgroup below the counted region
+(400 MB against a 5M pair of 0.9 GB a side, cold, both indexes built one after
+the other as the >8 GB path does):
+
+| | before | after |
+|---|---|---|
+| bytes read from storage, every run | 4.63 GB (2.52x input) | 3.71 GB (2.02x input) |
+| both indexes, 15 interleaved rounds | 5.32s | 4.30s — **1.21x [1.19–1.28]** |
+| wall | 8.52s | 7.56s — **1.11x [1.10–1.13]** |
+| A/A, same harness | | 1.00x [0.98–1.04], wall 1.02x [0.995–1.05] |
+
+The 0.5x of input removed is the counted half of each file (two sweep threads a
+file on that path). Warm, `bench_ab.sh` does not tell the builds apart on the
+5M or the 200k pair. At CI's scale the saving should be of the order of the
+~138s prelude; the next scale-ceiling run is what will say.
+
+The remaining 1.0x of re-reading is the join, which walks B in A's order.
+C++ and Zig still count before their sweeps; the same change applies to both.
+The >8 GB sequential path also still gives each build half the threads.
+
+---
+
 ## 2026-09-30 (reverted: zig key-list reservation) — #213 cost memory for a gap that was not there
 
 #213 reserved `first_row` and `occurrences` to `total` in `RowIndex.build`,
