@@ -41,6 +41,7 @@ mod slab;
 mod text;
 mod thrift;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -495,6 +496,12 @@ struct RowIndex {
     /// were first, and these are joined again afterwards and subtracted.
     later: Vec<i32>,
     track_later: bool,
+    /// Each repeated key's values, by its `first_row` position, decoded when
+    /// the insertion found the repeat: the key was just read to prove it, and
+    /// the duplicate section would otherwise read it again, from disk once the
+    /// file is past page cache. Only kept when the report has row lists.
+    dup_key_values: HashMap<u32, Vec<Val>>,
+    keep_dup_keys: bool,
 }
 
 impl RowIndex {
@@ -557,6 +564,9 @@ impl RowIndex {
                 let base = first as i32;
                 for pick in part.changed.iter_mut().chain(part.removed.iter_mut()) {
                     pick.row += base;
+                }
+                for kept in &mut part.kept.a_rows {
+                    kept.0 += base;
                 }
                 first += chunk.at.len();
                 SweptPart {
@@ -635,6 +645,8 @@ impl RowIndex {
             dup_rows: 0,
             later: Vec::new(),
             track_later: sink.is_some(),
+            dup_key_values: HashMap::new(),
+            keep_dup_keys: opt.row_lists,
         };
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
@@ -698,6 +710,19 @@ impl RowIndex {
                         if self.occurrences[key] == 2 {
                             self.dup_keys += 1;
                             self.dup_rows += 1; // the first occurrence counts once the key repeats
+                            if self.keep_dup_keys {
+                                // A key that does not decode is left to the
+                                // section, which reports it.
+                                let values: Option<Vec<Val>> = probe[..key_size]
+                                    .iter()
+                                    .map(|f| {
+                                        value_checked(&side.slab, *f, opt, "a duplicated key").ok()
+                                    })
+                                    .collect();
+                                if let Some(values) = values {
+                                    self.dup_key_values.insert(key as u32, values);
+                                }
+                            }
                         }
                         self.dup_rows += 1;
                         // The fused join joined this row as though it were
@@ -912,16 +937,17 @@ struct RowSink<'a> {
     /// plain atomic OR — the one shared write, and it is idempotent.
     seen: &'a [AtomicU64],
     nc: usize,
+    /// Whether each worker's part copies the rows the report may show.
+    keep_rows: bool,
 }
 
 impl RowSink<'_> {
     /// A worker's own join state: its part's counts and its row scratch.
     fn worker(&self) -> (Part, RowScratch) {
         let runs_len = self.ctx.runs.as_ref().map_or(0, Runs::len);
-        (
-            Part::blank(self.nc),
-            RowScratch::new(self.ctx.width, runs_len),
-        )
+        let mut part = Part::blank(self.nc);
+        part.kept.on = self.keep_rows;
+        (part, RowScratch::new(self.ctx.width, runs_len))
     }
 
     /// Joins one row into the worker's own part: its index in its chunk
@@ -1386,6 +1412,69 @@ struct Part {
     removed: Vec<Pick>,
     changed_total: i64,
     removed_total: i64,
+    /// The rows the report may show, copied while the fused sweep has them in
+    /// memory. Empty unless `Kept::on`.
+    kept: Kept,
+}
+
+/// Rows the report may show, copied as the fused sweep joins them.
+///
+/// Past page cache the report's rows are otherwise read back after the sweep,
+/// one at a time: at 150M rows tens of thousands of reads scattered over both
+/// files, 24s of a 287s run, where the sweep had every one of those pages in
+/// memory and let them go. So each row a pick list takes is copied as it is
+/// joined -- A's row, and for a changed row its mate in B -- and so are the
+/// rows of B that the matches skip over, which is where B's added rows are
+/// when the two files are in the same order. All of it is bounded by the
+/// pick cap, and a row nothing kept is read back as it always was.
+#[derive(Default)]
+struct Kept {
+    /// Whether this part keeps rows: the fused sweep's own parts, when the
+    /// report has row lists. Off for the parts that take repeats back, and
+    /// switched off for good if memory for a copy cannot be had -- the rows
+    /// are then read from the file, as they would have been.
+    on: bool,
+    /// Row bytes, each row's from its start to the next row's.
+    a: Vec<u8>,
+    b: Vec<u8>,
+    /// A's rows by id -- within the chunk until `build` numbers them for the
+    /// file -- and where each starts in `a`.
+    a_rows: Vec<(i32, usize)>,
+    /// B's rows by id, and where each starts in `b`.
+    b_rows: Vec<(i32, usize)>,
+    /// The last B row this part matched, and how many skipped rows it kept.
+    last_mate: i32,
+    skipped: usize,
+}
+
+impl Kept {
+    /// Appends `bytes` to `arena` and records `row` at its start. On the first
+    /// copy the arena is sized for the pick cap at this row's length: grown a
+    /// doubling at a time, the arenas left the heap fragmented enough to slow
+    /// the insertion that follows the sweep by half (0.21s to 0.3-0.5s on 8M
+    /// rows, the copies alone at 70 MB).
+    fn copy(
+        on: &mut bool,
+        arena: &mut Vec<u8>,
+        rows: &mut Vec<(i32, usize)>,
+        row: i32,
+        bytes: &[u8],
+        cap: usize,
+    ) {
+        if arena.capacity() == 0 {
+            const MOST: usize = 64 << 20;
+            let want = (bytes.len() + 16)
+                .saturating_mul(cap.saturating_add(1))
+                .saturating_mul(2);
+            let _ = arena.try_reserve_exact(want.min(MOST));
+        }
+        if arena.try_reserve(bytes.len()).is_err() || rows.try_reserve(1).is_err() {
+            *on = false;
+            return;
+        }
+        rows.push((row, arena.len()));
+        arena.extend_from_slice(bytes);
+    }
 }
 
 /// Decodes one row's key and compared columns into the owned values the report
@@ -1510,6 +1599,10 @@ impl Part {
             removed: Vec::new(),
             changed_total: 0,
             removed_total: 0,
+            kept: Kept {
+                last_mate: -1,
+                ..Kept::default()
+            },
         }
     }
 
@@ -1638,12 +1731,18 @@ fn join_row(
         Fast::Proved(mate) => {
             out.matched += 1;
             mark_seen(seen, mate);
+            if out.kept.on {
+                keep_skipped(ctx, out, mate);
+            }
             return;
         }
         Fast::Missed => {
             out.removed_total += 1;
             if ctx.keep_picks && (ctx.exporting || out.removed.len() <= ctx.cap) {
                 out.removed.push(Pick { row, mate: -1 });
+                if out.kept.on {
+                    keep_a(ctx, out, row, from, end);
+                }
             }
             return;
         }
@@ -1716,11 +1815,17 @@ fn join_row(
         out.removed_total += 1;
         if ctx.keep_picks && (ctx.exporting || out.removed.len() <= ctx.cap) {
             out.removed.push(Pick { row, mate: -1 });
+            if out.kept.on {
+                keep_a(ctx, out, row, from, end);
+            }
         }
         return;
     };
     out.matched += 1;
     mark_seen(seen, mate);
+    if out.kept.on {
+        keep_skipped(ctx, out, mate);
+    }
     // `same_bytes` is the proof's own verdict, so it is what the backoff
     // counts. A run of failures means two files where the rows really do
     // differ, and scanning them is work for nothing.
@@ -1776,7 +1881,67 @@ fn join_row(
         out.changed_total += 1;
         if ctx.keep_picks && (ctx.exporting || out.changed.len() <= ctx.cap) {
             out.changed.push(Pick { row, mate });
+            if out.kept.on {
+                keep_a(ctx, out, row, from, end);
+                keep_b(ctx, out, mate);
+            }
         }
+    }
+}
+
+/// Copies A's row `row`, bytes `from..end`, into the part's kept rows.
+fn keep_a(ctx: &JoinCtx, out: &mut Part, row: i32, from: usize, end: usize) {
+    let kept = &mut out.kept;
+    let bytes = &ctx.a.slab.data()[from..end];
+    Kept::copy(
+        &mut kept.on,
+        &mut kept.a,
+        &mut kept.a_rows,
+        row,
+        bytes,
+        ctx.cap,
+    );
+}
+
+/// Copies B's row `row` into the part's kept rows.
+fn keep_b(ctx: &JoinCtx, out: &mut Part, row: i32) {
+    let data = ctx.b.slab.data();
+    let (from, end) = (
+        ctx.bi.row_at[row as usize] as usize,
+        row_end(ctx.bi, row, data.len()),
+    );
+    let kept = &mut out.kept;
+    Kept::copy(
+        &mut kept.on,
+        &mut kept.b,
+        &mut kept.b_rows,
+        row,
+        &data[from..end],
+        ctx.cap,
+    );
+}
+
+/// How far apart two consecutive mates may be for the rows between them to be
+/// kept. A wider gap is two files in different orders, where what lies between
+/// is not where the added rows are.
+const SKIPPED_SPAN: i32 = 8;
+
+/// Keeps the rows of B between this part's last mate and `mate`: when both
+/// files are in the same order, the rows a run of matches skips are B's added
+/// rows (or its repeats), and their pages are the ones the mate was just read
+/// from. Bounded like a pick list.
+fn keep_skipped(ctx: &JoinCtx, out: &mut Part, mate: i32) {
+    let last = out.kept.last_mate;
+    out.kept.last_mate = mate;
+    if last < 0 || mate <= last + 1 || mate - last > SKIPPED_SPAN {
+        return;
+    }
+    for row in last + 1..mate {
+        if out.kept.skipped > ctx.cap || !out.kept.on {
+            return;
+        }
+        out.kept.skipped += 1;
+        keep_b(ctx, out, row);
     }
 }
 
@@ -1925,7 +2090,7 @@ fn join(
     parts.sort_by_key(|(t, _)| *t);
     let parts: Vec<Part> = parts.into_iter().map(|(_, part)| part).collect();
     join_tail(
-        a, ai, b, bi, opt, compared, exporting, threads, &ctx, &seen, parts,
+        a, ai, b, bi, opt, compared, exporting, threads, &ctx, &seen, parts, None,
     )
 }
 
@@ -1945,6 +2110,7 @@ fn join_tail(
     ctx: &JoinCtx,
     seen: &[AtomicU64],
     parts: Vec<Part>,
+    kept: Option<&KeptRows>,
 ) -> Result<Joined> {
     let key_size = ctx.key_size;
     let nc = ctx.nc;
@@ -2050,17 +2216,23 @@ fn join_tail(
     } else {
         (NONE, NONE, NONE)
     };
-    let mut removed_rows = map_rows(keep_removed, threads, "a removed row", |p| {
-        row_values(a, ai, p.row, opt)
-    })?;
-    let mut added_rows = map_rows(keep_added, threads, "an added row", |p| {
-        row_values(b, bi, p.row, opt)
-    })?;
+    // A row the sweep kept is decoded from its copy; anything else is read
+    // from the file, which past page cache means from disk.
+    let a_row = |row: i32| match kept.and_then(|k| k.values(a, true, row, opt)) {
+        Some(values) => Ok(values),
+        None => row_values(a, ai, row, opt),
+    };
+    let b_row = |row: i32| match kept.and_then(|k| k.values(b, false, row, opt)) {
+        Some(values) => Ok(values),
+        None => row_values(b, bi, row, opt),
+    };
+    let mut removed_rows = map_rows(keep_removed, threads, "a removed row", |p| a_row(p.row))?;
+    let mut added_rows = map_rows(keep_added, threads, "an added row", |p| b_row(p.row))?;
     let mut changed_a = map_rows(keep_changed, threads, "a changed row, A side", |p| {
-        row_values(a, ai, p.row, opt)
+        a_row(p.row)
     })?;
     let mut changed_b = map_rows(keep_changed, threads, "a changed row, B side", |p| {
-        row_values(b, bi, p.mate, opt)
+        b_row(p.mate)
     })?;
 
     phases.mark("  row values (par)");
@@ -2191,6 +2363,8 @@ fn fused_forced() -> bool {
 /// seen bitmap, which the tail's B round reads.
 struct FusedJoin<'x> {
     totals: Part,
+    /// The rows the sweep copied for the report, if it kept any.
+    kept: Option<KeptRows>,
     ai: RowIndex,
     ctx: JoinCtx<'x>,
     seen: Vec<AtomicU64>,
@@ -2213,10 +2387,13 @@ fn fused_join<'x>(
     let width = ctx.width;
     let runs_len = ctx.runs.as_ref().map_or(0, Runs::len);
 
+    // The report's rows are copied as they are joined, while their pages are
+    // in memory, rather than read back from disk afterwards.
     let sink = RowSink {
         ctx: &ctx,
         seen: &seen,
         nc,
+        keep_rows: ctx.keep_picks,
     };
     let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink))?;
 
@@ -2250,12 +2427,67 @@ fn fused_join<'x>(
         totals.changed = fused_picks(&ctx, &ai, &seen, &parts, PickList::Changed);
         totals.removed = fused_picks(&ctx, &ai, &seen, &parts, PickList::Removed);
     }
+    let kept = ctx.keep_picks.then(|| KeptRows::new(a, b, parts));
     Ok(FusedJoin {
         totals,
         ai,
         ctx,
         seen,
+        kept,
     })
+}
+
+/// Every part's kept rows, found by row id.
+struct KeptRows {
+    a: Vec<Slab>,
+    b: Vec<Slab>,
+    a_rows: HashMap<i32, (usize, usize)>,
+    b_rows: HashMap<i32, (usize, usize)>,
+}
+
+impl KeptRows {
+    fn new(a: &Side, b: &Side, parts: Vec<SweptPart>) -> KeptRows {
+        let mut out = KeptRows {
+            a: Vec::with_capacity(parts.len()),
+            b: Vec::with_capacity(parts.len()),
+            a_rows: HashMap::new(),
+            b_rows: HashMap::new(),
+        };
+        for (i, swept) in parts.into_iter().enumerate() {
+            let kept = swept.part.kept;
+            for (row, at) in kept.a_rows {
+                out.a_rows.entry(row).or_insert((i, at));
+            }
+            for (row, at) in kept.b_rows {
+                out.b_rows.entry(row).or_insert((i, at));
+            }
+            out.a.push(Slab::owned(kept.a, a.slab.dialect()));
+            out.b.push(Slab::owned(kept.b, b.slab.dialect()));
+        }
+        out
+    }
+
+    /// Row `row` of `side`'s values, from its copy, as `row_values` would
+    /// decode them from the file. `None` when no copy was kept, or when it does
+    /// not decode -- the file then gives the answer, error included.
+    fn values(&self, side: &Side, is_a: bool, row: i32, opt: &Options) -> Option<Vec<Val>> {
+        let (slabs, rows) = if is_a {
+            (&self.a, &self.a_rows)
+        } else {
+            (&self.b, &self.b_rows)
+        };
+        let &(part, at) = rows.get(&row)?;
+        let slab = &slabs[part];
+        let parser = side.parser()?;
+        let data = slab.data();
+        let mut fields = vec![ABSENT; side.width];
+        parser.parse(data, at, data.len(), &mut fields);
+        let mut out: Vec<Val> = alloc::sized(side.width, "a report row").ok()?;
+        for f in &fields {
+            out.push(value_checked(slab, *f, opt, "a report cell").ok()?);
+        }
+        Some(out)
+    }
 }
 
 /// Which of a part's two pick lists.
@@ -2412,6 +2644,7 @@ fn compare_fused(
             &fused.ctx,
             &fused.seen,
             vec![fused.totals],
+            fused.kept.as_ref(),
         )?;
         if fused_forced() {
             // How the tests reach this path: the ordinary join must agree,
@@ -2494,11 +2727,14 @@ fn empty_section(opt: &Options) -> Section {
 fn duplicate_section(side: &Side, idx: &RowIndex, opt: &Options) -> Result<Section> {
     let key_size = opt.key.len();
     let mut entries: Vec<(Vec<Val>, i64)> = Vec::new();
-    for (row, n) in idx.first_row.iter().zip(&idx.occurrences) {
+    for (at, (row, n)) in idx.first_row.iter().zip(&idx.occurrences).enumerate() {
         if *n <= 1 {
             continue;
         }
-        let key = key_values(side, idx, *row, opt)?;
+        let key = match idx.dup_key_values.get(&(at as u32)) {
+            Some(values) => values.clone(),
+            None => key_values(side, idx, *row, opt)?,
+        };
         alloc::push(&mut entries, (key, *n as i64), "a duplicated key")?;
     }
     entries.sort_by(|x, y| {
