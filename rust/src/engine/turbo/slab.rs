@@ -66,23 +66,6 @@ impl Slab {
         })
     }
 
-    /// Asks the kernel to start reading `from..from + len` of a mapped file
-    /// into memory now, ahead of the sweep that will want it. A hint: the call
-    /// returns once the reads are queued, a slab of owned bytes has nothing to
-    /// read, and a platform without `madvise` reads them when they are touched.
-    pub(super) fn will_need(&self, from: usize, len: usize) {
-        #[cfg(unix)]
-        if let Bytes::Mapped { map, .. } = &self.bytes {
-            let from = from.min(map.len());
-            let len = len.min(map.len() - from);
-            if len > 0 {
-                let _ = map.advise_range(memmap2::Advice::WillNeed, from, len);
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = (from, len);
-    }
-
     /// A slab over bytes this process built: the Parquet reader's arena.
     pub(super) fn owned(data: Vec<u8>, dialect: Dialect) -> Self {
         Slab {

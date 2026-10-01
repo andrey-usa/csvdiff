@@ -2590,23 +2590,23 @@ fn fused_picks(
 /// the insertion takes.
 const READ_AHEAD_PER_ROW: usize = 16;
 
-/// The step each chunk's read-ahead is asked for in, round-robin across the
-/// chunks so that every chunk's start arrives early, not the first chunk's
-/// whole share.
-///
-/// Small, because the kernel reads at most its readahead window per call:
-/// asked for 64 MB at four places, a cold 2.9GB file had 16 MB more in memory
-/// afterwards, and the 150M run's A sweep took 131.3s, no faster than without
-/// it. 128 KB is the smallest that window is by default; asked in 128 KB steps
-/// the same four places had all of a 1 GB request in memory, for 0.15s of
-/// calls on the thread that makes them.
-const READ_AHEAD_STEP: usize = 128 << 10;
+/// A page, the unit the read-ahead touches A in.
+const PAGE: usize = 4096;
 
-/// Starts reading the first bytes of each of A's sweep chunks, as many as the
-/// disk reads while `rows` rows are inserted, never more than half the file,
-/// and nothing more once `stop` is set.
-/// The chunks are where `chunk_bounds` will start them, near enough: the
-/// guessed split is the next newline after each even division.
+/// Reads the first bytes of each of A's sweep chunks into memory, as many as
+/// the disk reads while `rows` rows are inserted, never more than half the
+/// file, and nothing more once `stop` is set. The chunks are where
+/// `chunk_bounds` will start them, near enough: the guessed split is the next
+/// newline after each even division.
+///
+/// One thread per chunk touches a byte of every page, in order, as the sweep
+/// would: each waits on its own faults, so a few readahead windows are in
+/// flight rather than the whole budget. Asking for it all with
+/// madvise(MADV_WILLNEED) (in 128 KB calls -- larger ones read only the
+/// readahead window each) did shorten the 150M A sweep, 131.3s to 125.4s, but
+/// queued 2.4 GB at once ahead of the insertion's own reads -- the repeated
+/// keys it proves against the file -- and the insertion went from 7.5s to
+/// 12.4s.
 fn read_ahead(a: &Side, rows: usize, threads: usize, stop: &AtomicBool) {
     let Rows::Text { from, .. } = &a.rows else {
         return;
@@ -2619,15 +2619,22 @@ fn read_ahead(a: &Side, rows: usize, threads: usize, stop: &AtomicBool) {
     let span = size - from;
     let budget = rows.saturating_mul(READ_AHEAD_PER_ROW).min(span / 2);
     let each = budget / ways;
-    let mut done = 0usize;
-    while done < each && !stop.load(Ordering::Relaxed) {
-        let step = READ_AHEAD_STEP.min(each - done);
+    let data = a.slab.data();
+    std::thread::scope(|scope| {
         for i in 0..ways {
             let start = from + span * i / ways;
-            a.slab.will_need(start + done, step);
+            let end = (start + each).min(size);
+            scope.spawn(move || {
+                let mut seen = 0u8;
+                let mut at = start;
+                while at < end && !stop.load(Ordering::Relaxed) {
+                    seen ^= data[at];
+                    at += PAGE;
+                }
+                std::hint::black_box(seen);
+            });
         }
-        done += step;
-    }
+    });
 }
 
 /// The fused compare: B's index is built first on the full thread budget, then
