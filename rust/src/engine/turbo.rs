@@ -462,6 +462,52 @@ fn prefetch_slot(part: &[u32], slot: usize) {
     let _ = (part, slot);
 }
 
+/// Appends `parts` to `out`, in order, copying each on a thread of its own
+/// into the room `out` already has for all of them, and releasing each as soon
+/// as it is copied. Errs, `out` untouched, if that room is short or a copy
+/// cannot finish.
+fn append_in_parallel(out: &mut Vec<u64>, parts: Vec<Vec<u64>>) -> Result<()> {
+    let adding: usize = parts.iter().map(Vec::len).sum();
+    if out.capacity() - out.len() < adding {
+        return Err(Error::new("no room to join the sweep's chunks"));
+    }
+    if parts.len() <= 1 {
+        for part in parts {
+            out.extend_from_slice(&part);
+        }
+        return Ok(());
+    }
+    let len = out.len();
+    {
+        let mut room = &mut out.spare_capacity_mut()[..adding];
+        let mut tasks = Vec::with_capacity(parts.len());
+        for part in parts {
+            let (into, tail) = room.split_at_mut(part.len());
+            tasks.push(std::sync::Mutex::new(Some((into, part))));
+            room = tail;
+        }
+        let done = in_parallel(tasks.len(), |t| {
+            let (into, part) = tasks[t]
+                .lock()
+                .ok()
+                .and_then(|mut task| task.take())
+                .ok_or_else(|| Error::new("a chunk taken twice"))?;
+            for (slot, value) in into.iter_mut().zip(&part) {
+                slot.write(*value);
+            }
+            Ok(())
+        });
+        for d in done {
+            d?;
+        }
+    }
+    // Safety: every one of the `adding` slots after `len` was written above --
+    // the parts were laid end to end over exactly that room, and each task
+    // wrote all of its part -- and a task that failed returned before here.
+    unsafe { out.set_len(len + adding) };
+    Ok(())
+}
+
 /// An empty table of `cap` slots, with the zeroes written rather than taken from
 /// the kernel.
 ///
@@ -677,12 +723,13 @@ impl RowIndex {
         let rest = total - row_at.len();
         alloc::grow(&mut row_at, rest, "one offset per row")?;
         alloc::grow(&mut row_hash, rest, "one hash per row")?;
-        for chunk in chunks.iter_mut().skip(1) {
-            row_at.extend_from_slice(&chunk.at);
-            row_hash.extend_from_slice(&chunk.hash);
-            chunk.at = Vec::new();
-            chunk.hash = Vec::new();
-        }
+        // The rest are copied in, each by a thread of its own and released
+        // as soon as it has been: at 150M rows that is 1.8 GB, which on one
+        // thread was a second or more of every index's build.
+        let (ats, hashes): (Vec<Vec<u64>>, Vec<Vec<u64>>) =
+            chunks.drain(..).skip(1).map(|c| (c.at, c.hash)).unzip();
+        append_in_parallel(&mut row_at, ats)?;
+        append_in_parallel(&mut row_hash, hashes)?;
         drop(chunks);
         let mut idx = RowIndex {
             row_at,
