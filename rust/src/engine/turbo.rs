@@ -540,10 +540,31 @@ impl RowIndex {
         threads: usize,
         tag: &'static str,
         sink: Option<&RowSink<'_>>,
-    ) -> Result<(Self, Vec<Part>)> {
+    ) -> Result<(Self, Vec<SweptPart>)> {
         let mut phases = Phases::new(tag);
         let (mut chunks, fparts) = sweep(side, key_size, opt, threads, sink)?;
         phases.mark("sweep (parallel)");
+
+        // Each fused part is its chunk's, and its picks hold row ids within
+        // the chunk: the chunks before it are counted only now. One part per
+        // chunk, in chunk order, or none at all.
+        debug_assert!(fparts.is_empty() || fparts.len() == chunks.len());
+        let mut first = 0usize;
+        let fparts: Vec<SweptPart> = fparts
+            .into_iter()
+            .zip(&chunks)
+            .map(|(mut part, chunk)| {
+                let base = first as i32;
+                for pick in part.changed.iter_mut().chain(part.removed.iter_mut()) {
+                    pick.row += base;
+                }
+                first += chunk.at.len();
+                SweptPart {
+                    part,
+                    rows: base as usize..first,
+                }
+            })
+            .collect();
 
         let total: usize = chunks.iter().map(|c| c.at.len()).sum();
         // Sized once for the rows about to be inserted, at about a two-thirds
@@ -873,6 +894,12 @@ fn sweep(
     }
 }
 
+/// A fused sweep worker's part, with the rows of the chunk it joined.
+struct SweptPart {
+    part: Part,
+    rows: std::ops::Range<usize>,
+}
+
 /// What the sweep hands each row to, when the join runs inside it.
 ///
 /// Each sweep worker owns its part's `Part` and `RowScratch`; the sink only
@@ -897,18 +924,19 @@ impl RowSink<'_> {
         )
     }
 
-    /// Joins one row into the worker's own part: its byte range, key hash,
-    /// index in its part (for the proof backoff), and the next row's hash for
-    /// the lookup prefetch (`None` at a chunk's end).
+    /// Joins one row into the worker's own part: its index in its chunk
+    /// (the pick id until `build` makes it the file's, and the proof backoff's
+    /// counter), its byte range, key hash, and the next row's hash for the
+    /// lookup prefetch (`None` at a chunk's end).
     #[allow(clippy::too_many_arguments)]
     fn row(
         &self,
         part: &mut Part,
         scratch: &mut RowScratch,
+        j: usize,
         from: u64,
         end: u64,
         hash: u64,
-        k: usize,
         next_hash: Option<u64>,
     ) {
         if let Some(next) = next_hash {
@@ -918,11 +946,11 @@ impl RowSink<'_> {
             self.ctx,
             part,
             scratch,
-            -1,
+            j as i32,
             from as usize,
             end as usize,
             hash,
-            k,
+            j,
             self.seen,
         );
     }
@@ -1159,10 +1187,10 @@ fn sweep_chunks(
                 s.row(
                     part,
                     scratch,
+                    j,
                     chunk.at[j],
                     pos as u64,
                     chunk.hash[j],
-                    j,
                     Some(chunk.hash[j + 1]),
                 );
             }
@@ -1176,7 +1204,7 @@ fn sweep_chunks(
             && let Some(&lo) = chunk.at.last()
         {
             let j = chunk.at.len() - 1;
-            s.row(part, scratch, lo, pos as u64, chunk.hash[j], j, None);
+            s.row(part, scratch, j, lo, pos as u64, chunk.hash[j], None);
         }
         Ok((chunk, pos, fused.map(|(part, _)| part)))
     })
@@ -1485,11 +1513,10 @@ impl Part {
         }
     }
 
-    /// Folds another part's counts into this one. The fused path keeps no
-    /// picks, so only the totals move; the ordinary fold in `join_tail`
-    /// keeps its own pick merging.
+    /// Folds another part's counts into this one. Only the counts: the fused
+    /// path settles its picks in `fused_picks`, and the ordinary fold in
+    /// `join_tail` keeps its own pick merging.
     fn add(&mut self, other: &Part) {
-        debug_assert!(other.changed.is_empty() && other.removed.is_empty());
         self.matched += other.matched;
         for i in 0..self.changed_per.len() {
             self.changed_per[i] += other.changed_per[i];
@@ -1502,8 +1529,8 @@ impl Part {
 
     /// Takes another part's counts back out: the later-duplicate correction.
     /// A repeated key's first row stays matched, so the caller marks nothing.
+    /// The picks are not touched; a repeat's are dropped in `fused_picks`.
     fn sub(&mut self, other: &Part) {
-        debug_assert!(other.changed.is_empty() && other.removed.is_empty());
         self.matched -= other.matched;
         for i in 0..self.changed_per.len() {
             self.changed_per[i] -= other.changed_per[i];
@@ -2124,31 +2151,39 @@ fn join_tail(
 /// the insertion -- are joined again afterwards and subtracted. Counts are
 /// sums, so that is exact. The C, C++, and Zig ports do the same (#241-#243).
 ///
+/// The row lists (`--json`, the HTML report) come out the same as well: each
+/// sweep part keeps its chunk's first rows, and `fused_picks` drops the
+/// repeats among them and fills any place a repeat held.
+///
 /// Not with the normalisation flags: they refuse from inside a comparison, and
-/// a repeat's refusal could not be taken back. Not with row lists or exports
-/// either: a repeat taken back could have held a place in a capped list, so
-/// the fused path keeps no picks and production fusion is summary-only.
+/// a repeat's refusal could not be taken back. Not with an export, which wants
+/// every row, repeats taken back from lists that are not capped.
 ///
 /// `CSVDIFF_FUSED_JOIN=1` takes this path at any size, which is how the tests
-/// reach it. With row lists as well the ordinary join runs too, for the lists,
-/// and the two sets of counts must agree or the run fails.
+/// reach it. The ordinary join then runs too, and the two must agree -- the
+/// counts, and with row lists the rows -- or the run fails. With an export the
+/// ordinary join's rows are the ones written.
 fn fused_active(a_bytes: Option<u64>, b_bytes: Option<u64>, opt: &Options, threads: usize) -> bool {
     if needs_normalising(opt) {
         return false;
     }
-    let forced = std::env::var("CSVDIFF_FUSED_JOIN")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
-    if forced {
+    if fused_forced() {
         return true;
     }
-    if opt.row_lists || opt.export_dir.is_some() {
+    if opt.export_dir.is_some() {
         return false;
     }
     match (a_bytes, b_bytes) {
         (Some(a), Some(b)) => threads > 1 && a.saturating_add(b) > (8u64 << 30),
         _ => false,
     }
+}
+
+/// Whether `CSVDIFF_FUSED_JOIN` is set, and not to "0".
+fn fused_forced() -> bool {
+    std::env::var("CSVDIFF_FUSED_JOIN")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
 }
 
 /// What the fused sweep hands on: the folded totals (later duplicates already
@@ -2163,9 +2198,8 @@ struct FusedJoin<'x> {
 
 /// Sweeps A and joins each row as the sweep finds it, while its pages are hot.
 ///
-/// The row id handed to `join_row` is -1: ids only feed the pick lists, which
-/// the fused path never builds. Each sweep worker owns its part's counts, so
-/// no row takes a lock; the parts come back with the chunks and are folded.
+/// Each sweep worker owns its part's counts and picks, so no row takes a lock;
+/// the parts come back with the chunks and are folded.
 fn fused_join<'x>(
     a: &'x Side,
     b: &'x Side,
@@ -2175,13 +2209,7 @@ fn fused_join<'x>(
     threads: usize,
 ) -> Result<FusedJoin<'x>> {
     let key_size = opt.key.len();
-    let (base, seen) = join_setup(a, b, bi, opt, nc, false);
-    // The fused path keeps no picks: row ids are not known during the sweep,
-    // and a later duplicate taken back could have held a capped place.
-    let ctx = JoinCtx {
-        keep_picks: false,
-        ..base
-    };
+    let (ctx, seen) = join_setup(a, b, bi, opt, nc, false);
     let width = ctx.width;
     let runs_len = ctx.runs.as_ref().map_or(0, Runs::len);
 
@@ -2214,16 +2242,108 @@ fn fused_join<'x>(
         }
     }
     let mut totals = Part::blank(nc);
-    for part in &parts {
-        totals.add(part);
+    for swept in &parts {
+        totals.add(&swept.part);
     }
     totals.sub(&neg);
+    if ctx.keep_picks {
+        totals.changed = fused_picks(&ctx, &ai, &seen, &parts, PickList::Changed);
+        totals.removed = fused_picks(&ctx, &ai, &seen, &parts, PickList::Removed);
+    }
     Ok(FusedJoin {
         totals,
         ai,
         ctx,
         seen,
     })
+}
+
+/// Which of a part's two pick lists.
+#[derive(Clone, Copy)]
+enum PickList {
+    Changed,
+    Removed,
+}
+
+impl PickList {
+    fn of(self, part: &Part) -> (&[Pick], i64) {
+        match self {
+            PickList::Changed => (&part.changed, part.changed_total),
+            PickList::Removed => (&part.removed, part.removed_total),
+        }
+    }
+
+    fn take(self, part: &mut Part) -> Vec<Pick> {
+        match self {
+            PickList::Changed => std::mem::take(&mut part.changed),
+            PickList::Removed => std::mem::take(&mut part.removed),
+        }
+    }
+}
+
+/// The rows one list of the report keeps, from the fused sweep's parts.
+///
+/// The ordinary join's list is the first `cap + 1` rows to land in it, in file
+/// order, among the rows that are their key's first. Each sweep part kept its
+/// chunk's first `cap + 1`, repeats included, so dropping the repeats leaves
+/// every first row up to the last one the part held -- and if the part stopped
+/// keeping, the places the repeats held may belong to rows after that one.
+/// Those rows are joined again, from there until the list is full: a little of
+/// A read twice, against all of it.
+fn fused_picks(
+    ctx: &JoinCtx,
+    ai: &RowIndex,
+    seen: &[AtomicU64],
+    parts: &[SweptPart],
+    list: PickList,
+) -> Vec<Pick> {
+    let want = ctx.cap + 1;
+    // `later` is in file order: the insertion walks the rows in it.
+    let repeat = |row: usize| ai.later.binary_search(&(row as i32)).is_ok();
+    let data_len = ctx.a.slab.data().len();
+    let runs_len = ctx.runs.as_ref().map_or(0, Runs::len);
+    let mut out = Vec::new();
+    for swept in parts {
+        if out.len() >= want {
+            break;
+        }
+        let (held, total) = list.of(&swept.part);
+        for pick in held {
+            if out.len() >= want {
+                break;
+            }
+            if !repeat(pick.row as usize) {
+                out.push(*pick);
+            }
+        }
+        if out.len() >= want || total <= held.len() as i64 {
+            continue;
+        }
+        let from = held.last().map_or(swept.rows.start, |p| p.row as usize + 1);
+        let mut part = Part::blank(ctx.nc);
+        let mut scratch = RowScratch::new(ctx.width, runs_len);
+        for row in from..swept.rows.end {
+            if out.len() >= want {
+                break;
+            }
+            if repeat(row) {
+                continue;
+            }
+            join_row(
+                ctx,
+                &mut part,
+                &mut scratch,
+                row as i32,
+                ai.row_at[row] as usize,
+                row_end(ai, row as i32, data_len),
+                ai.row_hash[row],
+                row - swept.rows.start,
+                seen,
+            );
+            out.extend(list.take(&mut part));
+        }
+    }
+    out
 }
 
 /// The fused compare: B's index is built first on the full thread budget, then
@@ -2242,7 +2362,6 @@ fn compare_fused(
 ) -> Result<EngineResult> {
     let nc = resolved.compared.len();
     let exporting = opt.export_dir.is_some();
-    let keep_picks = opt.row_lists || exporting;
 
     // B first, on the full budget: its index is all the join needs from B.
     let b = b_input.project(wanted, key_size, total)?;
@@ -2252,9 +2371,9 @@ fn compare_fused(
     let fused = fused_join(&a, &b, &bi, opt, nc, total)?;
 
     let mut phases = Phases::new("");
-    let joined = if keep_picks {
-        // Forced by CSVDIFF_FUSED_JOIN with lists or exports: the ordinary
-        // join supplies the report, and the fused totals must agree with it.
+    let joined = if exporting {
+        // Only forced (`fused_active`): the ordinary join supplies the export,
+        // and the fused totals must agree with it.
         let check = join(
             &a,
             &fused.ai,
@@ -2280,8 +2399,8 @@ fn compare_fused(
         }
         check
     } else {
-        // Summary only: the fused totals are the join's A round.
-        join_tail(
+        // The fused totals and picks are the join's A round.
+        let joined = join_tail(
             &a,
             &fused.ai,
             &b,
@@ -2293,7 +2412,32 @@ fn compare_fused(
             &fused.ctx,
             &fused.seen,
             vec![fused.totals],
-        )?
+        )?;
+        if fused_forced() {
+            // How the tests reach this path: the ordinary join must agree,
+            // row lists included.
+            let check = join(
+                &a,
+                &fused.ai,
+                &b,
+                &bi,
+                opt,
+                &resolved.compared,
+                exporting,
+                total,
+            )?;
+            if joined.counts != check.counts
+                || joined.columns != check.columns
+                || joined.changed != check.changed
+                || joined.added != check.added
+                || joined.removed != check.removed
+            {
+                return Err(Error::new(
+                    "CSVDIFF_FUSED_JOIN: the join inside the sweep disagrees with the join after it",
+                ));
+            }
+        }
+        joined
     };
     phases.mark("fused join");
 
