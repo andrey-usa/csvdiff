@@ -631,11 +631,6 @@ impl RowIndex {
             .collect();
 
         let total: usize = chunks.iter().map(|c| c.at.len()).sum();
-        // The file has been read; what follows is the insertion of its `total`
-        // rows, on one thread.
-        if let Some(hook) = after_sweep {
-            hook(total);
-        }
         // Sized once for the rows about to be inserted, at about a two-thirds
         // load. Starting at four thousand and doubling meant twelve rehashes at
         // ten million rows, each one a full random-access pass over a table
@@ -708,7 +703,28 @@ impl RowIndex {
             dup_key_values: HashMap::new(),
             keep_dup_keys: opt.row_lists,
         };
-        if parallel_insert(total, threads) && idx.insert_parallel(side, key_size, opt, threads)? {
+        // The file has been read and what is left is the insertion. `after_sweep`
+        // starts reading the next file ahead, which fills memory with its
+        // pages; so it waits until this index has the memory it will write --
+        // the lists and the table above, and for the parallel insertion its
+        // key arrays too -- or every page the insertion touched would first
+        // have to be taken back from that reading. Called before them, B's
+        // insertion at 150M rows took 11.1s where it takes 5.9s alone.
+        let parallel = parallel_insert(total, threads);
+        let arrays = if parallel {
+            Some((
+                alloc::filled(0i32, total, "one row per distinct key")?,
+                alloc::filled(1u32, total, "one count per distinct key")?,
+            ))
+        } else {
+            None
+        };
+        if let Some(hook) = after_sweep {
+            hook(total);
+        }
+        if let Some(arrays) = arrays
+            && idx.insert_parallel(side, key_size, opt, threads, arrays)?
+        {
             phases.mark("index insert (parallel)");
             return Ok((idx, fparts));
         }
@@ -826,6 +842,7 @@ impl RowIndex {
         key_size: usize,
         opt: &Options,
         threads: usize,
+        (mut first_row, mut occurrences): (Vec<i32>, Vec<u32>),
     ) -> Result<bool> {
         let total = self.row_hash.len();
         let cap = self.table.len();
@@ -886,7 +903,10 @@ impl RowIndex {
 
         // `first_row` in file order: each thread fills the positions of a run
         // of bitmap words, which are a run of positions.
-        let mut first_row: Vec<i32> = alloc::filled(0, keys as usize, "one row per distinct key")?;
+        // `first_row` and `occurrences` came in one per row, written; there is a
+        // key per row at most.
+        first_row.truncate(keys as usize);
+        occurrences.truncate(keys as usize);
         {
             let ways = threads.max(1);
             let mut rest: &mut [i32] = &mut first_row;
@@ -952,8 +972,6 @@ impl RowIndex {
             }
         }
 
-        let mut occurrences: Vec<u32> =
-            alloc::filled(1, keys as usize, "one count per distinct key")?;
         let mut later = Vec::new();
         for region in regions_out {
             for (row, n) in region.counts {
