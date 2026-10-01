@@ -432,3 +432,81 @@ fn fused_kept_added_rows_match_the_ordinary_join() {
         }
     }
 }
+
+/// Runs the binary in `dir` with `env` added to its environment only -- not
+/// this process's, which the other tests share.
+fn run_with(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let out = Command::new(BIN)
+        .current_dir(dir)
+        .args(args)
+        .env_remove("CSVDIFF_FUSED_JOIN")
+        .env_remove("CSVDIFF_PARALLEL_INSERT")
+        .envs(env.iter().copied())
+        .output()
+        .expect("the binary");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The report's data, without what differs between two runs of the same
+/// comparison: the clock, and the time it was made.
+fn report_payload(path: &Path) -> String {
+    let html = fs::read_to_string(path).expect("the report");
+    let open = "<script id=\"payload\" type=\"application/json\">";
+    let start = html.find(open).expect("a plain payload") + open.len();
+    let end = start + html[start..].find("</script>").expect("the payload's end");
+    let mut doc: serde_json::Value = serde_json::from_str(&html[start..end]).expect("json");
+    if let Some(meta) = doc.get_mut("meta").and_then(|m| m.as_object_mut()) {
+        meta.remove("generated");
+        meta.remove("seconds");
+    }
+    doc.to_string()
+}
+
+#[test]
+fn the_parallel_insertion_builds_the_serial_index() {
+    // Forced at a size the threshold would leave serial, on four threads,
+    // through both the ordinary join and the one inside the sweep: the counts,
+    // the duplicate sections, and every row of the report must be the serial
+    // insertion's, repeated keys and all.
+    for fx in [Fixture::with_duplicates(), Fixture::with_early_repeats()] {
+        for fused in [false, true] {
+            let fused_env = if fused { "1" } else { "0" };
+            let args = [
+                "compare",
+                "a.csv",
+                "b.csv",
+                "-k",
+                "id",
+                "--threads",
+                "4",
+                "--max-rows",
+                "1000",
+                "--no-compress",
+                "-o",
+                "report.html",
+            ];
+            let (code, out, err) = run_with(&fx.0, &args, &[("CSVDIFF_FUSED_JOIN", fused_env)]);
+            assert!(code == 0 || code == 1, "serial run failed: {err}");
+            let serial = report_payload(&fx.path("report.html"));
+            let (pcode, pout, perr) = run_with(
+                &fx.0,
+                &args,
+                &[
+                    ("CSVDIFF_FUSED_JOIN", fused_env),
+                    ("CSVDIFF_PARALLEL_INSERT", "1"),
+                ],
+            );
+            assert_eq!(pcode, code, "parallel insertion, fused={fused}: {perr}");
+            assert_eq!(counts(&pout), counts(&out), "fused={fused}");
+            assert_eq!(
+                report_payload(&fx.path("report.html")),
+                serial,
+                "the parallel insertion's report differs, fused={fused}"
+            );
+        }
+    }
+}

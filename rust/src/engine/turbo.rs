@@ -415,6 +415,53 @@ fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
     }
 }
 
+/// From this many rows the key index is built on every thread
+/// (`RowIndex::insert_parallel`); below it the serial insertion takes well
+/// under a second and is left alone. `CSVDIFF_PARALLEL_INSERT=1` (set and not
+/// "0") takes the parallel insertion at any size, for the tests.
+const PARALLEL_INSERT_ROWS: usize = 1 << 20;
+
+/// The fewest slots a region of a parallel insertion is given.
+const MIN_REGION: usize = 64;
+
+fn parallel_insert(rows: usize, threads: usize) -> bool {
+    if threads < 2 {
+        return false;
+    }
+    let forced = std::env::var("CSVDIFF_PARALLEL_INSERT")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    forced || rows >= PARALLEL_INSERT_ROWS
+}
+
+/// One region's outcome in a parallel insertion: repeated keys' counts and
+/// values by their first row, the rows that repeated a key, and whether the
+/// region filled past what its probe can be trusted to end in.
+#[derive(Default)]
+struct Region {
+    counts: HashMap<i32, u32>,
+    dup_values: Vec<(i32, Vec<Val>)>,
+    later: Vec<i32>,
+    dup_keys: i64,
+    dup_rows: i64,
+    overfull: bool,
+}
+
+/// Starts the fetch of `part[slot]`, as `RowIndex::prefetch` does for a whole
+/// table.
+#[inline]
+fn prefetch_slot(part: &[u32], slot: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // Safety: the caller masks `slot` into `part`, and a prefetch has no
+    // architectural effect in any case.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(part.as_ptr().add(slot) as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (part, slot);
+}
+
 /// An empty table of `cap` slots, with the zeroes written rather than taken from
 /// the kernel.
 ///
@@ -485,6 +532,10 @@ struct RowIndex {
     pos_bits: u32,
     pos_mask: u32,
     mask: usize,
+    /// The slots a probe walks before it wraps: the whole table, or for an
+    /// index whose insertion ran in parallel, the region of the table its
+    /// key's home slot is in (`insert_parallel`).
+    region_mask: usize,
     /// The row that first carried each distinct key, in first-appearance order.
     first_row: Vec<i32>,
     occurrences: Vec<u32>,
@@ -532,14 +583,16 @@ impl RowIndex {
         ((word & self.pos_mask) - 1) as usize
     }
 
-    /// Finds and hashes every row in parallel, then inserts them on one thread in
-    /// file order.
+    /// Finds and hashes every row in parallel, then inserts them in file order.
     ///
     /// The split is safe because the two halves need different things: parsing a
     /// row depends on nothing but where it starts, while the table depends on the
     /// order rows arrive — first occurrence of a key wins, and the duplicate
-    /// counts follow from that. Doing the second half in parallel would make the
-    /// answer depend on thread scheduling.
+    /// counts follow from that. Handing rows to threads as they come would make
+    /// the answer depend on thread scheduling; past `PARALLEL_INSERT_ROWS` the
+    /// insertion is split by key instead (`insert_parallel`), each thread taking
+    /// every row of its own keys in file order, which leaves the answer the
+    /// serial one.
     fn build(
         side: &Side,
         key_size: usize,
@@ -638,8 +691,9 @@ impl RowIndex {
             pos_bits,
             pos_mask,
             mask: cap - 1,
-            first_row: alloc::sized(total, "one row per distinct key")?,
-            occurrences: alloc::sized(total, "one count per distinct key")?,
+            region_mask: cap - 1,
+            first_row: Vec::new(),
+            occurrences: Vec::new(),
             rows: 0,
             dup_keys: 0,
             dup_rows: 0,
@@ -648,6 +702,12 @@ impl RowIndex {
             dup_key_values: HashMap::new(),
             keep_dup_keys: opt.row_lists,
         };
+        if parallel_insert(total, threads) && idx.insert_parallel(side, key_size, opt, threads)? {
+            phases.mark("index insert (parallel)");
+            return Ok((idx, fparts));
+        }
+        idx.first_row = alloc::sized(total, "one row per distinct key")?;
+        idx.occurrences = alloc::sized(total, "one count per distinct key")?;
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
         for row in 0..total {
@@ -734,8 +794,281 @@ impl RowIndex {
                     }
                 }
             }
-            slot = (slot + 1) & self.mask;
+            slot = self.next(slot);
         }
+    }
+
+    /// Indexes every row on `threads` threads, each owning one region of the
+    /// table: a key's region is fixed by its home slot, so each thread sees
+    /// all the rows of its own keys, in file order, and the first occurrence
+    /// still wins -- the answer is the serial insertion's, `first_row` and
+    /// `occurrences` included. Only the probe changes: it wraps at the end of
+    /// its region (`next`).
+    ///
+    /// During the insertion a slot holds its key's first row rather than a
+    /// position in `first_row`, so the threads need no list of their own; the
+    /// rows that start a key are marked in a bitmap, and once every thread is
+    /// done a key's position is how many marks come before its row -- which
+    /// gives `first_row` in file order, and each slot its position.
+    ///
+    /// Returns `false`, the table emptied again, if a region filled past nine
+    /// tenths: the keys' hashes are not spread, and the serial insertion,
+    /// which can grow the table, takes over.
+    fn insert_parallel(
+        &mut self,
+        side: &Side,
+        key_size: usize,
+        opt: &Options,
+        threads: usize,
+    ) -> Result<bool> {
+        let total = self.row_hash.len();
+        let cap = self.table.len();
+        let mut regions = 1usize;
+        while regions * 2 <= threads && cap / (regions * 2) >= MIN_REGION {
+            regions *= 2;
+        }
+        if regions < 2 {
+            return Ok(false);
+        }
+        let size = cap / regions;
+        let shift = size.trailing_zeros();
+        let firsts: Vec<AtomicU64> = std::iter::repeat_with(|| AtomicU64::new(0))
+            .take(total.div_ceil(64))
+            .collect();
+
+        let mut table = std::mem::take(&mut self.table);
+        let outs = {
+            let parts: Vec<std::sync::Mutex<Option<&mut [u32]>>> = table
+                .chunks_mut(size)
+                .map(|c| std::sync::Mutex::new(Some(c)))
+                .collect();
+            let this = &*self;
+            let firsts = &firsts;
+            in_parallel(regions, |r| {
+                let part = parts[r]
+                    .lock()
+                    .ok()
+                    .and_then(|mut p| p.take())
+                    .ok_or_else(|| Error::new("an index region taken twice"))?;
+                this.insert_region(side, key_size, opt, r, regions, shift, part, firsts)
+            })
+        };
+        let mut regions_out = Vec::with_capacity(outs.len());
+        for out in outs {
+            regions_out.push(out?);
+        }
+        if regions_out.iter().any(|r| r.overfull) {
+            table.fill(EMPTY_SLOT);
+            self.table = table;
+            return Ok(false);
+        }
+
+        // A key's position: the marks before its first row.
+        let words: Vec<u64> = firsts.into_iter().map(AtomicU64::into_inner).collect();
+        let mut before: Vec<u32> = alloc::sized(words.len() + 1, "the key positions")?;
+        let mut keys = 0u32;
+        for w in &words {
+            before.push(keys);
+            keys += w.count_ones();
+        }
+        before.push(keys);
+        let position = |row: usize| -> usize {
+            let w = row >> 6;
+            let below = words[w] & ((1u64 << (row & 63)) - 1);
+            (before[w] + below.count_ones()) as usize
+        };
+
+        // `first_row` in file order: each thread fills the positions of a run
+        // of bitmap words, which are a run of positions.
+        let mut first_row: Vec<i32> = alloc::filled(0, keys as usize, "one row per distinct key")?;
+        {
+            let ways = threads.max(1);
+            let mut rest: &mut [i32] = &mut first_row;
+            let mut runs = Vec::with_capacity(ways);
+            let mut lo = 0usize;
+            for t in 0..ways {
+                let hi = words.len() * (t + 1) / ways;
+                let len = (before[hi] - before[lo]) as usize;
+                let (run, tail) = rest.split_at_mut(len);
+                runs.push(std::sync::Mutex::new(Some((lo, hi, run))));
+                rest = tail;
+                lo = hi;
+            }
+            let words = &words;
+            let done = in_parallel(ways, |t| {
+                let (lo, hi, run) = runs[t]
+                    .lock()
+                    .ok()
+                    .and_then(|mut r| r.take())
+                    .ok_or_else(|| Error::new("a run of keys taken twice"))?;
+                let mut at = 0usize;
+                for (w, &bits) in words[lo..hi].iter().enumerate() {
+                    let mut bits = bits;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        run[at] = (((lo + w) << 6) | bit) as i32;
+                        at += 1;
+                        bits &= bits - 1;
+                    }
+                }
+                Ok(())
+            });
+            for d in done {
+                d?;
+            }
+        }
+
+        // Each slot's row becomes its key's position.
+        {
+            let pos_mask = self.pos_mask;
+            let ways = threads.max(1);
+            let span = cap.div_ceil(ways);
+            let parts: Vec<std::sync::Mutex<Option<&mut [u32]>>> = table
+                .chunks_mut(span)
+                .map(|c| std::sync::Mutex::new(Some(c)))
+                .collect();
+            let done = in_parallel(parts.len(), |t| {
+                let part = parts[t]
+                    .lock()
+                    .ok()
+                    .and_then(|mut p| p.take())
+                    .ok_or_else(|| Error::new("an index region taken twice"))?;
+                for word in part.iter_mut() {
+                    if *word != EMPTY_SLOT {
+                        let row = ((*word & pos_mask) - 1) as usize;
+                        *word = (*word & !pos_mask) | (position(row) as u32 + 1);
+                    }
+                }
+                Ok(())
+            });
+            for d in done {
+                d?;
+            }
+        }
+
+        let mut occurrences: Vec<u32> =
+            alloc::filled(1, keys as usize, "one count per distinct key")?;
+        let mut later = Vec::new();
+        for region in regions_out {
+            for (row, n) in region.counts {
+                occurrences[position(row as usize)] = n;
+            }
+            for (row, values) in region.dup_values {
+                self.dup_key_values
+                    .insert(position(row as usize) as u32, values);
+            }
+            self.dup_keys += region.dup_keys;
+            self.dup_rows += region.dup_rows;
+            if later.is_empty() {
+                later = region.later;
+            } else {
+                alloc::grow(&mut later, region.later.len(), "a repeated key's row")?;
+                later.extend_from_slice(&region.later);
+            }
+        }
+        later.sort_unstable();
+
+        self.table = table;
+        self.region_mask = size - 1;
+        self.first_row = first_row;
+        self.occurrences = occurrences;
+        self.later = later;
+        self.rows = total as i64;
+        Ok(true)
+    }
+
+    /// One region's share of `insert_parallel`: every row whose key's home
+    /// slot is in region `r` (of `regions`, each `1 << shift` slots), in file
+    /// order, into `part`, that region's slots. A slot holds its key's first
+    /// row; `firsts` marks those rows.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_region(
+        &self,
+        side: &Side,
+        key_size: usize,
+        opt: &Options,
+        r: usize,
+        regions: usize,
+        shift: u32,
+        part: &mut [u32],
+        firsts: &[AtomicU64],
+    ) -> Result<Region> {
+        let mut out = Region::default();
+        let region_mask = part.len() - 1;
+        let full = part.len() / 10 * 9;
+        let mut keys = 0usize;
+        let mut probe = vec![ABSENT; side.width];
+        let mut mine = vec![ABSENT; side.width];
+        // Only one row in `regions` is this region's, so look that much
+        // further ahead for the next line to fetch.
+        let ahead = PREFETCH_AHEAD * regions;
+        for row in 0..self.row_hash.len() {
+            let hash = self.row_hash[row];
+            let home = self.slot(hash);
+            if let Some(&soon) = self.row_hash.get(row + ahead) {
+                let s = self.slot(soon);
+                if s >> shift == r {
+                    prefetch_slot(part, s & region_mask);
+                }
+            }
+            if home >> shift != r {
+                continue;
+            }
+            let mut slot = home & region_mask;
+            let mut mine_parsed = false;
+            loop {
+                let word = part[slot];
+                if word == EMPTY_SLOT {
+                    part[slot] = self.slot_for(hash, row);
+                    firsts[row >> 6].fetch_or(1 << (row & 63), Ordering::Relaxed);
+                    keys += 1;
+                    if keys > full {
+                        out.overfull = true;
+                        return Ok(out);
+                    }
+                    break;
+                }
+                if self.tag_is(word, hash) {
+                    let candidate = self.pos_of(word);
+                    if self.row_hash[candidate] == hash {
+                        if !mine_parsed {
+                            side.keys_at(self.row_at[row], key_size, &mut mine);
+                            mine_parsed = true;
+                        }
+                        side.keys_at(self.row_at[candidate], key_size, &mut probe);
+                        if (0..key_size)
+                            .all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt))
+                        {
+                            let n = out.counts.entry(candidate as i32).or_insert(1);
+                            *n += 1;
+                            if *n == 2 {
+                                out.dup_keys += 1;
+                                out.dup_rows += 1; // the first occurrence counts once the key repeats
+                                if self.keep_dup_keys {
+                                    let values: Option<Vec<Val>> = probe[..key_size]
+                                        .iter()
+                                        .map(|f| {
+                                            value_checked(&side.slab, *f, opt, "a duplicated key")
+                                                .ok()
+                                        })
+                                        .collect();
+                                    if let Some(values) = values {
+                                        out.dup_values.push((candidate as i32, values));
+                                    }
+                                }
+                            }
+                            out.dup_rows += 1;
+                            if self.track_later {
+                                alloc::push(&mut out.later, row as i32, "a repeated key's row")?;
+                            }
+                            break;
+                        }
+                    }
+                }
+                slot = (slot + 1) & region_mask;
+            }
+        }
+        Ok(out)
     }
 
     fn fields_of(&self, side: &Side, row: i32, out: &mut [Field]) {
@@ -749,6 +1082,13 @@ impl RowIndex {
     fn slot(&self, hash: u64) -> usize {
         // The high bits of an FNV hash are the well-mixed ones; fold them down.
         ((hash ^ (hash >> 32)) as usize) & self.mask
+    }
+
+    /// The slot a probe tries after `slot`: the next one, wrapping at the end
+    /// of `slot`'s region rather than the table's. One region is the table.
+    #[inline]
+    fn next(&self, slot: usize) -> usize {
+        (slot & !self.region_mask) | ((slot + 1) & self.region_mask)
     }
 
     /// Starts the fetch of the slot `hash` will land in, without waiting for it.
@@ -777,12 +1117,13 @@ impl RowIndex {
         let size = self.table.len() * 2;
         self.table = empty_table(size)?;
         self.mask = size - 1;
+        self.region_mask = self.mask;
         for key in 0..self.first_row.len() {
             let row = self.first_row[key];
             let hash = self.row_hash[row as usize];
             let mut slot = self.slot(hash);
             while self.table[slot] != EMPTY_SLOT {
-                slot = (slot + 1) & self.mask;
+                slot = self.next(slot);
             }
             self.table[slot] = self.slot_for(hash, key);
         }
@@ -850,7 +1191,7 @@ impl RowIndex {
                     }
                 }
             }
-            slot = (slot + 1) & self.mask;
+            slot = self.next(slot);
         }
     }
 
