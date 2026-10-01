@@ -131,6 +131,38 @@ impl Fixture {
         Fixture(dir)
     }
 
+    /// Past the chunking threshold, so four threads sweep four chunks, with a
+    /// repeat after every third key: changed, and removed where the key is
+    /// missing from B. Each part's first picks include repeats, so the report's
+    /// lists need the repeats dropped, the places they held refilled, and the
+    /// rows of every chunk after the first numbered past the ones before it.
+    fn with_early_repeats() -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "csvdiff-fused-lists-{}-{}",
+            std::process::id(),
+            fixture_id()
+        ));
+        fs::create_dir_all(&dir).expect("a temp directory");
+        let mut a = String::from("id,v,w\n");
+        let mut b = String::from("id,v,w\n");
+        for i in 0..300_000 {
+            a.push_str(&format!("{i},a{i},x\n"));
+            if i % 3 == 0 {
+                a.push_str(&format!("{i},rep{i},y\n"));
+            }
+            if i % 7 != 0 {
+                let v = if i % 2 == 0 { 'b' } else { 'a' };
+                b.push_str(&format!("{i},{v}{i},x\n"));
+            }
+        }
+        for i in 300_000..300_050 {
+            b.push_str(&format!("{i},n,x\n"));
+        }
+        fs::write(dir.join("a.csv"), a).expect("a.csv");
+        fs::write(dir.join("b.csv"), b).expect("b.csv");
+        Fixture(dir)
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
@@ -305,4 +337,36 @@ fn normalisation_still_takes_the_ordinary_path() {
     let (fcode, fout, ferr) = run(&fx.0, &args, true);
     assert_eq!(fcode, code, "run failed: {ferr}");
     assert_eq!(counts(&fout), counts(&out));
+}
+
+#[test]
+fn fused_row_lists_match_the_ordinary_join() {
+    let fx = Fixture::with_early_repeats();
+    // Forced, the run also joins after the sweep and fails unless the report's
+    // rows agree: the caps cut inside the first part (10), past it (50000,
+    // the default), and past every list (200000).
+    for threads in ["1", "4"] {
+        for max_rows in ["10", "50000", "200000"] {
+            let args = [
+                "compare",
+                "a.csv",
+                "b.csv",
+                "-k",
+                "id",
+                "--threads",
+                threads,
+                "--max-rows",
+                max_rows,
+                "-o",
+                "report.html",
+            ];
+            let (code, out, _) = run(&fx.0, &args, false);
+            let (fcode, fout, ferr) = run(&fx.0, &args, true);
+            assert_eq!(
+                fcode, code,
+                "fused lists, --threads {threads} --max-rows {max_rows}: {ferr}"
+            );
+            assert_eq!(counts(&fout), counts(&out));
+        }
+    }
 }
