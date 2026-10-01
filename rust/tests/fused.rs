@@ -441,6 +441,7 @@ fn run_with(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, St
         .args(args)
         .env_remove("CSVDIFF_FUSED_JOIN")
         .env_remove("CSVDIFF_PARALLEL_INSERT")
+        .env_remove("CSVDIFF_NARROW_HASH")
         .envs(env.iter().copied())
         .output()
         .expect("the binary");
@@ -492,21 +493,35 @@ fn the_parallel_insertion_builds_the_serial_index() {
             let (code, out, err) = run_with(&fx.0, &args, &[("CSVDIFF_FUSED_JOIN", fused_env)]);
             assert!(code == 0 || code == 1, "serial run failed: {err}");
             let serial = report_payload(&fx.path("report.html"));
-            let (pcode, pout, perr) = run_with(
-                &fx.0,
-                &args,
-                &[
-                    ("CSVDIFF_FUSED_JOIN", fused_env),
-                    ("CSVDIFF_PARALLEL_INSERT", "1"),
-                ],
-            );
-            assert_eq!(pcode, code, "parallel insertion, fused={fused}: {perr}");
-            assert_eq!(counts(&pout), counts(&out), "fused={fused}");
-            assert_eq!(
-                report_payload(&fx.path("report.html")),
-                serial,
-                "the parallel insertion's report differs, fused={fused}"
-            );
+            // Narrowed, different keys share a hash: the parallel insertion
+            // takes such a match for a repeat until it proves it, finds it is
+            // not, and leaves the index to the serial insertion, which tells
+            // the keys apart -- as the join after it must.
+            for narrow in ["", "10"] {
+                let (pcode, pout, perr) = run_with(
+                    &fx.0,
+                    &args,
+                    &[
+                        ("CSVDIFF_FUSED_JOIN", fused_env),
+                        ("CSVDIFF_PARALLEL_INSERT", "1"),
+                        ("CSVDIFF_NARROW_HASH", narrow),
+                    ],
+                );
+                assert_eq!(
+                    pcode, code,
+                    "parallel, fused={fused} narrow={narrow:?}: {perr}"
+                );
+                assert_eq!(
+                    counts(&pout),
+                    counts(&out),
+                    "fused={fused} narrow={narrow:?}"
+                );
+                assert_eq!(
+                    report_payload(&fx.path("report.html")),
+                    serial,
+                    "the parallel insertion's report differs, fused={fused} narrow={narrow:?}"
+                );
+            }
         }
     }
 }
