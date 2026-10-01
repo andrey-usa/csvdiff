@@ -190,7 +190,7 @@ jobs:
           # ports never produce; without it the phase times include report work.
           echo "--- phase breakdown ---" | tee -a "out/ceiling-${{ matrix.port }}-${{ matrix.size }}.txt"
           PHASE_FLAGS=""
-          if [ "${{ matrix.port }}" = "rust" ]; then PHASE_FLAGS="--summary"; fi
+          if [ "${{ matrix.port }}" = "rust" ]; then PHASE_FLAGS="--json $RUNNER_TEMP/probe.json -o $RUNNER_TEMP/probe.html"; fi
           CSVDIFF_PHASES=1 "$BIN" compare \
               "$RUNNER_TEMP/scale/${{ matrix.size }}_a.csv" "$RUNNER_TEMP/scale/${{ matrix.size }}_b.csv" \
               -k account_id,txn_id --threads "$(nproc)" $PHASE_FLAGS \
