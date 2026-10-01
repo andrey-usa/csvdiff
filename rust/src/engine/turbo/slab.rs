@@ -66,6 +66,22 @@ impl Slab {
         })
     }
 
+    /// Asks for `len` bytes at `from` to be read in, and returns without
+    /// waiting for them. A hint only: bytes already in memory, and bytes not
+    /// mapped from a file, make it a no-op.
+    pub(super) fn will_need(&self, from: usize, len: usize) {
+        #[cfg(unix)]
+        if let Bytes::Mapped { map, .. } = &self.bytes {
+            let from = from.min(map.len());
+            let len = len.min(map.len() - from);
+            if len > 0 {
+                let _ = map.advise_range(memmap2::Advice::WillNeed, from, len);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (from, len);
+    }
+
     /// A slab over bytes this process built: the Parquet reader's arena.
     pub(super) fn owned(data: Vec<u8>, dialect: Dialect) -> Self {
         Slab {

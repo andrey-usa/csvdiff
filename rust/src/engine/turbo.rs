@@ -372,7 +372,25 @@ fn key_hash(slab: &Slab, fields: &[Field], key_size: usize, opt: &Options) -> u6
     for f in &fields[..key_size] {
         h = hash_field(slab, *f, opt, normalise, h);
     }
-    h
+    match narrow_hash() {
+        Some(mask) => {
+            let x = ((h & mask) + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^ (x >> 29)
+        }
+        None => h,
+    }
+}
+
+/// `CSVDIFF_NARROW_HASH=<bits>` folds every key's hash into one of `1 << bits`
+/// values, still spread over the table, so that different keys share a full
+/// hash. It is how the tests reach the code that tells such keys apart, which
+/// real 64-bit hashes reach about never. Read once.
+fn narrow_hash() -> Option<u64> {
+    static MASK: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let bits: u32 = std::env::var("CSVDIFF_NARROW_HASH").ok()?.parse().ok()?;
+        (bits < 64).then(|| (1u64 << bits) - 1)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +463,9 @@ struct Region {
     dup_keys: i64,
     dup_rows: i64,
     overfull: bool,
+    /// A pair of rows whose hashes matched turned out to hold different keys:
+    /// the region took one for the other, so its insertion is not the answer.
+    unproven: bool,
 }
 
 /// Starts the fetch of `part[slot]`, as `RowIndex::prefetch` does for a whole
@@ -927,7 +948,7 @@ impl RowIndex {
         for out in outs {
             regions_out.push(out?);
         }
-        if regions_out.iter().any(|r| r.overfull) {
+        if regions_out.iter().any(|r| r.overfull || r.unproven) {
             table.fill(EMPTY_SLOT);
             self.table = table;
             return Ok(false);
@@ -1070,6 +1091,17 @@ impl RowIndex {
         let mut keys = 0usize;
         let mut probe = vec![ABSENT; side.width];
         let mut mine = vec![ABSENT; side.width];
+        // Rows whose hash matched an earlier key's in full, each with that
+        // key's first row, and the first rows whose key has just repeated.
+        // Proving a match reads both rows' keys from the file, and a repeated
+        // key is anywhere in it -- past memory, a read from the disk each. So
+        // their pages are asked for when the match is found and the keys
+        // compared after the loop, when those reads have long finished,
+        // rather than the region waiting on each in turn: with the next
+        // file's read-ahead queued on the disk, 7,500 such waits took B's
+        // insertion at 150M rows from 4.6s to 10.2s.
+        let mut matched: Vec<(usize, usize)> = Vec::new();
+        let mut repeated: Vec<usize> = Vec::new();
         // Only one row in `regions` is this region's, so look that much
         // further ahead for the next line to fetch.
         let ahead = PREFETCH_AHEAD * regions;
@@ -1086,7 +1118,6 @@ impl RowIndex {
                 continue;
             }
             let mut slot = home & region_mask;
-            let mut mine_parsed = false;
             loop {
                 let word = part[slot];
                 if word == EMPTY_SLOT {
@@ -1102,41 +1133,49 @@ impl RowIndex {
                 if self.tag_is(word, hash) {
                     let candidate = self.pos_of(word);
                     if self.row_hash[candidate] == hash {
-                        if !mine_parsed {
-                            side.keys_at(self.row_at[row], key_size, &mut mine);
-                            mine_parsed = true;
-                        }
-                        side.keys_at(self.row_at[candidate], key_size, &mut probe);
-                        if (0..key_size)
-                            .all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt))
-                        {
-                            let n = out.counts.entry(candidate as i32).or_insert(1);
-                            *n += 1;
-                            if *n == 2 {
-                                out.dup_keys += 1;
-                                out.dup_rows += 1; // the first occurrence counts once the key repeats
-                                if self.keep_dup_keys {
-                                    let values: Option<Vec<Val>> = probe[..key_size]
-                                        .iter()
-                                        .map(|f| {
-                                            value_checked(&side.slab, *f, opt, "a duplicated key")
-                                                .ok()
-                                        })
-                                        .collect();
-                                    if let Some(values) = values {
-                                        out.dup_values.push((candidate as i32, values));
-                                    }
-                                }
+                        // Taken as the same key now, proved below.
+                        side.slab.will_need(self.row_at[row] as usize, PAGE);
+                        side.slab.will_need(self.row_at[candidate] as usize, PAGE);
+                        alloc::push(&mut matched, (row, candidate), "a matched row")?;
+                        let n = out.counts.entry(candidate as i32).or_insert(1);
+                        *n += 1;
+                        if *n == 2 {
+                            out.dup_keys += 1;
+                            out.dup_rows += 1; // the first occurrence counts once the key repeats
+                            if self.keep_dup_keys {
+                                alloc::push(&mut repeated, candidate, "a repeated key")?;
                             }
-                            out.dup_rows += 1;
-                            if self.track_later {
-                                alloc::push(&mut out.later, row as i32, "a repeated key's row")?;
-                            }
-                            break;
                         }
+                        out.dup_rows += 1;
+                        if self.track_later {
+                            alloc::push(&mut out.later, row as i32, "a repeated key's row")?;
+                        }
+                        break;
                     }
                 }
                 slot = (slot + 1) & region_mask;
+            }
+        }
+
+        // Equal 64-bit hashes over different keys: never seen, but possible,
+        // and then the serial insertion, which proves each match before it
+        // takes it, has the answer.
+        for &(row, candidate) in &matched {
+            side.keys_at(self.row_at[row], key_size, &mut mine);
+            side.keys_at(self.row_at[candidate], key_size, &mut probe);
+            if !(0..key_size).all(|i| same(&side.slab, probe[i], &side.slab, mine[i], opt)) {
+                out.unproven = true;
+                return Ok(out);
+            }
+        }
+        for candidate in repeated {
+            side.keys_at(self.row_at[candidate], key_size, &mut probe);
+            let values: Option<Vec<Val>> = probe[..key_size]
+                .iter()
+                .map(|f| value_checked(&side.slab, *f, opt, "a duplicated key").ok())
+                .collect();
+            if let Some(values) = values {
+                out.dup_values.push((candidate as i32, values));
             }
         }
         Ok(out)
