@@ -163,6 +163,37 @@ impl Fixture {
         Fixture(dir)
     }
 
+    /// Past the chunking threshold, with B's added rows interleaved among the
+    /// rows A has -- one after every five hundredth -- rather than at the end:
+    /// the sweep keeps the rows its matches skip over, and these are them.
+    fn with_interleaved_additions() -> Fixture {
+        let dir = std::env::temp_dir().join(format!(
+            "csvdiff-fused-added-{}-{}",
+            std::process::id(),
+            fixture_id()
+        ));
+        fs::create_dir_all(&dir).expect("a temp directory");
+        let mut a = String::from("id,v,w\n");
+        let mut b = String::from("id,v,w\n");
+        for i in 0..300_000 {
+            let k = 2 * i;
+            a.push_str(&format!("{k},a{k},x\n"));
+            if i % 997 == 5 {
+                a.push_str(&format!("{k},rep{k},y\n"));
+            }
+            if i % 1000 != 7 {
+                let v = if i % 17 == 0 { 'b' } else { 'a' };
+                b.push_str(&format!("{k},{v}{k},x\n"));
+            }
+            if i % 500 == 3 {
+                b.push_str(&format!("{},new{},z\n", k + 1, k + 1));
+            }
+        }
+        fs::write(dir.join("a.csv"), a).expect("a.csv");
+        fs::write(dir.join("b.csv"), b).expect("b.csv");
+        Fixture(dir)
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
@@ -365,6 +396,37 @@ fn fused_row_lists_match_the_ordinary_join() {
             assert_eq!(
                 fcode, code,
                 "fused lists, --threads {threads} --max-rows {max_rows}: {ferr}"
+            );
+            assert_eq!(counts(&fout), counts(&out));
+        }
+    }
+}
+
+#[test]
+fn fused_kept_added_rows_match_the_ordinary_join() {
+    let fx = Fixture::with_interleaved_additions();
+    // Forced, the run fails unless every row of the report -- the added ones
+    // decoded from what the sweep kept -- agrees with the join after it.
+    for threads in ["1", "4"] {
+        for max_rows in ["10", "50000"] {
+            let args = [
+                "compare",
+                "a.csv",
+                "b.csv",
+                "-k",
+                "id",
+                "--threads",
+                threads,
+                "--max-rows",
+                max_rows,
+                "-o",
+                "report.html",
+            ];
+            let (code, out, _) = run(&fx.0, &args, false);
+            let (fcode, fout, ferr) = run(&fx.0, &args, true);
+            assert_eq!(
+                fcode, code,
+                "kept added rows, --threads {threads} --max-rows {max_rows}: {ferr}"
             );
             assert_eq!(counts(&fout), counts(&out));
         }

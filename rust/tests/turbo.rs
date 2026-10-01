@@ -804,3 +804,25 @@ fn the_json_byte_proof_skips_an_ignored_middle_value() {
         assert_eq!(changed_json(&row(na, aa), &row(nb, ab)), want, "{what}");
     }
 }
+
+/// Repeated composite keys on both sides, with keys whose columns differ: the
+/// duplicate sections carry each key's values as the insertion decoded them
+/// when it found the repeat, and those must be the values in key order, the
+/// same the reference engine reads.
+#[test]
+fn duplicate_sections_carry_the_whole_key_in_order() {
+    let mut a = String::from("region,acct,v\n");
+    let mut b = String::from("region,acct,v\n");
+    for i in 0..40 {
+        a.push_str(&format!("r{},a{i},x{i}\n", i % 3));
+        b.push_str(&format!("r{},a{i},y{i}\n", i % 3));
+    }
+    for i in (0..40).step_by(4) {
+        a.push_str(&format!("r{},a{i},again{i}\n", i % 3));
+    }
+    for i in (0..40).step_by(5) {
+        b.push_str(&format!("r{},a{i},again{i}\n", i % 3));
+        b.push_str(&format!("r{},a{i},thrice{i}\n", i % 3));
+    }
+    agrees(&a, &b, &["region", "acct"], false, false);
+}
