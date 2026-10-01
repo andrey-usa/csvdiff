@@ -145,12 +145,15 @@ fn escaped_script_text(s: &str) -> Result<String> {
     String::from_utf8(out).map_err(|_| Error::new("the report payload is not UTF-8"))
 }
 
-/// Deflate blocks, one megabyte of payload each.
+/// Deflate blocks, a quarter of a megabyte of payload each.
 ///
 /// Sized by the payload rather than by the thread count on purpose: the same
 /// input then produces the same bytes on any machine, which a block per core
-/// would not.
-const BLOCK: usize = 1 << 20;
+/// would not. A quarter rather than a whole megabyte so that the blocks share
+/// out evenly: the six-megabyte payload of a fifty-thousand-row report was six
+/// blocks over four cores, two rounds of which the second was half idle --
+/// 65ms of gzip where a quarter megabyte takes 45ms, for 1% more bytes.
+const BLOCK: usize = 1 << 18;
 
 /// Gzips `raw` on every core.
 ///
