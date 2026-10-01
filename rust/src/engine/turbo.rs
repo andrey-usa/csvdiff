@@ -43,7 +43,7 @@ mod thrift;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
@@ -547,6 +547,7 @@ impl RowIndex {
         threads: usize,
         tag: &'static str,
         sink: Option<&RowSink<'_>>,
+        after_sweep: Option<&(dyn Fn(usize) + Sync)>,
     ) -> Result<(Self, Vec<SweptPart>)> {
         let mut phases = Phases::new(tag);
         let (mut chunks, fparts) = sweep(side, key_size, opt, threads, sink)?;
@@ -577,6 +578,11 @@ impl RowIndex {
             .collect();
 
         let total: usize = chunks.iter().map(|c| c.at.len()).sum();
+        // The file has been read; what follows is the insertion of its `total`
+        // rows, on one thread.
+        if let Some(hook) = after_sweep {
+            hook(total);
+        }
         // Sized once for the rows about to be inserted, at about a two-thirds
         // load. Starting at four thousand and doubling meant twelve rehashes at
         // ten million rows, each one a full random-access pass over a table
@@ -2395,7 +2401,7 @@ fn fused_join<'x>(
         nc,
         keep_rows: ctx.keep_picks,
     };
-    let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink))?;
+    let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink), None)?;
 
     // The rows that turned out to repeat a key were joined as though first;
     // join them again and subtract. Re-marking the same seen bits changes
@@ -2578,6 +2584,45 @@ fn fused_picks(
     out
 }
 
+/// Bytes of A to read ahead per row of B while B's rows are inserted: the
+/// insertion takes about 50ns a row at 150M rows, and the runners' disks read
+/// 300-400 MB/s, so about 16 bytes a row is what the disk reads in the time
+/// the insertion takes.
+const READ_AHEAD_PER_ROW: usize = 16;
+
+/// The step each chunk's read-ahead is asked for in, round-robin across the
+/// chunks so that every chunk's start arrives early, not the first chunk's
+/// whole share.
+const READ_AHEAD_STEP: usize = 64 << 20;
+
+/// Starts reading the first bytes of each of A's sweep chunks, as many as the
+/// disk reads while `rows` rows are inserted, never more than half the file,
+/// and nothing more once `stop` is set.
+/// The chunks are where `chunk_bounds` will start them, near enough: the
+/// guessed split is the next newline after each even division.
+fn read_ahead(a: &Side, rows: usize, threads: usize, stop: &AtomicBool) {
+    let Rows::Text { from, .. } = &a.rows else {
+        return;
+    };
+    let size = a.slab.data().len();
+    if *from >= size {
+        return;
+    }
+    let ways = threads.max(1);
+    let span = size - from;
+    let budget = rows.saturating_mul(READ_AHEAD_PER_ROW).min(span / 2);
+    let each = budget / ways;
+    let mut done = 0usize;
+    while done < each && !stop.load(Ordering::Relaxed) {
+        let step = READ_AHEAD_STEP.min(each - done);
+        for i in 0..ways {
+            let start = from + span * i / ways;
+            a.slab.will_need(start + done, step);
+        }
+        done += step;
+    }
+}
+
 /// The fused compare: B's index is built first on the full thread budget, then
 /// A's sweep joins each row as it finds it.
 #[allow(clippy::too_many_arguments)]
@@ -2596,10 +2641,30 @@ fn compare_fused(
     let exporting = opt.export_dir.is_some();
 
     // B first, on the full budget: its index is all the join needs from B.
-    let b = b_input.project(wanted, key_size, total)?;
-    let (bi, _) = RowIndex::build(&b, key_size, opt, total, "B ", None)?;
     // A projected on the full budget too; its sweep joins as it goes.
+    let b = b_input.project(wanted, key_size, total)?;
     let a = a_input.project(wanted, key_size, total)?;
+    // While B's rows are inserted, on one thread, nothing reads the disk: A's
+    // sweep cannot start until B's index is whole. So the reads A's sweep will
+    // begin with are started then, by a thread that only asks for them.
+    let stop = AtomicBool::new(false);
+    let (bi, _) = std::thread::scope(|scope| {
+        let (go, wait) = std::sync::mpsc::channel::<usize>();
+        let (a, stop) = (&a, &stop);
+        scope.spawn(move || {
+            if let Ok(rows) = wait.recv() {
+                read_ahead(a, rows, total, stop);
+            }
+        });
+        let start = move |rows: usize| {
+            let _ = go.send(rows);
+        };
+        let built = RowIndex::build(&b, key_size, opt, total, "B ", None, Some(&start));
+        // A's sweep starts now and reads for itself; the read-ahead stops at
+        // its next step rather than queue reads the sweep is already making.
+        stop.store(true, Ordering::Relaxed);
+        built
+    })?;
     let fused = fused_join(&a, &b, &bi, opt, nc, total)?;
 
     let mut phases = Phases::new("");
@@ -2930,7 +2995,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let per_file = (total / 2).max(1);
     let prepare = |input: Input, tag: &'static str| -> Result<(Side, RowIndex)> {
         let side = input.project(&wanted, key_size, per_file)?;
-        let (index, _) = RowIndex::build(&side, key_size, opt, per_file, tag, None)?;
+        let (index, _) = RowIndex::build(&side, key_size, opt, per_file, tag, None, None)?;
         Ok((side, index))
     };
     let b_held = parallel::Once::new(b_input);
