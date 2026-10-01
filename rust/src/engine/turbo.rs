@@ -2120,7 +2120,15 @@ fn join_row(
         Missed,
         Skipped,
     }
-    let fast = if let (Some(runs), Some((delimiter, _))) = (&ctx.runs, ctx.guard) {
+    // The byte proof is worth its scan where rows repeat themselves; where
+    // they really differ every attempt fails and costs a scan, a probe and a
+    // compare before the parse that was always coming. So after
+    // `PROOF_BACKOFF` failures in a row it is tried once every
+    // `PROOF_BACKOFF` rows, and a success resumes it -- as C, C++ and Zig do.
+    let attempt = scratch.refused < PROOF_BACKOFF || k & (PROOF_BACKOFF - 1) == 0;
+    let fast = if !attempt {
+        Fast::Skipped
+    } else if let (Some(runs), Some((delimiter, _))) = (&ctx.runs, ctx.guard) {
         let data = ctx.a.slab.data();
         if runs.of_row(data, from, end, delimiter, &mut scratch.spans) {
             // No fields and no span: the first candidate whose whole
@@ -2179,6 +2187,14 @@ fn join_row(
         Fast::Skipped
     };
     match fast {
+        Fast::Proved(_) => scratch.refused = 0,
+        Fast::Unproven => scratch.refused = (scratch.refused + 1).min(PROOF_BACKOFF),
+        Fast::Missed | Fast::Skipped => {}
+    }
+    // An unproven candidate has had its bytes compared already, over the
+    // same span the parsed row would offer: asking again cannot succeed.
+    let proof_again = attempt && !matches!(fast, Fast::Unproven);
+    match fast {
         Fast::Proved(mate) => {
             out.matched += 1;
             mark_seen(seen, mate);
@@ -2206,24 +2222,27 @@ fn join_row(
     // A's row up to the end of the last column either file wants. The
     // end has to be a boundary in A as well: a quoted field ends on its
     // closing quote, and what follows is not part of the run.
-    let csv_span = ctx.span_tail.and_then(|(slot, delimiter, _)| {
-        let f = scratch.fa[slot];
-        if !field::is_real(f) {
-            return None;
-        }
-        let data = ctx.a.slab.data();
-        let to = field::offset_of(f) + field::len_of(f);
-        if to < from || to > data.len() {
-            return None;
-        }
-        if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
-            return None;
-        }
-        Some(Proof::Csv {
-            bytes: &data[from..to],
-            delimiter,
-        })
-    });
+    let csv_span = ctx
+        .span_tail
+        .filter(|_| proof_again)
+        .and_then(|(slot, delimiter, _)| {
+            let f = scratch.fa[slot];
+            if !field::is_real(f) {
+                return None;
+            }
+            let data = ctx.a.slab.data();
+            let to = field::offset_of(f) + field::len_of(f);
+            if to < from || to > data.len() {
+                return None;
+            }
+            if to < data.len() && data[to] != delimiter && data[to] != b'\n' {
+                return None;
+            }
+            Some(Proof::Csv {
+                bytes: &data[from..to],
+                delimiter,
+            })
+        });
     // Through the byte that closes the last value either file wants --
     // whichever it turns out to be, since two objects need not list their
     // names in the same order. `ctx.width` and not `ctx.nc`: the keys have to be
