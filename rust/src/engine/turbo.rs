@@ -2679,24 +2679,63 @@ fn join_tail(
     };
     let mut removed_rows = map_rows(keep_removed, threads, "a removed row", |p| a_row(p.row))?;
     let mut added_rows = map_rows(keep_added, threads, "an added row", |p| b_row(p.row))?;
-    let mut changed_a = map_rows(keep_changed, threads, "a changed row, A side", |p| {
-        a_row(p.row)
-    })?;
-    let mut changed_b = map_rows(keep_changed, threads, "a changed row, B side", |p| {
-        b_row(p.mate)
-    })?;
+    // A changed row is shown as its key and the cells that differ, and only
+    // an export wants the rest of it. So without one, a changed row decodes
+    // its key and the columns whose bytes differ, and nothing else: a column
+    // the two rows hold byte for byte is the same value whatever the options,
+    // and is never a cell. Decoding both whole rows first was two strings
+    // per column per kept row -- two million at fifty thousand rows of
+    // twenty columns -- nearly all of them thrown away again unread.
+    let mut changed_rows = if exporting {
+        Vec::new()
+    } else {
+        map_rows(keep_changed, threads, "a changed row", |p| {
+            let build = |kept: Option<&KeptRows>| {
+                let (sa, fa) = row_fields(a, ai, kept, true, p.row);
+                let (sb, fb) = row_fields(b, bi, kept, false, p.mate);
+                changed_row(sa, &fa, sb, &fb, key_size, nc, opt)
+            };
+            match kept {
+                // A copy that does not decode leaves the file to answer, as
+                // `KeptRows::values` does.
+                Some(_) => build(kept).or_else(|_| build(None)),
+                None => build(None),
+            }
+        })?
+    };
+    let (mut changed_a, mut changed_b) = if exporting {
+        (
+            map_rows(keep_changed, threads, "a changed row, A side", |p| {
+                a_row(p.row)
+            })?,
+            map_rows(keep_changed, threads, "a changed row, B side", |p| {
+                b_row(p.mate)
+            })?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     phases.mark("  row values (par)");
     sort_rows(&mut removed_rows, key_size);
     sort_rows(&mut added_rows, key_size);
     sort_changed_together(&mut changed_a, &mut changed_b, key_size);
+    changed_rows.sort_by(|x, y| compare_keys(&x.0, &y.0, key_size));
 
-    // Zipped by index rather than by iterator so the two sides can be chunked
-    // together; they are the same length and in the same order by construction.
     phases.mark("  sorts (serial)");
+    let mut changed_cells: Vec<Vec<Cell>> = alloc::sized(changed_rows.len(), "the changed rows")?;
+    for (keys, cells) in changed_rows {
+        let mut row: Vec<Cell> = alloc::sized(key_size + 1, "a changed row's key")?;
+        row.extend(keys.into_iter().map(Cell::Value));
+        row.push(Cell::Diffs(cells));
+        changed_cells.push(row);
+    }
+    // With an export: zipped by index rather than by iterator so the two
+    // sides can be chunked together; they are the same length and in the
+    // same order by construction.
     let mut rows: Vec<usize> = alloc::sized(changed_a.len(), "the changed-row index")?;
     rows.extend(0..changed_a.len());
-    let changed_cells: Vec<Vec<Cell>> = map_rows(&rows, threads, "a changed row's cells", |&r| {
+    let exported: Vec<Vec<Cell>> = map_rows(&rows, threads, "a changed row's cells", |&r| {
         let (ar, br) = (&changed_a[r], &changed_b[r]);
         let mut cells: Vec<CellDiff> = Vec::new();
         for i in 0..nc {
@@ -2723,6 +2762,7 @@ fn join_tail(
         row.push(Cell::Diffs(cells));
         Ok(row)
     })?;
+    changed_cells.extend(exported);
 
     phases.mark("  changed cells (par)");
     let counts = Counts {
@@ -2889,6 +2929,64 @@ fn fused_join<'x>(
 }
 
 /// Every part's kept rows, found by row id.
+/// Row `row` of `side`'s fields and the slab they point into: the sweep's
+/// copy where one was kept, the file otherwise.
+fn row_fields<'s>(
+    side: &'s Side,
+    idx: &RowIndex,
+    kept: Option<&'s KeptRows>,
+    is_a: bool,
+    row: i32,
+) -> (&'s Slab, Vec<Field>) {
+    if let Some(found) = kept.and_then(|k| k.fields(side, is_a, row)) {
+        return found;
+    }
+    let mut fields = vec![ABSENT; side.width];
+    idx.fields_of(side, row, &mut fields);
+    (&side.slab, fields)
+}
+
+/// A changed row's key values and its differing cells, decoded from the two
+/// rows' fields. A column whose two fields hold the same bytes is skipped
+/// undecoded: equal bytes are equal values under every option, so `differs`
+/// could only have said no. Every other column is decoded and asked, exactly
+/// as it was when the whole rows were.
+fn changed_row(
+    sa: &Slab,
+    fa: &[Field],
+    sb: &Slab,
+    fb: &[Field],
+    key_size: usize,
+    nc: usize,
+    opt: &Options,
+) -> Result<(Vec<Val>, Vec<CellDiff>)> {
+    let mut keys: Vec<Val> = alloc::sized(key_size, "a changed row's key")?;
+    for f in &fa[..key_size] {
+        keys.push(value_checked(sa, *f, opt, "a changed row's key")?);
+    }
+    let mut cells: Vec<CellDiff> = Vec::new();
+    for i in 0..nc {
+        let (x, y) = (fa[key_size + i], fb[key_size + i]);
+        if field::is_real(x) && field::is_real(y) && same_bytes(sa, x, sb, y) {
+            continue;
+        }
+        let xv = value_checked(sa, x, opt, "a changed cell")?;
+        let yv = value_checked(sb, y, opt, "a changed cell")?;
+        if differs(&xv, &yv, opt) {
+            alloc::push(
+                &mut cells,
+                CellDiff {
+                    column: i,
+                    a: xv,
+                    b: yv,
+                },
+                "a changed cell",
+            )?;
+        }
+    }
+    Ok((keys, cells))
+}
+
 struct KeptRows {
     a: Vec<Slab>,
     b: Vec<Slab>,
@@ -2918,10 +3016,8 @@ impl KeptRows {
         out
     }
 
-    /// Row `row` of `side`'s values, from its copy, as `row_values` would
-    /// decode them from the file. `None` when no copy was kept, or when it does
-    /// not decode -- the file then gives the answer, error included.
-    fn values(&self, side: &Side, is_a: bool, row: i32, opt: &Options) -> Option<Vec<Val>> {
+    /// Row `row` of `side`'s fields in its copy, and the copy they point into.
+    fn fields(&self, side: &Side, is_a: bool, row: i32) -> Option<(&Slab, Vec<Field>)> {
         let (slabs, rows) = if is_a {
             (&self.a, &self.a_rows)
         } else {
@@ -2933,6 +3029,14 @@ impl KeptRows {
         let data = slab.data();
         let mut fields = vec![ABSENT; side.width];
         parser.parse(data, at, data.len(), &mut fields);
+        Some((slab, fields))
+    }
+
+    /// Row `row` of `side`'s values, from its copy, as `row_values` would
+    /// decode them from the file. `None` when no copy was kept, or when it does
+    /// not decode -- the file then gives the answer, error included.
+    fn values(&self, side: &Side, is_a: bool, row: i32, opt: &Options) -> Option<Vec<Val>> {
+        let (slab, fields) = self.fields(side, is_a, row)?;
         let mut out: Vec<Val> = alloc::sized(side.width, "a report row").ok()?;
         for f in &fields {
             out.push(value_checked(slab, *f, opt, "a report cell").ok()?);
