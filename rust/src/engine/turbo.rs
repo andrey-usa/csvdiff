@@ -43,7 +43,7 @@ mod thrift;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use field::{ABSENT, Field, MAX_FIELD_LEN, TOO_LONG, count_byte, next_of1};
 use slab::{Dialect, Slab, same_bytes, text_of, text_of_checked};
@@ -646,6 +646,7 @@ impl RowIndex {
         threads: usize,
         tag: &'static str,
         sink: Option<&RowSink<'_>>,
+        after_sweep: Option<&(dyn Fn(usize) + Sync)>,
     ) -> Result<(Self, Vec<SweptPart>)> {
         let mut phases = Phases::new(tag);
         let (mut chunks, fparts) = sweep(side, key_size, opt, threads, sink)?;
@@ -749,7 +750,28 @@ impl RowIndex {
             dup_key_values: HashMap::new(),
             keep_dup_keys: opt.row_lists,
         };
-        if parallel_insert(total, threads) && idx.insert_parallel(side, key_size, opt, threads)? {
+        // The file has been read and what is left is the insertion. `after_sweep`
+        // starts reading the next file ahead, which fills memory with its
+        // pages; so it waits until this index has the memory it will write --
+        // the lists and the table above, and for the parallel insertion its
+        // key arrays too -- or every page the insertion touched would first
+        // have to be taken back from that reading. Called before them, B's
+        // insertion at 150M rows took 11.1s where it takes 5.9s alone.
+        let parallel = parallel_insert(total, threads);
+        let arrays = if parallel {
+            Some((
+                alloc::filled(0i32, total, "one row per distinct key")?,
+                alloc::filled(1u32, total, "one count per distinct key")?,
+            ))
+        } else {
+            None
+        };
+        if let Some(hook) = after_sweep {
+            hook(total);
+        }
+        if let Some(arrays) = arrays
+            && idx.insert_parallel(side, key_size, opt, threads, arrays)?
+        {
             phases.mark("index insert (parallel)");
             return Ok((idx, fparts));
         }
@@ -867,6 +889,7 @@ impl RowIndex {
         key_size: usize,
         opt: &Options,
         threads: usize,
+        (mut first_row, mut occurrences): (Vec<i32>, Vec<u32>),
     ) -> Result<bool> {
         let total = self.row_hash.len();
         let cap = self.table.len();
@@ -927,7 +950,10 @@ impl RowIndex {
 
         // `first_row` in file order: each thread fills the positions of a run
         // of bitmap words, which are a run of positions.
-        let mut first_row: Vec<i32> = alloc::filled(0, keys as usize, "one row per distinct key")?;
+        // `first_row` and `occurrences` came in one per row, written; there is a
+        // key per row at most.
+        first_row.truncate(keys as usize);
+        occurrences.truncate(keys as usize);
         {
             let ways = threads.max(1);
             let mut rest: &mut [i32] = &mut first_row;
@@ -993,8 +1019,6 @@ impl RowIndex {
             }
         }
 
-        let mut occurrences: Vec<u32> =
-            alloc::filled(1, keys as usize, "one count per distinct key")?;
         let mut later = Vec::new();
         for region in regions_out {
             for (row, n) in region.counts {
@@ -2783,7 +2807,7 @@ fn fused_join<'x>(
         nc,
         keep_rows: ctx.keep_picks,
     };
-    let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink))?;
+    let (ai, parts) = RowIndex::build(a, key_size, opt, threads, "A ", Some(&sink), None)?;
 
     // The rows that turned out to repeat a key were joined as though first;
     // join them again and subtract. Re-marking the same seen bits changes
@@ -2966,6 +2990,59 @@ fn fused_picks(
     out
 }
 
+/// Bytes of A to read ahead per row of B while B's rows are inserted: the
+/// insertion takes about 50ns a row at 150M rows, and the runners' disks read
+/// 300-400 MB/s, so about 16 bytes a row is what the disk reads in the time
+/// the insertion takes.
+const READ_AHEAD_PER_ROW: usize = 16;
+
+/// A page, the unit the read-ahead touches A in.
+const PAGE: usize = 4096;
+
+/// Reads the first bytes of each of A's sweep chunks into memory, as many as
+/// the disk reads while `rows` rows are inserted, never more than half the
+/// file, and nothing more once `stop` is set. The chunks are where
+/// `chunk_bounds` will start them, near enough: the guessed split is the next
+/// newline after each even division.
+///
+/// One thread per chunk touches a byte of every page, in order, as the sweep
+/// would: each waits on its own faults, so a few readahead windows are in
+/// flight rather than the whole budget. Asking for it all with
+/// madvise(MADV_WILLNEED) (in 128 KB calls -- larger ones read only the
+/// readahead window each) did shorten the 150M A sweep, 131.3s to 125.4s, but
+/// queued 2.4 GB at once ahead of the insertion's own reads -- the repeated
+/// keys it proves against the file -- and the insertion went from 7.5s to
+/// 12.4s.
+fn read_ahead(a: &Side, rows: usize, threads: usize, stop: &AtomicBool) {
+    let Rows::Text { from, .. } = &a.rows else {
+        return;
+    };
+    let size = a.slab.data().len();
+    if *from >= size {
+        return;
+    }
+    let ways = threads.max(1);
+    let span = size - from;
+    let budget = rows.saturating_mul(READ_AHEAD_PER_ROW).min(span / 2);
+    let each = budget / ways;
+    let data = a.slab.data();
+    std::thread::scope(|scope| {
+        for i in 0..ways {
+            let start = from + span * i / ways;
+            let end = (start + each).min(size);
+            scope.spawn(move || {
+                let mut seen = 0u8;
+                let mut at = start;
+                while at < end && !stop.load(Ordering::Relaxed) {
+                    seen ^= data[at];
+                    at += PAGE;
+                }
+                std::hint::black_box(seen);
+            });
+        }
+    });
+}
+
 /// The fused compare: B's index is built first on the full thread budget, then
 /// A's sweep joins each row as it finds it.
 #[allow(clippy::too_many_arguments)]
@@ -2984,10 +3061,30 @@ fn compare_fused(
     let exporting = opt.export_dir.is_some();
 
     // B first, on the full budget: its index is all the join needs from B.
-    let b = b_input.project(wanted, key_size, total)?;
-    let (bi, _) = RowIndex::build(&b, key_size, opt, total, "B ", None)?;
     // A projected on the full budget too; its sweep joins as it goes.
+    let b = b_input.project(wanted, key_size, total)?;
     let a = a_input.project(wanted, key_size, total)?;
+    // While B's rows are inserted, on one thread, nothing reads the disk: A's
+    // sweep cannot start until B's index is whole. So the reads A's sweep will
+    // begin with are started then, by a thread that only asks for them.
+    let stop = AtomicBool::new(false);
+    let (bi, _) = std::thread::scope(|scope| {
+        let (go, wait) = std::sync::mpsc::channel::<usize>();
+        let (a, stop) = (&a, &stop);
+        scope.spawn(move || {
+            if let Ok(rows) = wait.recv() {
+                read_ahead(a, rows, total, stop);
+            }
+        });
+        let start = move |rows: usize| {
+            let _ = go.send(rows);
+        };
+        let built = RowIndex::build(&b, key_size, opt, total, "B ", None, Some(&start));
+        // A's sweep starts now and reads for itself; the read-ahead stops at
+        // its next step rather than queue reads the sweep is already making.
+        stop.store(true, Ordering::Relaxed);
+        built
+    })?;
     let fused = fused_join(&a, &b, &bi, opt, nc, total)?;
 
     let mut phases = Phases::new("");
@@ -3318,7 +3415,7 @@ pub fn compare(a_path: &Path, b_path: &Path, opt: &Options) -> Result<EngineResu
     let per_file = (total / 2).max(1);
     let prepare = |input: Input, tag: &'static str| -> Result<(Side, RowIndex)> {
         let side = input.project(&wanted, key_size, per_file)?;
-        let (index, _) = RowIndex::build(&side, key_size, opt, per_file, tag, None)?;
+        let (index, _) = RowIndex::build(&side, key_size, opt, per_file, tag, None, None)?;
         Ok((side, index))
     };
     let b_held = parallel::Once::new(b_input);
