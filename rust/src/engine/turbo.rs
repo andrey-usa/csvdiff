@@ -425,9 +425,32 @@ fn row_end(ix: &RowIndex, row: i32, size: usize) -> usize {
 /// instead is work the kernel is far better at: at ten million rows it halves the
 /// insert, 1.55s to 0.74s.
 fn empty_table(cap: usize) -> Result<Vec<u32>> {
-    let mut table = alloc::sized(cap, "the key index")?;
+    let mut table = index_array(cap, cap / 2, "the key index")?;
     table.resize(cap, EMPTY_SLOT);
     Ok(table)
+}
+
+/// From this many rows the key index's arrays go on 2 MB pages.
+///
+/// The insertion and every lookup of the join probe them at random, and at
+/// 150M rows the table alone is a gigabyte: on 4 KB pages each probe is a TLB
+/// miss as well as a cache miss. A loop doing what the insertion does over
+/// 150M hashes took 11.5-14.7s on 4 KB pages, 10.3s with the table on 2 MB
+/// pages, and 8.1-9.1s with `first_row` and `occurrences` there too. At 8M
+/// rows it went the other way -- inserts 0.33s to 0.5-0.7s, the join 0.05s
+/// faster -- the huge pages costing more to find and fault in than the misses
+/// they save. Hence a threshold, at the size where the arrays are hundreds of
+/// megabytes.
+const HUGE_INDEX_ROWS: usize = 1 << 25;
+
+/// An empty vector of capacity `n` for an array of an index over `rows` rows:
+/// on 2 MB pages at [`HUGE_INDEX_ROWS`] rows and up.
+fn index_array<T>(n: usize, rows: usize, what: &str) -> Result<Vec<T>> {
+    if rows >= HUGE_INDEX_ROWS {
+        alloc::sized_huge(n, what)
+    } else {
+        alloc::sized(n, what)
+    }
 }
 
 /// A slot holds the top bits of its key's hash above `pos_bits` and the
@@ -628,8 +651,8 @@ impl RowIndex {
             pos_bits,
             pos_mask,
             mask: cap - 1,
-            first_row: alloc::sized(total, "one row per distinct key")?,
-            occurrences: alloc::sized(total, "one count per distinct key")?,
+            first_row: index_array(total, total, "one row per distinct key")?,
+            occurrences: index_array(total, total, "one count per distinct key")?,
             rows: 0,
             dup_keys: 0,
             dup_rows: 0,

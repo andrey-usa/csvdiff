@@ -88,6 +88,40 @@ pub fn sized<T>(n: usize, what: &str) -> Result<Vec<T>> {
     Ok(v)
 }
 
+/// [`sized`], asking for 2 MB pages: for the arrays the key index probes at
+/// random, each probe a TLB miss on 4 KB pages once the array outgrows the
+/// cache. Linux's transparent huge pages back the advised range only if they
+/// are set to `madvise` or `always` (the GitHub runners say `madvise`), so
+/// elsewhere this is [`sized`].
+pub fn sized_huge<T>(n: usize, what: &str) -> Result<Vec<T>> {
+    let mut v = sized(n, what)?;
+    advise_huge(&mut v);
+    Ok(v)
+}
+
+/// `madvise(MADV_HUGEPAGE)` over the whole 2 MB pages inside `v`'s buffer,
+/// before anything has touched them. Not under Miri, which cannot call it.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn advise_huge<T>(v: &mut Vec<T>) {
+    unsafe extern "C" {
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    const MADV_HUGEPAGE: i32 = 14;
+    const HUGE: usize = 2 << 20;
+    let start = v.as_mut_ptr() as usize;
+    let end = start + v.capacity() * size_of::<T>();
+    let (lo, hi) = (start.next_multiple_of(HUGE), end & !(HUGE - 1));
+    if hi > lo {
+        // Safety: [lo, hi) lies inside the vector's own allocation, and the
+        // advice changes how its pages are backed, never what they hold. A
+        // refusal leaves 4 KB pages, which is what there was.
+        unsafe { madvise(lo as *mut std::ffi::c_void, hi - lo, MADV_HUGEPAGE) };
+    }
+}
+
+#[cfg(not(all(target_os = "linux", not(miri))))]
+fn advise_huge<T>(_: &mut Vec<T>) {}
+
 /// `vec![value; n]` that returns instead of aborting.
 ///
 /// The fill is written rather than taken from the kernel, which is the same
