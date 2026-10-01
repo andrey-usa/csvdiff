@@ -2593,7 +2593,14 @@ const READ_AHEAD_PER_ROW: usize = 16;
 /// The step each chunk's read-ahead is asked for in, round-robin across the
 /// chunks so that every chunk's start arrives early, not the first chunk's
 /// whole share.
-const READ_AHEAD_STEP: usize = 64 << 20;
+///
+/// Small, because the kernel reads at most its readahead window per call:
+/// asked for 64 MB at four places, a cold 2.9GB file had 16 MB more in memory
+/// afterwards, and the 150M run's A sweep took 131.3s, no faster than without
+/// it. 128 KB is the smallest that window is by default; asked in 128 KB steps
+/// the same four places had all of a 1 GB request in memory, for 0.15s of
+/// calls on the thread that makes them.
+const READ_AHEAD_STEP: usize = 128 << 10;
 
 /// Starts reading the first bytes of each of A's sweep chunks, as many as the
 /// disk reads while `rows` rows are inserted, never more than half the file,
