@@ -555,6 +555,16 @@ std::string text_of(const Slab& s, Field f) {
     return lx == ly;
 }
 
+// `same_bytes` for two present values, with the escaped case -- a doubled
+// quote, a JSON escape -- left out of line, so the join's loop inlines only the
+// compare it nearly always makes.
+[[gnu::noinline]] bool same_escaped(const Slab& a, Field x, const Slab& b, Field y) {
+    return same_bytes(a, x, b, y);
+}
+[[gnu::always_inline]] inline bool same_plain(const Slab& a, Field x, const Slab& b, Field y) {
+    if (is_escaped(x) || is_escaped(y)) return same_escaped(a, x, b, y);
+    return a.raw(x) == b.raw(y);
+}
 
 // ---------------------------------------------------------------------------
 // Values: raw bytes on the fast path, normalised strings when asked
@@ -2749,6 +2759,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             b_seen[static_cast<std::size_t>(mate) >> 6].fetch_or(
                 std::uint64_t{1} << (static_cast<std::size_t>(mate) & 63), std::memory_order_relaxed);
     };
+    // Whether any flag changes what equal means, asked once. Asked per cell --
+    // `cell_differs`, then `same`, then `is_absent` twice -- it was four loads
+    // and four tests of the options each time, kept in the loop because `same`
+    // is a call the compiler cannot see through: 250M of 2.69G instructions on
+    // a 400k-row pair. With none set a cell is absent or it is its bytes, and
+    // the loop below says so directly, as the C port's does.
+    const bool plain = !needs_normalising(opt);
     auto join_row = [&](const ProofRows& proof, Part& out, Scratch& s, const ARow& ar, int row,
                         std::size_t at) {
         const bool attempt = s.backoff.attempt(at);
@@ -2827,13 +2844,26 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         }
         proof.bi.fields_of(mate, s.fb.data());
         bool any = false;
-        for (std::size_t i = 0; i < nc; ++i) {
-            const Field x = s.fa[key_size + i], y = s.fb[key_size + i];
-            if (cell_differs(a, x, b, y, opt)) {
-                any = true;
-                ++out.columns[i].changed;
-                if (is_absent(b, y, opt)) ++out.columns[i].blanked;
-                if (is_absent(a, x, opt)) ++out.columns[i].filled;
+        if (plain) {
+            for (std::size_t i = 0; i < nc; ++i) {
+                const Field x = s.fa[key_size + i], y = s.fb[key_size + i];
+                const bool xa = !is_real(x) || len_of(x) == 0, ya = !is_real(y) || len_of(y) == 0;
+                if ((xa || ya) ? xa != ya : !same_plain(a, x, b, y)) {
+                    any = true;
+                    ++out.columns[i].changed;
+                    if (ya) ++out.columns[i].blanked;
+                    if (xa) ++out.columns[i].filled;
+                }
+            }
+        } else {
+            for (std::size_t i = 0; i < nc; ++i) {
+                const Field x = s.fa[key_size + i], y = s.fb[key_size + i];
+                if (cell_differs(a, x, b, y, opt)) {
+                    any = true;
+                    ++out.columns[i].changed;
+                    if (is_absent(b, y, opt)) ++out.columns[i].blanked;
+                    if (is_absent(a, x, opt)) ++out.columns[i].filled;
+                }
             }
         }
         if (any) {
@@ -3350,10 +3380,44 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             std::vector<Val> key;
             int row, mate;
         };
-        std::vector<KeptChange> kept;
-        kept.reserve(changed.held.size());
-        for (const auto& [row, mate] : changed.held)
-            kept.push_back({key_values(a, ai, row, width, key_size, opt), row, mate});
+        // Both passes over the kept rows -- their keys for the sort, then their
+        // differing cells -- run on the whole thread budget, each worker over a
+        // contiguous range writing only its own slots. They were serial: at 4M
+        // rows 0.14s, on its own, after the join, for the 50,000 rows the report
+        // keeps by default. A range's failure (the --ignore-case refusal) is
+        // rethrown in range order, so it is the one the serial loop met first.
+        const auto over_kept = [&](std::size_t n, const auto& body) {
+            const unsigned ways = n < (std::size_t{1} << 12) ? 1u : budget;
+            std::vector<std::exception_ptr> failures(ways);
+            const auto range = [&](unsigned p) {
+                try {
+                    body(n * p / ways, n * (p + 1) / ways);
+                } catch (...) {
+                    failures[p] = std::current_exception();
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(ways - 1);
+            for (unsigned p = 1; p < ways; ++p) {
+                try {
+                    workers.emplace_back(range, p);
+                } catch (const std::system_error&) {
+                    range(p);
+                }
+            }
+            range(0);
+            for (auto& w : workers) w.join();
+            for (const auto& f : failures)
+                if (f) std::rethrow_exception(f);
+        };
+
+        std::vector<KeptChange> kept(changed.held.size());
+        over_kept(kept.size(), [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t i = lo; i < hi; ++i) {
+                const auto [row, mate] = changed.held[i];
+                kept[i] = {key_values(a, ai, row, width, key_size, opt), row, mate};
+            }
+        });
 
         const auto by_key = [&](const std::vector<Val>& x, const std::vector<Val>& y) {
             return compare_keys(x, y, key_size) < 0;
@@ -3363,20 +3427,23 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         std::stable_sort(kept.begin(), kept.end(),
                          [&](const KeptChange& x, const KeptChange& y) { return by_key(x.key, y.key); });
 
-        std::vector<Field> fa(width), fb(width);
-        for (KeptChange& k : kept) {
-            ChangedRow out;
-            out.key = std::move(k.key);
-            ai.fields_of(k.row, fa.data());
-            bi.fields_of(k.mate, fb.data());
-            for (std::size_t i = 0; i < nc; ++i) {
-                const Field x = fa[key_size + i], y = fb[key_size + i];
-                if (cell_differs(a, x, b, y, opt))
-                    out.cells.push_back(
-                        {i, value_of(a, x, opt, Fold::display), value_of(b, y, opt, Fold::display)});
+        r.changed.resize(kept.size());
+        over_kept(kept.size(), [&](std::size_t lo, std::size_t hi) {
+            std::vector<Field> fa(width), fb(width);
+            for (std::size_t at = lo; at < hi; ++at) {
+                KeptChange& k = kept[at];
+                ChangedRow& out = r.changed[at];
+                out.key = std::move(k.key);
+                ai.fields_of(k.row, fa.data());
+                bi.fields_of(k.mate, fb.data());
+                for (std::size_t i = 0; i < nc; ++i) {
+                    const Field x = fa[key_size + i], y = fb[key_size + i];
+                    if (cell_differs(a, x, b, y, opt))
+                        out.cells.push_back(
+                            {i, value_of(a, x, opt, Fold::display), value_of(b, y, opt, Fold::display)});
+                }
             }
-            r.changed.push_back(std::move(out));
-        }
+        });
 
         const auto dup_section = [&](const Slab& s, const RowIndex& idx, std::vector<DupRow>& out,
                                      bool& truncated) {
