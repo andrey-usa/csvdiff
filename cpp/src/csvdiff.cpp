@@ -2923,6 +2923,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     if (worker_failure) std::rethrow_exception(worker_failure);
     const RowIndex& ai = *ai_slot;
     const RowIndex& bi = *bi_slot;
+    // The join after the sweep marks B's matched rows too, so that its added
+    // rows are the same walk over the bitmap rather than a probed pass over A's
+    // index. Not when the two joins are being held against each other: the
+    // probed pass is then the independent answer the walk is checked against.
+    if (opt.row_lists && !b_seen && !fused_forced)
+        b_seen = std::make_unique<std::atomic<std::uint64_t>[]>(
+            static_cast<std::size_t>(bi.rows()) / 64 + 1);
     // From here on there is one thread again, so one timer covers it.
     RowIndex::Phases whole("");
 
@@ -2973,8 +2980,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // The `--json` path keeps the old arithmetic. Whether `budget - 1` is the
     // right reservation when `b_side` itself takes `b_ways` threads is a
     // separate question this does not answer.
-    unsigned join_ways = opt.row_lists ? std::max(1u, budget > 1 ? budget - 1 : 1u)
-                                       : std::max(1u, budget);
+    //
+    // That separate question has gone away: the added rows are now read off a
+    // bitmap the A side fills (`b_seen`), after it, so nothing runs beside it
+    // and it takes the whole budget. Only the forced cross-check still runs
+    // the probed B side beside it.
+    unsigned join_ways = opt.row_lists && fused_forced ? std::max(1u, budget > 1 ? budget - 1 : 1u)
+                                                       : std::max(1u, budget);
     if (a_keys.size() < 1u << 14) join_ways = 1;  // too few keys to be worth splitting
     std::vector<Part> parts(join_ways);
     for (auto& part : parts) part.columns.resize(nc);
@@ -3197,6 +3209,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // The added rows are B's keys no row of A matched, in B's order: its
     // first rows whose bit is clear.
     Capped f_changed(opt.max_rows), f_added(opt.max_rows), f_removed(opt.max_rows);
+    const auto added_from_seen = [&](Capped& into) {
+        for (const int row : bi.first_rows()) {
+            const auto bit = static_cast<std::size_t>(row);
+            if (!(b_seen[bit >> 6].load(std::memory_order_relaxed) & (std::uint64_t{1} << (bit & 63))))
+                into.push(row, -1);
+        }
+    };
     const auto fused_lists = [&]() -> bool {
         const std::vector<int>& later = ai.later();
         const std::vector<std::int64_t>& first = ai.part_first();
@@ -3222,11 +3241,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         }
         f_changed.total = fused_totals.changed;
         f_removed.total = fused_totals.removed;
-        for (const int row : bi.first_rows()) {
-            const auto bit = static_cast<std::size_t>(row);
-            if (!(b_seen[bit >> 6].load(std::memory_order_relaxed) & (std::uint64_t{1} << (bit & 63))))
-                f_added.push(row, -1);
-        }
+        added_from_seen(f_added);
         return complete && f_added.total == bi.unique_keys() - fused_totals.matched;
     };
     const bool listed = fused && opt.row_lists && fused_lists();
@@ -3249,6 +3264,10 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         std::int64_t seen = 0;
         for (const Part& part : parts) seen += part.matched;
         added.total = bi.unique_keys() - seen;
+    } else if (b_seen && !fused_forced) {
+        a_side();
+        added_from_seen(added);
+        whole.mark("added rows");
     } else {
         std::exception_ptr failure;
         std::thread worker([&] {
