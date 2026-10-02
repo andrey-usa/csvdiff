@@ -299,7 +299,7 @@ for ext in csv ndjson; do
   out=$(CSVDIFF_FUSED_JOIN=1 build/csvdiff compare "$thr/f_a.$ext" "$thr/f_b.$ext" -k k \
       --json "$thr/f.json" 2>&1 >/dev/null) || code=$?
   if [ "$code" -le 1 ] && [ -z "$out" ]; then
-    printf '  ok    %s: and its column counts, checked against the join after it\n' "$ext"
+    printf '  ok    %s: and its column counts and row lists, checked against the join after it\n' "$ext"
   else
     printf '  FAIL  %s: the join inside the sweep, with --json: %s\n' "$ext" "${out:-exit $code}"; fail=1
   fi
