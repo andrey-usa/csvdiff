@@ -2821,6 +2821,11 @@ fn join_tail(
 
 /// Past page cache the join runs inside A's sweep instead of after it.
 ///
+/// Where page cache ends is the machine's to say: [`crate::memory`] reads it
+/// (the container's limit included) and draws the line at half of what is
+/// available. Below it the join after the sweep is the faster plan -- on a 4M
+/// pair in memory, 1.74s against 2.05s for the join inside the sweep.
+///
 /// Past memory every pass is a read from disk, and the join used to be the
 /// fourth: both sweeps, then both files again for the rows to compare -- at
 /// 150M rows as long as a cold read of both files. Built first, B's index is
@@ -2856,7 +2861,9 @@ fn fused_active(a_bytes: Option<u64>, b_bytes: Option<u64>, opt: &Options, threa
         return false;
     }
     match (a_bytes, b_bytes) {
-        (Some(a), Some(b)) => threads > 1 && a.saturating_add(b) > (8u64 << 30),
+        (Some(a), Some(b)) => {
+            threads > 1 && a.saturating_add(b) > crate::memory::streaming_threshold(opt.memory)
+        }
         _ => false,
     }
 }

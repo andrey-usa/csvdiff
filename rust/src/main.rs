@@ -47,6 +47,9 @@ compare options:
       --encoding ENC
       --engine E          auto | turbo | sortmerge | native
       --threads N
+      --memory SIZE       Memory to plan for, e.g. 8G (default: what the machine or
+                          container has free); decides when large files are joined
+                          in one pass instead of two
       --export-dir DIR    Write full changed/added/removed CSVs here
   -o, --out PATH          Report path (default: <a>__vs__<b>.html in the current directory)
       --json PATH         Also write a JSON summary (counts + column stats) here
@@ -283,6 +286,13 @@ fn cmd_compare(argv: &[String]) -> Result<u8> {
     }
     if let Some(v) = args.number::<usize>("threads")? {
         opt.threads = Some(v);
+    }
+    if let Some(v) = args.get("memory", None) {
+        opt.memory = Some(csvdiff::memory::parse_size(v).ok_or_else(|| {
+            Error::new(format!(
+                "--memory must be a size such as 512M or 8G, got: {v}"
+            ))
+        })?);
     }
     if let Some(v) = args.get("delimiter", None) {
         opt.delimiter = v.chars().next();
