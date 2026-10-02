@@ -90,7 +90,13 @@ int main(int argc, char** argv) {
         // over B for output nobody asked for.
         opt.row_lists = !json_path.empty();
 
-        const csvdiff::Result r = csvdiff::compare(a_path, b_path, opt);
+        // Left for the process's exit to reclaim rather than freed here. With
+        // --json it holds the report's row samples -- 50,000 changed rows by
+        // default, each a vector of strings -- and taking that apart one
+        // allocation at a time was 45M instructions on a 400k pair, on a path
+        // that returns straight to the OS. The Rust port forgets its result for
+        // the same reason (#252).
+        const csvdiff::Result& r = *new csvdiff::Result(csvdiff::compare(a_path, b_path, opt));
 
         if (!json_path.empty()) {
             // std::ios::binary so the Microsoft runtime does not turn every \n in
