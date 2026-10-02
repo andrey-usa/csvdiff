@@ -95,6 +95,13 @@ pub struct Options {
     pub threads: Option<usize>,
     pub export_dir: Option<String>,
 
+    /// How much memory the comparison may count on, in bytes, or `None` to
+    /// ask the machine (see [`crate::memory`]). It decides whether a large
+    /// pair is joined after both files are indexed or inside A's sweep; it is
+    /// not a cap, and nothing is refused for going past it.
+    #[serde(skip)]
+    pub memory: Option<u64>,
+
     /// Whether the engine materialises the report's rows.
     ///
     /// The counts, the per-column stats and the duplicate-key tallies are the
@@ -129,6 +136,7 @@ impl Default for Options {
             engine: Engine::Auto.label().to_string(),
             threads: None,
             export_dir: None,
+            memory: None,
             row_lists: true,
         }
     }
@@ -184,6 +192,9 @@ impl Options {
         }
         if self.threads == Some(0) {
             return Err(Error::new("--threads must be positive, got 0"));
+        }
+        if self.memory == Some(0) {
+            return Err(Error::new("--memory must be positive, got 0"));
         }
         if self.encoding.is_empty() {
             self.encoding = "utf-8".to_string();

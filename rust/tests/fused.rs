@@ -1,7 +1,9 @@
 //! The fused join: A's sweep joins each row while its pages are hot.
 //!
-//! Production only takes this path past 8 GB, so the tests force it with
-//! `CSVDIFF_FUSED_JOIN=1`. The env var is process-global and the tests run as
+//! Production takes this path once the input is past half the memory the
+//! machine has available, so most tests force it with `CSVDIFF_FUSED_JOIN=1`;
+//! `a_small_memory_budget_takes_the_fused_path` reaches it the way production
+//! does, through `--memory` and `CSVDIFF_MEMORY`. The env var is process-global and the tests run as
 //! parallel threads, so every test that touches it holds the mutex below while
 //! the var is set: a leaked `=1` would flip the path under the OOM tests, whose
 //! allocation expectations assume the ordinary sweep.
@@ -442,6 +444,8 @@ fn run_with(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, St
         .env_remove("CSVDIFF_FUSED_JOIN")
         .env_remove("CSVDIFF_PARALLEL_INSERT")
         .env_remove("CSVDIFF_NARROW_HASH")
+        .env_remove("CSVDIFF_MEMORY")
+        .env_remove("CSVDIFF_PHASES")
         .envs(env.iter().copied())
         .output()
         .expect("the binary");
@@ -523,5 +527,83 @@ fn the_parallel_insertion_builds_the_serial_index() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn a_small_memory_budget_takes_the_fused_path() {
+    // Unforced: the budget alone decides. A pair past half of it is joined
+    // inside A's sweep, one under it after both sweeps -- and the report is
+    // the same either way, row for row.
+    let fx = Fixture::with_early_repeats();
+    let args = |memory: &'static str| {
+        [
+            "compare",
+            "a.csv",
+            "b.csv",
+            "-k",
+            "id",
+            "--threads",
+            "4",
+            "--max-rows",
+            "1000",
+            "--no-compress",
+            "-o",
+            "report.html",
+            "--memory",
+            memory,
+        ]
+    };
+    let phases = [("CSVDIFF_PHASES", "1")];
+
+    let (code, out, err) = run_with(&fx.0, &args("64G"), &phases);
+    assert!(code == 0 || code == 1, "in-memory run failed: {err}");
+    assert!(
+        !err.contains("fused join"),
+        "64G took the fused path:\n{err}"
+    );
+    let ordinary = report_payload(&fx.path("report.html"));
+
+    let (fcode, fout, ferr) = run_with(&fx.0, &args("64K"), &phases);
+    assert_eq!(fcode, code, "fused run failed: {ferr}");
+    assert!(
+        ferr.contains("fused join"),
+        "64K did not take the fused path:\n{ferr}"
+    );
+    assert_eq!(counts(&fout), counts(&out));
+    assert_eq!(report_payload(&fx.path("report.html")), ordinary);
+
+    // The environment says the same thing for a caller that cannot pass a flag.
+    let plain: Vec<&str> = args("1")[..12].to_vec();
+    let (ecode, eout, eerr) = run_with(
+        &fx.0,
+        &plain,
+        &[("CSVDIFF_PHASES", "1"), ("CSVDIFF_MEMORY", "64K")],
+    );
+    assert_eq!(ecode, code, "CSVDIFF_MEMORY run failed: {eerr}");
+    assert!(
+        eerr.contains("fused join"),
+        "CSVDIFF_MEMORY=64K did not take the fused path:\n{eerr}"
+    );
+    assert_eq!(counts(&eout), counts(&out));
+}
+
+#[test]
+fn a_memory_flag_that_is_not_a_size_is_refused() {
+    let fx = Fixture::new();
+    for bad in ["lots", "0", "8X"] {
+        let args = [
+            "compare",
+            "a.csv",
+            "b.csv",
+            "-k",
+            "account_id,txn_id",
+            "--summary",
+            "--memory",
+            bad,
+        ];
+        let (code, _, err) = run_with(&fx.0, &args, &[]);
+        assert_eq!(code, 2, "--memory {bad} was accepted");
+        assert!(err.contains("--memory"), "--memory {bad}: {err}");
     }
 }
