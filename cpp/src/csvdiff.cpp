@@ -3380,10 +3380,44 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             std::vector<Val> key;
             int row, mate;
         };
-        std::vector<KeptChange> kept;
-        kept.reserve(changed.held.size());
-        for (const auto& [row, mate] : changed.held)
-            kept.push_back({key_values(a, ai, row, width, key_size, opt), row, mate});
+        // Both passes over the kept rows -- their keys for the sort, then their
+        // differing cells -- run on the whole thread budget, each worker over a
+        // contiguous range writing only its own slots. They were serial: at 4M
+        // rows 0.14s, on its own, after the join, for the 50,000 rows the report
+        // keeps by default. A range's failure (the --ignore-case refusal) is
+        // rethrown in range order, so it is the one the serial loop met first.
+        const auto over_kept = [&](std::size_t n, const auto& body) {
+            const unsigned ways = n < (std::size_t{1} << 12) ? 1u : budget;
+            std::vector<std::exception_ptr> failures(ways);
+            const auto range = [&](unsigned p) {
+                try {
+                    body(n * p / ways, n * (p + 1) / ways);
+                } catch (...) {
+                    failures[p] = std::current_exception();
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(ways - 1);
+            for (unsigned p = 1; p < ways; ++p) {
+                try {
+                    workers.emplace_back(range, p);
+                } catch (const std::system_error&) {
+                    range(p);
+                }
+            }
+            range(0);
+            for (auto& w : workers) w.join();
+            for (const auto& f : failures)
+                if (f) std::rethrow_exception(f);
+        };
+
+        std::vector<KeptChange> kept(changed.held.size());
+        over_kept(kept.size(), [&](std::size_t lo, std::size_t hi) {
+            for (std::size_t i = lo; i < hi; ++i) {
+                const auto [row, mate] = changed.held[i];
+                kept[i] = {key_values(a, ai, row, width, key_size, opt), row, mate};
+            }
+        });
 
         const auto by_key = [&](const std::vector<Val>& x, const std::vector<Val>& y) {
             return compare_keys(x, y, key_size) < 0;
@@ -3393,20 +3427,23 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         std::stable_sort(kept.begin(), kept.end(),
                          [&](const KeptChange& x, const KeptChange& y) { return by_key(x.key, y.key); });
 
-        std::vector<Field> fa(width), fb(width);
-        for (KeptChange& k : kept) {
-            ChangedRow out;
-            out.key = std::move(k.key);
-            ai.fields_of(k.row, fa.data());
-            bi.fields_of(k.mate, fb.data());
-            for (std::size_t i = 0; i < nc; ++i) {
-                const Field x = fa[key_size + i], y = fb[key_size + i];
-                if (cell_differs(a, x, b, y, opt))
-                    out.cells.push_back(
-                        {i, value_of(a, x, opt, Fold::display), value_of(b, y, opt, Fold::display)});
+        r.changed.resize(kept.size());
+        over_kept(kept.size(), [&](std::size_t lo, std::size_t hi) {
+            std::vector<Field> fa(width), fb(width);
+            for (std::size_t at = lo; at < hi; ++at) {
+                KeptChange& k = kept[at];
+                ChangedRow& out = r.changed[at];
+                out.key = std::move(k.key);
+                ai.fields_of(k.row, fa.data());
+                bi.fields_of(k.mate, fb.data());
+                for (std::size_t i = 0; i < nc; ++i) {
+                    const Field x = fa[key_size + i], y = fb[key_size + i];
+                    if (cell_differs(a, x, b, y, opt))
+                        out.cells.push_back(
+                            {i, value_of(a, x, opt, Fold::display), value_of(b, y, opt, Fold::display)});
+                }
             }
-            r.changed.push_back(std::move(out));
-        }
+        });
 
         const auto dup_section = [&](const Slab& s, const RowIndex& idx, std::vector<DupRow>& out,
                                      bool& truncated) {
