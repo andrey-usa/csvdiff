@@ -1982,6 +1982,23 @@ class RowIndex {
                       std::size_t stop, std::size_t end, Chunk& out, std::size_t part,
                       RowSink* sink) const {
         std::vector<Field> fields(parser.width());
+        // Sized before the first row, from the line count of the chunk's first
+        // 64 KB, with an eighth to spare. Grown by doubling instead, each of
+        // these was copied five or six times over on its way to a million rows,
+        // and every copy wrote pages the kernel had to fault in fresh: on a 4M
+        // pair this port took 145k minor faults where the C port, whose
+        // `realloc` grows in place, took 95k. A guess that comes up short still
+        // grows the ordinary way; one that comes up long reserves address
+        // space the sweep never touches, which costs no memory.
+        if (stop > begin) {
+            const std::size_t span = stop - begin;
+            const std::size_t probe = std::min<std::size_t>(span, std::size_t{64} << 10);
+            const auto lines = static_cast<std::size_t>(
+                std::count(d.data() + begin, d.data() + begin + probe, '\n'));
+            const std::size_t guess = span / probe * lines + span % probe * lines / probe;
+            out.starts.reserve(guess + guess / 8 + 16);
+            out.hashes.reserve(guess + guess / 8 + 16);
+        }
         std::size_t pos = begin;
         while (pos < stop) {
             // A line with nothing on it is not a row.
