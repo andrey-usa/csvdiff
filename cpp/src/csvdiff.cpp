@@ -555,6 +555,16 @@ std::string text_of(const Slab& s, Field f) {
     return lx == ly;
 }
 
+// `same_bytes` for two present values, with the escaped case -- a doubled
+// quote, a JSON escape -- left out of line, so the join's loop inlines only the
+// compare it nearly always makes.
+[[gnu::noinline]] bool same_escaped(const Slab& a, Field x, const Slab& b, Field y) {
+    return same_bytes(a, x, b, y);
+}
+[[gnu::always_inline]] inline bool same_plain(const Slab& a, Field x, const Slab& b, Field y) {
+    if (is_escaped(x) || is_escaped(y)) return same_escaped(a, x, b, y);
+    return a.raw(x) == b.raw(y);
+}
 
 // ---------------------------------------------------------------------------
 // Values: raw bytes on the fast path, normalised strings when asked
@@ -2749,6 +2759,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             b_seen[static_cast<std::size_t>(mate) >> 6].fetch_or(
                 std::uint64_t{1} << (static_cast<std::size_t>(mate) & 63), std::memory_order_relaxed);
     };
+    // Whether any flag changes what equal means, asked once. Asked per cell --
+    // `cell_differs`, then `same`, then `is_absent` twice -- it was four loads
+    // and four tests of the options each time, kept in the loop because `same`
+    // is a call the compiler cannot see through: 250M of 2.69G instructions on
+    // a 400k-row pair. With none set a cell is absent or it is its bytes, and
+    // the loop below says so directly, as the C port's does.
+    const bool plain = !needs_normalising(opt);
     auto join_row = [&](const ProofRows& proof, Part& out, Scratch& s, const ARow& ar, int row,
                         std::size_t at) {
         const bool attempt = s.backoff.attempt(at);
@@ -2827,13 +2844,26 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         }
         proof.bi.fields_of(mate, s.fb.data());
         bool any = false;
-        for (std::size_t i = 0; i < nc; ++i) {
-            const Field x = s.fa[key_size + i], y = s.fb[key_size + i];
-            if (cell_differs(a, x, b, y, opt)) {
-                any = true;
-                ++out.columns[i].changed;
-                if (is_absent(b, y, opt)) ++out.columns[i].blanked;
-                if (is_absent(a, x, opt)) ++out.columns[i].filled;
+        if (plain) {
+            for (std::size_t i = 0; i < nc; ++i) {
+                const Field x = s.fa[key_size + i], y = s.fb[key_size + i];
+                const bool xa = !is_real(x) || len_of(x) == 0, ya = !is_real(y) || len_of(y) == 0;
+                if ((xa || ya) ? xa != ya : !same_plain(a, x, b, y)) {
+                    any = true;
+                    ++out.columns[i].changed;
+                    if (ya) ++out.columns[i].blanked;
+                    if (xa) ++out.columns[i].filled;
+                }
+            }
+        } else {
+            for (std::size_t i = 0; i < nc; ++i) {
+                const Field x = s.fa[key_size + i], y = s.fb[key_size + i];
+                if (cell_differs(a, x, b, y, opt)) {
+                    any = true;
+                    ++out.columns[i].changed;
+                    if (is_absent(b, y, opt)) ++out.columns[i].blanked;
+                    if (is_absent(a, x, opt)) ++out.columns[i].filled;
+                }
             }
         }
         if (any) {
