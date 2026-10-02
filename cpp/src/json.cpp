@@ -5,9 +5,10 @@
 #include "csvdiff.hpp"
 
 #include <array>
+#include <charconv>
 #include <cmath>
+#include <concepts>
 #include <cstdio>
-#include <sstream>
 
 namespace csvdiff {
 namespace {
@@ -23,20 +24,51 @@ constexpr std::array<bool, 256> kEscape = [] {
     return t;
 }();
 
-// One `write` per run of ordinary bytes, not one `put` per byte.
+// The payload, built in a plain string.
 //
-// `o << c` does not append a byte to a buffer. Each one constructs an
-// `ostream::sentry` -- which checks the stream's state and flushes whatever is
-// tied to it -- for the single character that follows. Callgrind on a 400k pair
-// found 67.7M instructions in `std::ostream::put` and another 37.5M in
-// `sentry`: 3.9% of the entire run, spent on stream bookkeeping, to write a
-// payload whose values are almost all escape-free. The C port's JSON writer
-// does not appear in its profile at all.
+// It was a `std::ostringstream`, and every `<<` on one -- a comma, a bracket,
+// a count -- constructs an `ostream::sentry`, which checks the stream's state
+// and flushes whatever is tied to it, before the byte or two that follows. The
+// runs of ordinary bytes were already written one call apiece (it had been one
+// `put` per byte), but the punctuation between them still went through the
+// stream: on a 400k pair `to_json` was 164M instructions, 60M of them in
+// `ostream::put` and most of the rest in the sentry and the stream's buffer.
+// The C port's writer does not show in its profile at all.
 //
-// So each clean run is written in one call and pays that cost once instead of
-// once per byte. Escapes are rare enough that a `write` apiece for them costs
-// nothing worth saving.
-void write_string(std::ostringstream& o, std::string_view s) {
+// `Out` keeps the `<<` spelling so the writer below reads as it did, and each
+// one is an append. The only double, `seconds`, is printed as the stream
+// printed it -- `%g`, six significant digits -- since the parity job compares
+// these documents byte for byte apart from the timing.
+struct Out {
+    std::string s;
+    Out& operator<<(std::string_view v) {
+        s.append(v);
+        return *this;
+    }
+    Out& operator<<(char c) {
+        s.push_back(c);
+        return *this;
+    }
+    template <std::integral T>
+    Out& operator<<(T v) {
+        char buf[24];
+        const auto res = std::to_chars(buf, buf + sizeof buf, v);
+        s.append(buf, static_cast<std::size_t>(res.ptr - buf));
+        return *this;
+    }
+    Out& operator<<(double v) {
+        char buf[32];
+        const int n = std::snprintf(buf, sizeof buf, "%g", v);
+        s.append(buf, static_cast<std::size_t>(n));
+        return *this;
+    }
+    void write(const char* p, std::size_t n) { s.append(p, n); }
+    void put(char c) { s.push_back(c); }
+};
+
+// One `write` per run of ordinary bytes, not one `put` per byte. Escapes are
+// rare enough that a `write` apiece for them costs nothing worth saving.
+void write_string(Out& o, std::string_view s) {
     o.put('"');
     std::size_t run = 0;
     for (std::size_t i = 0; i < s.size(); ++i) {
@@ -46,7 +78,7 @@ void write_string(std::ostringstream& o, std::string_view s) {
             continue;
         }
         if (run) {
-            o.write(s.data() + i - run, static_cast<std::streamsize>(run));
+            o.write(s.data() + i - run, run);
             run = 0;
         }
         switch (c) {
@@ -62,11 +94,11 @@ void write_string(std::ostringstream& o, std::string_view s) {
             }
         }
     }
-    if (run) o.write(s.data() + s.size() - run, static_cast<std::streamsize>(run));
+    if (run) o.write(s.data() + s.size() - run, run);
     o.put('"');
 }
 
-void write_val(std::ostringstream& o, const Val& v) {
+void write_val(Out& o, const Val& v) {
     if (!v) {
         o << "null";
         return;
@@ -74,7 +106,7 @@ void write_val(std::ostringstream& o, const Val& v) {
     write_string(o, *v);
 }
 
-void write_strings(std::ostringstream& o, const std::vector<std::string>& v) {
+void write_strings(Out& o, const std::vector<std::string>& v) {
     o << '[';
     for (std::size_t i = 0; i < v.size(); ++i) {
         if (i) o << ',';
@@ -83,7 +115,7 @@ void write_strings(std::ostringstream& o, const std::vector<std::string>& v) {
     o << ']';
 }
 
-void write_row(std::ostringstream& o, const std::vector<Val>& row) {
+void write_row(Out& o, const std::vector<Val>& row) {
     o << '[';
     for (std::size_t i = 0; i < row.size(); ++i) {
         if (i) o << ',';
@@ -96,7 +128,8 @@ void write_row(std::ostringstream& o, const std::vector<Val>& row) {
 
 std::string to_json(const Result& r, const std::string& a_path, const std::string& b_path,
                     const Options& opt) {
-    std::ostringstream o;
+    Out o;
+    o.s.reserve(std::size_t{1} << 16);
     o << "{\"meta\":{";
     o << "\"key\":";
     write_strings(o, r.key);
@@ -195,7 +228,7 @@ std::string to_json(const Result& r, const std::string& a_path, const std::strin
 
     (void)opt;
     o << '}';
-    return o.str();
+    return std::move(o.s);
 }
 
 }  // namespace csvdiff
