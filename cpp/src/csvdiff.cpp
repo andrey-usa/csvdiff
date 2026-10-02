@@ -14,6 +14,8 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 #include <bit>
 #include <optional>
 #include <thread>
@@ -1600,7 +1602,14 @@ class RowIndex {
         phase.mark("sweep (parallel)");
 
         std::size_t total = 0;
-        for (const auto& c : chunks) total += c.starts.size();
+        // Each part's first row, for a sink that numbered its rows within the
+        // part: the parts are drained in order, so part i starts after the rows
+        // of every part before it.
+        part_first_.clear();
+        for (const auto& c : chunks) {
+            part_first_.push_back(static_cast<std::int64_t>(total));
+            total += c.starts.size();
+        }
         row_start_.reserve(total);
         row_hash_.reserve(total);
 
@@ -1818,6 +1827,8 @@ class RowIndex {
     /// Rows that repeat a key already seen, in file order -- kept only when the
     /// build was given a sink, which joined them as though each were first.
     const std::vector<int>& later() const { return later_; }
+    /// The first row of each sweep part, in part order.
+    const std::vector<std::int64_t>& part_first() const { return part_first_; }
 
   private:
     static constexpr std::uint32_t kEmpty = 0;
@@ -2097,6 +2108,7 @@ class RowIndex {
     std::vector<int> first_row_;
     bool track_later_ = false;
     std::vector<int> later_;
+    std::vector<std::int64_t> part_first_;
     std::vector<std::uint32_t> occurrences_;
     // Re-used by every probe. A lookup happens once per distinct key, so a
     // vector constructed here would be one heap allocation per row of the file.
@@ -2465,16 +2477,16 @@ struct ProofRows {
 
     // The proof's span found by counting delimiters, without parsing the row.
     // `seg` is the worker's scratch for the gapped proof, two words a run.
-    Guard guard(const ARow& row, Field* probe, std::size_t* seg) const {
+    Guard guard(const ARow& row, Field* probe, std::size_t* seg, int& mate) const {
         if (!plan.guard_commas) return Guard::Untried;
-        if (plan.runs() > 1) return gapped(row, seg);
+        if (plan.runs() > 1) return gapped(row, seg, mate);
         const std::size_t a_lo = row.lo;
         const std::size_t span =
             guard_span(a.bytes(), a_lo, row.hi, a_delim, plan.guard_commas);
         if (!span) return Guard::Untried;
         bool proven = false;
-        const int mate = bi.lookup_proof(a, nullptr, row.hash, probe,
-                                         a.bytes().data() + a_lo, span, 0, false, proven);
+        mate = bi.lookup_proof(a, nullptr, row.hash, probe,
+                               a.bytes().data() + a_lo, span, 0, false, proven);
         if (mate < 0) return Guard::Removed;
         return proven ? Guard::Proven : Guard::Unsettled;
     }
@@ -2484,7 +2496,7 @@ struct ProofRows {
     // hash match, and each run's bytes where B's own gaps put it. A run's bytes
     // include its closing byte, so equal bytes leave B at the start of its next
     // field, as they leave A.
-    Guard gapped(const ARow& row, std::size_t* seg) const {
+    Guard gapped(const ARow& row, std::size_t* seg, int& mate) const {
         const std::size_t runs = plan.runs();
         const std::size_t a_lo = row.lo, a_hi = row.hi;
         FieldWalker wa(a.bytes(), a_lo, a_hi, a_delim);
@@ -2499,7 +2511,7 @@ struct ProofRows {
             at = wa.past(end, plan.gap_fields[j], false);
             if (at == FieldWalker::kShort) return Guard::Untried;
         }
-        const int mate = bi.first_match(row.hash);
+        mate = bi.first_match(row.hash);
         if (mate < 0) return Guard::Removed;
         const char* da = a.bytes().data();
         const char* db = b.bytes().data();
@@ -2727,6 +2739,16 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // sweep, which only happens without them (see `fused`). `at` is the row's
     // place in the worker's run, for the backoff; it decides how the answer is
     // reached, never what it is.
+    // B's rows a row of A matched, one bit each, when the join runs inside A's
+    // sweep with row lists: the added section is then B's keys whose bit is
+    // clear, read off in one ordered walk instead of a second probed pass over
+    // A's index -- a pass that past page cache reads A's keys back from disk.
+    std::unique_ptr<std::atomic<std::uint64_t>[]> b_seen;
+    const auto mark_seen = [&](int mate) {
+        if (b_seen)
+            b_seen[static_cast<std::size_t>(mate) >> 6].fetch_or(
+                std::uint64_t{1} << (static_cast<std::size_t>(mate) & 63), std::memory_order_relaxed);
+    };
     auto join_row = [&](const ProofRows& proof, Part& out, Scratch& s, const ARow& ar, int row,
                         std::size_t at) {
         const bool attempt = s.backoff.attempt(at);
@@ -2737,7 +2759,8 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
         // collision `lookup_proof` passed over -- and compared.
         bool spanned = false;
         if (attempt) {
-            switch (proof.guard(ar, s.probe.data(), s.seg.data())) {
+            int guarded = -1;
+            switch (proof.guard(ar, s.probe.data(), s.seg.data(), guarded)) {
                 case ProofRows::Guard::Untried:
                     break;
                 case ProofRows::Guard::Removed:
@@ -2746,6 +2769,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
                     return;
                 case ProofRows::Guard::Proven:
                     ++out.matched;
+                    mark_seen(guarded);
                     s.backoff.proved();
                     return;
                 case ProofRows::Guard::Unsettled:
@@ -2774,6 +2798,7 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             return;
         }
         ++out.matched;
+        mark_seen(mate);
         if (need) {
             if (proven) {
                 s.backoff.proved();
@@ -2831,23 +2856,23 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // by the insertion -- are joined again afterwards and subtracted. Counts are
     // sums, so that is exact. The C port does the same (#241).
     //
-    // Not with --json: its row lists keep the first rows of each section in key
-    // order, and a repeat taken back could have held a place in one. Not with the
-    // normalisation flags either: --ignore-case refuses from inside a comparison,
-    // and a repeat's refusal could not be taken back.
+    // With --json too: each part keeps its own first changed and removed rows,
+    // and the repeats among them are dropped once the insertion has named them
+    // (`fused_lists` below), the way the Rust port does (#245). Not with the
+    // normalisation flags: --ignore-case refuses from inside a comparison, and a
+    // repeat's refusal could not be taken back.
     //
     // CSVDIFF_FUSED_JOIN=1 takes this path at any size, which is how the tests
     // reach it. With --json as well -- which is how the fuzzer runs -- the
-    // join after the sweep runs too, for the lists, and the two sets of counts
-    // must agree or the run fails.
+    // join after the sweep runs too, and its counts and its row lists must be
+    // the ones the join inside the sweep found, or the run fails.
     const bool normalising = opt.trim || opt.ignore_case || opt.empty_is_null || opt.tolerance > 0.0;
     const bool fused_forced = [] {
         const char* v = std::getenv("CSVDIFF_FUSED_JOIN");
         return v && *v && std::string_view(v) != "0";
     }();
     const bool fused = !normalising &&
-                       ((!opt.row_lists && a.bytes().size() + b.bytes().size() > (std::size_t{8} << 30) &&
-                         budget > 1) ||
+                       ((a.bytes().size() + b.bytes().size() > (std::size_t{8} << 30) && budget > 1) ||
                         fused_forced);
     std::vector<Part> fused_parts;
 
@@ -2855,14 +2880,22 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     std::exception_ptr worker_failure;
     if (fused) {
         bi_slot.emplace(b, bp, b_start, key_size, opt, budget, "B ");
+        if (opt.row_lists)
+            b_seen = std::make_unique<std::atomic<std::uint64_t>[]>(
+                static_cast<std::size_t>(bi_slot->rows()) / 64 + 1);
         const ProofRows proof{a, b, *bi_slot, plan, a_delim, width, key_size, nc};
         fused_parts.resize(budget);
         for (auto& part : fused_parts) part.columns.resize(nc);
         std::vector<Scratch> scratch(budget, Scratch(width, plan.runs()));
         std::vector<std::size_t> seen(budget, 0);
         FnSink sink;
+        // A row is named by its place in its part: which row of the file it is
+        // depends on the parts before it, which are still being swept. The
+        // lists are moved onto file rows once the sweep is done.
         sink.on_row = [&](std::size_t p, std::size_t lo, std::size_t hi, std::uint64_t hash) {
-            join_row(proof, fused_parts[p], scratch[p], ARow{lo, hi, hash}, -1, seen[p]++);
+            const std::size_t local = seen[p]++;
+            join_row(proof, fused_parts[p], scratch[p], ARow{lo, hi, hash}, static_cast<int>(local),
+                     local);
         };
         sink.on_reset = [&](std::size_t p) {
             fused_parts[p] = Part{};
@@ -2890,6 +2923,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     if (worker_failure) std::rethrow_exception(worker_failure);
     const RowIndex& ai = *ai_slot;
     const RowIndex& bi = *bi_slot;
+    // The join after the sweep marks B's matched rows too, so that its added
+    // rows are the same walk over the bitmap rather than a probed pass over A's
+    // index. Not when the two joins are being held against each other: the
+    // probed pass is then the independent answer the walk is checked against.
+    if (opt.row_lists && !b_seen && !fused_forced)
+        b_seen = std::make_unique<std::atomic<std::uint64_t>[]>(
+            static_cast<std::size_t>(bi.rows()) / 64 + 1);
     // From here on there is one thread again, so one timer covers it.
     RowIndex::Phases whole("");
 
@@ -2940,8 +2980,13 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
     // The `--json` path keeps the old arithmetic. Whether `budget - 1` is the
     // right reservation when `b_side` itself takes `b_ways` threads is a
     // separate question this does not answer.
-    unsigned join_ways = opt.row_lists ? std::max(1u, budget > 1 ? budget - 1 : 1u)
-                                       : std::max(1u, budget);
+    //
+    // That separate question has gone away: the added rows are now read off a
+    // bitmap the A side fills (`b_seen`), after it, so nothing runs beside it
+    // and it takes the whole budget. Only the forced cross-check still runs
+    // the probed B side beside it.
+    unsigned join_ways = opt.row_lists && fused_forced ? std::max(1u, budget > 1 ? budget - 1 : 1u)
+                                                       : std::max(1u, budget);
     if (a_keys.size() < 1u << 14) join_ways = 1;  // too few keys to be worth splitting
     std::vector<Part> parts(join_ways);
     for (auto& part : parts) part.columns.resize(nc);
@@ -3150,13 +3195,79 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             added.total = bi.unique_keys() - matched;
         }
     }
+    // The row lists from the join inside the sweep.
+    //
+    // Each part kept the first changed and removed rows of its own stretch of
+    // A, as though each row were the first of its key. In part order, with the
+    // rows that repeat a key dropped, that is the order the join after the
+    // sweep keeps them in -- first occurrences, in file order -- so the first
+    // `max_rows` of it are the same rows. Unless a part ran out: it stopped
+    // keeping at `max_rows`, and if repeats it kept then leave the merged list
+    // short while that part had more, the rows after its last one are not
+    // here. Then the lists come from the join after the sweep, as before.
+    //
+    // The added rows are B's keys no row of A matched, in B's order: its
+    // first rows whose bit is clear.
+    Capped f_changed(opt.max_rows), f_added(opt.max_rows), f_removed(opt.max_rows);
+    const auto added_from_seen = [&](Capped& into) {
+        for (const int row : bi.first_rows()) {
+            const auto bit = static_cast<std::size_t>(row);
+            if (!(b_seen[bit >> 6].load(std::memory_order_relaxed) & (std::uint64_t{1} << (bit & 63))))
+                into.push(row, -1);
+        }
+    };
+    const auto fused_lists = [&]() -> bool {
+        const std::vector<int>& later = ai.later();
+        const std::vector<std::int64_t>& first = ai.part_first();
+        const auto repeat = [&](std::int64_t row) {
+            return std::binary_search(later.begin(), later.end(), static_cast<int>(row));
+        };
+        bool complete = true;
+        const auto gather = [&](Capped& into, const std::vector<std::pair<int, int>>& list,
+                                std::int64_t list_total, std::int64_t base) {
+            for (const auto& [local, mate] : list) {
+                const std::int64_t row = base + local;
+                if (!repeat(row) && into.held.size() <= into.cap)
+                    into.held.emplace_back(static_cast<int>(row), mate);
+            }
+            if (list_total > static_cast<std::int64_t>(list.size()) && into.held.size() <= into.cap)
+                complete = false;
+        };
+        for (std::size_t p = 0; p < fused_parts.size(); ++p) {
+            const Part& part = fused_parts[p];
+            const std::int64_t base = p < first.size() ? first[p] : 0;
+            gather(f_changed, part.changed, part.changed_total, base);
+            gather(f_removed, part.removed, part.removed_total, base);
+        }
+        f_changed.total = fused_totals.changed;
+        f_removed.total = fused_totals.removed;
+        added_from_seen(f_added);
+        return complete && f_added.total == bi.unique_keys() - fused_totals.matched;
+    };
+    const bool listed = fused && opt.row_lists && fused_lists();
+    whole.mark("fused row lists");
+
     if (fused && !opt.row_lists) {
         // Counted above; nothing more to do.
+    } else if (listed && !fused_forced) {
+        matched = fused_totals.matched;
+        for (std::size_t i = 0; i < nc; ++i) {
+            r.columns[i].changed = fused_totals.columns[i].changed;
+            r.columns[i].blanked = fused_totals.columns[i].blanked;
+            r.columns[i].filled = fused_totals.columns[i].filled;
+        }
+        changed = std::move(f_changed);
+        removed = std::move(f_removed);
+        added = std::move(f_added);
     } else if (!opt.row_lists) {
         a_side();
         std::int64_t seen = 0;
         for (const Part& part : parts) seen += part.matched;
         added.total = bi.unique_keys() - seen;
+    } else if (b_seen && !fused_forced) {
+        a_side();
+        added_from_seen(added);
+        whole.mark("added rows");
     } else {
         std::exception_ptr failure;
         std::thread worker([&] {
@@ -3183,6 +3294,11 @@ Result compare(const std::string& a_path, const std::string& b_path, const Optio
             same = fused_totals.columns[i].changed == r.columns[i].changed &&
                    fused_totals.columns[i].blanked == r.columns[i].blanked &&
                    fused_totals.columns[i].filled == r.columns[i].filled;
+        // And with lists of its own, the same rows in them.
+        if (listed && fused_forced)
+            same = same && f_changed.held == changed.held && f_changed.total == changed.total &&
+                   f_removed.held == removed.held && f_removed.total == removed.total &&
+                   f_added.held == added.held && f_added.total == added.total;
         if (!same)
             throw Error("CSVDIFF_FUSED_JOIN: the join inside the sweep disagrees with the join after it");
     }
